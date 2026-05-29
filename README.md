@@ -4,13 +4,16 @@
 
 通过分析 `hermes-agent` 的项目结构和开发文档，我们可以看出一个成熟的 AI Agent 包含以下几个核心模块：
 
-1. **核心对话循环 (Core Agent Loop -** **`run_agent.py`)**：
+1. **核心对话循环 (Core Agent Loop - `run_agent.py`)**：
    这是 Agent 的“大脑”。它负责维护一个完整的对话循环（`while` 循环），将用户的输入发送给 LLM（如 OpenAI、Anthropic），检查 LLM 的返回是否包含工具调用（Tool Calls）。如果有，则暂停对话，执行工具，将结果拼接到上下文中并再次请求 LLM，直到 LLM 给出最终的文本回复。
-2. **工具注册与调度系统 (Tool Orchestration -** **`model_tools.py`,** **`tools/registry.py`)**：
+
+2. **工具注册与调度系统 (Tool Orchestration - `model_tools.py`, `tools/registry.py`)**：
    Agent 需要“手和脚”来操作环境。该系统负责将普通的 Python 函数转换成 LLM 能理解的 JSON Schema，并在 LLM 要求调用时，通过路由找到对应的函数并执行。
-3. **用户交互入口 (CLI / Gateway -** **`cli.py`,** **`gateway/`)**：
+
+3. **用户交互入口 (CLI / Gateway - `cli.py`, `gateway/`)**：
    Agent 的“嘴巴和耳朵”。负责接收用户的指令，并以友好的方式（如终端流式输出、进度条）将 Agent 的思考和操作过程展示给用户。
-4. **状态与记忆管理 (State & Memory -** **`hermes_state.py`)**：
+
+4. **状态与记忆管理 (State & Memory - `hermes_state.py`)**：
    用于持久化存储对话历史、工具执行结果和系统配置，保证多轮对话的连贯性。
 
 ## 2. 构建 R-Agent：第一步需要完成什么？
@@ -32,73 +35,22 @@
 - **Phase 4: 完善体验** ✅
   - 添加流式输出、终端 UI 美化（对标 hermes-agent 的 CLI，已通过 `rich` 库实现）。
 
-## 3. 环境与密钥配置
-
-为了保证代码提交的安全性，R-Agent 将所有敏感的 API 密钥和接口配置都从代码中解耦。你既可以通过命令行交互时录入并保存在本地 `config/settings.json` 中，也强烈推荐使用 **环境变量 (Environment Variables)** 来动态配置。
-
-### 推荐：使用 `.env` 文件一劳永逸配置
-
-每次打开终端手动 `export` 太麻烦，R-Agent 已集成 `python-dotenv`。
-在项目根目录复制环境变量模板：
-
-```bash
-cp .env.example .env
-```
-
-然后在 `.env` 文件中填入你的真实配置（`.env` 文件已被 gitignore 忽略，不会提交）。
-
-支持两种客户端模式：标准 `OpenAI` 接口和 `AzureOpenAI` 接口。
-
-### 方式一：标准 OpenAI 接口配置（默认）
-
-适用于官方 OpenAI 或任何兼容 OpenAI 接口格式的第三方模型代理（如 DeepSeek、OpenRouter、vLLM 等）。
-
-在终端执行 R-Agent 前，注入以下环境变量：
-
-```bash
-# 1. 声明使用标准 openai 客户端
-export LLM_CLIENT_TYPE="openai"
-
-# 2. 配置你的 API Key
-export OPENAI_API_KEY="sk-xxxxxx"
-
-# 3. (可选) 指定模型名称，默认为 gpt-5.5-2026-04-24
-export LLM_MODEL="gpt-4o"
-
-# 4. (可选) 如果你使用第三方代理，需要配置 Base URL
-export OPENAI_BASE_URL="https://api.deepseek.com/v1"
-
-# 运行 Agent
-python main.py
-```
-
-### 方式二：Azure OpenAI 接口配置
-
-适用于企业内部或 Azure 提供的云端大模型接口。
-
-在终端执行 R-Agent 前，注入以下环境变量：
-
-```bash
-# 1. 声明使用 azure 客户端
-export LLM_CLIENT_TYPE="azure"
-
-# 2. 配置你的 Azure API Key
-export OPENAI_API_KEY="your-azure-api-key"
-
-# 3. 指定 Azure Endpoint 地址
-export AZURE_OPENAI_ENDPOINT="https://your-resource-name.openai.azure.com/"
-
-# 4. 指定 API 版本号
-export AZURE_OPENAI_API_VERSION="2024-02-01"
-
-# 5. (可选) 指定部署的模型名称
-export LLM_MODEL="gpt-4-turbo"
-
-# 运行 Agent
-python main.py
-```
-
-***
+---
 
 我们已经完成了基础骨架和终端 UI 美化（Phase 1 & Phase 4）。
 请通过 `pip install -r requirements.txt` 安装依赖，然后运行 `python main.py` 体验美观的 CLI 交互！
+
+## 3. 环境配置
+
+R-Agent 采用纯环境变量配置，不再使用任何本地 JSON 配置文件。请在项目根目录下创建一个 `.env` 文件（可以参考 `.env.example`）来配置你的环境：
+
+```env
+# 1. 客户端类型 (openai 或 azure)
+LLM_CLIENT_TYPE="azure"
+
+# 2. 你的 API 密钥
+OPENAI_API_KEY="你的_API_KEY"
+
+# 3. 模型名称 (OpenAI模式) 或 接入点名称 (Azure模式)
+LLM_MODEL="gpt-4o"
+```

@@ -13,8 +13,13 @@ class SkillManager:
         "uncategorized": "未分类",
     }
 
-    def __init__(self, skills_dir: str = "R-Agent/skills"):
-        self.skills_dir = skills_dir
+    def __init__(self, skills_dir: str = None):
+        if skills_dir is None:
+            # 动态获取 R-Agent 根目录下的 skills 文件夹
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            self.skills_dir = os.path.join(base_dir, "skills")
+        else:
+            self.skills_dir = skills_dir
         os.makedirs(self.skills_dir, exist_ok=True)
 
     def _display_category_name(self, category: str) -> str:
@@ -70,15 +75,17 @@ class SkillManager:
             
         return result
 
-    def view_skill(self) -> str:
-        """查看指定技能的完整 SKILL.md (Tier 2)"""
-        pass
-
     def view_skill(self, skill_name: str) -> str:
-        skill_path = os.path.join(self.skills_dir, skill_name, "SKILL.md")
-        if not os.path.exists(skill_path):
+        """查看指定技能的完整 SKILL.md (Tier 2)"""
+        import glob
+        # 查找该技能的真实路径 (因为它可能在某个分类目录下)
+        search_pattern = os.path.join(self.skills_dir, "**", skill_name, "SKILL.md")
+        matches = glob.glob(search_pattern, recursive=True)
+        
+        if not matches:
             return f"Error: 技能 '{skill_name}' 不存在。"
         
+        skill_path = matches[0]
         with open(skill_path, "r", encoding="utf-8") as f:
             return f.read()
 
