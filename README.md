@@ -36,6 +36,17 @@
 
 为了保证代码提交的安全性，R-Agent 将所有敏感的 API 密钥和接口配置都从代码中解耦。你既可以通过命令行交互时录入并保存在本地 `config/settings.json` 中，也强烈推荐使用 **环境变量 (Environment Variables)** 来动态配置。
 
+### 推荐：使用 `.env` 文件一劳永逸配置
+
+每次打开终端手动 `export` 太麻烦，R-Agent 已集成 `python-dotenv`。
+在项目根目录复制环境变量模板：
+
+```bash
+cp .env.example .env
+```
+
+然后在 `.env` 文件中填入你的真实配置（`.env` 文件已被 gitignore 忽略，不会提交）。
+
 支持两种客户端模式：标准 `OpenAI` 接口和 `AzureOpenAI` 接口。
 
 ### 方式一：标准 OpenAI 接口配置（默认）

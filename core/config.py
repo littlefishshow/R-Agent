@@ -1,10 +1,16 @@
 import os
 import json
+from dotenv import load_dotenv
 
 # Ensure absolute path based on this file's location
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CONFIG_DIR = os.path.join(BASE_DIR, "config")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "settings.json")
+
+# 自动加载根目录下的 .env 文件
+env_path = os.path.join(BASE_DIR, ".env")
+if os.path.exists(env_path):
+    load_dotenv(env_path)
 
 def load_config():
     """加载配置"""
@@ -21,8 +27,9 @@ def save_config(config):
         
 def get_api_key():
     config = load_config()
-    # 优先从环境变量读取，其次读取配置文件
-    return os.environ.get("OPENAI_API_KEY") or config.get("api_key")
+    # 优先从环境变量读取，其次读取配置文件。防范空字符串 ""
+    val = os.environ.get("OPENAI_API_KEY") or config.get("api_key")
+    return val if val else ""
     
 def set_api_key(api_key):
     config = load_config()
@@ -31,7 +38,12 @@ def set_api_key(api_key):
 
 def get_model():
     config = load_config()
-    return os.environ.get("LLM_MODEL") or config.get("model", "gpt-5.5-2026-04-24")
+    # Azure 模式下，通常使用特定的部署名，如 gpt-4o 或其他模型名。
+    # 支持多种常见的环境变量名，防范空字符串 "" 覆盖默认值
+    val = os.environ.get("LLM_MODEL") or os.environ.get("OPENAI_MODEL") or os.environ.get("MODEL") or config.get("model")
+    if not val:
+        return "gpt-4o"
+    return val
 
 def set_model(model):
     config = load_config()
