@@ -36,3 +36,4 @@ venv/
 # Logs and Data
 *.log
 sandbox/
+test*
