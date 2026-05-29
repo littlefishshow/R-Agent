@@ -21,7 +21,8 @@ def save_config(config):
         
 def get_api_key():
     config = load_config()
-    return config.get("api_key")
+    # 优先从环境变量读取，其次读取配置文件
+    return os.environ.get("OPENAI_API_KEY") or config.get("api_key")
     
 def set_api_key(api_key):
     config = load_config()
@@ -30,12 +31,29 @@ def set_api_key(api_key):
 
 def get_model():
     config = load_config()
-    return config.get("model", "gpt-5.5-2026-04-24")
+    return os.environ.get("LLM_MODEL") or config.get("model", "gpt-5.5-2026-04-24")
 
 def set_model(model):
     config = load_config()
     config["model"] = model
     save_config(config)
+
+def get_client_type():
+    """获取客户端类型：'openai' 或 'azure'"""
+    config = load_config()
+    return os.environ.get("LLM_CLIENT_TYPE") or config.get("client_type", "openai")
+
+def get_azure_endpoint():
+    config = load_config()
+    return os.environ.get("AZURE_OPENAI_ENDPOINT") or config.get("azure_endpoint", "https://aidp.bytedance.net/api/modelhub/online/v2/crawl")
+
+def get_azure_api_version():
+    config = load_config()
+    return os.environ.get("AZURE_OPENAI_API_VERSION") or config.get("azure_api_version", "2024-02-01")
+
+def get_openai_base_url():
+    config = load_config()
+    return os.environ.get("OPENAI_BASE_URL") or config.get("base_url", "")
 
 def get_display_mode():
     config = load_config()
@@ -45,3 +63,28 @@ def set_display_mode(mode):
     config = load_config()
     config["display_mode"] = mode
     save_config(config)
+
+def create_llm_client(api_key=None):
+    """
+    根据配置或环境变量统一创建 LLM 客户端。
+    支持 openai 和 azure 两种客户端。
+    """
+    key = api_key or get_api_key()
+    client_type = get_client_type().lower()
+    
+    if client_type == "azure":
+        from openai import AzureOpenAI
+        import uuid
+        return AzureOpenAI(
+            api_key=key,
+            api_version=get_azure_api_version(),
+            azure_endpoint=get_azure_endpoint(),
+            default_headers={"X-TT-LOGID": uuid.uuid4().hex}
+        )
+    else:
+        from openai import OpenAI
+        base_url = get_openai_base_url()
+        kwargs = {"api_key": key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return OpenAI(**kwargs)

@@ -1,8 +1,7 @@
 import os
-from openai import OpenAI
 from tools.registry import registry
 from core.memory import memory_manager
-from core.config import get_api_key, get_model
+from core.config import get_api_key, get_model, create_llm_client
 from core.prompt_builder import build_system_prompt
 
 class RAgent:
@@ -20,10 +19,8 @@ class RAgent:
             # Fallback for the case where config might not be fully initialized yet
             api_key = ""
             
-        # 配置 OpenAI 客户端
-        self.client = OpenAI(
-            api_key=api_key
-        )
+        # 根据配置统一初始化客户端 (支持 OpenAI / AzureOpenAI)
+        self.client = create_llm_client(api_key)
         self.messages = []
         self.context_memory = []  # 新增：用于存放子任务上下文压缩摘要
 

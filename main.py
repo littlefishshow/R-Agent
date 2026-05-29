@@ -6,7 +6,7 @@ import re
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.agent import RAgent
-from core.config import get_api_key, set_api_key, get_model, set_model, get_display_mode, set_display_mode, CONFIG_FILE
+from core.config import get_api_key, set_api_key, get_model, set_model, get_display_mode, set_display_mode, CONFIG_FILE, get_client_type, create_llm_client
 import tools  # 这将触发 tools/__init__.py 动态加载所有工具
 from tools.registry import registry
 from core.memory import memory_manager
@@ -39,7 +39,7 @@ def display_welcome_banner():
     banner_text.append("\n", style="default")
     banner_text.append("💡 提示: 默认模型为 ", style="info")
     banner_text.append(f"{get_model()}", style="bold cyan")
-    banner_text.append(" (OpenAI)。当前显示模式: ", style="info")
+    banner_text.append(f" ({get_client_type().upper()})。当前显示模式: ", style="info")
     banner_text.append(f"{get_display_mode()}", style="bold cyan")
     banner_text.append("。\n", style="info")
     # banner_text.append("⌨️  命令: 输入 ", style="info")
@@ -219,7 +219,8 @@ def ensure_api_key():
     api_key = get_api_key()
     if not api_key:
         console.print("[bold yellow]⚠️ 未检测到 API Key，请先配置[/bold yellow]")
-        api_key = console.input("请输入 OpenAI API Key: ")
+        client_type = get_client_type()
+        api_key = console.input(f"请输入 {client_type.upper()} API Key: ")
         set_api_key(api_key)
         console.print(f"✅ API Key 已保存至: [bold green]{os.path.abspath(CONFIG_FILE)}[/bold green]\n")
 
@@ -269,11 +270,8 @@ def main():
             
             # 每次对话前，由于模型可能被切换，需要更新 agent 实例的模型
             agent.model = get_model()
-            # 同样需要更新 agent 的 client (如果 API Key 被更新了)
-            from openai import OpenAI
-            agent.client = OpenAI(
-                api_key=get_api_key()
-            )
+            # 同样需要更新 agent 的 client (如果 API Key 或配置被更新了)
+            agent.client = create_llm_client()
             
             # 状态回调函数
             def on_think(iteration):
