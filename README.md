@@ -39,5 +39,3 @@
 
 我们已经完成了基础骨架和终端 UI 美化（Phase 1 & Phase 4）。
 请通过 `pip install -r requirements.txt` 安装依赖，然后运行 `python main.py` 体验美观的 CLI 交互！
-# R-Agent
-# R-Agent
