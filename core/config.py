@@ -38,6 +38,39 @@ def get_openai_base_url():
 def get_display_mode():
     return os.environ.get("DISPLAY_MODE", "detailed")
 
+def get_max_iterations():
+    """单次对话允许的最大思考轮数。"""
+    try:
+        return int(os.environ.get("MAX_ITERATIONS", "30"))
+    except ValueError:
+        return 30
+
+def get_soft_warn_ratio():
+    """软提醒阈值占 max_iterations 的比例（达到此比例后注入提醒）。"""
+    try:
+        ratio = float(os.environ.get("SOFT_WARN_RATIO", "0.7"))
+    except ValueError:
+        ratio = 0.7
+    if ratio <= 0 or ratio >= 1:
+        ratio = 0.7
+    return ratio
+
+def get_llm_max_retries():
+    """瞬时错误（超时/限流/5xx）的最大重试次数（不含首次请求）。"""
+    try:
+        n = int(os.environ.get("LLM_MAX_RETRIES", "3"))
+    except ValueError:
+        n = 3
+    return max(0, n)
+
+def get_llm_retry_base_delay():
+    """重试初始等待秒数，按 2^attempt 指数退避。"""
+    try:
+        d = float(os.environ.get("LLM_RETRY_BASE_DELAY", "1.0"))
+    except ValueError:
+        d = 1.0
+    return max(0.0, d)
+
 def create_llm_client(api_key=None):
     """
     根据环境变量统一创建 LLM 客户端。

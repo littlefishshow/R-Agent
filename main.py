@@ -7,7 +7,6 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.agent import RAgent
 from core import config
-from tools import builtin  # 导入此模块以触发工具注册
 from tools.registry import registry
 from core.skills import skill_manager
 from core.memory import memory_manager
@@ -293,8 +292,15 @@ def main():
             agent.client = config.create_llm_client()
             
             # 状态回调函数
-            def on_think(iteration):
-                status.update(f"[bold cyan]🤖 Agent 正在思考 (第 {iteration+1} 轮)...[/bold cyan]")
+            def on_think(iteration, **kwargs):
+                if "retry_attempt" in kwargs:
+                    status.update(
+                        f"[bold yellow]🤖 模型请求瞬时失败，正在重试 "
+                        f"({kwargs['retry_attempt']}/{kwargs['retry_max']})，"
+                        f"约 {kwargs['retry_delay']:.1f}s 后继续...[/bold yellow]"
+                    )
+                else:
+                    status.update(f"[bold cyan]🤖 Agent 正在思考 (第 {iteration+1} 轮)...[/bold cyan]")
                 
             def on_tool_start(func_name, func_args):
                 if config.get_display_mode() == "concise":
@@ -329,6 +335,44 @@ def main():
                 expand=False
             ))
             console.print()
+
+            # 若 Agent 因迭代上限被强制收尾，主动询问用户是否扩展预算续跑
+            while agent.is_truncated():
+                console.print(
+                    "[bold yellow]⚠️  Agent 已达迭代上限并完成强制收尾。"
+                    "上下文完整保留，可输入额外轮数继续推进，"
+                    "或回车跳过（保留当前结果）。[/bold yellow]"
+                )
+                extra_raw = session.prompt(
+                    HTML('<ansiyellow><b>➕ 扩展轮数&gt;</b></ansiyellow> ')
+                ).strip()
+                if not extra_raw:
+                    break
+                try:
+                    extra = int(extra_raw)
+                except ValueError:
+                    console.print("[bold red]请输入正整数，或回车跳过[/bold red]")
+                    continue
+                if extra <= 0:
+                    break
+
+                with console.status(
+                    f"[bold cyan]🤖 Agent 续跑中（+{extra} 轮）...[/bold cyan]",
+                    spinner="dots",
+                ) as status:
+                    response = agent.continue_after_truncation(
+                        extra,
+                        on_think=on_think,
+                        on_tool_start=on_tool_start,
+                        on_tool_end=on_tool_end,
+                    )
+                console.print(Panel(
+                    Markdown(response),
+                    title="[bold blue]🤖 R-Agent (续跑)[/bold blue]",
+                    border_style="blue",
+                    expand=False,
+                ))
+                console.print()
             
         except (KeyboardInterrupt, EOFError):
             console.print("\n[bold yellow]👋 再见！[/bold yellow]")

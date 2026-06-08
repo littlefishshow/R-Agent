@@ -21,7 +21,7 @@ def delegate_task(tasks: str) -> str:
     def _run_subagent(task_index, goal):
         # Create a fresh isolated sub-agent
         console.print(f"\n[bold blue]🚀 [Sub-Agent {task_index}][/bold blue] 开始执行子任务: {goal}")
-        sub_agent = RAgent(max_iterations=5)
+        sub_agent = RAgent(max_iterations=30)
         
         # 遵循 hermes-agent 的上下文隔离 trick：子智能体拥有专属、聚焦的 system prompt
         system_prompt = (
@@ -34,7 +34,7 @@ def delegate_task(tasks: str) -> str:
         )
         
         # 定义回调以避免默认的 print 输出造成终端混乱，同时显示执行进度
-        def on_think(iteration):
+        def on_think(iteration, **kwargs):
             pass
             
         def on_tool_start(func_name, func_args):
