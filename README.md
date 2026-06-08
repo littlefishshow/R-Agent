@@ -54,3 +54,26 @@ OPENAI_API_KEY="你的_API_KEY"
 # 3. 模型名称 (OpenAI模式) 或 接入点名称 (Azure模式)
 LLM_MODEL="gpt-4o"
 ```
+
+---
+
+## 更新日志
+
+### 2026-06-08
+
+#### Agent Memory 系统阶段性升级
+
+- **P0 文件 memory 安全加固**：重构 `core/memory.py`，为 `USER.md` / `MEMORY.md` 增加 atomic write、进程/线程锁、duplicate check、unique replace/remove、char limit 与基础 prompt injection / secret 扫描。
+- **Frozen Snapshot 语义**：新增 `load_snapshot()`、`read_memory_snapshot()`、`read_memory_live()`；`main.py` 在启动 system prompt 时加载一次 memory snapshot，memory tool 写入只影响落盘与未来会话。
+- **Memory 工具稳定性**：更新 `tools/memory_tool.py`，统一返回 `success/error` JSON，补充“当前 frozen system prompt 不会被修改”的可见性提示，并兼容异常类重命名导致的热加载问题。
+- **P1-minimal 检索能力**：新增 `tools/memory_read_tool.py`，注册 `memory_search` 与 `memory_get`，支持在 `USER.md` / `MEMORY.md` 上进行纯文本行级搜索和分页读取，为后续 SQLite FTS/vector index 保持接口稳定。
+- **CLI memory 读取修正**：`/mem USER`、`/mem MEMORY` 改为通过 `MemoryManager.read_target()` 读取，避免绕过锁与文件初始化逻辑。
+- **测试与验证**：新增 memory P0/P1 测试文件；当前环境未安装 pytest，已用手动脚本验证 P0/P1 核心行为，并通过 `python3 -m py_compile core/memory.py tools/memory_tool.py tools/memory_read_tool.py main.py`。
+- **维护进度文档**：新增并维护 `outputs/agent_memory_maintenance_progress.md`，记录当前 Agent Memory 迭代进展、已完成事项、验证结果和下一步建议；保留 `outputs/current_memory_system_improvement_plan.md` 作为设计路线图。
+- **工程清理**：调整 `.gitignore`，避免提交本地临时仓库、memory lock 等运行时文件，并允许纳入正式 `tests/` 目录。
+
+#### 下一步建议
+
+- 补齐 P0 增强：drift detection、entry id / metadata block。
+- 进入 P2：实现 session summary / compaction flush，避免把临时任务状态误写入长期 memory。
+

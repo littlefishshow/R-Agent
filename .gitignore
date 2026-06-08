@@ -36,4 +36,11 @@ venv/
 # Logs and Data
 *.log
 sandbox/
-test*
+# Test artifacts (keep tests/ source directory trackable)
+test-output/
+test_outputs/
+tmp_test*/
+# Runtime/local agent state
+R-Agent/memories/.memory.lock
+repos/
+outputs/tts/

@@ -205,11 +205,9 @@ def handle_slash_command(command_str: str, console) -> bool:
                 text += "\n\n> 💡 **提示**: 输入 `/mem <空格>` 然后选择 `USER` 或 `MEMORY` 查看具体记忆内容。"
             console.print(Panel(Markdown(text), title="🧠 记忆区"))
         elif arg.upper() == "USER":
-            with open(memory_manager.user_file, "r", encoding="utf-8") as f:
-                console.print(Panel(f.read(), title="🧠 USER Memory"))
+            console.print(Panel(memory_manager.read_target("user"), title="🧠 USER Memory"))
         elif arg.upper() == "MEMORY":
-            with open(memory_manager.memory_file, "r", encoding="utf-8") as f:
-                console.print(Panel(f.read(), title="🧠 MEMORY Memory"))
+            console.print(Panel(memory_manager.read_target("memory"), title="🧠 MEMORY Memory"))
         else:
             console.print("[bold red]只支持 /mem USER 或 /mem MEMORY[/bold red]")
         return True
@@ -257,6 +255,7 @@ def main():
         "1. 更新技能(Skills)：你可以使用 `skill_create` 工具随时创建新的技能，或者为现有技能添加新分类。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
         "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
         "请始终使用中文回复用户。"
+        + memory_manager.load_snapshot()
     )
     
     # 初始化 prompt_toolkit session
