@@ -8,7 +8,7 @@
 
 ## 1. 当前迭代目标
 
-当前正在重构 R-Agent 的 memory 系统，目标是从简单的 `USER.md` / `MEMORY.md` 文件追加机制，逐步演进为更安全、可维护、可检索、可压缩恢复的 Agent Memory 架构。
+当前正在重构 R-Agent 的 memory 系统，目标是从简单的 `memories/USER.md` / `memories/MEMORY.md` 文件追加机制，逐步演进为更安全、可维护、可检索、可压缩恢复的 Agent Memory 架构。
 
 长期设计分层参考：
 
@@ -161,6 +161,71 @@ tests/test_memory_p0.py
 
 ---
 
+
+### 2026-06-08：Memory 目录规范化迁移
+
+涉及文件：
+
+```text
+core/memory.py
+.gitignore
+memories/USER.md
+memories/MEMORY.md
+R-Agent/memories/USER.md
+R-Agent/memories/MEMORY.md
+outputs/current_memory_system_improvement_plan.md
+outputs/memory_directory_migration_2026-06-08.md
+```
+
+迁移内容：
+
+- 将默认活跃 memory 目录从 `R-Agent/memories/` 改为 `memories/`；
+- 将旧活跃目录中的真实 `USER.md` / `MEMORY.md` 内容迁移到根目录 `memories/`；
+- 原根目录 `memories/` 中的 `<br />` 占位内容已被替换；
+- 删除旧嵌套目录下被 git 跟踪的 memory 文件，避免双目录混淆；
+- 更新 `.gitignore`，忽略 `memories/.memory.lock`，并继续忽略旧路径 lock；
+- 生成迁移备份文档，便于审计。
+
+---
+
+
+### 2026-06-08：delete_file 安全审批 A 方案修正
+
+涉及文件：
+
+```text
+tools/file_tools.py
+README.md
+outputs/agent_memory_maintenance_progress.md
+```
+
+背景与结论：
+
+- 审查 git diff 后发现当前实现实际是 B/token 方案：`delete_file_tool(path, confirm, approval_token)`，permission response 与 schema 中都包含 `approval_token`；
+- 用户指出 token 字段可能触发接口安全审核，因此改回 A 方案：只使用 `confirm=true` 作为二次确认信号，不返回、不要求、不注册 `approval_token`；
+- 删除沙盒外文件/目录时不再通过 `console.input()` 阻塞等待，统一返回结构化 `permission_required`，避免 rich.status spinner 覆盖隐藏输入。
+
+已完成能力：
+
+1. `delete_file_tool` 签名改为：
+
+```python
+def delete_file_tool(path: str, confirm: bool = False) -> str:
+```
+
+2. `delete_file` tool schema 仅保留：
+
+```text
+path
+confirm
+```
+
+3. `permission_required` 返回体不含 `approval_token`，只提示用户明确同意后再次传入 `confirm=true`；
+4. 工作区外删除也改为非阻塞审批返回，避免继续走 `check_outside_workspace_auth()` 的 `console.input()`；
+5. `is_in_sandbox()` / `is_in_workspace()` 改为 `os.path.commonpath()` 边界判断，避免 `sandbox_evil` / 工作区同名前缀路径误判。
+
+---
+
 ## 4. 已验证内容
 
 ### 2026-06-08
@@ -206,6 +271,28 @@ No module named pytest
 
 ---
 
+
+### 2026-06-08：delete_file A 方案验证
+
+已执行：
+
+```bash
+python3 -m py_compile tools/file_tools.py
+```
+
+结果：通过。
+
+已执行手动行为测试，覆盖：
+
+- `sandbox/tmp_delete_file_review.txt`：沙盒内文件无需确认，直接删除成功；
+- `tmp_delete_file_review.txt`：工作区沙盒外文件首次返回 `permission_required=true`，文件仍存在；
+- 同一工作区沙盒外文件再次 `confirm=true` 删除成功；
+- `/tmp/r_agent_delete_file_review.txt`：工作区外文件首次返回 `permission_required=true`，不再阻塞等待 `console.input()`；
+- 返回体与源码中无 `approval_token` / `DELETE_APPROVAL` / `secrets.token` 残留；
+- `sandbox_evil/file.txt` 不再被误判为沙盒内，`sandbox/file.txt` 正确识别为沙盒内。
+
+---
+
 ## 5. 当前未完成事项
 
 ### P0 剩余建议
@@ -215,7 +302,7 @@ No module named pytest
    - 当前尚未执行 README 更新，因为本次用户只是提出要求，还未明确进入 git push/升级发布步骤。
 
 2. **决定是否提交运行时 memory 文件**
-   - 当前 `R-Agent/memories/USER.md` 有本地用户偏好变更；
+   - 已将活跃 memory 目录规范化为 `memories/`；旧 `R-Agent/memories/` 不再作为默认路径；
    - 建议后续决定是否将 `R-Agent/memories/*.md` 纳入 git 管理；
    - 如果该 repo 不应提交个人运行时状态，应加入 `.gitignore` 或在提交前 revert。
 
@@ -312,11 +399,11 @@ memory_get
 ```text
 outputs/current_memory_system_improvement_plan.md
 outputs/agent_memory_maintenance_progress.md
-git diff -- core/memory.py tools/memory_tool.py main.py tests/test_memory_p0.py
+git diff -- tools/file_tools.py README.md outputs/agent_memory_maintenance_progress.md
 ```
 
 然后优先继续实现：
 
 ```text
-P1-minimal：memory_search + memory_get 纯文本版
+继续评估 delete_file A 方案是否需要为 read/write/search 的工作区外阻塞 input 做同类 permission_required 改造；或推进 P0/P2 memory 后续事项
 ```

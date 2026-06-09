@@ -57,7 +57,7 @@ class MemoryManager:
         r"password\s*[:=]",
     ]
 
-    def __init__(self, memory_dir: str = "R-Agent/memories"):
+    def __init__(self, memory_dir: str = "memories"):
         self.memory_dir = memory_dir
         os.makedirs(self.memory_dir, exist_ok=True)
 

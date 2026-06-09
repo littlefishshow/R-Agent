@@ -41,6 +41,8 @@ test-output/
 test_outputs/
 tmp_test*/
 # Runtime/local agent state
-R-Agent/memories/.memory.lock
+memories/.memory.lock
+# Deprecated nested project directory (old accidental R-Agent/R-Agent/* paths)
+R-Agent/
 repos/
 outputs/tts/

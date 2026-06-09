@@ -71,6 +71,16 @@ LLM_MODEL="gpt-4o"
 - **测试与验证**：新增 memory P0/P1 测试文件；当前环境未安装 pytest，已用手动脚本验证 P0/P1 核心行为，并通过 `python3 -m py_compile core/memory.py tools/memory_tool.py tools/memory_read_tool.py main.py`。
 - **维护进度文档**：新增并维护 `outputs/agent_memory_maintenance_progress.md`，记录当前 Agent Memory 迭代进展、已完成事项、验证结果和下一步建议；保留 `outputs/current_memory_system_improvement_plan.md` 作为设计路线图。
 - **工程清理**：调整 `.gitignore`，避免提交本地临时仓库、memory lock 等运行时文件，并允许纳入正式 `tests/` 目录。
+- **Memory 目录规范化**：将默认活跃 memory 目录从 `R-Agent/memories/` 迁移为仓库根目录 `memories/`，迁移真实 USER/MEMORY 内容，删除旧嵌套 tracked 文件，并补充迁移备份文档。
+
+
+#### delete_file 安全审批 A 方案修正
+
+- **移除审批 token 字段**：将 `tools/file_tools.py` 中的 `delete_file_tool` 从 token/B 方案修正为 A 方案，仅保留 `path` 与 `confirm` 参数，避免 `approval_token` 等字段触发接口安全审核。
+- **非阻塞危险删除审批**：删除沙盒外文件/目录时不再调用 `console.input()` 阻塞等待输入，而是首次返回 `permission_required=true`；只有用户明确同意后，Agent 才可再次调用并传入 `confirm=true` 执行。
+- **覆盖工作区外路径**：工作区外删除同样改为结构化审批返回，不再触发隐藏输入问题，并在返回消息中提示更高风险与绝对路径核对。
+- **路径边界加固**：将 `is_in_sandbox()` / `is_in_workspace()` 从字符串 `startswith` 判断改为 `os.path.commonpath()`，避免 `sandbox_evil` 等前缀路径被误判为沙盒内。
+- **验证结果**：已通过 `python3 -m py_compile tools/file_tools.py`，并手动验证沙盒内直接删除、沙盒外首次不删除、`confirm=true` 后删除、工作区外首次返回审批、无 `approval_token` 残留。
 
 #### 下一步建议
 

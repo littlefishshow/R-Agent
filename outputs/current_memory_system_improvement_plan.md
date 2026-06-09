@@ -3,7 +3,77 @@
 > 本文是 Agent Memory 系统的设计方案与路线图；实际维护进度与阶段性更新请查看 `outputs/agent_memory_maintenance_progress.md`。
 
 > 目标：基于 OpenClaw、opencode-mem、Hermes Agent 的调研结果，提出一套适合当前 R-Agent 的 memory 改造路线。  
-> 本文只给设计与实现步骤，不直接修改现有 `core/memory.py` / `tools/memory_tool.py`，避免在未确认前改变行为。
+> 本文最初用于设计与实现步骤；当前已同步记录阶段性落地状态。详细执行日志请以维护进度文档为准。
+
+---
+
+
+## 0. 当前实施状态快照（2026-06-08）
+
+> 本节用于避免把历史“缺口描述”误读为当前仍未实现。完整执行记录见 `outputs/agent_memory_maintenance_progress.md`。
+
+### 0.1 已阶段性完成
+
+- **P0 文件 memory 安全稳定化：核心完成**
+  - atomic write；
+  - 进程/线程锁；
+  - duplicate check；
+  - unique replace/remove；
+  - char limit；
+  - 基础 prompt injection / secret scan；
+  - frozen snapshot 语义；
+  - memory tool 热加载兼容与结构化错误返回。
+
+- **P1-minimal：纯文本 memory_search / memory_get 已完成**
+  - 新增 `tools/memory_read_tool.py`；
+  - 注册 `memory_search(query, target?, max_results?)`；
+  - 注册 `memory_get(target, from_line?, lines?)`；
+  - 先基于 `USER.md` / `MEMORY.md` 做行级搜索与分页读取，暂不引入 SQLite。
+
+- **维护与审计文档**
+  - `README.md` 已新增按日期记录的更新日志；
+  - `outputs/agent_memory_maintenance_progress.md` 用于记录当前维护进度；
+  - 本文继续作为路线图与设计基线。
+
+### 0.2 当前仍待推进
+
+- **P0 增强**
+  - drift detection：发现 memory 文件格式异常、过大、控制字符或非预期结构时拒绝自动覆盖；
+  - entry id / metadata block：避免长期依赖 substring 做 replace/remove；
+  - token 级预算估算：当前已实现 char limit，但尚未做 tokenizer 级 token limit。
+
+- **P2：session summary / compaction flush**
+  - 复杂任务结束、上下文压缩前，沉淀 session summary；
+  - 避免把临时任务状态、执行日志误写入 curated long-term memory。
+
+- **P3+**
+  - SQLite FTS；
+  - Searchable History；
+  - vector index；
+  - provider interface。
+
+
+### 0.3 Memory 目录规范化（2026-06-08）
+
+当前已将默认活跃 memory 目录从嵌套路径：
+
+```text
+R-Agent/memories/
+```
+
+规范化为仓库根目录下的：
+
+```text
+memories/
+```
+
+迁移策略：
+
+- 将原 `R-Agent/memories/USER.md` 与 `R-Agent/memories/MEMORY.md` 的真实内容迁移到 `memories/`；
+- 原 `memories/` 下只有 `<br />` 占位内容，已被真实内容替换；
+- `MemoryManager` 默认 `memory_dir` 改为 `"memories"`；
+- `.memory.lock` 改为在 `memories/.memory.lock` 下生成并被 `.gitignore` 忽略；
+- 保留迁移备份记录：`outputs/memory_directory_migration_2026-06-08.md`。
 
 ---
 
@@ -21,7 +91,7 @@ tools/memory_tool.py
 当前 `MemoryManager` 做了：
 
 ```python
-memory_dir = "R-Agent/memories"
+memory_dir = "memories"
 USER.md
 MEMORY.md
 ```
@@ -54,20 +124,24 @@ memory(action, target, content, old_text)
 3. **工具语义清晰**：区分 user memory 与 environment/project memory。
 4. **已有 replace/remove**：长期记忆维护所需的基本操作已经有了。
 
-### 1.3 当前主要缺口
+### 1.3 缺口状态更新
 
-| 缺口 | 风险 |
-|---|---|
-| 直接 append/write，无 atomic write | 写入中断可能导致文件半写或损坏 |
-| 无并发保护 | 多 agent / 多任务同时写可能互相覆盖 |
-| 无 duplicate check | memory 容易重复膨胀 |
-| 无 char/token limit | system prompt 可能无限增长 |
-| 无 prompt injection / secret scan | 恶意内容可能被长期注入 system prompt |
-| replace/remove 使用全局字符串替换 | 可能误替换多个位置 |
-| 没有 frozen snapshot 语义 | 需要明确“写入落盘”和“当前 prompt 可见性”的关系 |
-| 没有 memory_search / memory_get | 只能把全部 memory 注入 prompt，无法扩展到大量历史 |
-| 没有 session_search | 临时任务状态和历史对话容易被误写入长期 memory |
-| 没有 compaction/task-end flush | 上下文压缩或复杂任务结束时没有稳定沉淀机制 |
+> 下表中的“原始缺口”来自改造前评估；“当前状态”反映 2026-06-08 阶段性实现后的情况。
+
+| 原始缺口 | 当前状态 | 后续说明 |
+|---|---|---|
+| 直接 append/write，无 atomic write | ✅ 已关闭 | `core/memory.py` 已使用临时文件 + fsync + `os.replace()`。 |
+| 无并发保护 | ✅ 已关闭核心风险 | 已加入 `fcntl.flock` 与 `threading.RLock`；跨平台无 `fcntl` 时仍会退化。 |
+| 无 duplicate check | ✅ 已关闭 | append 前会 normalize 并跳过重复条目。 |
+| 无 char/token limit | 🟡 部分关闭 | 已实现 char limit；tokenizer 级 token limit 尚未实现。 |
+| 无 prompt injection / secret scan | ✅ 已关闭基础风险 | 已实现基础 suspicious pattern scan；后续可扩展策略和审计日志。 |
+| replace/remove 使用全局字符串替换 | ✅ 已关闭核心风险 | `old_text` 必须唯一匹配，否则拒绝操作。 |
+| 没有 frozen snapshot 语义 | ✅ 已关闭 | `main.py` 启动时 `load_snapshot()`；工具写入只影响落盘和未来 session。 |
+| 没有 memory_search / memory_get | ✅ 已关闭 minimal 版 | 已实现 Markdown 行级搜索与分页读取；SQLite FTS 仍属 P3。 |
+| 没有 session_search | ❌ 未开始 | 属于 P2/P3 范畴，用于区分 session 历史与长期 curated memory。 |
+| 没有 compaction/task-end flush | ❌ 未开始 | 属于 P2，建议下一阶段推进。 |
+| 无 drift detection | ❌ 未开始 | P0 增强项，建议优先补齐。 |
+| 无 entry id / metadata block | ❌ 未开始 | P0/P1 增强项，可降低 substring replace/remove 风险。 |
 
 ---
 
@@ -161,6 +235,8 @@ L5 Provider Interface
 ## 4. 分阶段改造路线
 
 ## P0：先把现有文件 memory 做安全、稳定
+
+**当前状态：核心已完成，剩余 drift detection / entry id / token limit 等增强项。**
 
 这一阶段不引入数据库，只增强当前 `USER.md` / `MEMORY.md`。
 
@@ -306,6 +382,8 @@ Successfully appended to USER memory. This will be visible in future sessions.
 
 ## P1：增加 memory_search / memory_get
 
+**当前状态：minimal 纯文本版已完成；SQLite FTS 仍作为中期增强。**
+
 这一阶段解决“长期 memory 不能无限注入 prompt”的问题。
 
 ### P1.1 新增工具
@@ -346,6 +424,29 @@ def memory_search_text(query: str, files: list[str], max_results: int = 5):
                 })
     return sorted(results, key=lambda x: x["score"], reverse=True)[:max_results]
 ```
+
+### P1.2.1 当前落地实现说明（2026-06-08）
+
+当前已采用最小实现，保持 Markdown 文件为 source of truth：
+
+```text
+core/memory.py
+  - search_memory(query, target="all", max_results=5)
+  - get_memory(target, from_line=1, lines=50)
+
+tools/memory_read_tool.py
+  - memory_search
+  - memory_get
+```
+
+当前工具返回的是行级结果：
+
+- `memory_search` 返回 `target`、`line`、`score`、`snippet`；
+- `memory_get` 返回 `total_lines`、`end_line`、`has_more` 和带行号内容；
+- `max_results` 限制在 1-50；
+- `lines` 限制在 1-200。
+
+这版不建立索引，适合当前小容量 curated memory；后续当 memory/history 增大后再引入 SQLite FTS。
 
 ### P1.3 中期实现：SQLite FTS
 

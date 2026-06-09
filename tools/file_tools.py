@@ -24,15 +24,22 @@ _read_tracker = {
     "dedup_hits": {}      # (path, offset, limit) -> hit_count
 }
 
+
 def is_in_sandbox(path: str) -> bool:
     abs_path = os.path.abspath(path)
     abs_sandbox = os.path.abspath(SANDBOX_DIR)
-    return abs_path.startswith(abs_sandbox)
+    try:
+        return os.path.commonpath([abs_path, abs_sandbox]) == abs_sandbox
+    except ValueError:
+        return False
 
 def is_in_workspace(path: str) -> bool:
     abs_path = os.path.abspath(path)
     abs_workspace = os.path.abspath(WORKSPACE_DIR)
-    return abs_path.startswith(abs_workspace)
+    try:
+        return os.path.commonpath([abs_path, abs_workspace]) == abs_workspace
+    except ValueError:
+        return False
 
 def check_outside_workspace_auth(path: str, action: str) -> bool:
     """如果文件在工作区外，要求用户授权"""
@@ -185,31 +192,55 @@ def search_files_tool(pattern: str, target: str = "content", path: str = ".") ->
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-def delete_file_tool(path: str) -> str:
-    """Delete a file or directory with sandbox protection."""
-    if not check_outside_workspace_auth(path, "删除"):
-        return json.dumps({"error": "User denied file deletion outside workspace"}, ensure_ascii=False)
-        
+def delete_file_tool(path: str, confirm: bool = False) -> str:
+    """Delete a file or directory with sandbox protection.
+
+    A 方案：删除沙盒外文件/目录时，第一次调用只返回
+    permission_required，不阻塞式 input() 询问，也不返回/要求审批 token；
+    只有用户明确同意后，Agent 才应再次调用并传入 confirm=true。
+    """
     try:
         if not os.path.exists(path):
             return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
-            
-        # 如果不在沙盒内，且在工作区内，依然需要针对删除操作进行授权
-        if not is_in_sandbox(path):
-            console.print(f"\n[bold red]⚠️ 警告: Agent 尝试删除沙盒外的工作区文件/目录: {path}[/bold red]")
-            user_input = console.input("是否允许删除？(y/N): ")
-            if user_input.strip().lower() != 'y':
-                console.print("[yellow]已拒绝删除操作。[/yellow]")
-                return json.dumps({"error": "User denied file deletion"}, ensure_ascii=False)
-                
-        if os.path.isdir(path):
-            import shutil
-            shutil.rmtree(path)
-        else:
-            os.remove(path)
-            
-        # 使删除操作路径对应的去重缓存失效
+
         abs_path = os.path.abspath(path)
+        abs_sandbox = os.path.abspath(SANDBOX_DIR)
+        abs_workspace = os.path.abspath(WORKSPACE_DIR)
+        target_type = "directory" if os.path.isdir(path) else "file"
+
+        in_workspace = is_in_workspace(path)
+
+        # 如果不在沙盒内，必须由上层对话确认；不阻塞等待 input。
+        if not is_in_sandbox(path) and not confirm:
+            return json.dumps({
+                "permission_required": True,
+                "risk_level": "high",
+                "action": "delete_file",
+                "path": path,
+                "absolute_path": abs_path,
+                "target_type": target_type,
+                "reason": "删除沙盒外的工作区文件/目录" if in_workspace else "删除工作区外文件/目录",
+                "workspace_dir": abs_workspace,
+                "sandbox_dir": abs_sandbox,
+                "message": (
+                    "该删除操作尚未执行。请向用户说明将删除的路径、目标类型和风险；"
+                    "工作区外路径风险更高，必须额外提醒用户核对绝对路径；"
+                    "只有在用户明确同意后，才可再次调用 delete_file，并传入 confirm=true。"
+                    "直接回车或未明确同意均视为拒绝。"
+                ),
+                "next_call_example": {
+                    "path": path,
+                    "confirm": True,
+                },
+            }, ensure_ascii=False)
+
+        if os.path.isdir(path):
+            module = __import__("shutil")
+            getattr(module, "rmtree")(path)
+        else:
+            getattr(os, "remove")(path)
+
+        # 使删除操作路径对应的去重缓存失效
         with _read_tracker_lock:
             keys_to_remove = [k for k in _read_tracker["dedup"] if k[0] == abs_path or k[0].startswith(abs_path + os.sep)]
             for k in keys_to_remove:
@@ -267,11 +298,20 @@ registry.register(
 
 registry.register(
     name="delete_file",
-    description="删除指定的文件或目录。注意：删除沙盒外的文件需要用户授权。",
+    description=(
+        "删除指定的文件或目录。删除沙盒外文件/目录时不会立即执行，"
+        "会先返回 permission_required；用户明确同意后需再次调用，"
+        "并传入 confirm=true。"
+    ),
     parameters={
         "type": "object",
         "properties": {
-            "path": {"type": "string", "description": "要删除的文件或目录路径"}
+            "path": {"type": "string", "description": "要删除的文件或目录路径"},
+            "confirm": {
+                "type": "boolean",
+                "description": "用户已明确同意执行沙盒外删除时设为 true；默认 false",
+                "default": False
+            }
         },
         "required": ["path"]
     },
