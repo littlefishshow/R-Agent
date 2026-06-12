@@ -1,6 +1,10 @@
 import sys
 import os
 import json
+import atexit
+import shutil
+import tempfile
+import uuid
 
 # 确保 R-Agent 目录在模块搜索路径中
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -10,6 +14,7 @@ from core import config
 from tools.registry import registry
 from core.skills import skill_manager
 from core.memory import memory_manager
+from core.prompt_builder import build_system_prompt
 
 # 导入 rich 相关库
 from rich.console import Console
@@ -31,6 +36,33 @@ custom_theme = Theme({
 })
 
 console = Console(theme=custom_theme)
+
+# 工具输出超过该字符数后会写入缓存日志文件，CLI 中只显示截断 + 展开链接
+TOOL_OUTPUT_TRUNCATE_LIMIT = 2000
+
+# 本次 Agent 进程的日志缓存目录，进程退出时自动清理
+TOOL_LOG_CACHE_DIR = os.path.join(
+    tempfile.gettempdir(), f"r-agent-logs-{uuid.uuid4().hex[:8]}"
+)
+
+
+def _cleanup_tool_log_cache():
+    """关闭 Agent 时清理本次会话产生的工具输出日志缓存。"""
+    shutil.rmtree(TOOL_LOG_CACHE_DIR, ignore_errors=True)
+
+
+os.makedirs(TOOL_LOG_CACHE_DIR, exist_ok=True)
+atexit.register(_cleanup_tool_log_cache)
+
+
+def _dump_tool_output(func_name: str, content: str) -> str:
+    """将超长工具输出写入缓存日志文件，返回文件绝对路径。"""
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in func_name) or "tool"
+    filename = f"{safe_name}-{uuid.uuid4().hex[:8]}.log"
+    log_path = os.path.join(TOOL_LOG_CACHE_DIR, filename)
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    return log_path
 
 def update_env_var(key: str, value: str):
     env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -250,11 +282,11 @@ def main():
     
     agent = RAgent()
     system_prompt = (
-        "你是一个强大的 AI Agent，你可以使用提供的工具来完成任务。\n"
-        "【重要提示：自我进化能力】\n"
-        "1. 更新技能(Skills)：你可以使用 `skill_create` 工具随时创建新的技能，或者为现有技能添加新分类。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
-        "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
-        "请始终使用中文回复用户。"
+        build_system_prompt()
+        + "\n\n【重要提示：自我进化能力】\n"
+        + "1. 更新技能(Skills)：你可以使用 `skill_create` 工具随时创建新的技能，或者为现有技能添加新分类。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
+        + "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
+        + "请始终使用中文回复用户。"
         + memory_manager.load_snapshot()
     )
     
@@ -310,10 +342,19 @@ def main():
             def on_tool_end(func_name, result):
                 if config.get_display_mode() == "concise":
                     return
-                # 如果结果太长，截断显示
+                # 输出过长时，前 N 字符正常展示，省略部分写入日志缓存并提供可点击的展开链接
                 str_res = str(result)
-                if len(str_res) > 200:
-                    str_res = str_res[:200] + " ... (已截断)"
+                if len(str_res) > TOOL_OUTPUT_TRUNCATE_LIMIT:
+                    log_path = _dump_tool_output(func_name, str_res)
+                    head = str_res[:TOOL_OUTPUT_TRUNCATE_LIMIT]
+                    omitted = len(str_res) - TOOL_OUTPUT_TRUNCATE_LIMIT
+                    console.log(
+                        f"[bold green]✅ 工具返回:[/bold green] [dim]{head}...[/dim]"
+                        f" [yellow](已省略 {omitted} 字符，"
+                        f"[link=file://{log_path}]展开[/link]"
+                        f"，关闭 Agent 后自动清理)[/yellow]"
+                    )
+                    return
                 console.log(f"[bold green]✅ 工具返回:[/bold green] [dim]{str_res}[/dim]")
                 
             # 显示状态动画

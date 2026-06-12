@@ -2,7 +2,7 @@
 
 > 用途：记录当前 Agent Memory 系统迭代进展，便于重启 Agent 后快速恢复上下文。  
 > 依据：`outputs/current_memory_system_improvement_plan.md`、当前 git diff、已完成的 P0 实现与修复。  
-> 最近更新日期：2026-06-08
+> 最近更新日期：2026-06-09
 
 ---
 
@@ -224,6 +224,92 @@ confirm
 4. 工作区外删除也改为非阻塞审批返回，避免继续走 `check_outside_workspace_auth()` 的 `console.input()`；
 5. `is_in_sandbox()` / `is_in_workspace()` 改为 `os.path.commonpath()` 边界判断，避免 `sandbox_evil` / 工作区同名前缀路径误判。
 
+### 2026-06-09：文件/代码工具风险审批非阻塞修复
+
+涉及文件：
+
+```text
+tools/file_tools.py
+tools/sys_tools.py
+README.md
+outputs/agent_memory_maintenance_progress.md
+```
+
+背景与结论：
+
+- 用户反馈：出现 `⚠️ 警告: Agent 尝试在工作区外执行 [搜索] 操作: ../hermes-agent` 后，终端无法进行授权或白名单操作；
+- 根因：`read_file` / `write_file` / `search_files` 仍使用旧的 `console.input()` 阻塞式授权；当前 Agent 工具经由 API 调用，用户无法在隐藏 stdin 中输入 `y`；
+- 同类问题：`run_python` 对包含 `os.remove` / `shutil.rmtree` 的代码也使用 `console.input()`。
+
+已完成修复：
+
+1. 新增非阻塞工作区外权限响应：首次调用返回 `permission_required=true`，包含操作、路径、绝对路径、工作区、风险等级、说明与 `next_call_example`；
+2. `read_file_tool` / `write_file_tool` / `search_files_tool` 增加 `allow_outside_workspace` 参数；
+3. 对应 tool schema 和描述同步更新，明确用户同意后再次传入 `allow_outside_workspace=true`；
+4. `run_python_tool` 增加 `allow_dangerous_code` 参数，危险代码首次调用返回结构化审批请求；
+5. 移除上述路径上的真实 `console.input()` 依赖，避免隐藏终端输入导致授权不可用。
+
+验证：
+
+```bash
+python3 -m py_compile tools/file_tools.py tools/sys_tools.py
+```
+
+结果：通过。
+
+手动验证覆盖：
+
+- `search_files_tool(..., path='../hermes-agent')` 首次返回 `permission_required=true`；
+- `read_file_tool('../hermes-agent/README.md')` 首次返回 `permission_required=true`；
+- `write_file_tool('../hermes-agent/tmp.txt', ...)` 首次返回 `permission_required=true`；
+- `run_python_tool("import os; os.remove('x')")` 首次返回 `permission_required=true`。
+
+---
+
+### 2026-06-09：简化版 SOUL.md 主身份迁移
+
+涉及文件：
+
+```text
+core/prompt_builder.py
+main.py
+SOUL.md
+README.md
+outputs/agent_memory_maintenance_progress.md
+```
+
+背景与结论：
+
+- 参考 Hermes Agent 的 `SOUL.md` 机制，将其简化迁移到 R-Agent；
+- R-Agent 不引入 Hermes 的 profile/HERMES_HOME 全量体系，采用项目根目录单一 `SOUL.md` 作为主身份文件；
+- `SOUL.md` 只负责稳定 persona / tone / behavior，memory 仍通过 `memory_manager.load_snapshot()` 作为 frozen snapshot 单独注入。
+
+已完成能力：
+
+1. `core/prompt_builder.py` 新增 `get_project_root()` / `get_soul_path()` / `ensure_default_soul_md()`；
+2. `load_soul_md()` 改为项目级主身份加载入口，缺失/空文件时返回空串以触发 `DEFAULT_AGENT_IDENTITY` 回退；
+3. 新增基础安全扫描 `_scan_soul_content()`，阻断明显 prompt injection / secret-exfiltration 指令进入 system prompt；
+4. 新增 `_truncate_soul_content()`，对超长 `SOUL.md` 做 head/tail 截断；
+5. `build_system_prompt()` 明确以 `SOUL.md` 为 identity slot，并在首次构建时自动 seed 默认文件；
+6. `main.py` 改为使用 `build_system_prompt()`，再叠加自我进化提示与 memory frozen snapshot；
+7. 根目录 `SOUL.md` 更新为简洁可编辑模板。
+
+验证：
+
+```bash
+python3 -m py_compile core/prompt_builder.py main.py
+```
+
+结果：通过。
+
+手动验证：
+
+- `get_soul_path()` 指向 `R-Agent/SOUL.md`；
+- `load_soul_md()` 返回非空；
+- `build_system_prompt()` 首段来自 `SOUL.md`，未使用硬编码 fallback。
+
+---
+
 ---
 
 ## 4. 已验证内容
@@ -405,5 +491,5 @@ git diff -- tools/file_tools.py README.md outputs/agent_memory_maintenance_progr
 然后优先继续实现：
 
 ```text
-继续评估 delete_file A 方案是否需要为 read/write/search 的工作区外阻塞 input 做同类 permission_required 改造；或推进 P0/P2 memory 后续事项
+SOUL.md 简化主身份迁移已完成；下一步可继续推进 P0 drift detection / entry id，或进入 P2 session summary
 ```

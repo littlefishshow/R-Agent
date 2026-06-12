@@ -41,20 +41,65 @@ def is_in_workspace(path: str) -> bool:
     except ValueError:
         return False
 
-def check_outside_workspace_auth(path: str, action: str) -> bool:
-    """如果文件在工作区外，要求用户授权"""
-    if not is_in_workspace(path):
-        console.print(f"\n[bold red]⚠️ 警告: Agent 尝试在工作区外执行 [{action}] 操作: {path}[/bold red]")
-        user_input = console.input("是否允许？(y/N): ")
-        if user_input.strip().lower() != 'y':
-            console.print("[yellow]已拒绝操作。[/yellow]")
-            return False
-    return True
+def _outside_workspace_permission_required(
+    path: str,
+    action: str,
+    tool_name: str,
+    allow_param: str = "allow_outside_workspace",
+) -> str:
+    """Return a non-blocking approval response for outside-workspace file operations.
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500) -> str:
+    Tool calls are executed through an API/agent loop, so blocking on
+    ``console.input()`` is not visible or usable for the human user.  Instead,
+    the first call returns a structured ``permission_required`` payload.  The
+    assistant must explain the risk to the user; only after explicit chat
+    approval may it retry with ``allow_outside_workspace=true``.
+    """
+    abs_path = os.path.abspath(os.path.expanduser(path))
+    abs_workspace = os.path.abspath(WORKSPACE_DIR)
+    risk_level = "high" if action in {"写入/修改", "删除"} else "medium"
+
+    return json.dumps({
+        "permission_required": True,
+        "risk_level": risk_level,
+        "action": tool_name,
+        "operation": action,
+        "path": path,
+        "absolute_path": abs_path,
+        "workspace_dir": abs_workspace,
+        "reason": f"目标路径不在当前工作区内，执行 [{action}] 操作需要用户显式授权",
+        "message": (
+            "该文件操作尚未执行。请向用户说明操作、路径和风险；"
+            f"只有在用户明确同意后，才可再次调用 {tool_name}，"
+            f"并传入 {allow_param}=true。工具不会再通过终端 input() 等待授权。"
+        ),
+        "next_call_example": {
+            "path": path,
+            allow_param: True,
+        },
+    }, ensure_ascii=False)
+
+
+def check_outside_workspace_auth(
+    path: str,
+    action: str,
+    allow_outside_workspace: bool = False,
+    tool_name: str = "file_operation",
+) -> object:
+    """Check outside-workspace access without blocking for terminal input.
+
+    Returns None when the operation may continue; otherwise returns a JSON
+    string containing ``permission_required=true``.
+    """
+    if not is_in_workspace(path) and not allow_outside_workspace:
+        return _outside_workspace_permission_required(path, action, tool_name)
+    return None
+
+def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_workspace: bool = False) -> str:
     """Read a file with pagination and line numbers."""
-    if not check_outside_workspace_auth(path, "读取"):
-        return json.dumps({"error": "User denied file read outside workspace"}, ensure_ascii=False)
+    permission_response = check_outside_workspace_auth(path, "读取", allow_outside_workspace, "read_file")
+    if permission_response:
+        return permission_response
         
     if not os.path.exists(path):
         return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
@@ -122,10 +167,11 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-def write_file_tool(path: str, content: str) -> str:
+def write_file_tool(path: str, content: str, allow_outside_workspace: bool = False) -> str:
     """Write content to a file, completely replacing existing content."""
-    if not check_outside_workspace_auth(path, "写入/修改"):
-        return json.dumps({"error": "User denied file write outside workspace"}, ensure_ascii=False)
+    permission_response = check_outside_workspace_auth(path, "写入/修改", allow_outside_workspace, "write_file")
+    if permission_response:
+        return permission_response
         
     try:
         old_content = ""
@@ -164,10 +210,11 @@ def write_file_tool(path: str, content: str) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-def search_files_tool(pattern: str, target: str = "content", path: str = ".") -> str:
+def search_files_tool(pattern: str, target: str = "content", path: str = ".", allow_outside_workspace: bool = False) -> str:
     """Search for content or files."""
-    if not check_outside_workspace_auth(path, "搜索"):
-        return json.dumps({"error": "User denied file search outside workspace"}, ensure_ascii=False)
+    permission_response = check_outside_workspace_auth(path, "搜索", allow_outside_workspace, "search_files")
+    if permission_response:
+        return permission_response
         
     try:
         import re
@@ -254,13 +301,18 @@ def delete_file_tool(path: str, confirm: bool = False) -> str:
 
 registry.register(
     name="read_file",
-    description="读取文件的内容，支持分页。返回内容带有行号。",
+    description="读取文件的内容，支持分页。返回内容带有行号。读取工作区外路径时会先返回 permission_required；用户明确同意后需再次调用，并传入 allow_outside_workspace=true。",
     parameters={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "要读取的文件路径"},
             "offset": {"type": "integer", "description": "起始行号 (默认 1)", "default": 1},
-            "limit": {"type": "integer", "description": "最大读取行数 (默认 500)", "default": 500}
+            "limit": {"type": "integer", "description": "最大读取行数 (默认 500)", "default": 500},
+            "allow_outside_workspace": {
+                "type": "boolean",
+                "description": "用户已明确同意读取工作区外路径时设为 true；默认 false",
+                "default": False
+            }
         },
         "required": ["path"]
     },
@@ -269,12 +321,17 @@ registry.register(
 
 registry.register(
     name="write_file",
-    description="将内容写入文件，覆盖已有文件，会自动创建父目录。可在沙盒内外自由写入，修改会有 diff 提示。",
+    description="将内容写入文件，覆盖已有文件，会自动创建父目录。写入工作区外路径时会先返回 permission_required；用户明确同意后需再次调用，并传入 allow_outside_workspace=true。",
     parameters={
         "type": "object",
         "properties": {
             "path": {"type": "string", "description": "要写入的文件路径"},
-            "content": {"type": "string", "description": "文件完整内容"}
+            "content": {"type": "string", "description": "文件完整内容"},
+            "allow_outside_workspace": {
+                "type": "boolean",
+                "description": "用户已明确同意写入工作区外路径时设为 true；默认 false",
+                "default": False
+            }
         },
         "required": ["path", "content"]
     },
@@ -283,13 +340,18 @@ registry.register(
 
 registry.register(
     name="search_files",
-    description="搜索文件内容或按名称查找文件。",
+    description="搜索文件内容或按名称查找文件。搜索工作区外路径时会先返回 permission_required；用户明确同意后需再次调用，并传入 allow_outside_workspace=true。",
     parameters={
         "type": "object",
         "properties": {
             "pattern": {"type": "string", "description": "正则表达式模式"},
             "target": {"type": "string", "enum": ["content", "files"], "description": "'content' 搜索文件内容, 'files' 搜索文件名"},
-            "path": {"type": "string", "description": "搜索的根目录 (默认 .)", "default": "."}
+            "path": {"type": "string", "description": "搜索的根目录 (默认 .)", "default": "."},
+            "allow_outside_workspace": {
+                "type": "boolean",
+                "description": "用户已明确同意搜索工作区外路径时设为 true；默认 false",
+                "default": False
+            }
         },
         "required": ["pattern"]
     },

@@ -45,4 +45,6 @@ memories/.memory.lock
 # Deprecated nested project directory (old accidental R-Agent/R-Agent/* paths)
 R-Agent/
 repos/
-outputs/tts/
+outputs/
+进度.md
+上下文.md

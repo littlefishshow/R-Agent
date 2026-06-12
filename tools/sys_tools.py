@@ -482,15 +482,26 @@ def run_command_tool(
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def run_python_tool(code: str, timeout: int = 30) -> str:
+def run_python_tool(code: str, timeout: int = 30, allow_dangerous_code: bool = False) -> str:
     """Execute python code and return its output."""
     try:
-        # 简单检查 Python 代码是否包含危险操作
-        if 'os.remove' in code or 'shutil.rmtree' in code:
-            console.print(f"\n[bold red]⚠️ 警告: Agent 尝试执行包含文件删除的 Python 代码。[/bold red]")
-            user_input = console.input("是否允许执行？(y/N): ")
-            if user_input.strip().lower() != 'y':
-                return json.dumps({"error": "User denied dangerous python code execution"}, ensure_ascii=False)
+        # 简单检查 Python 代码是否包含危险操作。工具调用经由 API/Agent loop，
+        # 不能依赖隐藏的终端 input() 授权；首次仅返回结构化审批请求。
+        if ('os.remove' in code or 'shutil.rmtree' in code) and not allow_dangerous_code:
+            return json.dumps({
+                "permission_required": True,
+                "risk_level": "high",
+                "action": "run_python",
+                "reason": "Python 代码包含文件删除相关调用，可能破坏文件系统",
+                "message": (
+                    "该 Python 代码尚未执行。请向用户说明代码中的删除风险；"
+                    "只有在用户明确同意后，才可再次调用 run_python，"
+                    "并传入 allow_dangerous_code=true。工具不会再通过终端 input() 等待授权。"
+                ),
+                "next_call_example": {
+                    "allow_dangerous_code": True,
+                },
+            }, ensure_ascii=False)
 
         import tempfile
         with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
@@ -582,12 +593,20 @@ registry.register(
 
 registry.register(
     name="run_python",
-    description="执行 Python 代码片段并返回输出结果。",
+    description=(
+        "执行 Python 代码片段并返回输出结果。包含文件删除等危险操作时会先返回 "
+        "permission_required；用户明确同意后需再次调用，并传入 allow_dangerous_code=true。"
+    ),
     parameters={
         "type": "object",
         "properties": {
             "code": {"type": "string", "description": "要执行的 Python 完整代码"},
-            "timeout": {"type": "integer", "description": "超时时间(秒)，默认 30", "default": 30}
+            "timeout": {"type": "integer", "description": "超时时间(秒)，默认 30", "default": 30},
+            "allow_dangerous_code": {
+                "type": "boolean",
+                "description": "用户已明确授权执行包含删除等危险操作的 Python 代码时设为 true；默认 false",
+                "default": False
+            }
         },
         "required": ["code"]
     },

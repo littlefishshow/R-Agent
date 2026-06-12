@@ -59,6 +59,25 @@ LLM_MODEL="gpt-4o"
 
 ## 更新日志
 
+### 2026-06-09
+
+#### 简化版 SOUL.md 主身份迁移
+
+- **迁移 Hermes SOUL.md 核心机制**：将 `SOUL.md` 作为 R-Agent 的项目级主身份/persona 文件，system prompt 构建时优先加载，缺失或为空时回退到 `DEFAULT_AGENT_IDENTITY`。
+- **默认模板与初始化**：`core/prompt_builder.py` 新增 `ensure_default_soul_md()`，首次构建 prompt 时自动创建项目根目录 `SOUL.md`，且不会覆盖用户已有内容。
+- **安全与长度控制**：加载 `SOUL.md` 时增加基础 prompt injection / secret-exfiltration 扫描，并对超长内容做 head/tail 截断，避免无界注入 system prompt。
+- **CLI 接入**：`main.py` 改为通过 `build_system_prompt()` 构建基础 system prompt，再叠加自我进化提示和 frozen memory snapshot，保留当前 memory 语义。
+- **模板更新**：更新根目录 `SOUL.md` 为简洁中文默认行为/persona 说明，便于用户直接编辑定制。
+- **验证结果**：已通过 `python3 -m py_compile core/prompt_builder.py main.py`，并手动确认 `SOUL.md` 成功作为 identity slot 加载。
+
+#### 文件/代码工具风险审批非阻塞修复
+
+- **修复工作区外文件操作授权不可用问题**：`read_file` / `write_file` / `search_files` 不再通过隐藏的 `console.input()` 等待终端输入，避免用户在 API/CLI 工具调用过程中无法授权或白名单的问题。
+- **统一结构化二次确认**：工作区外读取、写入、搜索首次调用会返回 `permission_required=true`、风险原因、绝对路径与 `next_call_example`；用户在对话中明确同意后，Agent 可再次调用并传入 `allow_outside_workspace=true`。
+- **危险 Python 执行审批修复**：`run_python` 检测到 `os.remove` / `shutil.rmtree` 等删除代码时，同样改为非阻塞 `permission_required`，明确同意后通过 `allow_dangerous_code=true` 二次执行。
+- **保留命令审批机制**：`run_command` 仍使用 `permission_required + approval_token + allow_high_privilege=true` 的一次性 token 审批，未改动其高风险命令拦截模型。
+- **验证结果**：已通过 `python3 -m py_compile tools/file_tools.py tools/sys_tools.py`，并手动验证工作区外搜索/读取/写入与危险 Python 首次调用均返回结构化审批请求，不再尝试读取终端输入。
+
 ### 2026-06-08
 
 #### Agent Memory 系统阶段性升级

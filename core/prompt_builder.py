@@ -1,4 +1,8 @@
 import os
+import re
+from pathlib import Path
+from typing import Optional
+
 
 DEFAULT_AGENT_IDENTITY = (
     "You are R-Agent, an intelligent AI assistant. "
@@ -114,38 +118,121 @@ SKILLS_GUIDANCE = (
     "Skills that aren't maintained become liabilities."
 )
 
+SOUL_MAX_CHARS = 12000
+SOUL_TRUNCATE_HEAD_RATIO = 0.65
+SOUL_FILENAME = "SOUL.md"
+
+_SUSPICIOUS_SOUL_PATTERNS = [
+    r"ignore\s+(all\s+)?previous\s+instructions",
+    r"ignore\s+(the\s+)?system\s+prompt",
+    r"reveal\s+(the\s+)?system\s+prompt",
+    r"print\s+(the\s+)?system\s+prompt",
+    r"exfiltrate",
+    r"steal\s+(secrets|credentials|tokens|keys)",
+]
+
+
+def get_project_root() -> Path:
+    """Return the R-Agent repository root."""
+    return Path(__file__).resolve().parent.parent
+
+
+def get_soul_path() -> Path:
+    """Return the simplified R-Agent SOUL.md path."""
+    return get_project_root() / SOUL_FILENAME
+
+
+def ensure_default_soul_md() -> Path:
+    """Create a default SOUL.md if it does not exist.
+
+    Simplified Hermes migration: R-Agent keeps one project-local persona file
+    instead of profile-specific HERMES_HOME files. Existing SOUL.md is never
+    overwritten.
+    """
+    soul_path = get_soul_path()
+    if not soul_path.exists():
+        soul_path.write_text(
+            "# R-Agent Persona\n\n"
+            "You are R-Agent, an intelligent AI assistant. You are helpful, "
+            "knowledgeable, direct, and careful with tools. You communicate in "
+            "Chinese by default unless the user asks otherwise. You prioritize "
+            "completing the user's task with verified actions over describing "
+            "plans.\n\n"
+            "<!-- Edit this file to customize R-Agent's identity, tone, and stable behavior. -->\n",
+            encoding="utf-8",
+        )
+    return soul_path
+
+
+def _scan_soul_content(content: str) -> str:
+    """Block obviously malicious persona content before system injection."""
+    lowered = content.lower()
+    findings = [pat for pat in _SUSPICIOUS_SOUL_PATTERNS if re.search(pat, lowered, re.I)]
+    if findings:
+        return (
+            "[BLOCKED: SOUL.md contained potential prompt injection or secret-exfiltration "
+            f"instructions ({', '.join(findings)}). Content not loaded.]"
+        )
+    return content
+
+
+def _truncate_soul_content(content: str, max_chars: int = SOUL_MAX_CHARS) -> str:
+    """Head/tail truncate large SOUL.md content with an explicit marker."""
+    if len(content) <= max_chars:
+        return content
+    head_chars = int(max_chars * SOUL_TRUNCATE_HEAD_RATIO)
+    tail_chars = max_chars - head_chars
+    return (
+        content[:head_chars]
+        + f"\n\n[...truncated SOUL.md: kept {head_chars}+{tail_chars} of {len(content)} chars.]\n\n"
+        + content[-tail_chars:]
+    )
+
+
 def load_soul_md() -> str:
-    """Load SOUL.md from R-Agent directory."""
-    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    soul_path = os.path.join(base_dir, "SOUL.md")
-    if os.path.exists(soul_path):
-        with open(soul_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-            if content:
-                return content
-    return ""
+    """Load project-local SOUL.md as the primary agent identity.
+
+    Returns an empty string when the file is missing or has no meaningful
+    content, so callers can fall back to DEFAULT_AGENT_IDENTITY.
+    """
+    soul_path = get_soul_path()
+    if not soul_path.exists():
+        return ""
+    try:
+        content = soul_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    if not content:
+        return ""
+    return _truncate_soul_content(_scan_soul_content(content))
+
 
 def build_system_prompt(agent_tools=None) -> str:
-    """Build the complete system prompt for R-Agent."""
+    """Build the complete system prompt for R-Agent.
+
+    SOUL.md is the primary identity slot. It is loaded once when the CLI builds
+    the frozen system prompt; runtime edits affect future sessions.
+    """
+    ensure_default_soul_md()
     parts = []
-    
-    # 1. Identity
+
+    # 1. Identity: SOUL.md first, hardcoded fallback second.
     soul_content = load_soul_md()
     if soul_content:
         parts.append(soul_content)
     else:
         parts.append(DEFAULT_AGENT_IDENTITY)
-        
+
     # 2. General Tool Use Enforcement
     parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
-    
+
     # 3. Model Execution Discipline
     parts.append(MODEL_EXECUTION_GUIDANCE)
-    
+
     # 4. Memory Guidance (if memory tools are available, assume they might be)
     parts.append(MEMORY_GUIDANCE)
-    
+
     # 5. Skills Guidance
     parts.append(SKILLS_GUIDANCE)
-    
+
     return "\n\n".join(parts)
