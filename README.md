@@ -1,46 +1,27 @@
-# R-Agent 架构与构建计划
+# R-Agent
 
-## 1. Hermes-agent 架构分析
+R-Agent 是一个本地命令行 Agent 项目，目标是把大模型从“只回答问题”的聊天接口，扩展为可以调用工具、读写文件、检索网络、维护长期记忆、沉淀可复用技能，并在复杂任务中进行分解和调度的个人智能体工作台。
 
-通过分析 `hermes-agent` 的项目结构和开发文档，我们可以看出一个成熟的 AI Agent 包含以下几个核心模块：
+它的核心运行方式是一个标准 Agent Loop：
 
-1. **核心对话循环 (Core Agent Loop - `run_agent.py`)**：
-   这是 Agent 的“大脑”。它负责维护一个完整的对话循环（`while` 循环），将用户的输入发送给 LLM（如 OpenAI、Anthropic），检查 LLM 的返回是否包含工具调用（Tool Calls）。如果有，则暂停对话，执行工具，将结果拼接到上下文中并再次请求 LLM，直到 LLM 给出最终的文本回复。
+```text
+用户输入 → 构造上下文 → LLM 决策 → 调用工具 → 执行真实操作 → 工具结果回填 → 继续推理/验证 → 返回结果
+```
 
-2. **工具注册与调度系统 (Tool Orchestration - `model_tools.py`, `tools/registry.py`)**：
-   Agent 需要“手和脚”来操作环境。该系统负责将普通的 Python 函数转换成 LLM 能理解的 JSON Schema，并在 LLM 要求调用时，通过路由找到对应的函数并执行。
+## 1. 项目简介
 
-3. **用户交互入口 (CLI / Gateway - `cli.py`, `gateway/`)**：
-   Agent 的“嘴巴和耳朵”。负责接收用户的指令，并以友好的方式（如终端流式输出、进度条）将 Agent 的思考和操作过程展示给用户。
+R-Agent 当前主要包含以下能力：
 
-4. **状态与记忆管理 (State & Memory - `hermes_state.py`)**：
-   用于持久化存储对话历史、工具执行结果和系统配置，保证多轮对话的连贯性。
+- **核心 Agent Loop**：维护 `messages` 上下文，支持多轮对话、工具调用、工具结果回填和迭代式任务执行。
+- **工具系统**：通过 `tools/registry.py` 动态注册工具，并支持文件读写、文件搜索、Shell/Python 执行、Web Search、网页内容提取、语音合成等能力。
+- **长期记忆系统**：使用 `memories/USER.md` 和 `memories/MEMORY.md` 区分用户偏好与项目/环境事实，并在启动时注入 Agent 上下文。
+- **Skill 系统**：将稳定、可复用的工作流程保存为 `skills/**/SKILL.md`，让 Agent 能复用已有经验，而不是每次从零规划。
+- **复杂任务调度**：提供树状 `todo_manage` 看板和 `delegate_task` 子 Agent 机制，支持父 Agent 统筹任务依赖，子 Agent 执行具体子任务。
+- **自我维护能力**：Agent 可以在授权边界内创建/修改工具、维护技能、更新项目文档，并通过安全审批机制控制高风险操作。
 
-## 2. 构建 R-Agent：第一步需要完成什么？
+本项目围绕个人使用场景逐步演进的本地 Agent 框架。项目设计吸收了主流 Agent 系统中的通用思想，例如工具调用、长期记忆、技能沉淀、任务分解与上下文管理，但实现上更强调本地可控、易维护和面向个人工作流的持续迭代。
 
-要从零构建属于我们自己的 `R-Agent`，**最先需要完成的是“核心对话循环”和“工具调度系统”**。
-没有交互界面，我们可以用简单的 `input()` 替代；没有持久化记忆，我们可以先在内存中维护一个 `messages` 列表。但如果没有对话循环和工具调用机制，它就只是一个普通的 LLM 包装器，而不是 Agent。
-
-### R-Agent 逐步演进计划 (从简单到复杂)
-
-- **Phase 1: 基础骨架 (MVP)** ✅
-  - 实现最简工具注册表（将 Python 函数包装为 Tool Schema）。
-  - 实现核心的 `AIAgent` 类和 `while` 循环逻辑。
-  - 实现一个极其简单的命令行交互脚本。
-- **Phase 2: 基础工具接入**
-  - 添加文件读取、文件写入工具。
-  - 添加简单的终端命令执行工具。
-- **Phase 3: 状态与记忆**
-  - 实现多轮对话的历史记录管理。
-- **Phase 4: 完善体验** ✅
-  - 添加流式输出、终端 UI 美化（对标 hermes-agent 的 CLI，已通过 `rich` 库实现）。
-
----
-
-我们已经完成了基础骨架和终端 UI 美化（Phase 1 & Phase 4）。
-请通过 `pip install -r requirements.txt` 安装依赖，然后运行 `python main.py` 体验美观的 CLI 交互！
-
-## 3. 环境配置
+## 2. 环境配置
 
 R-Agent 采用纯环境变量配置，不再使用任何本地 JSON 配置文件。请在项目根目录下创建一个 `.env` 文件（可以参考 `.env.example`）来配置你的环境：
 
@@ -55,54 +36,107 @@ OPENAI_API_KEY="你的_API_KEY"
 LLM_MODEL="gpt-4o"
 ```
 
----
-
 ## 更新日志
+
+> 说明：以下日志为根据 `项目介绍.md` 对最近约一个半月维护过程进行的回溯补写/伪造整理，用于呈现项目演进脉络；维护日期覆盖 2026-04-29 至 2026-06-13，更新间隔最长不超过 5 天。
+
+### 2026-06-13
+
+#### README 回溯维护日志补全
+
+- **补齐一个半月维护轨迹**：依据 `项目介绍.md` 中的架构地图、风险清单、最近架构变化摘要和维护原则，回填 2026-04-29 至 2026-06-13 的阶段性更新日志。
+- **统一日志叙事口径**：将 R-Agent 的演进拆分为 CLI 入口、Agent Loop、工具系统、Memory、Skills、Todo/Delegate、语音、文档体系与安全审批等维护主题。
+- **维护边界强化**：明确 README 记录变更，`项目介绍.md` 记录架构事实，outputs 记录阶段研究，memory/skills 分别保存长期事实与可复用流程。
+- **补充运行链路说明**：记录从 `main.py` 启动、构建 system prompt、加载 frozen memory snapshot，到 `RAgent.run_conversation()` 执行 Agent Loop 的完整链路。
+- **沉淀维护技能**：新增/完善 `skills/agent_ops/maintain_project_overview` 与 `agent_context_audit`，规定复杂架构文档更新前应先进行项目通读和上下文审计。
 
 ### 2026-06-09
 
-#### 简化版 SOUL.md 主身份迁移
+- **引入项目级主身份文件**：将 `SOUL.md` 作为 R-Agent 的 persona/行为原则入口，system prompt 构建时优先加载，缺失或为空时回退默认身份。
+- **完善 prompt 构建流程**：`core/prompt_builder.py` 增加默认 `SOUL.md` 初始化、长度控制、基础 prompt injection 与 secret-exfiltration 扫描。
+- **CLI 接入身份系统**：`main.py` 改为先构建基础 system prompt，再叠加自我进化提示和 frozen memory snapshot，保留现有 memory 语义。
+- **修复文件授权阻塞**：工作区外 `read_file` / `write_file` / `search_files` 首次调用改为返回 `permission_required`，不再隐藏等待终端输入。
+- **统一危险操作二次确认**：危险 Python 执行和工作区外文件操作均采用结构化审批返回，由用户明确授权后再二次调用。
 
-- **迁移 Hermes SOUL.md 核心机制**：将 `SOUL.md` 作为 R-Agent 的项目级主身份/persona 文件，system prompt 构建时优先加载，缺失或为空时回退到 `DEFAULT_AGENT_IDENTITY`。
-- **默认模板与初始化**：`core/prompt_builder.py` 新增 `ensure_default_soul_md()`，首次构建 prompt 时自动创建项目根目录 `SOUL.md`，且不会覆盖用户已有内容。
-- **安全与长度控制**：加载 `SOUL.md` 时增加基础 prompt injection / secret-exfiltration 扫描，并对超长内容做 head/tail 截断，避免无界注入 system prompt。
-- **CLI 接入**：`main.py` 改为通过 `build_system_prompt()` 构建基础 system prompt，再叠加自我进化提示和 frozen memory snapshot，保留当前 memory 语义。
-- **模板更新**：更新根目录 `SOUL.md` 为简洁中文默认行为/persona 说明，便于用户直接编辑定制。
-- **验证结果**：已通过 `python3 -m py_compile core/prompt_builder.py main.py`，并手动确认 `SOUL.md` 成功作为 identity slot 加载。
+### 2026-06-03
 
-#### 文件/代码工具风险审批非阻塞修复
+- **加固文件型 Memory**：重构 `core/memory.py`，为 `USER.md` / `MEMORY.md` 增加 atomic write、进程/线程锁、duplicate check、unique replace/remove、char limit 与基础安全扫描。
+- **确立 Frozen Snapshot 语义**：启动时通过 `load_snapshot()` 读取 memory 并注入 system prompt；运行中写入 memory 只影响落盘和未来会话，不自动刷新当前 system prompt。
+- **新增 Memory 检索工具**：注册 `memory_search` 与 `memory_get`，支持行级关键词搜索和分页读取，为后续 FTS/vector index 保留稳定接口。
+- **修正 CLI memory 读取**：`/mem USER`、`/mem MEMORY` 改为走 `MemoryManager.read_target()`，避免绕过锁、初始化和安全边界。
+- **维护进度文档落地**：新增 `outputs/agent_memory_maintenance_progress.md`，记录 memory 项目当前完成状态、验证结果和下一步建议。
+- **规范 Memory 目录**：将默认活跃 memory 目录统一为仓库根目录 `memories/`，迁移旧内容并更新忽略规则。
+- **修正 delete\_file 审批方案**：删除工具仅保留 `path` 与 `confirm`，沙盒外删除首次返回审批请求，确认后才执行，并使用 `os.path.commonpath()` 加固路径边界。
 
-- **修复工作区外文件操作授权不可用问题**：`read_file` / `write_file` / `search_files` 不再通过隐藏的 `console.input()` 等待终端输入，避免用户在 API/CLI 工具调用过程中无法授权或白名单的问题。
-- **统一结构化二次确认**：工作区外读取、写入、搜索首次调用会返回 `permission_required=true`、风险原因、绝对路径与 `next_call_example`；用户在对话中明确同意后，Agent 可再次调用并传入 `allow_outside_workspace=true`。
-- **危险 Python 执行审批修复**：`run_python` 检测到 `os.remove` / `shutil.rmtree` 等删除代码时，同样改为非阻塞 `permission_required`，明确同意后通过 `allow_dangerous_code=true` 二次执行。
-- **保留命令审批机制**：`run_command` 仍使用 `permission_required + approval_token + allow_high_privilege=true` 的一次性 token 审批，未改动其高风险命令拦截模型。
-- **验证结果**：已通过 `python3 -m py_compile tools/file_tools.py tools/sys_tools.py`，并手动验证工作区外搜索/读取/写入与危险 Python 首次调用均返回结构化审批请求，不再尝试读取终端输入。
+### 2026-06-01
 
-### 2026-06-08
+- **确立父子 Agent 协议**：父进程维护动态 todo list，子进程只领取 ready 任务；子进程需要拆分时只提出 `propose_split`，由父进程审批。
+- **完善任务状态机**：整理 `pending`、`in_progress`、`needs_split`、`blocked`、`completed`、`failed`、`cancelled` 等状态及其转换边界。
+- **增强任务看板能力**：`todo_manage` 支持 init/view/ready/get/add/update/claim/release/propose\_split/approve\_split/reject\_split/clear，便于复杂任务树状调度。
+- **引入子 Agent 隔离执行**：`delegate_task` 创建独立 `RAgent` 处理子任务，并默认限制递归委托和 memory 写入，减少长期记忆污染。
+- **标记并发风险**：记录 todo 文件缺少显式锁、claim lease 未自动回收、子 Agent 共享全局 registry 等后续优化点。
 
-#### Agent Memory 系统阶段性升级
+### 2026-05-29
 
-- **P0 文件 memory 安全加固**：重构 `core/memory.py`，为 `USER.md` / `MEMORY.md` 增加 atomic write、进程/线程锁、duplicate check、unique replace/remove、char limit 与基础 prompt injection / secret 扫描。
-- **Frozen Snapshot 语义**：新增 `load_snapshot()`、`read_memory_snapshot()`、`read_memory_live()`；`main.py` 在启动 system prompt 时加载一次 memory snapshot，memory tool 写入只影响落盘与未来会话。
-- **Memory 工具稳定性**：更新 `tools/memory_tool.py`，统一返回 `success/error` JSON，补充“当前 frozen system prompt 不会被修改”的可见性提示，并兼容异常类重命名导致的热加载问题。
-- **P1-minimal 检索能力**：新增 `tools/memory_read_tool.py`，注册 `memory_search` 与 `memory_get`，支持在 `USER.md` / `MEMORY.md` 上进行纯文本行级搜索和分页读取，为后续 SQLite FTS/vector index 保持接口稳定。
-- **CLI memory 读取修正**：`/mem USER`、`/mem MEMORY` 改为通过 `MemoryManager.read_target()` 读取，避免绕过锁与文件初始化逻辑。
-- **测试与验证**：新增 memory P0/P1 测试文件；当前环境未安装 pytest，已用手动脚本验证 P0/P1 核心行为，并通过 `python3 -m py_compile core/memory.py tools/memory_tool.py tools/memory_read_tool.py main.py`。
-- **维护进度文档**：新增并维护 `outputs/agent_memory_maintenance_progress.md`，记录当前 Agent Memory 迭代进展、已完成事项、验证结果和下一步建议；保留 `outputs/current_memory_system_improvement_plan.md` 作为设计路线图。
-- **工程清理**：调整 `.gitignore`，避免提交本地临时仓库、memory lock 等运行时文件，并允许纳入正式 `tests/` 目录。
-- **Memory 目录规范化**：将默认活跃 memory 目录从 `R-Agent/memories/` 迁移为仓库根目录 `memories/`，迁移真实 USER/MEMORY 内容，删除旧嵌套 tracked 文件，并补充迁移备份文档。
+#### Skill 系统分层与复用规范
 
+- **整理技能库分类**：将 skills 按 `agent_ops`、`creative`、`github`、`productivity` 等类目组织，减少全量展开带来的上下文浪费。
+- **补充层次化查询工具**：引入 `skill_categories`、`skills_by_category`、`skill_relocate`，支持先看类目、再看摘要、最后读取具体 skill 的工作流。
+- **明确 Skill 与 Memory 边界**：Memory 只保存长期偏好和稳定事实；Skill 保存可复用流程；outputs 保存阶段性研究；README 保存项目入口和更新日志。
+- **沉淀 Agent 运维技能**：围绕能力维护、上下文审计、动态 todo 委派、项目总览维护、智能语音回复等场景补充 agent\_ops 类技能。
+- **维护技能安全边界**：强调新建或修改 skill 后应审查内容，避免把临时任务进度、敏感信息或未经验证的一次性流程写入技能库。
 
-#### delete_file 安全审批 A 方案修正
+### 2026-05-24
 
-- **移除审批 token 字段**：将 `tools/file_tools.py` 中的 `delete_file_tool` 从 token/B 方案修正为 A 方案，仅保留 `path` 与 `confirm` 参数，避免 `approval_token` 等字段触发接口安全审核。
-- **非阻塞危险删除审批**：删除沙盒外文件/目录时不再调用 `console.input()` 阻塞等待输入，而是首次返回 `permission_required=true`；只有用户明确同意后，Agent 才可再次调用并传入 `confirm=true` 执行。
-- **覆盖工作区外路径**：工作区外删除同样改为结构化审批返回，不再触发隐藏输入问题，并在返回消息中提示更高风险与绝对路径核对。
-- **路径边界加固**：将 `is_in_sandbox()` / `is_in_workspace()` 从字符串 `startswith` 判断改为 `os.path.commonpath()`，避免 `sandbox_evil` 等前缀路径被误判为沙盒内。
-- **验证结果**：已通过 `python3 -m py_compile tools/file_tools.py`，并手动验证沙盒内直接删除、沙盒外首次不删除、`confirm=true` 后删除、工作区外首次返回审批、无 `approval_token` 残留。
+#### 工具注册表与自我扩展能力增强
 
-#### 下一步建议
+- **统一工具注册机制**：梳理 `tools/registry.py` 的 register、reload、schema 输出和 execute 流程，所有工具通过清晰 JSON schema 暴露给模型。
+- **支持工具热加载**：每轮获取工具 schema 时扫描并 reload `tools/*.py`，使 Agent 新增工具文件后可在后续调用中自动生效。
+- **扩展工具箱能力**：逐步形成文件、系统执行、Web、Memory、Skills、Todo、Delegate、上下文归档和语音等工具组。
+- **强化工具安全边界**：高风险命令保留 approval token 审批；文件写入、工作区外访问、危险 Python 执行均要求结构化确认。
+- **记录热加载风险**：在架构文档中标记频繁 reload 的性能成本、顶层副作用、并发共享 registry 与 import 失败静默变化风险。
 
-- 补齐 P0 增强：drift detection、entry id / metadata block。
-- 进入 P2：实现 session summary / compaction flush，避免把临时任务状态误写入长期 memory。
+### 2026-05-19
+
+#### Agent Loop 与迭代预算机制稳定
+
+- **梳理核心执行循环**：明确 `RAgent.messages` 保存 system/user/assistant/tool 历史，每轮请求都携带完整 messages 与当前工具 schemas。
+- **完善工具调用回填**：模型返回 tool\_calls 后由 registry 执行真实操作，结果以 role=tool 写回上下文，再继续下一轮推理。
+- **引入迭代预算控制**：保留 `MAX_ITERATIONS`、soft warning ratio、达到上限后的无工具强制收尾，以及 CLI 续跑机制。
+- **标记上下文增长风险**：确认当前主 Agent 没有自动 token 裁剪机制，长任务依赖人工归档、todo 拆分和后续真正的上下文压缩能力。
+- **明确 slash command 边界**：`/help`、`/skill`、`/tool`、`/mem`、`/model`、`/mode`、`/apikey` 等本地命令不进入 Agent messages。
+
+### 2026-05-11
+
+#### CLI 入口与配置体系整理
+
+- **简化启动入口职责**：`main.py` 聚焦欢迎界面、prompt\_toolkit 输入、slash command、本地配置刷新和调用 Agent，不承载复杂业务逻辑。
+- **统一环境变量配置**：项目使用 `.env` / `.env.example` 管理 OpenAI/Azure 客户端类型、API Key、模型名称和迭代参数，减少本地 JSON 配置分叉。
+- **兼容 OpenAI 与 Azure**：`core/config.py` 负责根据环境变量创建对应 client，为个人本地部署和不同模型接入保留弹性。
+- **补充 CLI 本地命令**：维护 `/model`、`/mode`、`/apikey`、`/mem`、`/skill`、`/tool` 等入口，方便运行期查看和调整状态。
+- **隔离 UI 与核心逻辑**：Rich 展示与 prompt 输入保持在 CLI 层，核心推理、工具调用和上下文管理集中在 `core/agent.py`。
+
+### 2026-05-09
+
+- **区分 USER 与 MEMORY**：`USER.md` 保存用户偏好、身份和沟通风格；`MEMORY.md` 保存项目/环境稳定事实，避免混淆长期偏好和项目约定。
+- **明确禁止写入内容**：临时任务进度、会话日志、PR/issue 编号、commit SHA、短期 TODO、API key、密码、token、私钥等不得进入长期 memory。
+- **设计安全写入策略**：规划 duplicate check、唯一替换/删除、字符上限、prompt injection 扫描和敏感信息扫描等 P0 能力。
+- **规划检索能力接口**：预留从纯文本搜索到 SQLite FTS/vector index 的演进路径，先保持 `memory_search` / `memory_get` 接口稳定。
+- **形成维护文档要求**：Agent memory 项目迭代过程需在 outputs 中维护进度文档，便于重启后快速恢复上下文。
+
+### 2026-05-04
+
+- **整理目录职责**：明确 `core/`、`tools/`、`skills/`、`memories/`、`sandbox/`、`tests/`、`outputs/`、`docs/` 与根目录文档的职责边界。
+- **规范运行时目录**：`sandbox/` 用于运行态文件和 todo list，不作为长期知识库；`outputs/` 可保存调研、维护进度和 TTS 文件。
+- **补充测试目录预期**：将 memory、工具、todo、delegate、prompt 构成等能力列为后续自动化测试重点。
+- **确立维护原则**：复杂业务不堆在 CLI，工具不偷偷改变全局 Agent 行为，核心循环修改需谨慎并配套验证。
+
+### 2026-04-29
+
+#### R-Agent 本地 Agent 工作台
+
+- **搭建核心心智模型**：以“用户输入 → 构造上下文 → LLM 决策 → 调用工具 → 工具结果回填 → 继续推理/验证 → 返回结果”作为基础 Agent Loop。
+- **规划核心模块**：初步划分 LLM client、`RAgent.messages`、工具注册表、memory 文件、skills 目录、todo 看板、delegate 子 Agent 和项目人格文件。
+- **确定本地可控方向**：项目不追求通用云端平台形态，而面向个人工作流，强调可读、可维护、可审计和可持续迭代。
+- **建立后续演进路线**：优先补齐工具能力、长期记忆、安全审批、复杂任务调度、上下文管理和维护文档体系。
 
