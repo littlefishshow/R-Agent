@@ -1,0 +1,203 @@
+\documentclass{resume}
+\usepackage{zh_CN-Adobefonts_external} 
+\usepackage{linespacing_fix}
+\usepackage{cite}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric}
+\usepackage{hyperref}
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    filecolor=magenta,      
+    urlcolor=blue,
+}
+
+
+%***********个人项目流程图样式**************
+\tikzset{
+    rflow/.style={draw, rounded corners=2pt, align=center, fill=blue!6, minimum height=0.42cm, inner sep=2.2pt},
+    rstore/.style={draw, rounded corners=2pt, align=center, fill=orange!10, minimum height=0.42cm, inner sep=2.2pt},
+    rdecision/.style={draw, diamond, aspect=2.0, align=center, fill=green!8, inner sep=0.8pt},
+    rarrow/.style={-{Latex[length=1.7mm]}, thick}
+}
+\newcommand{\RAgentLoopFigure}{%
+\par\vspace{0.05em}
+\begin{center}
+\resizebox{0.86\linewidth}{!}{%
+\begin{tikzpicture}[font=\fontsize{6.5pt}{7.2pt}\selectfont, node distance=0.46cm and 0.58cm]
+    \node[rflow] (user) {用户输入};
+    \node[rflow, right=of user] (ctx) {上下文构造\\SOUL / Memory / Messages};
+    \node[rflow, right=of ctx] (llm) {LLM 决策};
+    \node[rdecision, right=of llm] (needtool) {需要\\工具?};
+    \node[rflow, right=of needtool] (final) {最终回答 / 验证};
+    \node[rflow, below=0.46cm of needtool] (tool) {工具执行\\文件 / 命令 / Web / Skill};
+    \node[rflow, below=0.46cm of llm] (result) {结果回填\\messages};
+
+    \draw[rarrow] (user) -- (ctx);
+    \draw[rarrow] (ctx) -- (llm);
+    \draw[rarrow] (llm) -- (needtool);
+    \draw[rarrow] (needtool) -- node[above, font=\fontsize{5.6pt}{6pt}\selectfont]{否} (final);
+    \draw[rarrow] (needtool) -- node[right, font=\fontsize{5.6pt}{6pt}\selectfont]{是} (tool);
+    \draw[rarrow] (tool) -- (result);
+    \draw[rarrow] (result) -- node[left, font=\fontsize{5.6pt}{6pt}\selectfont]{继续} (llm);
+\end{tikzpicture}%
+}
+\end{center}
+\vspace{0.05em}
+}
+\newcommand{\RAgentDelegateFigure}{%
+\par\vspace{0.05em}
+\begin{center}
+\resizebox{0.86\linewidth}{!}{%
+\begin{tikzpicture}[font=\fontsize{6.0pt}{6.7pt}\selectfont, node distance=0.44cm and 0.56cm]
+    \node[rflow] (parent) {父 Agent\\全局目标};
+    \node[rstore, right=of parent] (todo) {树状 Todo\\依赖拓扑};
+    \node[rflow, right=of todo] (ready) {筛选 Ready\\可执行任务};
+    \node[rflow, right=of ready] (sub) {子 Agent\\隔离上下文领取};
+    \node[rdecision, right=of sub] (split) {需要\\拆分?};
+    \node[rflow, below=0.42cm of split] (proposal) {拆分提案\\父进程审批};
+    \node[rflow, below=0.42cm of sub] (done) {执行 / 验证};
+    \node[rstore, below=0.42cm of ready] (update) {状态回填\\Todo};
+
+    \draw[rarrow] (parent) -- (todo);
+    \draw[rarrow] (todo) -- (ready);
+    \draw[rarrow] (ready) -- (sub);
+    \draw[rarrow] (sub) -- (split);
+    \draw[rarrow] (split) -- node[right, font=\fontsize{5.2pt}{5.7pt}\selectfont]{是} (proposal);
+    \draw[rarrow] (split.south west) -- node[above left, font=\fontsize{5.2pt}{5.7pt}\selectfont]{否} (done.north east);
+    \draw[rarrow] (proposal) -- (done);
+    \draw[rarrow] (done) -- (update);
+    \draw[rarrow] (update) -- (todo);
+\end{tikzpicture}%
+}
+\end{center}
+\vspace{0.05em}
+}
+
+\begin{document}
+\pagenumbering{gobble}
+
+%***"%"后面的所有内容是注释而非代码，不会输出到最后的PDF中
+%***使用本模板，只需要参照输出的PDF，在本文档的相应位置做简单替换即可
+%***修改之后，输出更新后的PDF，只需要点击Overleaf中的“Recompile”按钮即可
+
+%在大括号内填写其他信息，最多填写4个，但是如果选择不填信息，
+%那么大括号必须空着不写，而不能删除大括号。
+%\otherInfo后面的四个大括号里的所有信息都会在一行输出
+%如果想要写两行，那就用两次这个指令（\otherInfo{}{}{}{}）即可
+
+
+%***********个人信息**************
+\MyName{\textbf{任圣杰}}
+\sepspace
+\otherInfo{(+86) 186-9842-3826}{rensj@lamda.nju.edu.cn}{}{}
+% \SimpleEntry{南京大学人工智能学院}{}
+% \SimpleEntry{rensj@lamda.nju.edu.cn}
+% \SimpleEntry{(+86) 18698423826}
+
+%************照片**************
+%照片需要放到images文件夹下，名字必须是you.jpg，注意.jpg后缀（可以去resume.cls第101行处修改），如果不需要照片可以不添加此行命令
+%0.15的意思是，照片的宽度是页面宽度的0.15倍，调整大小，避免遮挡文字
+% \yourphoto{0.14}
+
+%***********教育背景**************
+\section{教育背景}
+%***第一个大括号里的内容向左对齐，第二个大括号里的内容向右对齐
+%***\textbf{}括号里的字是粗体，\textit{}括号里的字是斜体
+\mysubsection{\textbf{南京大学}\quad\textbf{硕士}\quad\textbf{机器学习与数据挖掘研究所(\href{https://www.lamda.nju.edu.cn/CH.MainPage.ashx}{LAMDA}) / 导师：钱超}}{2024.9 -- 2027.6}\\
+\mysubsection{\textbf{南京大学}\quad\textbf{学士}\quad\textbf{人工智能学院}}{2020.9 - 2024.6}
+
+
+%***********过往经历**************
+\section{实习/比赛}
+\datedsubsection{\textbf{字节跳动，Data-Flow-AI推荐，豆包应用LLM4REC}}{2025.11 - 至今}
+\begin{itemize}
+    \item[1.] \textbf{豆包创作 Memory}：根据用户每日发送（图片/视频）创作消息，使用 LLM 进行层次化用户记忆构建
+    % \begin{itemize}
+        \item \textbf{Intent Classification}：基于意图识别模型筛选出“图片/视频创作”类消息，天级收集用户全生命周期主动消息序列
+        \item \textbf{Summary 阶段}：将Sessions级别消息文本归纳用户兴趣，需要进行创作内容聚合(多条消息归类同一兴趣)、工具类消息识别过滤以及创作内容多层次总结(根据题材、画风、主体、细节、创作意图)
+        \item \textbf{兴趣点向量化}：利用 LLM-emb 模型将兴趣点映射为高维向量，并基于 Silhouette Score 优化余弦相似度的聚类阈值，以确立最佳分类粒度，赋能下游特征及 Merge 阶段的实体匹配
+        \item \textbf{Merge 阶段}：根据兴趣点与兴趣点类目之间的 embedding 余弦相似度进行匹配，将匹配到的兴趣点融合到对应的长期兴趣点类目中，并更新兴趣点的时间与频率强度
+        \item  \textbf{关键技术}：数据生产->消息队列->触发器控制线上流量->集群 LLM 服务部署 -> Abase/Hive（工作流链路搭建）；规则 + LLM 进行数据集清洗；LLM as judge 评估大模型；SFT 三阶段层次化蒸馏方法，实现推理复杂度匹配
+    % \end{itemize}
+    \item[2.] \textbf{主动创作Suggestion生成}：根据豆包 Memory，使用 LLM 进行个性化主动创作消息生成
+    % \begin{itemize}
+        \item \textbf{Interest 选择}：基于 Merge 后的短期兴趣的频次得分，使用温度系数调节 Softmax 采样概率的平滑度采样兴趣点；同时将用户长期兴趣被作为辅助上下文信息融入，补充用户总体兴趣信息    
+        \item \textbf{主动创作消息生成}：以用户的采样兴趣与长期兴趣为双重输入，生成具备高泛化性的创作 Prompt 及配套展示文案；系统需深度适配 Seedream 模型的生成特性(严格校验画风的精致度、画面元素的复杂度及 IP 内容的可生成性)，同时针对“图生图”与“文生图”场景实施差异化的文案策略，并考虑创作出的文案的多样性
+        \item \textbf{DPO 与 RLHF 模型能力提升}：采用 DPO 与 RLHF 对 LLM 微调提升生成能力。使用主动创作消息推荐的精排模型(预测展示文案点击率)作为奖励 R1；SFT 多模态 LLM 对创作文案及生成的图片进行打分作为奖励 R2。R1 偏向点击率，R2 偏向图片生成质量，同时考虑其他规则打分 R3，最终使用奖励的几何平均(因为强调任务的转化率)。基于该奖励值生成大量偏好对数据进行 DPO 训练。接着尝试使用 GRPO、DAPO 与 GSPO 对模型进行了微调。DPO 后模型能力有显著提升，而 RLHF 效果也有些许提升(提升效果依赖人工评审与 Teacher model 评估)
+        \item \textbf{成果}：主动创作消息候选\textbf{从3万增加到百万级别}，且可持续更新；正在进行安审，小流量主动消息点击率 \textbf{+4.56\%}
+    % \end{itemize}
+    \item[3.] \textbf{全域特征建模}：使用豆包创作 Memory 补充精排模型特征，并完成精排模型的迭代升级
+    % \begin{itemize}
+        \item \textbf{精排特征补充}：将豆包 Memory 兴趣 Embedding 序列注入主动消息与豆包创作社区模型中，并采用可学习权重、注意力分桶的 DIN 架构进行深度建模，提升精排模型性能，各目标\textbf{UAUC +0.5\%}左右，每日人均发消息 \textbf{+0.39\%}
+        \item \textbf{精排模型迭代}：累计上线 3 次 LR：a.~使用 DBMTL 进行漏斗行为建模(上下游目标之间存在先后关系，使用上有任务补充下游任务)，使用交叉网络 EMSNet 提高特征提取能力，使用高阶特征交叉 MMCN 作为主 Tower 增加网络深度。豆包创作大盘\textbf{LT7 +0.054\%}，人均点击做同款 \textbf{+1.15\%}；
+        b.~使用 MMOE 以及帕累托流形学习进行多任务学习网络构建，实现精排模型的 scaling up, 使用特征消偏技术消除消除特殊特征带来的偏差影响。\textbf{人均点击做同款 +0.54\%}；c.~增加预测点击观看时长的回归目标，使用 distill 分桶策略学习回归目标。模板页停留时长 \textbf{+3.16\%}
+    % \end{itemize}
+\end{itemize}
+\datedsubsection{\textbf{腾讯广告算法大赛 (Top 10\%)}}{2025.8 - 2025.9}
+\begin{itemize}
+    \item \textbf{模型结构}:使用 HSTU 架构，缓解长尾物品和新物品注意力低的问题；使用 SENet 实现多通道特征交叉
+    \item \textbf{关键改动}：将用户行为编码为 Token，用于建模并预测物品的点击概率；在推理阶段，利用 KV Cache 机制缓存历史键值对，基于预测点击率对召回的 Top-K 候选物品进行排序(Ranking)；增加负采样样本数量精度，提升对比学习效果
+    \item \textbf{其他}：采用了混合精度训练、梯度检查点（gradient checkpointing）以及梯度累积等显存优化策略，缓解显存开销
+\end{itemize}
+\section{科研工作（多目标优化方向）}
+
+
+\datedsubsection{\textbf{[1]重利用归档集在多目标优化中的理论效用分析}}{2025.7 - 2026.1}
+\begin{itemize}
+    \item {\textbf{发表于Proceedings of the 40th AAAI Conference on Artificial Intelligence (AAAI'26，CCF-A会议，第一作者\%)}\ \href{https://ojs.aaai.org/index.php/AAAI/article/view/41045}{[PDF]}}
+    \item {\textbf{贡献}}：证明重利用归档集中的解可以提升帕累托前沿分布均匀性，并缓解目标空间与决策空间的不一致性的问题
+\end{itemize}
+\datedsubsection{\textbf{[2]多目标优化探索：存档与随机更新的协同效应}}{2024.10 - 2025.1}
+\begin{itemize}
+    \item {\textbf{发表于 Proceedings of the 34th International Joint Conference on Artificial Intelligence (IJCAI'25, CCF-A，第一作者)}}\href{https://www.ijcai.org/proceedings/2025/0992.pdf}{[PDF]}
+    \item {\textbf{贡献}：随机更新通过保留部分非精英解，在崎岖适应度地形上优于纯精英策略。本文引入存档用来保存帕累托最优解，在保留其探索能力的同时，进一步提升搜索效率与解集质量} 
+\end{itemize}
+\datedsubsection{\textbf{[3] SPEA2 多目标优化算法的首次理论分析}}{2024.3 - 2024.7}
+\begin{itemize}
+    \item {\textbf{发表于 International Conference on Parallel Problem Solving from Nature (PPSN'24，CCF-B，第一作者)}}\href{https://link.springer.com/chapter/10.1007/978-3-031-70071-2_19}{[PDF]}
+    \item {\textbf{贡献}：首次从理论上分析了 SPEA2 算法的期望运行时间，并且提出了适用于其他多目标算法的一般性定理} 
+\end{itemize}
+\datedsubsection{\textbf{[4]多样性保持机制在多模多目标优化上的效用分析}}{2023.11 - 2024.2}
+\begin{itemize}
+    \item {\textbf{发表于 Proceedings of the 33rd International Joint Conference on Artificial Intelligence (IJCAI'24, CCF-A，第一作者)}}\href{https://www.ijcai.org/proceedings/2024/0775.pdf}{[PDF]}
+    \item {\textbf{贡献}：多模多目标优化问题指同一目标向量对应多个决策空间解。针对传统算法忽视解空间多样性的局限，本文提出在目标空间拥挤区域引入解空间多样性以更新候选解集，并从理论上证明该机制能显著加速收敛} 
+\end{itemize}
+
+\section{个人项目}
+\datedsubsection{\textbf{R-Agent：可自我进化的本地智能体框架}}{2026.6 - 2026.6}
+\begin{itemize}
+    \item \textbf{项目动机}：学习主流 Hermes-Agent 的 Skill/Tool 自演进编排范式；探索类似 OpenClaw 的周期响应能力；复现并测试 Claude Code 的 Memory 机制；将面向用户兴趣的 Mem 机制与 Agent 性格改写融合，构建可长期陪伴的自适应 Agent。
+    \item \textbf{Agent Loop 架构}：基于本地 CLI 构建“用户输入 $\rightarrow$ 上下文构造 $\rightarrow$ LLM 决策 $\rightarrow$ 工具调用 $\rightarrow$ 真实执行 $\rightarrow$ 结果回填 $\rightarrow$ 继续推理/验证”的闭环。系统使用 messages 维护黑板式上下文，通过动态工具注册表暴露文件、命令、Web、Memory、Skill、Todo 与 Delegate 等操作能力，使 Agent 从文本回答扩展为可执行、可验证、可维护的任务执行器。
+    \item[]\begin{minipage}{\linewidth}
+        \RAgentLoopFigure
+    \end{minipage}
+    \item \textbf{Skill/Tool 自演进}：支持 Agent 通过 write\_file 新增工具、通过 sys\_reload 热加载注册表，并将复杂工作流沉淀为分层 Skill。实现包括 Web Search/Web Extract、文件读写搜索、Shell/Python 执行、安全授权、Skill 创建/迁移、Memory 搜索/写入、语音开关、线上 research 等基础能力。
+    \item \textbf{调度能力}：实现树状 Todo List 与子 Agent Delegate 机制，由父 Agent 维护依赖拓扑和任务状态，子 Agent 只领取可执行任务并在必要时提交拆分提案；同时设计上下文归档、项目维护日志等 Skill，从而维持复杂任务的长链路执行与自我维护。
+    \item[]\begin{minipage}{\linewidth}
+        \RAgentDelegateFigure
+    \end{minipage}
+\end{itemize}
+
+
+
+
+
+%课程项目能写吗？
+% \section{专业技能}
+% \begin{itemize}
+%     \item 熟悉大模型后训练，包括监督微调(SFT)、人类对齐(RLHF、DPO)及参数高效微调(LoRA、P-Tuning)；掌握主流架构(Transformer、MoE)及推理加速框架的使用(vLLM、量化)，具备大规模集群实战经验。
+% \end{itemize}
+%\begin{itemize}
+%    \item \textbf{数学}：高等代数、概率统计、微积分、凸优化理论、算法分析理论、近代应用数学（泛函分析+群论）
+%\end{itemize}
+
+
+
+%\section{Services}
+%\datedsubsection{\textbf{第二十一届中国机器学习及其应用研讨会志愿者}}{中国江苏南京，2023.11}
+%\datedsubsection{\textbf{LAMDA \& RIKEN-AIP 机器学习联合研讨会 志愿者}}{中国江苏南京，2024.5}
+%\datedsubsection{\textbf{AAAI 2024 志愿者}}{加拿大温哥华，2024.2}
+
+\end{document}
