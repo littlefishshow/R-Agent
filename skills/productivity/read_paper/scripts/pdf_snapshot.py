@@ -4,7 +4,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 WORKSPACE = Path.cwd().resolve()
-DEFAULT_ASSET_ROOT = Path("outputs/papers_output/assets")
+DEFAULT_PAPERS_ROOT = Path("outputs/papers")
+DEFAULT_OUTPUT_ROOT = Path("outputs/papers_output")
 
 
 def _resolve_workspace_path(path: str) -> Path:
@@ -333,7 +334,16 @@ def pdf_snapshot_tool(
         if output_dir:
             out_dir = _resolve_workspace_path(output_dir)
         else:
-            out_dir = (WORKSPACE / DEFAULT_ASSET_ROOT / pdf.stem).resolve()
+            # Mirror outputs/papers/<category>/paper.pdf to
+            # outputs/papers_output/<category>/assets/<paper_stem>/.
+            papers_root = (WORKSPACE / DEFAULT_PAPERS_ROOT).resolve()
+            output_root = (WORKSPACE / DEFAULT_OUTPUT_ROOT).resolve()
+            try:
+                rel_pdf = pdf.relative_to(papers_root)
+                rel_dir = rel_pdf.parent if str(rel_pdf.parent) != "." else Path("")
+            except ValueError:
+                rel_dir = Path("")
+            out_dir = (output_root / rel_dir / "assets" / pdf.stem).resolve()
         try:
             out_dir.relative_to(WORKSPACE)
         except ValueError:

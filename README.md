@@ -38,6 +38,15 @@ LLM_MODEL="gpt-4o"
 
 ## 更新日志
 
+### 2026-06-20
+
+#### read_paper 分类目录镜像与输出清理
+
+- **支持论文分类目录镜像**：明确 `outputs/papers/<category>/xxx.pdf` 的阅读笔记输出到 `outputs/papers_output/<category>/xxx_阅读笔记.md`，例如 `agent_RL` 与 `OPD` 分类目录。
+- **调整截图资产目录**：`pdf_snapshot.py` 默认按论文相对目录输出到 `outputs/papers_output/<category>/assets/<pdf_stem>/`，阅读笔记继续使用相对路径 `assets/<pdf_stem>/...`，便于目录整体移动和预览。
+- **规范暂存文件位置**：更新 `read_paper` skill，要求全文抽取、分块文本、索引 JSON、OCR/debug 日志等中间文件统一写入 `sandbox/read_paper/<paper_stem>/`，不再污染 `outputs/papers_output/`。
+- **整理现有论文输出**：将已有 Agent RL 与 OPD 阅读笔记及图片资产移动到对应分类目录，并清理 `outputs/papers_output/_tmp` 与 `outputs/papers_output/extracted` 中的临时抽取文件，保留阅读笔记、用户导出版和图片资产。
+
 ### 2026-06-19
 
 #### read_paper 改为 skill-local scripts 调用

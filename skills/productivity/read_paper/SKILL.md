@@ -27,9 +27,15 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 ## Default Directories
 - 默认论文目录：`outputs/papers/`
 - 默认输出目录：`outputs/papers_output/`
-- 若 `outputs/papers/` 下存在分类子目录，输出目录要镜像相对路径：
-  - `outputs/papers/agentic_rl/foo.pdf`
-  - → `outputs/papers_output/agentic_rl/foo_阅读笔记.md`
+- 用户可自行维护分类子目录；`read_paper` 必须把论文路径在 `outputs/papers/` 下的相对目录镜像到 `outputs/papers_output/`：
+  - `outputs/papers/agent_RL/foo.pdf`
+  - → `outputs/papers_output/agent_RL/foo_阅读笔记.md`
+  - `outputs/papers/OPD/2604.13016.pdf`
+  - → `outputs/papers_output/OPD/2604.13016_阅读笔记.md`
+- 每个分类目录的图片资产放在该分类输出目录下：
+  - `outputs/papers_output/agent_RL/assets/foo/<figure>.png`
+  - Markdown 中引用为 `assets/foo/<figure>.png`。
+- 中间/暂存文件（全文抽取、分块、OCR 临时文本、索引 JSON、调试日志等）不要放在 `outputs/papers_output/`；统一放在 `sandbox/read_paper/<paper_stem>/`，最终完成后可删除。`outputs/papers_output/` 只保留阅读笔记、用户明确需要的导出版和图片资产。
 
 ## Required Tool / Skill-local Scripts
 - read_paper 专用能力默认采用 **skill-local scripts + `run_command`** 调用方式，避免把论文专用入口注册成全局 LLM tools，从而减少每轮 tool schema 干扰。
@@ -42,7 +48,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
   ```bash
   python3 skills/productivity/read_paper/scripts/pdf_snapshot.py <pdf_path> --mode smart
   ```
-  默认输出到 `outputs/papers_output/assets/<pdf_stem>/`；自动裁剪不理想时，用 `--mode crops --crops-json '<json>'` 精裁。
+  默认根据 PDF 在 `outputs/papers/` 下的相对目录镜像输出到 `outputs/papers_output/<category>/assets/<pdf_stem>/`；自动裁剪不理想时，用 `--mode crops --crops-json '<json>'` 精裁。
 - `skills/productivity/read_paper/scripts/` 中的核心脚本：
   - `paper_locator.py`：论文定位与输出路径计算。
   - `pdf_snapshot.py`：PDF Figure/Table caption 定位、智能裁剪和渲染。
@@ -50,7 +56,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ## Inputs
 - `query`：日期、标题关键词、文件名片段、arXiv ID 等，例如 `2025-02-20`、`STeCa`。
-- `category`：可选类别目录，例如 `agentic_rl`。
+- `category`：可选类别目录，例如 `agent_RL`、`OPD`。
 - 用户关注点：方法细节、公式、实验公平性、落地成本、某个图表、与某类 baseline 的差异、可复现性、后续研究方向等。
 - 输出语言：默认中文。
 
@@ -75,12 +81,13 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 - 公式必须使用正常 Markdown 数学环境：复杂/块级公式用独立的 double-dollar display math block，不要把复杂公式塞进 Markdown 表格或行内代码。
 - 必须保留“研究者阅读记录”：阅读动机、预读预测、读后校正、反证/不利证据、后续可执行实验。
 - **强制重检查与最终验收**：初版 Markdown 生成后，必须将总结文件和论文原文/抽取文本重新对照读一遍，查漏补缺，并把补充/修正整合进最终 Markdown；复杂任务还要执行最终验收，验证关键数值、公式、截图、Markdown 格式和重检查记录。
+- **输出目录保持整洁**：最终版生成后，`outputs/papers_output/<category>/` 不应残留 `extracted*`、`*_fulltext.txt`、`chunk_*.txt`、临时索引 JSON、OCR/debug 中间文件；这些文件只允许留在 `sandbox/read_paper/<paper_stem>/`，除非用户明确要求保留。
 
 ## Reading Procedure
 
 ### 1. 定位与抽取论文内容
 1. 使用 `run_command` 调用 `paper_locator.py`，或根据明确路径选定论文文件，并确定输出 Markdown 路径。
-2. 抽取文本：PDF 优先使用 PyMuPDF、pdftotext 或 OCR/文档工具；若 PDF 是扫描件或图表文字缺失，使用 OCR/截图辅助理解。
+2. 抽取文本：PDF 优先使用 PyMuPDF、pdftotext 或 OCR/文档工具；若 PDF 是扫描件或图表文字缺失，使用 OCR/截图辅助理解。抽取全文、分块文本、索引 JSON 等中间文件必须写入 `sandbox/read_paper/<paper_stem>/`，不要写入 `outputs/papers_output/`。
 3. 建立章节索引：记录 Abstract、Introduction、Related Work、Method、Experiments、Ablation、Analysis、Conclusion、Limitations、Appendix 等位置。
 4. 建立术语/简称表：从标题、摘要、引言、方法和实验设置中抽取所有高频简称、方法名、数据集名、指标名、算法名和任务名；尽量回查原文首次定义，记录完整英文名、中文解释、所在章节/页码。若原文未展开，标注“原文未展开”。
 5. 如果全文过长，分阶段阅读：先全局扫描，再按 Method/Experiments/Appendix/Limitations 深读。
@@ -140,7 +147,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 ### 4.1 图表与截图的就地插入规则
 对论文中的图、表、算法框、流程图、案例和错误样本进行系统梳理，但输出时要嵌入主线：
 - 先用 `run_command` 调用 `pdf_snapshot.py` 为关键 Figure/Table 生成 PNG 截图；优先使用 `--mode smart`，结合 caption、相邻文本和像素内容自动精裁；不理想时再用 `--mode crops --crops-json ...` 指定 bbox 精裁。
-- 将截图保存到 `outputs/papers_output/assets/<pdf_stem>/`；如果阅读笔记位于 `outputs/papers_output/xxx_阅读笔记.md`，图片链接必须写成相对该 Markdown 文件的 `assets/<pdf_stem>/xxx.png`，不要写成 `outputs/papers_output/assets/...`，否则 Markdown 预览可能找不到图片。
+- 将截图保存到阅读笔记所在输出目录的 `assets/<pdf_stem>/` 下，例如 `outputs/papers_output/agent_RL/assets/foo/foo_p001_figure_1.png`；图片链接必须写成相对当前 Markdown 文件的 `assets/<pdf_stem>/xxx.png`，不要写成 `outputs/papers_output/...` 绝对式路径，否则移动分类目录后 Markdown 预览可能找不到图片。
 - 图：在讲到相关方法/实验节点时插入截图，说明图号、标题、作者想表达的信息、与当前论证的关系。
 - 表：在讲到对应结果或消融时插入截图，说明比较对象、指标、最佳结果、相对提升，以及作者分析是否充分。
 - 对关键架构图/流程图：截图之外，必要时用 Mermaid 或 ASCII 重画一个更易懂的抽象流程，但重画图要跟原图截图放在同一叙事节点。
@@ -300,7 +307,7 @@ PY
 ### 11.4 最终验收与父进程二次对照
 当阅读任务由多步/子任务完成，或已经生成初版/重检查版 Markdown 后，必须把最终验收并入 `read_paper` 流程，而不是另建独立论文检查技能：
 
-1. 定位最终 Markdown、抽取文本和原 PDF。
+1. 定位最终 Markdown、sandbox 中的抽取文本/索引和原 PDF。
 2. 读取最终 Markdown 全文或关键章节，确认包含 `## 重检查记录`，并检查是否存在空章节、重复章节、未闭合代码块、表格错位、图片链接缺失、数学公式渲染风险。
 3. 针对论文类型抽查关键证据：
    - 主结果表格与附录表格的数值、设置差异，例如 strict/loose、ID/OOD、不同模型/数据集。
