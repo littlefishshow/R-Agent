@@ -40,6 +40,16 @@ LLM_MODEL="gpt-4o"
 
 ### 2026-06-19
 
+#### CLI Esc 中断与上下文回退
+
+- **新增运行中断入口**：`main.py` 将 Agent 执行改为后台线程运行，前台 Rich 状态动画显示“按 Esc 中断”，并在 TTY 下通过 `select`/`termios` 监听 Esc 单键。
+- **增加用户可见反馈**：检测到 Esc 后立即打印 `esc 中断`，随后提示本轮 assistant/tool 中间上下文已回退，避免用户误以为 Agent 仍在继续处理。
+- **接入取消信号**：`core/agent.py` 新增 `AgentInterrupted` 与 `cancel_event` 支持，在模型请求前后、重试等待、工具执行边界和强制收尾流程中检查中断。
+- **新增工具进程隔离**：`tools/registry.py` 新增 `execute_tool_isolated()`，Agent 工具调用默认在子进程执行；Esc 触发后父进程会终止/kill 正在运行的工具子进程，并抛出 `AgentInterrupted` 回滚上下文。
+- **强化中断状态提示**：`main.py` 统一追加 `[dim](按 Esc 中断)[/dim]`，默认等待、思考中、模型重试和工具执行状态都会持续提醒用户可按 Esc。
+- **实现上下文回退**：普通对话中断后保留本次用户输入，丢弃其后的 assistant/tool/system 中间消息；截断续跑中断后回滚本次续跑追加内容。
+- **补充最小验证**：新增 `tests/test_agent_interrupt.py`、`tests/test_tool_process_isolation.py`、`tests/test_status_hint.py`，覆盖普通/续跑回滚、隔离工具取消、状态提示去重；本地已通过 `py_compile` 与完整 `pytest` 验证。
+
 #### read_paper 主线串读与论文截图复核
 
 - **按最新版 skill 重写 RAGEN 阅读笔记主线**：使用更新后的 `read_paper` 规范重读 2025-04-24 RAGEN 论文，将第 4 节改为按论文行文顺序串联 Introduction、MDP/StarPO、PPO/GRPO、Echo Trap、StarPO-S、rollout 设计、reasoning 衰退和 Appendix 反证。

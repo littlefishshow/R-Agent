@@ -5,11 +5,16 @@ import atexit
 import shutil
 import tempfile
 import uuid
+import threading
+import select
+import termios
+import tty
+
 
 # 确保 R-Agent 目录在模块搜索路径中
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from core.agent import RAgent
+from core.agent import AgentInterrupted, RAgent
 from core import config
 from tools.registry import registry
 from core.skills import skill_manager
@@ -63,6 +68,92 @@ def _dump_tool_output(func_name: str, content: str) -> str:
     with open(log_path, "w", encoding="utf-8") as f:
         f.write(content)
     return log_path
+
+
+INTERRUPT_STATUS_HINT = "[dim](按 Esc 中断)[/dim]"
+
+
+def _with_interrupt_status_hint(message: str) -> str:
+    """为可 Esc 中断的 Rich status 文案追加提示，并避免重复追加。
+
+    该 helper 只在 interruptible status 流程中调用，避免影响普通/非中断场景的状态文案。
+    """
+    if "按 Esc 中断" in message:
+        return message
+    if not message:
+        return INTERRUPT_STATUS_HINT
+    return f"{message} {INTERRUPT_STATUS_HINT}"
+
+
+def _run_with_esc_interrupt(run_callable, status_message: str, status_ref=None):
+    """后台执行 Agent，前台在状态动画期间监听 Esc 并请求中断。"""
+    cancel_event = threading.Event()
+    finished = threading.Event()
+    result = {"response": None, "error": None}
+
+    def worker():
+        try:
+            result["response"] = run_callable(cancel_event)
+        except BaseException as exc:  # noqa: BLE001 - 需要把后台异常传回主线程
+            result["error"] = exc
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=worker, daemon=True)
+    interrupted = False
+    stdin_fd = None
+    old_tty_attrs = None
+
+    def request_interrupt():
+        nonlocal interrupted
+        if not interrupted:
+            interrupted = True
+            cancel_event.set()
+            console.print("\n[bold yellow]esc 中断[/bold yellow]")
+
+    try:
+        if sys.stdin.isatty():
+            stdin_fd = sys.stdin.fileno()
+            old_tty_attrs = termios.tcgetattr(stdin_fd)
+            tty.setcbreak(stdin_fd)
+    except Exception:
+        stdin_fd = None
+        old_tty_attrs = None
+
+    try:
+        with console.status(
+            _with_interrupt_status_hint(status_message),
+            spinner="dots",
+        ) as status:
+            if status_ref is not None:
+                status_ref["status"] = status
+            thread.start()
+            try:
+                while not finished.wait(0.1):
+                    if stdin_fd is None:
+                        continue
+                    readable, _, _ = select.select([sys.stdin], [], [], 0)
+                    if readable and sys.stdin.read(1) == "\x1b":
+                        request_interrupt()
+            except KeyboardInterrupt:
+                request_interrupt()
+                while not finished.wait(0.1):
+                    pass
+    finally:
+        if old_tty_attrs is not None and stdin_fd is not None:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_attrs)
+            except Exception:
+                pass
+        if status_ref is not None:
+            status_ref["status"] = None
+
+    thread.join(timeout=0)
+
+    if result["error"] is not None:
+        raise result["error"]
+    return result["response"]
+
 
 def update_env_var(key: str, value: str):
     env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
@@ -323,19 +414,26 @@ def main():
             agent.client = config.create_llm_client()
             
             # 状态回调函数
+            status_ref = {"status": None}
+
+            def update_status(message: str):
+                current_status = status_ref.get("status")
+                if current_status is not None:
+                    current_status.update(_with_interrupt_status_hint(message))
+
             def on_think(iteration, **kwargs):
                 if "retry_attempt" in kwargs:
-                    status.update(
+                    update_status(
                         f"[bold yellow]🤖 模型请求瞬时失败，正在重试 "
                         f"({kwargs['retry_attempt']}/{kwargs['retry_max']})，"
                         f"约 {kwargs['retry_delay']:.1f}s 后继续...[/bold yellow]"
                     )
                 else:
-                    status.update(f"[bold cyan]🤖 Agent 正在思考 (第 {iteration+1} 轮)...[/bold cyan]")
+                    update_status(f"[bold cyan]🤖 Agent 正在思考 (第 {iteration+1} 轮)...[/bold cyan]")
                 
             def on_tool_start(func_name, func_args):
+                update_status(f"[bold cyan]🤖 Agent 正在执行: {func_name}...[/bold cyan]")
                 if config.get_display_mode() == "concise":
-                    status.update(f"[bold cyan]🤖 Agent 正在执行: {func_name}...[/bold cyan]")
                     return
                 console.log(f"[bold yellow]🛠️  调用工具:[/bold yellow] [bold magenta]{func_name}[/bold magenta]\n[dim]参数: {func_args}[/dim]")
                 
@@ -357,20 +455,29 @@ def main():
                     return
                 console.log(f"[bold green]✅ 工具返回:[/bold green] [dim]{str_res}[/dim]")
                 
-            # 显示状态动画
-            with console.status("[bold cyan]🤖 Agent 正在思考...[/bold cyan]", spinner="dots") as status:
-                response = agent.run_conversation(
-                    user_input, 
-                    system_message=system_prompt,
-                    on_think=on_think,
-                    on_tool_start=on_tool_start,
-                    on_tool_end=on_tool_end
+            # 后台运行 Agent，前台监听 Esc 中断
+            try:
+                response = _run_with_esc_interrupt(
+                    lambda cancel_event: agent.run_conversation(
+                        user_input,
+                        system_message=system_prompt,
+                        on_think=on_think,
+                        on_tool_start=on_tool_start,
+                        on_tool_end=on_tool_end,
+                        cancel_event=cancel_event,
+                    ),
+                    "[bold cyan]🤖 Agent 正在思考...[/bold cyan]",
+                    status_ref=status_ref,
                 )
-            
+            except AgentInterrupted:
+                console.print("[yellow]已中断，本轮 assistant/tool 中间上下文已回退。[/yellow]")
+                console.print()
+                continue
+
             # 打印回复
             console.print(Panel(
-                Markdown(response), 
-                title="[bold blue]🤖 R-Agent[/bold blue]", 
+                Markdown(response),
+                title="[bold blue]🤖 R-Agent[/bold blue]",
                 border_style="blue",
                 expand=False
             ))
@@ -396,16 +503,22 @@ def main():
                 if extra <= 0:
                     break
 
-                with console.status(
-                    f"[bold cyan]🤖 Agent 续跑中（+{extra} 轮）...[/bold cyan]",
-                    spinner="dots",
-                ) as status:
-                    response = agent.continue_after_truncation(
-                        extra,
-                        on_think=on_think,
-                        on_tool_start=on_tool_start,
-                        on_tool_end=on_tool_end,
+                try:
+                    response = _run_with_esc_interrupt(
+                        lambda cancel_event: agent.continue_after_truncation(
+                            extra,
+                            on_think=on_think,
+                            on_tool_start=on_tool_start,
+                            on_tool_end=on_tool_end,
+                            cancel_event=cancel_event,
+                        ),
+                        f"[bold cyan]🤖 Agent 续跑中（+{extra} 轮）...[/bold cyan]",
+                        status_ref=status_ref,
                     )
+                except AgentInterrupted:
+                    console.print("[yellow]已中断，本次续跑中间上下文已回退。[/yellow]")
+                    console.print()
+                    break
                 console.print(Panel(
                     Markdown(response),
                     title="[bold blue]🤖 R-Agent (续跑)[/bold blue]",

@@ -2,7 +2,7 @@
 
 > 用途：记录当前 Agent Memory 系统迭代进展，便于重启 Agent 后快速恢复上下文。  
 > 依据：`outputs/current_memory_system_improvement_plan.md`、当前 git diff、已完成的 P0 实现与修复。  
-> 最近更新日期：2026-06-09
+> 最近更新日期：2026-06-19
 
 ---
 
@@ -464,6 +464,64 @@ memory_get
 
 ---
 
+### 2026-06-19：CLI Esc 中断与上下文回退维护
+
+> 说明：本节不是 Agent Memory P0/P1 的直接功能项，但属于 R-Agent 主项目维护进展；根据用户约定，同步记录到 outputs 维护进度文档，便于重启后恢复上下文。
+
+涉及文件：
+
+```text
+main.py
+core/agent.py
+tools/registry.py
+tests/test_agent_interrupt.py
+tests/test_tool_process_isolation.py
+tests/test_status_hint.py
+README.md
+outputs/agent_memory_maintenance_progress.md
+skills/agent_ops/cli_runtime_interrupt/SKILL.md
+```
+
+已完成能力：
+
+1. **运行期 Esc 提示与监听**
+   - Agent 思考/工具执行期间，Rich status 显示“按 Esc 中断”；
+   - `main.py` 使用后台线程执行 Agent，主线程保持状态动画并监听 Esc；
+   - 检测到 Esc 后立即打印 `esc 中断`，并设置 `cancel_event`。
+
+2. **Agent Loop 取消信号接入**
+   - `core/agent.py` 新增 `AgentInterrupted`；
+   - `run_conversation()`、`continue_after_truncation()`、`_loop()`、`_chat_completion_with_retry()`、`_force_finalize()` 增加 `cancel_event` 参数；
+   - 在模型请求前后、重试退避等待、工具调用边界、强制收尾边界检查中断。
+
+3. **上下文回退语义**
+   - 普通对话：中断后保留本次用户输入，删除本轮产生的 assistant/tool/system 中间消息；
+   - 截断续跑：中断后回滚本次续跑追加的 user 指令及其后的中间消息；
+   - 中断会清理截断标记和软提醒状态，避免后续对话误判。
+
+4. **工具执行进程隔离**
+   - `tools/registry.py` 新增 `execute_tool_isolated()`，工具 handler 在独立子进程中运行；
+   - Agent 调用工具时父进程轮询 `cancel_event`，Esc 后会 terminate/kill 工具子进程并抛出 `AgentInterrupted`；
+   - 正常工具返回保持原 `execute_tool()` JSON 字符串兼容，异常/超时/无返回/不可序列化结果返回 JSON error。
+
+5. **状态提示持续化**
+   - `main.py` 新增 `_with_interrupt_status_hint()`，统一为 interruptible Rich status 追加 `[dim](按 Esc 中断)[/dim]`；
+   - 默认等待、思考中、模型重试、工具执行状态都会显示 Esc 提醒，并避免重复追加。
+
+6. **验证情况**
+   - `python3 -m py_compile core/agent.py tools/registry.py main.py tests/test_agent_interrupt.py tests/test_tool_process_isolation.py tests/test_status_hint.py` 通过；
+   - 手工 smoke test 验证隔离工具 pid 不同、cancel_event 可终止长耗时工具、状态提示 helper 追加/去重通过；
+   - 新增 `tests/test_agent_interrupt.py`、`tests/test_tool_process_isolation.py`、`tests/test_status_hint.py`；
+   - `python3 -m pytest -q` 通过：122 passed, 8 skipped, 1 warning。
+
+已知限制：
+
+- 已隔离的长耗时工具可以在 Esc 后由父进程终止子进程；但已经发出的同步 LLM HTTP 请求仍无法底层 abort，需要等请求返回或未来改造成流式/可取消请求。
+- 工具子进程隔离优先使用 `fork` 保留动态注册 handler；在不支持 fork 的平台会回退到模块工具重载，动态/不可 pickle handler 的兼容性较弱。
+- 非 TTY 环境不会启用单键监听，但不影响后台执行和正常返回。
+
+---
+
 ## 7. 重要用户约定
 
 用户已明确要求：
@@ -485,7 +543,7 @@ memory_get
 ```text
 outputs/current_memory_system_improvement_plan.md
 outputs/agent_memory_maintenance_progress.md
-git diff -- tools/file_tools.py README.md outputs/agent_memory_maintenance_progress.md
+git diff -- main.py core/agent.py tests/test_agent_interrupt.py README.md outputs/agent_memory_maintenance_progress.md
 ```
 
 然后优先继续实现：

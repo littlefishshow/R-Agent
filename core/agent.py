@@ -10,6 +10,15 @@ _TRUNCATED_FLAG = "_truncated"
 _PENDING_USER_MSG = "_pending_user_message"
 
 
+class AgentInterrupted(Exception):
+    """用户主动中断当前 Agent 运行。"""
+
+
+def _is_cancelled(cancel_event=None) -> bool:
+    """兼容 threading.Event 等带 is_set() 的取消信号。"""
+    return bool(cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)())
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """
     判断异常是否属于"瞬时错误"，值得重试。
@@ -92,7 +101,7 @@ class RAgent:
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
-    def _chat_completion_with_retry(self, on_think=None, iteration=None, **kwargs):
+    def _chat_completion_with_retry(self, on_think=None, iteration=None, cancel_event=None, **kwargs):
         """
         包装 client.chat.completions.create，对瞬时错误自动指数退避重试。
         非瞬时错误（如内容策略 cyber_policy / 鉴权 / 参数错误）直接抛出。
@@ -102,8 +111,13 @@ class RAgent:
 
         last_exc = None
         for attempt in range(max_retries + 1):
+            if _is_cancelled(cancel_event):
+                raise AgentInterrupted()
             try:
-                return self.client.chat.completions.create(**kwargs)
+                response = self.client.chat.completions.create(**kwargs)
+                if _is_cancelled(cancel_event):
+                    raise AgentInterrupted()
+                return response
             except Exception as e:
                 last_exc = e
                 if attempt >= max_retries or not _is_transient_error(e):
@@ -122,7 +136,11 @@ class RAgent:
                 else:
                     print(f"[retry {attempt + 1}/{max_retries}] 模型瞬时错误: "
                           f"{_format_llm_error(e)}，{delay:.1f}s 后重试...")
-                time.sleep(delay)
+                deadline = time.monotonic() + delay
+                while time.monotonic() < deadline:
+                    if _is_cancelled(cancel_event):
+                        raise AgentInterrupted()
+                    time.sleep(min(0.1, max(0, deadline - time.monotonic())))
         # 不应到达这里，但出于完整性
         raise last_exc  # type: ignore[misc]
 
@@ -135,7 +153,7 @@ class RAgent:
         )
         self.messages.append({"role": "system", "content": warn})
 
-    def _force_finalize(self, used: int, total: int, on_think=None) -> str:
+    def _force_finalize(self, used: int, total: int, on_think=None, cancel_event=None) -> str:
         """
         最后一次请求：禁用 tools，要求模型输出文本总结与未完成清单。
         即使模型仍想调用工具，由于没有 tools 字段，它只能输出文本。
@@ -148,6 +166,8 @@ class RAgent:
             "3) 在「建议下一步」小节给出用户可以做的明确选择"
             "（例如：扩展预算继续 / 缩小问题范围 / 提供更多信息）。"
         )
+        if _is_cancelled(cancel_event):
+            raise AgentInterrupted()
         self.messages.append({"role": "system", "content": finalize_hint})
 
         if on_think:
@@ -157,12 +177,17 @@ class RAgent:
             response = self._chat_completion_with_retry(
                 on_think=on_think,
                 iteration=used,
+                cancel_event=cancel_event,
                 model=self.model,
                 messages=self.messages,
             )
+        except AgentInterrupted:
+            raise
         except Exception as e:
             return f"模型强制收尾失败: {_format_llm_error(e)}"
 
+        if _is_cancelled(cancel_event):
+            raise AgentInterrupted()
         message = response.choices[0].message
         self.messages.append(message)
         return message.content or "(模型未返回文本)"
@@ -172,12 +197,18 @@ class RAgent:
     # ------------------------------------------------------------------
     def run_conversation(self, user_message: str, system_message: str = None,
                          on_think=None, on_tool_start=None, on_tool_end=None,
-                         exclude_tools=None) -> str:
-        """核心对话循环 (The Agent Loop)"""
+                         exclude_tools=None, cancel_event=None) -> str:
+        """核心对话循环 (The Agent Loop)。
+
+        cancel_event 用于 CLI 的 Esc 中断：一旦置位，当前轮会回滚到本次
+        用户输入后的快照（保留用户输入，丢弃 assistant/tool 中间消息）并
+        抛出 AgentInterrupted。
+        """
         if system_message and not any(m.get("role") == "system" for m in self.messages):
             self.messages.append({"role": "system", "content": system_message})
 
         self.messages.append({"role": "user", "content": user_message})
+        rollback_index = len(self.messages)
 
         # 新一轮 run，复位截断/软提醒标记，并恢复默认预算。
         # continue_after_truncation 只应影响当前被截断任务，不应永久抬高后续对话预算。
@@ -186,19 +217,29 @@ class RAgent:
         self._soft_warned = False
         self._active_exclude_tools = set(exclude_tools or [])
 
-        return self._loop(start_iteration=0, on_think=on_think,
-                          on_tool_start=on_tool_start, on_tool_end=on_tool_end,
-                          exclude_tools=self._active_exclude_tools)
+        try:
+            return self._loop(start_iteration=0, on_think=on_think,
+                              on_tool_start=on_tool_start, on_tool_end=on_tool_end,
+                              exclude_tools=self._active_exclude_tools,
+                              cancel_event=cancel_event)
+        except AgentInterrupted:
+            self.messages = self.messages[:rollback_index]
+            setattr(self, _TRUNCATED_FLAG, False)
+            self._soft_warned = False
+            raise
 
     def continue_after_truncation(self, extra_iterations: int,
                                   on_think=None, on_tool_start=None,
-                                  on_tool_end=None, exclude_tools=None) -> str:
+                                  on_tool_end=None, exclude_tools=None,
+                                  cancel_event=None) -> str:
         """
         在被强制截断后，由 CLI 询问用户并扩展预算后调用，直接续跑。
         不会让用户重新输入问题，messages 历史完整保留。
         """
         if extra_iterations <= 0:
             return "未扩展迭代预算，已保留当前结果。"
+
+        rollback_index = len(self.messages)
 
         # 在历史中追加一条 user 风格的指令：让模型继续推进未完成事项
         self.messages.append({
@@ -216,9 +257,16 @@ class RAgent:
         used_before = self.max_iterations - extra_iterations
         active_exclude_tools = self._active_exclude_tools if exclude_tools is None else set(exclude_tools or [])
         self._active_exclude_tools = set(active_exclude_tools)
-        return self._loop(start_iteration=used_before, on_think=on_think,
-                          on_tool_start=on_tool_start, on_tool_end=on_tool_end,
-                          exclude_tools=active_exclude_tools)
+        try:
+            return self._loop(start_iteration=used_before, on_think=on_think,
+                              on_tool_start=on_tool_start, on_tool_end=on_tool_end,
+                              exclude_tools=active_exclude_tools,
+                              cancel_event=cancel_event)
+        except AgentInterrupted:
+            self.messages = self.messages[:rollback_index]
+            setattr(self, _TRUNCATED_FLAG, False)
+            self._soft_warned = False
+            raise
 
     def is_truncated(self) -> bool:
         return bool(getattr(self, _TRUNCATED_FLAG, False))
@@ -227,12 +275,16 @@ class RAgent:
     # 真实循环
     # ------------------------------------------------------------------
     def _loop(self, start_iteration: int, on_think=None,
-              on_tool_start=None, on_tool_end=None, exclude_tools=None) -> str:
+              on_tool_start=None, on_tool_end=None, exclude_tools=None,
+              cancel_event=None) -> str:
         soft_threshold = max(1, int(self.max_iterations * config.get_soft_warn_ratio()))
         iteration = start_iteration
         excluded = set(exclude_tools or [])
 
         while iteration < self.max_iterations:
+            if _is_cancelled(cancel_event):
+                raise AgentInterrupted()
+
             # 软提醒（一次性）
             if not self._soft_warned and iteration >= soft_threshold:
                 self._inject_soft_warning(iteration, self.max_iterations)
@@ -257,16 +309,23 @@ class RAgent:
                 response = self._chat_completion_with_retry(
                     on_think=on_think,
                     iteration=iteration,
+                    cancel_event=cancel_event,
                     **kwargs,
                 )
+            except AgentInterrupted:
+                raise
             except Exception as e:
                 return f"模型请求失败: {_format_llm_error(e)}"
 
+            if _is_cancelled(cancel_event):
+                raise AgentInterrupted()
             message = response.choices[0].message
             self.messages.append(message)
 
             if message.tool_calls:
                 for tool_call in message.tool_calls:
+                    if _is_cancelled(cancel_event):
+                        raise AgentInterrupted()
                     func_name = tool_call.function.name
                     func_args = tool_call.function.arguments
 
@@ -278,7 +337,15 @@ class RAgent:
                     if func_name in excluded:
                         result = f'工具 {func_name} 已在当前上下文中被禁用，未执行。'
                     else:
-                        result = registry.execute_tool(func_name, func_args)
+                        result = registry.execute_tool_isolated(
+                            func_name,
+                            func_args,
+                            cancel_event=cancel_event,
+                            interrupted_exception=AgentInterrupted,
+                        )
+
+                    if _is_cancelled(cancel_event):
+                        raise AgentInterrupted()
 
                     if on_tool_end:
                         on_tool_end(func_name, result)
@@ -298,7 +365,8 @@ class RAgent:
                 return message.content
 
         # 达到上限：强制收尾
-        finalized = self._force_finalize(iteration, self.max_iterations, on_think=on_think)
+        finalized = self._force_finalize(iteration, self.max_iterations, on_think=on_think,
+                                         cancel_event=cancel_event)
         setattr(self, _TRUNCATED_FLAG, True)
 
         prefix = (
