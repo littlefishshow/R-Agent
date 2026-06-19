@@ -40,6 +40,13 @@ LLM_MODEL="gpt-4o"
 
 ### 2026-06-19
 
+#### read_paper 改为 skill-local scripts 调用
+
+- **移除全局 wrapper 工具**：删除 `tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py`，不再注册 `locate_paper` / `pdf_snapshot` 两个全局 LLM tools。
+- **改用 run_command 调脚本**：`read_paper` 流程改为通过 `run_command` 调用 `skills/productivity/read_paper/scripts/paper_locator.py` 与 `pdf_snapshot.py`，类似 `ocr-and-documents` 的 helper script 使用方式。
+- **保留脚本可执行入口**：为 `paper_locator.py` 与 `pdf_snapshot.py` 补充 CLI 参数入口，便于 Agent 和用户直接从终端调用。
+- **减少工具选择干扰**：论文阅读专用能力不再占用每轮全局 tool schema，只在读取 `read_paper` skill 后按需运行脚本。
+
 #### CLI Esc 中断与上下文回退
 
 - **新增运行中断入口**：`main.py` 将 Agent 执行改为后台线程运行，前台 Rich 状态动画显示“按 Esc 中断”，并在 TTY 下通过 `select`/`termios` 监听 Esc 单键。

@@ -32,14 +32,21 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
   - → `outputs/papers_output/agentic_rl/foo_阅读笔记.md`
 
 ## Required Tool / Skill-local Scripts
-- 定位论文时优先调用 `locate_paper` tool。
-- `locate_paper` 默认递归搜索 `outputs/papers/`，默认输出到 `outputs/papers_output/`，并自动计算 Markdown 输出路径。
-- 匹配策略保持简单：明确路径/日期/文件名关键词/类别目录。不手写复杂匹配逻辑。
-- 论文含关键 Figure/Table 时必须优先调用 `pdf_snapshot` tool 生成 PNG 截图，并把截图插入阅读笔记；默认输出到 `outputs/papers_output/assets/<pdf_stem>/`。
-- `locate_paper` 与 `pdf_snapshot` 的核心实现属于本 skill，放在 `skills/productivity/read_paper/scripts/`：
+- read_paper 专用能力默认采用 **skill-local scripts + `run_command`** 调用方式，避免把论文专用入口注册成全局 LLM tools，从而减少每轮 tool schema 干扰。
+- 定位论文时通过 `run_command` 调用：
+  ```bash
+  python3 skills/productivity/read_paper/scripts/paper_locator.py "<query>" --category "<category>"
+  ```
+  该脚本默认递归搜索 `outputs/papers/`，默认输出到 `outputs/papers_output/`，并自动计算 Markdown 输出路径。匹配策略保持简单：明确路径/日期/文件名关键词/类别目录。
+- 论文含关键 Figure/Table 时通过 `run_command` 调用：
+  ```bash
+  python3 skills/productivity/read_paper/scripts/pdf_snapshot.py <pdf_path> --mode smart
+  ```
+  默认输出到 `outputs/papers_output/assets/<pdf_stem>/`；自动裁剪不理想时，用 `--mode crops --crops-json '<json>'` 精裁。
+- `skills/productivity/read_paper/scripts/` 中的核心脚本：
   - `paper_locator.py`：论文定位与输出路径计算。
   - `pdf_snapshot.py`：PDF Figure/Table caption 定位、智能裁剪和渲染。
-- `tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py` 只保留薄 wrapper，用于向全局工具注册表暴露 `locate_paper` / `pdf_snapshot`；维护算法逻辑时优先改 scripts，避免 skill 逻辑散落在 tools 目录。
+- 不再保留 `tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py` 全局 wrapper；维护算法逻辑时只改 skill-local scripts。
 
 ## Inputs
 - `query`：日期、标题关键词、文件名片段、arXiv ID 等，例如 `2025-02-20`、`STeCa`。
@@ -49,18 +56,18 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ## Paper Discovery Procedure
 1. 若用户给出明确文件路径：直接使用该路径；输出路径仍尽量按 `outputs/papers` 到 `outputs/papers_output` 的相对路径镜像生成。
-2. 否则调用 `locate_paper`：
+2. 否则通过 `run_command` 调用 `paper_locator.py`：
    - `query` 填用户给出的日期、标题关键词、arXiv ID 或文件名片段。
    - `category` 填用户给出的类别目录；没有则留空。
    - 默认 `papers_dir="outputs/papers"`，`output_dir="outputs/papers_output"`。
-3. 处理 `locate_paper` 返回：
+3. 处理 `paper_locator.py` 返回 JSON：
    - `status="unique"`：直接阅读 `selected.paper_path`，输出到 `selected.output_path`。
    - `status="ambiguous"`：如果上下文不能明显决定，列出候选路径让用户选择。
    - `status="no_match"` 或 `no_files`：告知没有找到，并列出使用的查询条件和默认目录。
 4. 在 Markdown 基本信息中记录：论文路径、类别目录、输出路径、搜索线索。
 
 ## Output Requirements
-- 每篇论文生成一份 Markdown 总结，保存到 `locate_paper` 返回的 `output_path`。
+- 每篇论文生成一份 Markdown 总结，保存到 `paper_locator.py` 返回 JSON 中的 `output_path`。
 - 总结必须优先回答用户明确要求的信息；若用户没有额外指定，则按本技能模板完整输出。
 - 不确定的信息必须标注“论文未明确说明”或“未在当前可读内容中找到”，不得猜测。
 - 引用图表、公式、实验结果时尽量标注原文页码、章节号、图号或表号。
@@ -72,7 +79,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 ## Reading Procedure
 
 ### 1. 定位与抽取论文内容
-1. 使用 `locate_paper` 或明确路径选定论文文件，并确定输出 Markdown 路径。
+1. 使用 `run_command` 调用 `paper_locator.py`，或根据明确路径选定论文文件，并确定输出 Markdown 路径。
 2. 抽取文本：PDF 优先使用 PyMuPDF、pdftotext 或 OCR/文档工具；若 PDF 是扫描件或图表文字缺失，使用 OCR/截图辅助理解。
 3. 建立章节索引：记录 Abstract、Introduction、Related Work、Method、Experiments、Ablation、Analysis、Conclusion、Limitations、Appendix 等位置。
 4. 建立术语/简称表：从标题、摘要、引言、方法和实验设置中抽取所有高频简称、方法名、数据集名、指标名、算法名和任务名；尽量回查原文首次定义，记录完整英文名、中文解释、所在章节/页码。若原文未展开，标注“原文未展开”。
@@ -132,7 +139,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ### 4.1 图表与截图的就地插入规则
 对论文中的图、表、算法框、流程图、案例和错误样本进行系统梳理，但输出时要嵌入主线：
-- 先用 `pdf_snapshot` 为关键 Figure/Table 生成 PNG 截图；优先使用 `mode="smart"`，结合 caption、相邻文本和像素内容自动精裁；不理想时再用 `mode="crops"` 指定 bbox 精裁。
+- 先用 `run_command` 调用 `pdf_snapshot.py` 为关键 Figure/Table 生成 PNG 截图；优先使用 `--mode smart`，结合 caption、相邻文本和像素内容自动精裁；不理想时再用 `--mode crops --crops-json ...` 指定 bbox 精裁。
 - 将截图保存到 `outputs/papers_output/assets/<pdf_stem>/`；如果阅读笔记位于 `outputs/papers_output/xxx_阅读笔记.md`，图片链接必须写成相对该 Markdown 文件的 `assets/<pdf_stem>/xxx.png`，不要写成 `outputs/papers_output/assets/...`，否则 Markdown 预览可能找不到图片。
 - 图：在讲到相关方法/实验节点时插入截图，说明图号、标题、作者想表达的信息、与当前论证的关系。
 - 表：在讲到对应结果或消融时插入截图，说明比较对象、指标、最佳结果、相对提升，以及作者分析是否充分。
@@ -191,7 +198,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ### 10. 初版 Markdown 写入
 1. 按推荐模板生成初版阅读笔记。
-2. 写入 `locate_paper` 返回或明确路径推导出的输出路径。
+2. 写入 `paper_locator.py` 返回或明确路径推导出的输出路径。
 3. 记录初版文件路径、行数和主要章节。
 
 
@@ -270,7 +277,7 @@ PY
 - 公式是否漏掉关键符号、符号定义、约束条件、超参数含义。
 - 主线、图表和公式是否按论文行文顺序串联，而不是分裂成“主线清单 / 图表清单 / 公式清单”三块。
 - 图表是否覆盖主文所有关键 Figure/Table；表格数值是否抄错；提升幅度是否算错。
-- 关键 Figure/Table 是否已通过 `pdf_snapshot` 截图并就地插入到对应解释附近；截图路径是否存在，Markdown 链接是否相对当前笔记可访问（通常应为 `assets/<pdf_stem>/xxx.png`）；自动裁剪是否截到主体，必要时是否用 crops 精裁。
+- 关键 Figure/Table 是否已通过 `pdf_snapshot.py` 截图并就地插入到对应解释附近；截图路径是否存在，Markdown 链接是否相对当前笔记可访问（通常应为 `assets/<pdf_stem>/xxx.png`）；自动裁剪是否截到主体，必要时是否用 crops 精裁。
 - 关键公式是否就地出现在相关方法/实验/理论段落，而不是集中堆在公式表里；公式是否解释了它如何服务当前论证。
 - Appendix 中是否有重要细节未纳入：数据统计、prompt 模板、训练超参、额外实验、更多消融、案例、限制。
 - Baseline 公平性判断是否有证据；是否遗漏计算预算、数据预算、模型规模、训练轮数。
@@ -444,7 +451,7 @@ $$
 ````
 
 ## Quality Checklist
-- 是否调用 `locate_paper` 定位论文并确定输出路径？
+- 是否通过 `run_command` 调用 `paper_locator.py` 定位论文并确定输出路径？
 - 输出是否镜像 `outputs/papers/` 下的相对目录到 `outputs/papers_output/`？
 - 是否写下阅读动机、预读预测和读后校正，而不是只总结作者结论？
 - 是否明确了问题、现有不足、作者方案和提升幅度？

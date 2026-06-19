@@ -205,3 +205,28 @@ def locate_paper_tool(
         "note": "If status is ambiguous, ask the user to choose one candidate unless context makes the choice obvious.",
     }, ensure_ascii=False)
 
+
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Locate a paper and compute read_paper Markdown output path.")
+    parser.add_argument("query", nargs="?", default="", help="Paper clue: date, title keyword, filename fragment, or arXiv ID.")
+    parser.add_argument("--category", default="", help="Optional category directory such as agentic_rl.")
+    parser.add_argument("--papers-dir", default=DEFAULT_PAPERS_DIR, help="Workspace-relative paper root.")
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Workspace-relative output root.")
+    parser.add_argument("--limit", type=int, default=10, help="Maximum candidates to return.")
+    args = parser.parse_args()
+    print(locate_paper_tool(
+        query=args.query,
+        category=args.category,
+        papers_dir=args.papers_dir,
+        output_dir=args.output_dir,
+        limit=args.limit,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

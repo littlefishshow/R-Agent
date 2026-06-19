@@ -440,3 +440,69 @@ def pdf_snapshot_tool(
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
 
+
+
+
+def _parse_pages_arg(value: str):
+    if not value:
+        return None
+    pages = []
+    for part in value.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        if '-' in part:
+            start, end = part.split('-', 1)
+            pages.extend(range(int(start), int(end) + 1))
+        else:
+            pages.append(int(part))
+    return pages or None
+
+
+def _load_json_arg(value: str):
+    if not value:
+        return None
+    path = Path(value)
+    if path.exists():
+        return json.loads(path.read_text(encoding='utf-8'))
+    return json.loads(value)
+
+
+def _main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Render PDF pages/figures/tables to PNG screenshots for read_paper notes.")
+    parser.add_argument("pdf_path", help="Workspace-local PDF path.")
+    parser.add_argument("--output-dir", default="", help="Workspace-relative output directory.")
+    parser.add_argument("--pages", default="", help="1-based pages, e.g. '1,3,5-7'. Empty means all pages.")
+    parser.add_argument("--crops-json", default="", help="JSON string or JSON file for crops; required for mode=crops.")
+    parser.add_argument("--mode", default="auto", choices=["auto", "smart", "pages", "crops"])
+    parser.add_argument("--dpi", type=int, default=200)
+    parser.add_argument("--include-tables", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--caption-above-ratio", type=float, default=0.48)
+    parser.add_argument("--caption-below-ratio", type=float, default=0.16)
+    parser.add_argument("--max-auto-per-page", type=int, default=8)
+    parser.add_argument("--smart-crop", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--content-refine", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--crop-margin", type=float, default=8.0)
+    args = parser.parse_args()
+    print(pdf_snapshot_tool(
+        pdf_path=args.pdf_path,
+        output_dir=args.output_dir,
+        pages=_parse_pages_arg(args.pages),
+        crops=_load_json_arg(args.crops_json),
+        mode=args.mode,
+        dpi=args.dpi,
+        include_tables=args.include_tables,
+        caption_above_ratio=args.caption_above_ratio,
+        caption_below_ratio=args.caption_below_ratio,
+        max_auto_per_page=args.max_auto_per_page,
+        smart_crop=args.smart_crop,
+        content_refine=args.content_refine,
+        crop_margin=args.crop_margin,
+    ))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())
