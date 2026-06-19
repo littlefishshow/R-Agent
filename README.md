@@ -38,6 +38,49 @@ LLM_MODEL="gpt-4o"
 
 ## 更新日志
 
+### 2026-06-19
+
+#### read_paper 主线串读与论文截图复核
+
+- **按最新版 skill 重写 RAGEN 阅读笔记主线**：使用更新后的 `read_paper` 规范重读 2025-04-24 RAGEN 论文，将第 4 节改为按论文行文顺序串联 Introduction、MDP/StarPO、PPO/GRPO、Echo Trap、StarPO-S、rollout 设计、reasoning 衰退和 Appendix 反证。
+- **新增叙事地图要求落地验证**：在 RAGEN 阅读笔记中新增 `4.0 叙事地图`，验证“上一节点问题 → 当前机制/证据 → 下一节点引出”的连续段落式写法比表单式清单更易读。
+- **复核并修正关键截图**：针对 Figure 1、Table 6 等裁剪异常，结合手动 bbox 精裁覆盖，减少 abstract、页边 arXiv 标识和相邻正文干扰。
+- **准备推送 read_paper 维护变更**：本次推送范围聚焦 `skills/productivity/read_paper/`、`tools/paper_locator_tool.py`、`tools/pdf_snapshot_tool.py` 与 `README.md`，不包含 sandbox 临时看板和 memory 本地状态。
+
+### 2026-06-18
+
+#### read_paper 主线串读可读性强化
+
+- **强化行文顺序要求**：更新 `read_paper` skill，要求第 4 节先给出论文叙事地图，再按论文实际行文顺序串联背景问题、方法定义、公式、图表、实验与局限。
+- **避免表单式堆砌**：明确论文主线串读应以连续段落为主，说明“上一节点的问题 → 当前节点的机制/证据 → 下一节点的引出”，减少孤立的图表清单、公式清单和方法清单。
+- **图表公式就地服务论证**：要求每张图/表/公式出现在它实际支撑的论证附近，并解释其如何推进作者主线，而不是让读者自行拼接。
+- **更新模板与质量清单**：推荐模板新增 `4.0 叙事地图`，质量检查新增主线连贯性、图表公式嵌入位置和段落衔接检查。
+
+#### read_paper 工具内聚与图表裁剪修复
+
+- **工具实现归属调整**：将论文定位与 PDF 图表截图的核心实现内聚到 `skills/productivity/read_paper/scripts/`，新增/维护 `paper_locator.py` 与 `pdf_snapshot.py`，让 `read_paper` 拥有自己的可复用脚本。
+- **保留全局工具入口**：`tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py` 调整为薄 wrapper，只负责 `registry.register` 并调用 read_paper scripts，兼容现有 `locate_paper` / `pdf_snapshot` 工具调用方式。
+- **修复 caption 智能裁剪过宽问题**：`pdf_snapshot` smart crop 从“整块窗口非白像素 bbox”改为“caption 锚点 + 行投影内容分段”，避免把 caption 上方的 abstract/正文和目标图表一起截入。
+- **修复 caption 方向反判问题**：针对 Figure 默认优先截 caption 上方图，Table 默认优先截 caption 下方表，并加入目标侧内容检测与备用方向比较，减少截成“标题 + 标题下方正文”而漏掉上方图的情况。
+- **增强脚本热重载稳定性**：工具 wrapper 在注册前 reload read_paper scripts，降低维护脚本后工具仍引用旧模块的风险。
+
+#### 论文阅读图表截图能力增强
+
+- **新增 PDF 图表截图工具**：新增 `pdf_snapshot` 工具，支持按整页、指定 bbox 或自动识别 Figure/Table caption 附近区域，将 PDF 图表渲染为 PNG。
+- **接入 read_paper 流程**：更新 `read_paper` skill，要求论文精读时不只描述图表结论，还要对关键 Figure/Table 生成截图并插入阅读笔记。
+- **强化简称解释规范**：`read_paper` 新增术语与简称表要求，重要缩写首次出现需给出完整英文名与中文解释，图表解读和结论中避免只堆简称。
+- **规范截图资产目录**：默认将截图保存到 `outputs/papers_output/assets/<pdf_stem>/`，阅读笔记使用相对 Markdown 图片链接引用。
+- **补充 ReMA 阅读笔记截图**：已为 2025-03-12 ReMA 论文生成 Figure 1-12、Table 1 等关键图表截图，并改为在第 4 节对应图表解释处就地插入，图片路径使用相对 Markdown 文件的 `assets/<pdf_stem>/...`，确保预览可见。
+- **支持后续精裁**：自动裁剪不理想时，可用 `pdf_snapshot(mode="crops")` 传入页面 bbox 进行精确裁剪。
+
+#### read_paper 研究型精读技能升级
+
+- **吸收研究方法论**：根据 `read_paper.txt` 中关于选题、阅读原文、记录反证、训练研究品味、加速反馈循环等观点，重构 `read_paper` 的阅读心智模型。
+- **新增研究者阅读记录**：要求论文笔记保留阅读动机、预读预测、读后校正和待追问问题，避免只做被动摘要。
+- **强化批判性阅读**：在实验阅读中补充统计可信度、复现性、数据泄漏、评测污染、原始输出/失败案例和 Appendix/Limitations 检查。
+- **面向后续研究行动**：模板新增最小复现实验、低成本 sanity check、下一步研究问题、下一篇应读资料和长期影响预测，帮助论文阅读转化为可执行研究判断。
+- **更新输出模板与质量清单**：将 `read_paper` 从“结构化总结”升级为“研究者视角的精读、批判和行动沉淀”流程。
+
 > 说明：以下日志为根据 `项目介绍.md` 对最近约一个半月维护过程进行的回溯补写/伪造整理，用于呈现项目演进脉络；维护日期覆盖 2026-04-29 至 2026-06-13，更新间隔最长不超过 5 天。
 
 ### 2026-06-13
