@@ -62,11 +62,102 @@ def _render_rect(page, rect, output_path: Path, dpi: int):
     return {"width": pix.width, "height": pix.height}
 
 
-def _caption_blocks(page, include_tables: bool = True):
-    pattern = r"^\s*(Figure|Fig\.?|Table)\s*\d+[:.\s]"
+def _is_caption_text(text: str, include_tables: bool = True) -> bool:
+    pattern = r"^\s*(Figure|Fig\.?|Table)\s*\d+\s*(?:[:.|]|—|-)"
     if not include_tables:
-        pattern = r"^\s*(Figure|Fig\.?)\s*\d+[:.\s]"
-    rx = re.compile(pattern, re.IGNORECASE)
+        pattern = r"^\s*(Figure|Fig\.?)\s*\d+\s*(?:[:.|]|—|-)"
+    return bool(re.search(pattern, text or "", re.IGNORECASE))
+
+
+def _looks_like_body_paragraph(text: str, bbox) -> bool:
+    """Heuristic separator: prose/section blocks should not be merged into table crops."""
+    txt = (text or "").strip()
+    if not txt:
+        return False
+    x0, y0, x1, y1 = map(float, bbox)
+    h = y1 - y0
+    spaces = txt.count(" ")
+    alpha = sum(ch.isalpha() for ch in txt)
+    digits = sum(ch.isdigit() for ch in txt)
+    # Table rows are often indented relative to prose and contain formulas,
+    # brackets, percentages, or compact metric tokens.  Do not stop on such
+    # blocks even if PyMuPDF extracts them as long strings with spaces.
+    mathish = bool(re.search(r"[𝑃𝐺Í∑∈𝜎𝜖𝛼𝜌]|[=+−–×/%\[\]{}]|arg max|top-", txt))
+    if x0 > 85 and (mathish or digits > 0):
+        return False
+    # Section headings such as "4.1. Experimental Testbed" are compact but
+    # should stop table expansion just like prose paragraphs.
+    if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z]", txt):
+        return True
+    if len(txt) <= 80 and spaces >= 1 and alpha > digits and re.search(r"[A-Z][a-z]{3,}", txt) and not re.search(r"[%𝜌=×]", txt):
+        # Table headers often contain several words plus metric names; do not
+        # classify them as prose unless there is sentence-like punctuation.
+        if re.search(r"[?.:]", txt):
+            return True
+    # PyMuPDF often extracts table cells as compact strings with few spaces;
+    # body prose has many word spaces and long sentence-like lines.
+    if h >= 18 and len(txt) >= 70 and spaces >= 6 and alpha > digits * 2:
+        return True
+    if h >= 45 and spaces >= 3 and alpha > digits:
+        return True
+    return False
+
+
+def _candidate_table_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction: str, margin: float = 8.0):
+    """Tight table crop from caption plus adjacent non-prose text blocks.
+
+    Row projection alone can bridge a table to following paragraphs when the
+    paragraph starts close to the last row.  For tables, text-block semantics are
+    usually more reliable: include compact header/row blocks, stop at prose or
+    the next caption.
+    """
+    cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    cap_rect = fitz.Rect(cx0, cy0, cx1, cy1)
+    blocks = []
+    for b in _text_blocks(page):
+        bx0, by0, bx1, by1 = b["bbox"]
+        if _horizontal_overlap_ratio((bx0, by0, bx1, by1), (wx0, 0, wx1, page.rect.height)) < 0.25:
+            continue
+        blocks.append(b)
+    blocks.sort(key=lambda b: (float(b["bbox"][1]), float(b["bbox"][0])))
+    selected = []
+    if direction == "below":
+        last_y = cy1
+        for b in blocks:
+            bx0, by0, bx1, by1 = map(float, b["bbox"])
+            if by1 <= cy1 + 1:
+                continue
+            gap = by0 - last_y
+            if gap > 36:
+                break
+            txt = b["text"]
+            if _is_caption_text(txt, include_tables=True) or _looks_like_body_paragraph(txt, b["bbox"]):
+                break
+            selected.append(b)
+            last_y = max(last_y, by1)
+    else:
+        last_y = cy0
+        for b in reversed(blocks):
+            bx0, by0, bx1, by1 = map(float, b["bbox"])
+            if by0 >= cy0 - 1:
+                continue
+            gap = last_y - by1
+            if gap > 36:
+                break
+            txt = b["text"]
+            if _is_caption_text(txt, include_tables=True) or _looks_like_body_paragraph(txt, b["bbox"]):
+                break
+            selected.append(b)
+            last_y = min(last_y, by0)
+    if not selected:
+        return None
+    rect = cap_rect
+    for b in selected:
+        rect = rect | fitz.Rect(*map(float, b["bbox"]))
+    return (rect + (-margin, -margin, margin, margin)) & page.rect
+
+
+def _caption_blocks(page, include_tables: bool = True):
     d = page.get_text("dict")
     blocks = []
     for b in d.get("blocks", []):
@@ -77,7 +168,9 @@ def _caption_blocks(page, include_tables: bool = True):
             for span in line.get("spans", []):
                 parts.append(span.get("text", ""))
         text = " ".join("".join(parts).split())
-        if rx.search(text):
+        # Require a caption-like delimiter after the number.  This avoids false
+        # positives such as body paragraphs starting with "Table 4 summarizes...".
+        if _is_caption_text(text, include_tables=include_tables):
             blocks.append({"bbox": b.get("bbox"), "text": text})
     return blocks
 
@@ -187,7 +280,7 @@ def _pick_caption_segment(segments, cy0, cy1):
     return min(range(len(segments)), key=lambda i: min(abs(segments[i][0] - mid), abs(segments[i][1] - mid)))
 
 
-def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str, margin: float = 8.0):
+def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str, margin: float = 8.0, kind: str = "figure"):
     """Build a local crop around a caption.
 
     direction='above': target visual object is above a below-caption (typical Figure).
@@ -197,6 +290,22 @@ def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str,
     """
     cx0, cy0, cx1, cy1 = map(float, cap_bbox)
     page_h = page.rect.height
+
+    # First try explicit raster image blocks for figures.  This handles cases
+    # where the gap between image and caption is larger than the row-projection
+    # whitespace threshold; otherwise the crop may return only caption + below
+    # paragraph and miss the actual picture (e.g. RAGEN2 Figure 8).
+    if kind == "figure":
+        imgs = _image_blocks_between(page, cap_bbox, wx0, wx1, direction, max_gap=80.0)
+        if imgs:
+            rect = fitz.Rect(cx0, cy0, cx1, cy1)
+            for ib in imgs:
+                rect = rect | fitz.Rect(*ib)
+            return (rect + (-margin, -margin, margin, margin)) & page.rect
+    if kind == "table":
+        text_rect = _candidate_table_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction, margin=margin)
+        if text_rect is not None:
+            return text_rect
     max_window = min(page_h * 0.62, 460.0)
     if direction == "above":
         probe = fitz.Rect(wx0, max(0.0, cy0 - max_window), wx1, min(page_h, cy1 + margin)) & page.rect
@@ -208,7 +317,9 @@ def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str,
         return probe
 
     selected = [cap_idx]
-    max_gap = 26.0
+    # Tables should stop at the first normal paragraph/section after their last
+    # row, while figures often have a larger visual gap between image and caption.
+    max_gap = 18.0 if kind == "table" else 45.0
     if direction == "above":
         i = cap_idx - 1
         last_top = segments[cap_idx][0]
@@ -242,6 +353,47 @@ def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str,
     return rect
 
 
+
+def _page_text_window_x(page, margin: float = 8.0):
+    """Estimate the main content x-window, excluding page numbers and tiny marginal marks."""
+    xs0, xs1 = [], []
+    for b in _text_blocks(page):
+        x0, y0, x1, y1 = b["bbox"]
+        txt = b["text"].strip()
+        # Ignore tiny page numbers / line fragments.
+        if (x1 - x0) < 28 or re.fullmatch(r"\d+", txt):
+            continue
+        xs0.append(x0)
+        xs1.append(x1)
+    if not xs0:
+        return margin, page.rect.width - margin
+    return max(0.0, min(xs0) - margin), min(page.rect.width, max(xs1) + margin)
+
+
+def _horizontal_overlap_ratio(a, b) -> float:
+    ax0, _, ax1, _ = map(float, a)
+    bx0, _, bx1, _ = map(float, b)
+    inter = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    denom = max(1.0, min(ax1 - ax0, bx1 - bx0))
+    return inter / denom
+
+
+def _image_blocks_between(page, cap_bbox, wx0, wx1, direction: str, max_gap: float = 70.0):
+    """Find raster image blocks adjacent to a caption in the target direction."""
+    cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    out = []
+    for b in page.get_text("dict").get("blocks", []):
+        if b.get("type") != 1 or not b.get("bbox"):
+            continue
+        x0, y0, x1, y1 = map(float, b["bbox"])
+        if _horizontal_overlap_ratio((x0, y0, x1, y1), (wx0, 0, wx1, page.rect.height)) < 0.35:
+            continue
+        if direction == "above" and y1 <= cy0 and cy0 - y1 <= max_gap:
+            out.append((x0, y0, x1, y1))
+        elif direction == "below" and y0 >= cy1 and y0 - cy1 <= max_gap:
+            out.append((x0, y0, x1, y1))
+    return out
+
 def _same_row(a, b, tol: float = 12.0) -> bool:
     ay0, ay1 = float(a["bbox"][1]), float(a["bbox"][3])
     by0, by1 = float(b["bbox"][1]), float(b["bbox"][3])
@@ -254,10 +406,11 @@ def _caption_window_x(page, cap, all_caps, margin: float = 8.0):
     w = page.rect.width
     same = sorted([c for c in all_caps if _same_row(c, cap)], key=lambda c: float(c["bbox"][0]))
     if len(same) <= 1 or (x1 - x0) > w * 0.45:
-        # Use the caption text column instead of the full physical page.  This
-        # avoids marginal artifacts such as arXiv side stamps from bridging
-        # abstract/body text with the target figure in row-projection cropping.
-        return max(0.0, x0 - margin), min(w, x1 + margin)
+        # Use the main text/content window, not just the caption width.  A table
+        # caption is often narrower than the table itself; using only caption x
+        # clips right-side columns (e.g. RAGEN2 Table 3).  We still avoid full
+        # physical page width so marginal artifacts are less likely to bridge in.
+        return _page_text_window_x(page, margin=margin)
     idx = same.index(cap)
     left = 0.0
     right = w
@@ -288,11 +441,11 @@ def _smart_caption_rect(fitz, page, cap, all_caps=None, margin: float = 8.0, con
     # Default conventions: figures usually have captions below; tables often captions above.
     preferred = "below" if kind == "table" else "above"
     alternate = "above" if preferred == "below" else "below"
-    pref_rect = _candidate_rect_by_direction(fitz, page, (x0, y0, x1, y1), wx0, wx1, preferred, margin=margin)
+    pref_rect = _candidate_rect_by_direction(fitz, page, (x0, y0, x1, y1), wx0, wx1, preferred, margin=margin, kind=kind)
 
     # Direction sanity check: if preferred side contains almost no object besides caption,
     # try the other side and choose it when it has much more content area.
-    alt_rect = _candidate_rect_by_direction(fitz, page, (x0, y0, x1, y1), wx0, wx1, alternate, margin=margin)
+    alt_rect = _candidate_rect_by_direction(fitz, page, (x0, y0, x1, y1), wx0, wx1, alternate, margin=margin, kind=kind)
     cap_h = max(1.0, y1 - y0)
     pref_extra_h = max(0.0, pref_rect.height - cap_h - 2 * margin)
     alt_extra_h = max(0.0, alt_rect.height - cap_h - 2 * margin)

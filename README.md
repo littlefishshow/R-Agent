@@ -38,6 +38,18 @@ LLM_MODEL="gpt-4o"
 
 ## 更新日志
 
+### 2026-06-22
+
+#### read_paper PDF 图表智能裁剪双向匹配修复
+
+- **修复 RAGEN2 关键截图裁剪问题**：针对 Table 3 只截半张表、Table 5 截入大量正文、Figure 8 漏掉上方图片的问题，调整 `pdf_snapshot.py` 的 smart crop 逻辑并重新生成对应 PNG。
+- **引入双向候选裁剪选择**：以 caption 为锚点同时生成上方/下方候选区域，结合 Figure/Table 的默认版式、目标侧内容高度和图像块检测选择更合理的裁剪框。
+- **改进表格横向与纵向边界**：表格不再只使用 caption 文本宽度，而是估计页面主内容 x-window，避免宽表右侧列被裁掉；同时降低表格跨段合并阈值，减少把后续正文并入表格截图。
+- **过滤 caption 误识别**：caption 正则要求编号后出现 `:/.|/-` 等 caption 分隔符，避免把正文中的 “Table 4 summarizes ...” 误当作新表格 caption。
+- **增加表格文本块语义截断**：针对 Table 7/8 这种 caption 下方紧跟短表、随后紧贴正文的布局，优先用“caption + 相邻非正文文本块”生成表格裁剪框，遇到下一段 prose/section heading 或下一 caption 即停止。
+- **修正表格行误判为正文的问题**：针对 Table 1/6 中带公式、数学符号、百分号、区间和紧凑指标名的长表格行，增加 math/table-like block 保护，避免语义截断过早停止后回退到 row-projection 并把下方正文一起截入。
+- **验证 RAGEN2 截图结果**：重新验证 Table 1、Table 3、Table 5、Figure 8、Table 6、Table 7、Table 8 的裁剪框和 PNG 尺寸，确认输出图片已覆盖目标主体且排除明显相邻正文干扰。
+
 ### 2026-06-20
 
 #### read_paper 分类目录镜像与输出清理
