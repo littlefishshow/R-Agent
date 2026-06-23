@@ -36,6 +36,207 @@ OPENAI_API_KEY="你的_API_KEY"
 LLM_MODEL="gpt-4o"
 ```
 
+## 3. Gateway 服务模式：本地启动与微信/飞书/QQ 接入
+
+R-Agent 现在可以通过 `gateway/` 作为 HTTP 服务运行，并接入飞书 Bot、微信公众号，或通过 QQ 官方/中间层机器人方案接入 QQ。
+
+### 3.1 本地启动 Gateway
+
+安装依赖：
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+配置模型环境变量：
+
+```bash
+export OPENAI_API_KEY="你的 OpenAI 或兼容接口 Key"
+export LLM_MODEL="gpt-4o"
+```
+
+如果你使用 OpenAI 兼容服务，可以额外配置：
+
+```bash
+export OPENAI_BASE_URL="https://你的模型服务地址/v1"
+```
+
+启动服务：
+
+```bash
+python3 -m gateway.server --host 0.0.0.0 --port 8080
+```
+
+健康检查：
+
+```bash
+curl http://127.0.0.1:8080/healthz
+```
+
+正常返回：
+
+```json
+{"ok": true, "service": "r-agent-gateway"}
+```
+
+测试聊天接口：
+
+```bash
+curl -X POST http://127.0.0.1:8080/v1/chat \
+  -H 'Content-Type: application/json' \
+  -d '{"session_id":"test","message":"你好，介绍一下你自己"}'
+```
+
+如果返回 `answer` 字段，说明 Gateway 已经正常调用 R-Agent。
+
+### 3.2 暴露公网 HTTPS 地址
+
+飞书、微信和 QQ 平台回调都需要公网 HTTPS 地址，不能直接填写 `127.0.0.1`。
+
+本地调试可以用 ngrok：
+
+```bash
+ngrok http 8080
+```
+
+或 cloudflared：
+
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
+
+得到的 HTTPS 地址后面分别拼接：
+
+```text
+/webhook/feishu
+/webhook/wechat
+# QQ 当前建议先通过中间层调用 /v1/chat；若实现 QQ webhook adapter，可使用 /webhook/qq
+```
+
+### 3.3 接入飞书 Bot
+
+飞书推荐先开启异步 webhook，避免 R-Agent 思考时间过长导致回调超时：
+
+```bash
+export OPENAI_API_KEY="你的模型 Key"
+export LLM_MODEL="gpt-4o"
+
+export FEISHU_APP_ID="你的飞书 App ID"
+export FEISHU_APP_SECRET="你的飞书 App Secret"
+export FEISHU_VERIFICATION_TOKEN="飞书事件订阅里的 Verification Token"
+export RAGENT_GATEWAY_ASYNC_WEBHOOKS=true
+
+python3 -m gateway.server --host 0.0.0.0 --port 8080
+```
+
+飞书后台配置步骤：
+
+1. 在飞书开放平台创建「企业自建应用」。
+2. 添加「机器人」能力。
+3. 进入「事件订阅」。
+4. 请求地址填写：
+
+   ```text
+   https://你的公网域名/webhook/feishu
+   ```
+
+5. 保存时飞书会发起 URL 验证，Gateway 会自动返回 challenge。
+6. 订阅事件：
+
+   ```text
+   im.message.receive_v1
+   ```
+
+7. 在权限管理中添加机器人接收消息、发送消息相关权限，并发布/安装应用。
+8. 私聊机器人或在群里 @机器人即可测试。
+
+### 3.4 接入微信公众号
+
+> 个人微信没有官方 Bot webhook，不建议使用非官方个人微信协议。当前 Gateway 支持的是微信公众号明文 XML 回调的最小接入。
+
+启动 Gateway：
+
+```bash
+export OPENAI_API_KEY="你的模型 Key"
+export LLM_MODEL="gpt-4o"
+export WECHAT_TOKEN="你准备填到微信后台的 Token"
+
+python3 -m gateway.server --host 0.0.0.0 --port 8080
+```
+
+微信公众号后台配置：
+
+1. 进入「微信公众平台 → 开发 → 基本配置 → 服务器配置」。
+2. 填写：
+
+   ```text
+   URL: https://你的公网域名/webhook/wechat
+   Token: 与 WECHAT_TOKEN 完全一致
+   EncodingAESKey: 先选择明文模式或不启用安全模式
+   ```
+
+3. 提交配置，微信会请求 Gateway 做验证。
+4. 验证通过后，关注公众号并发送文本消息即可测试。
+
+
+### 3.5 接入 QQ 官方机器人
+
+R-Agent Gateway 已内置 QQ 官方机器人 Webhook 最小适配，路由为：
+
+```text
+POST /webhook/qq
+```
+
+启动前配置：
+
+```bash
+export OPENAI_API_KEY="你的模型 Key"
+export LLM_MODEL="gpt-4o"
+
+export QQ_APP_ID="QQ 开放平台 AppID"
+export QQ_APP_SECRET="QQ 开放平台 AppSecret"
+# 测试版/沙箱机器人可按需开启
+export QQ_SANDBOX=true
+
+# 推荐开启：QQ 回调快速返回，后台处理消息
+export RAGENT_GATEWAY_ASYNC_WEBHOOKS=true
+
+python3 -m gateway.server --host 0.0.0.0 --port 8080
+```
+
+QQ 开放平台配置步骤：
+
+1. 在 QQ 开放平台创建机器人，填写基础资料。
+2. 在「沙箱配置」中配置测试 QQ 群或频道。
+3. 在「开发管理」中记录 `AppID`、`Token`、`AppSecret`，并把 Gateway 所在服务器公网 IP 加入 IP 白名单。
+4. 使用公网 HTTPS 暴露 Gateway，例如 cloudflared/ngrok/正式域名。
+5. 将 QQ 官方机器人的回调请求地址配置为：
+
+   ```text
+   https://你的公网域名/webhook/qq
+   ```
+
+6. QQ 平台发起 Webhook 校验时，Gateway 会根据 `plain_token`、`event_ts` 和 `QQ_APP_SECRET` 生成签名并返回。
+7. 用户在 QQ 群 @机器人或私聊机器人后，Gateway 会解析 QQ 事件，调用 R-Agent，并通过 QQ 官方 API 回复。
+
+注意：QQ Webhook 校验使用 Ed25519 签名，需安装依赖：
+
+```bash
+pip install PyNaCl>=1.5.0
+```
+
+`requirements.txt` 已包含该依赖。QQ 官方对 AIGC 接入有合规要求，请遵守平台规则；不建议使用非官方个人 QQ 协议。
+
+### 3.6 常见问题
+
+- **本地能访问，飞书/微信访问不到**：需要公网 HTTPS，使用 ngrok/cloudflared 或正式服务器域名。
+- **飞书不回复**：检查 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN`、事件订阅、权限和应用是否已发布。
+- **微信验证失败**：检查 `WECHAT_TOKEN` 是否与后台一致、URL 是否为 `/webhook/wechat`、是否使用 HTTPS。
+- **微信回复超时**：微信公众号被动回复时间较短，复杂任务建议后续改成异步客服消息回复。
+- **需要更完整部署说明**：参考 `gateway/docs/DEPLOYMENT.md`；更详细平台接入说明见 `gateway/docs/CONNECTORS.md`。
+
 ## 更新日志
 
 ### 2026-06-23
@@ -48,6 +249,35 @@ LLM_MODEL="gpt-4o"
 - **补充隔离执行测试**：扩展 `tests/test_tool_process_isolation.py`，覆盖工具超时、异常返回和不可 JSON 序列化结果的错误路径，防止工具进程无结果退出问题回归。
 
 ### 2026-06-22
+
+
+
+
+
+#### Gateway 入门解释文档补充
+
+- **补充小白向 Gateway 说明**：新增 `gateway/docs/GATEWAY_EXPLAINED_FOR_BEGINNERS.md`，从 IP、端口、HTTP、路由、公网隧道、Webhook 开始解释 Gateway 的作用，并用 QQ/飞书/微信消息流转例子说明 bot 消息如何经 Gateway 交给 R-Agent 处理。
+
+#### Gateway QQ 接入文档补充
+
+- **补充 QQ 接入说明**：README 与 gateway 文档新增 QQ 接入路径，新增 QQ 官方机器人原生 Webhook 最小适配，提供 `/webhook/qq`、URL 校验签名、消息事件解析、R-Agent 调用与 QQ 官方 API 文本回复。
+- **明确风险边界**：不建议使用非官方个人 QQ 协议，避免稳定性和账号风险。
+
+#### Gateway 服务化与微信/飞书接入
+
+- **新增 Gateway 服务模式**：新增 `gateway/` 服务层，将 `RAgent.run_conversation()` 封装为可长期运行的 HTTP 服务，支持 `/healthz`、`/v1/chat`、会话查看/重置等接口。
+- **支持微信与飞书 Webhook**：新增微信公众号明文 XML 回调适配、飞书 URL verification、`im.message.receive_v1` 解析和飞书文本消息发送客户端。
+- **增加多会话隔离**：通过 `AgentSessionManager` 按 `session_id`、微信用户或飞书 chat 隔离上下文，避免不同外部会话串线。
+- **补充轻量生产化能力**：新增 `gateway/queue.py`，支持飞书 `event_id` 内存 TTL 去重和可选异步后台队列，降低重复投递与回调超时风险。
+- **新增部署与接入文档**：新增 `.env.gateway.example`、`Dockerfile.gateway`、`docker-compose.gateway.yml`、`gateway/docs/CONNECTORS.md`、`gateway/docs/DEPLOYMENT.md`、`gateway/docs/LOCAL_START_AND_CONNECT_SIMPLE.md`，并将 Gateway 本地启动、飞书 Bot、微信公众号、QQ 官方机器人原生接入指南整合进 README。
+- **补充测试覆盖**：新增 `tests/test_gateway_adapters.py`，覆盖微信签名/XML、飞书事件解析、gateway handler 和事件去重逻辑。
+
+#### paper_repo_code_research 源码阅读技能重构
+
+- **聚焦论文核心方法定位**：重构 `paper_repo_code_research` skill，从“仓库调研百科”改为围绕“论文核心方法在源码中如何落地”的定位型源码阅读流程。
+- **压缩输出模板**：删除冗长的工程地图式模板，改为源码阅读结论、核心文件、论文方法 ↔ 代码定位表、最小执行链、关键源码解读、配置/复现/改造注意事项。
+- **强化低噪声阅读原则**：要求只保留影响理解、复现和改造的工程细节，明确跳过 logger、wandb、分布式样板、普通 helper 等低信息内容。
+- **新增可改造导向**：每个论文核心点需要定位具体类/函数/配置项，并说明何时调用、输入输出、与 baseline 的差异，以及如何关闭或替换。
 
 #### read_paper PDF 图表智能裁剪双向匹配修复
 
