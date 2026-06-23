@@ -38,6 +38,15 @@ LLM_MODEL="gpt-4o"
 
 ## 更新日志
 
+### 2026-06-23
+
+#### Web 工具 fork 崩溃修复
+
+- **定位崩溃原因**：`web_search` / `web_extract` 在普通同步执行下可返回结果，但在 Agent 默认的 `execute_tool_isolated()` 子进程模式下偶发返回 `Tool process ended without returning a result`；根因是 macOS 下 `urllib` 默认代理发现可能调用系统 `_scproxy` / CoreFoundation，fork 子进程中进行网络请求时会在 Python 异常处理前退出。
+- **修复网络请求入口**：`tools/web_tools.py` 改为优先通过 `curl` 子进程抓取网页，并保留显式 `ProxyHandler({})` 的 urllib 兜底，避免 macOS fork 子进程中 DNS/TLS/系统代理解析导致 Python 子进程无结果退出。
+- **增强网页解析稳定性**：补充 HTML 实体反转义、script/style 清理、基础段落换行与 DuckDuckGo HTML 搜索结果兼容解析，并新增 Bing/Yahoo 搜索 fallback；当 DuckDuckGo 返回 anomaly/反爬页面时自动切换搜索源，减少空结果和粘连文本。
+- **补充隔离执行测试**：扩展 `tests/test_tool_process_isolation.py`，覆盖工具超时、异常返回和不可 JSON 序列化结果的错误路径，防止工具进程无结果退出问题回归。
+
 ### 2026-06-22
 
 #### read_paper PDF 图表智能裁剪双向匹配修复
