@@ -40,3 +40,24 @@ python3 -m pytest tests/test_self_evolution_skill_manage.py tests/test_archive_s
 ### Unfinished / Next Steps
 
 提交后下一阶段：把 self_evolution_review 升级为受限子 Agent；curator 增加 report/backup/rollback；接入 compaction flush 与 active memory recall。
+
+## Progress Entry — 2026-06-25 follow-up: duplicate cleanup and safety hardening
+
+### Summary
+
+按用户要求先解决重复问题，再解决重构问题：`skill_create` / `skill_delete` 旧接口改为委托 `skill_manage_tool`；`core/skills.py` 加固同名 skill、重复 create、category 和 `SKILL.md/...` 路径边界。
+
+### Key Changes
+
+- `tools/skills_tool.py`：旧 create/delete 工具不再重复调用 `skill_manager`，统一转发到 `skill_manage_tool`；schema 增加 `overwrite`。
+- `core/skills.py`：新增 `_validate_simple_name` / `_validate_category`；多同名 skill 报错；create 默认拒绝覆盖；拒绝 `SKILL.md/child`。
+- `tests/test_self_evolution_skill_manage.py`：新增旧接口委托和安全边界回归测试。
+- `README.md` 与 outputs 进度文档已记录本次维护。
+
+### Verification
+
+`python3 -m pytest tests/test_self_evolution_skill_manage.py tests/test_skill_curator_tool.py -q` => 6 passed.
+
+### Remaining
+
+后续可继续处理 deleted telemetry、per-skill lock、skill_view 文件大小限制、hierarchy/core 扫描逻辑合并。

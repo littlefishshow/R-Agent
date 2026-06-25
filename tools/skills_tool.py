@@ -30,40 +30,34 @@ def skill_view_tool(skill_name: str, file_path: str = None) -> str:
 
 
 def skill_create_tool(skill_name: str, description: str, content: str, category: str = "uncategorized") -> str:
-    """创建或更新一个新的技能（兼容旧接口）"""
-    if not skill_name or not description or not content:
-        return _json_error("skill_name, description, and content are required.")
-    try:
-        res = skill_manager.create_skill(skill_name, description, content, category)
-        record_event(skill_name, "create", created_by="foreground_agent", write_origin="foreground")
-        record_event(skill_name, "patch")
-        return _json_ok(message=res)
-    except Exception as exc:
-        return _json_error(exc)
+    """创建一个新的技能（兼容旧接口；实际逻辑委托给 skill_manage）。"""
+    return skill_manage_tool(
+        action="create",
+        skill_name=skill_name,
+        description=description,
+        content=content,
+        category=category,
+        created_by="foreground_agent",
+        write_origin="foreground",
+    )
 
 
 def skill_delete_tool(skill_name: str) -> str:
-    """删除一个技能"""
-    if not skill_name:
-        return _json_error("skill_name is required.")
-    try:
-        res = skill_manager.delete_skill(skill_name)
-        return _json_ok(message=res)
-    except Exception as exc:
-        return _json_error(exc)
+    """删除一个技能（兼容旧接口；实际逻辑委托给 skill_manage）。"""
+    return skill_manage_tool(action="delete", skill_name=skill_name)
 
 
 def skill_manage_tool(action: str, skill_name: str = "", description: str = "", content: str = "",
                       category: str = "uncategorized", file_path: str = "", old_string: str = "",
                       new_string: str = "", created_by: str = "foreground_agent",
-                      write_origin: str = "foreground") -> str:
+                      write_origin: str = "foreground", overwrite: bool = False) -> str:
     """统一技能包管理工具，支持 create/patch/edit/delete/write_file/remove_file/usage。"""
     action = (action or "").strip()
     try:
         if action == "create":
             if not skill_name or not description or not content:
                 return _json_error("create requires skill_name, description, content.")
-            msg = skill_manager.create_skill(skill_name, description, content, category)
+            msg = skill_manager.create_skill(skill_name, description, content, category, overwrite=overwrite)
             record_event(skill_name, "create", created_by=created_by, write_origin=write_origin)
             record_event(skill_name, "patch")
             return _json_ok(action=action, message=msg)
@@ -121,7 +115,7 @@ registry.register(
 
 registry.register(
     name="skill_create",
-    description="创建一个新技能。当你成功解决了一个复杂问题，并且认为这个工作流以后还会用到时，使用此工具将其固化为技能。",
+    description="兼容旧接口：创建一个新技能。新代码优先使用 skill_manage(action=create)。",
     parameters={
         "type": "object",
         "properties": {
@@ -137,7 +131,7 @@ registry.register(
 
 registry.register(
     name="skill_delete",
-    description="删除一个不再需要的技能。如果某个工作流已经过时或存在错误，可以使用此工具将其删除。",
+    description="兼容旧接口：删除一个技能。新代码优先使用 skill_manage(action=delete)。",
     parameters={"type": "object", "properties": {"skill_name": {"type": "string", "description": "要删除的技能名称"}}, "required": ["skill_name"]},
     handler=skill_delete_tool,
 )
@@ -158,6 +152,7 @@ registry.register(
             "new_string": {"type": "string", "description": "patch 替换后的新文本"},
             "created_by": {"type": "string", "description": "foreground_agent/background_review/user/system"},
             "write_origin": {"type": "string", "description": "foreground/background_review"},
+            "overwrite": {"type": "boolean", "description": "create 时是否允许覆盖已有 skill；默认 false"},
         },
         "required": ["action"],
     },

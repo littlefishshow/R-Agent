@@ -26,14 +26,25 @@ class SkillManager:
     def _display_category_name(self, category: str) -> str:
         return self.CATEGORY_DISPLAY_NAMES.get(category, category.capitalize())
 
-    def _validate_skill_name(self, skill_name: str) -> str:
-        if not isinstance(skill_name, str) or not skill_name.strip():
-            raise ValueError("skill_name is required.")
-        name = skill_name.strip()
+    def _validate_simple_name(self, value: str, field_name: str) -> str:
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{field_name} is required.")
+        name = value.strip()
         p = Path(name)
         if p.is_absolute() or ".." in p.parts or any(sep in name for sep in ("/", "\\")):
-            raise ValueError("skill_name must be a simple relative directory name without path traversal.")
+            raise ValueError(f"{field_name} must be a simple relative directory name without path traversal.")
+        if name.startswith("."):
+            raise ValueError(f"{field_name} must not start with '.'.")
         return name
+
+    def _validate_skill_name(self, skill_name: str) -> str:
+        return self._validate_simple_name(skill_name, "skill_name")
+
+    def _validate_category(self, category: str | None) -> str:
+        cat = (category or "uncategorized").strip() or "uncategorized"
+        if cat == "uncategorized":
+            return cat
+        return self._validate_simple_name(cat, "category")
 
     def _skill_dirs(self, skill_name: str):
         name = self._validate_skill_name(skill_name)
@@ -41,13 +52,19 @@ class SkillManager:
         return [Path(p).parent for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
 
     def resolve_skill_dir(self, skill_name: str) -> Path:
-        matches = self._skill_dirs(skill_name)
+        matches = sorted(self._skill_dirs(skill_name), key=lambda p: str(p))
         if not matches:
             raise FileNotFoundError(f"技能 '{skill_name}' 不存在。")
-        resolved = sorted(matches, key=lambda p: str(p))[0].resolve()
         root = Path(self.skills_dir).resolve()
-        resolved.relative_to(root)
-        return resolved
+        resolved_matches = []
+        for match in matches:
+            resolved = match.resolve()
+            resolved.relative_to(root)
+            resolved_matches.append(resolved)
+        if len(resolved_matches) > 1:
+            rels = [str(p.relative_to(root)) for p in resolved_matches]
+            raise ValueError(f"技能 '{skill_name}' 存在多个匹配，请先按类目消歧: {rels}")
+        return resolved_matches[0]
 
     def _safe_file_path(self, skill_dir: Path, file_path: str | None) -> Path:
         if not file_path:
@@ -59,6 +76,8 @@ class SkillManager:
         parts = [p for p in rel.parts if p not in ("", ".")]
         if not parts:
             raise ValueError("file_path is empty.")
+        if parts[0] == "SKILL.md" and len(parts) != 1:
+            raise ValueError("SKILL.md cannot be used as a directory in file_path.")
         if parts[0] != "SKILL.md" and parts[0] not in self.ALLOWED_SUPPORT_DIRS:
             raise ValueError("file_path must be SKILL.md or under one of: " + ", ".join(sorted(self.ALLOWED_SUPPORT_DIRS)))
         target = (skill_dir / rel).resolve()
@@ -95,14 +114,24 @@ class SkillManager:
         if not target.exists() or not target.is_file(): raise FileNotFoundError(f"技能文件不存在: {file_path or 'SKILL.md'}")
         return target.read_text(encoding="utf-8")
 
-    def create_skill(self, skill_name: str, description: str, content: str, category: str = "uncategorized") -> str:
-        name = self._validate_skill_name(skill_name); cat = (category or "uncategorized").strip()
-        if Path(cat).is_absolute() or ".." in Path(cat).parts: raise ValueError("category must be a relative directory name.")
+    def create_skill(self, skill_name: str, description: str, content: str, category: str = "uncategorized", overwrite: bool = False) -> str:
+        name = self._validate_skill_name(skill_name); cat = self._validate_category(category)
         skill_folder = Path(self.skills_dir) / (cat if cat != "uncategorized" else "") / name
+        target_resolved = skill_folder.resolve()
+        existing = sorted(self._skill_dirs(name), key=lambda p: str(p))
+        if existing:
+            root = Path(self.skills_dir).resolve()
+            rels = [str(p.resolve().relative_to(root)) for p in existing]
+            target_exists = any(p.resolve() == target_resolved for p in existing)
+            if not overwrite:
+                raise FileExistsError(f"技能 '{name}' 已存在；如需覆盖请使用 edit/patch 或显式 overwrite。匹配: {rels}")
+            if not target_exists:
+                raise FileExistsError(f"技能 '{name}' 已存在于其他类目；拒绝通过 create 生成同名副本。匹配: {rels}")
         skill_folder.mkdir(parents=True, exist_ok=True)
         body = content if content.lstrip().startswith("---") else f"---\nname: \"{name}\"\ndescription: \"{description}\"\n---\n\n{content}"
         (skill_folder / "SKILL.md").write_text(body, encoding="utf-8")
-        return f"Successfully created/updated skill: {name} in category: {cat}"
+        verb = "updated" if existing else "created"
+        return f"Successfully {verb} skill: {name} in category: {cat}"
 
     def edit_skill_file(self, skill_name: str, content: str, file_path: str = None) -> str:
         skill_dir = self.resolve_skill_dir(skill_name); target = self._safe_file_path(skill_dir, file_path)

@@ -630,3 +630,71 @@ skill_manage
 3. 增加 active memory recall 与 compaction flush，让 archive 前先判断是否需要写 memory/skill。
 4. 为工具使用也增加 telemetry，形成 skill/tool 双维护闭环。
 5. 给 Mermaid / Markdown 文档增加轻量 lint，避免再次出现图表解析错误。
+
+## 追加维护：先解决重复问题，再解决安全重构问题
+
+用户指出 `tools/skills_tool.py` 与 `core/skills.py` 之间可能存在重复功能和隐患后，本轮按“先重复、再重构”的顺序继续维护。
+
+### A. 先解决重复问题：旧接口委托统一入口
+
+涉及文件：
+
+- `tools/skills_tool.py`
+- `tests/test_self_evolution_skill_manage.py`
+
+具体处理：
+
+1. 保留旧工具 `skill_create` 和 `skill_delete`，避免破坏已有提示词、脚本或外部调用。
+2. 去掉旧工具内部直接调用 `skill_manager.create_skill/delete_skill` 的重复逻辑。
+3. 改为：
+
+```python
+skill_create_tool(...) -> skill_manage_tool(action="create", ...)
+skill_delete_tool(...) -> skill_manage_tool(action="delete", ...)
+```
+
+4. 更新工具描述，明确旧接口只是兼容入口，新代码优先使用 `skill_manage(action=create/delete)`。
+5. 新增测试 `test_legacy_skill_create_delete_delegate_to_skill_manage`，验证旧接口仍可创建/删除，并且返回统一入口中的 `action` 字段。
+
+效果：外部兼容性保留，核心创建/删除行为收敛到 `skill_manage_tool`，后续修改 create/delete 语义时不再维护两套工具逻辑。
+
+### B. 再解决安全重构问题：收紧 SkillManager 边界
+
+涉及文件：
+
+- `core/skills.py`
+- `tools/skills_tool.py`
+- `tests/test_self_evolution_skill_manage.py`
+
+具体处理：
+
+1. 新增 `_validate_simple_name(value, field_name)`：校验 skill name 和 category，禁止空值、绝对路径、`..`、`/`、`\` 和以 `.` 开头。
+2. category 从“只禁止绝对路径和 `..`”升级为“必须是单级安全名称”。例如 `agent_ops` 合法，`agent_ops/nested` 非法。
+3. `resolve_skill_dir(skill_name)` 遇到多个同名 skill 时不再取排序第一个，而是报错，避免静默改错或删错目录。
+4. `_safe_file_path(...)` 明确拒绝 `SKILL.md/...`，避免把 `SKILL.md` 当作目录使用。
+5. `create_skill(...)` 默认不再覆盖已有 skill；如确实需要覆盖，必须显式传 `overwrite=True`，或使用 edit/patch。
+6. `skill_manage` schema 增加 `overwrite` 参数，仅用于 create，默认 false。
+
+新增测试覆盖：
+
+- 旧接口委托统一入口；
+- 重复 create 默认拒绝；
+- 非法 category 拒绝；
+- `SKILL.md/child` 拒绝；
+- 多个同名 skill 时 `resolve_skill_dir` 拒绝歧义。
+
+验证命令：
+
+```bash
+python3 -m pytest tests/test_self_evolution_skill_manage.py tests/test_skill_curator_tool.py -q
+# 6 passed
+```
+
+### 当前仍保留的后续改进
+
+这次只按用户要求先处理“重复问题”和“核心安全重构问题”。以下问题仍建议后续单独处理：
+
+1. 删除 skill 后 usage telemetry 如何标记 deleted 或清理。
+2. skill 文件写入增加 per-skill lock，避免并发覆盖。
+3. `skill_view` 增加文件大小限制或分页读取。
+4. `tools/skill_hierarchy_tool.py` 与 `core/skills.py` 的扫描逻辑仍有部分重复，后续可把结构化扫描下沉到 core。
