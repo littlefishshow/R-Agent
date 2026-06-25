@@ -1,0 +1,153 @@
+core/skill_usage.py
+  h_200a9ca5cd7f1a 7,9,13-14,17-19,31,47-58,60,63,96-99,104-105,108-111,113,115-122,154,164,200-201 gitai:{"mixed_line_ranges":[{"Single":115}],"operations":[]}
+  s_def51e5d1f917f::t_c77b085b941709 114 gitai:{"mixed_line_ranges":[{"Single":114}],"operations":[{"operation_id":"6a3cef132d2a139f1da89100","tool_type":"agent","tool_id":"SearchReplace","line_ranges":[{"Single":114}]}]}
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "47ad4e957b0029360b7ed4a0df6fb6036e4cf78b",
+  "prompts": {},
+  "humans": {
+    "h_200a9ca5cd7f1a": {
+      "author": "littlefishshow <1790326323@qq.com>"
+    }
+  },
+  "sessions": {
+    "s_def51e5d1f917f": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a27cb744c68f75ba036ee5a",
+        "model": "gemini-3.1-pro__dev"
+      },
+      "human_author": "littlefishshow <1790326323@qq.com>"
+    }
+  },
+  "attestation_metadata": {
+    "core/skill_usage.py": [
+      {
+        "hash": "h_200a9ca5cd7f1a",
+        "line_ranges": [
+          {
+            "Single": 7
+          },
+          {
+            "Single": 9
+          },
+          {
+            "Range": [
+              13,
+              14
+            ]
+          },
+          {
+            "Range": [
+              17,
+              19
+            ]
+          },
+          {
+            "Single": 31
+          },
+          {
+            "Range": [
+              47,
+              58
+            ]
+          },
+          {
+            "Single": 60
+          },
+          {
+            "Single": 63
+          },
+          {
+            "Range": [
+              96,
+              99
+            ]
+          },
+          {
+            "Range": [
+              104,
+              105
+            ]
+          },
+          {
+            "Range": [
+              108,
+              111
+            ]
+          },
+          {
+            "Single": 113
+          },
+          {
+            "Range": [
+              115,
+              122
+            ]
+          },
+          {
+            "Single": 154
+          },
+          {
+            "Single": 164
+          },
+          {
+            "Range": [
+              200,
+              201
+            ]
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Single": 115
+          }
+        ],
+        "operations": []
+      },
+      {
+        "hash": "s_def51e5d1f917f::t_c77b085b941709",
+        "line_ranges": [
+          {
+            "Single": 114
+          }
+        ],
+        "mixed_line_ranges": [
+          {
+            "Single": 114
+          }
+        ],
+        "operations": [
+          {
+            "operation_id": "6a3cef132d2a139f1da89100",
+            "tool_type": "agent",
+            "tool_id": "SearchReplace",
+            "line_ranges": [
+              {
+                "Single": 114
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "remote_transcripts": {
+    "s_def51e5d1f917f": {
+      "tool": "trae",
+      "conversation_id": "6a27cb744c68f75ba036ee5a",
+      "session_id": "6a27cb744c68f75ba036ee5a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    },
+    "s_def51e5d1f917f::t_c77b085b941709": {
+      "tool": "trae",
+      "conversation_id": "6a27cb744c68f75ba036ee5a",
+      "session_id": "6a27cb744c68f75ba036ee5a",
+      "status": "remote_only",
+      "message": "Remote transcript resolution is not implemented yet for TRAE prompts."
+    }
+  }
+}
