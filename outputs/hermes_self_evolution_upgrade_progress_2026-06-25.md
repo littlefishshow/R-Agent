@@ -10,33 +10,33 @@
 
 ```mermaid
 flowchart TD
-    A[读取 gap plan 与上轮记录] --> B[查看 Hermes 源码]
-    B --> C[确认可迁移模块]
-    C --> D[修复/补强 skill usage]
-    D --> E[skill_manage + skill_view(file_path)]
-    E --> F[archive_subtask 真压缩]
-    F --> G[self_evolution_review dry-run]
-    G --> H[deterministic curator]
-    H --> I[新增测试]
-    I --> J[更新 README 与进度文档]
-    J --> K[保存 Project_progress 上下文]
-    K --> L[git commit]
+    A["读取 gap plan 与上轮记录"] --> B["查看 Hermes 源码"]
+    B --> C["确认可迁移模块"]
+    C --> D["修复/补强 skill usage"]
+    D --> E["skill_manage + skill_view(file_path)"]
+    E --> F["archive_subtask 真压缩"]
+    F --> G["self_evolution_review dry-run"]
+    G --> H["deterministic curator"]
+    H --> I["新增测试"]
+    I --> J["更新 README 与进度文档"]
+    J --> K["保存 Project_progress 上下文"]
+    K --> L["git commit"]
 ```
 
 ## 已落地能力
 
 ```mermaid
 flowchart LR
-    U[用户/Agent 执行任务] --> S[读取/修改 Skill]
-    S --> T[skills/.usage.json]
-    U --> A[archive_subtask]
-    A --> C[压缩 messages]
-    U --> R[self_evolution_review dry-run]
-    R --> O[outputs/self_evolution/latest_review.json]
-    T --> K[skill_curator_run]
-    K --> P{pinned?}
-    P -- 是 --> X[跳过]
-    P -- 否 --> Y[active/stale/archived]
+    U["用户/Agent 执行任务"] --> S["读取/修改 Skill"]
+    S --> T["skills/.usage.json"]
+    U --> A["archive_subtask"]
+    A --> C["压缩 messages"]
+    U --> R["self_evolution_review dry-run"]
+    R --> O["outputs/self_evolution/latest_review.json"]
+    T --> K["skill_curator_run"]
+    K --> P{"pinned?"}
+    P -- 是 --> X["跳过"]
+    P -- 否 --> Y["active/stale/archived"]
 ```
 
 | 模块 | 文件 | 状态 |
