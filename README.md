@@ -269,6 +269,7 @@ flowchart LR
 - **增强 Todo 看板任务明细可见性**：`delegate_task` 的 Todo Progress 面板新增“✅ 已完成任务”和“🕓 未完成任务”分组，未完成任务会直接列出 pending/in_progress/blocked/needs_split/failed/cancelled 等状态及分配信息，避免只看到总数、状态计数和 ready id 而看不到具体任务内容。
 - **补充 Todo 看板明细回归测试**：扩展 `tests/test_delegate_progress.py`，覆盖已完成/未完成任务列表、blocked 任务提醒以及最终 100% 快照中的任务明细。
 - **停止跟踪 outputs 文本产物**：确认 `outputs/` 已在 `.gitignore` 中，并将历史已跟踪的 outputs 文本/研究产物从 Git 索引移除（保留本地工作区文件），避免运行输出和阶段性研究稿继续进入版本库。
+- **统一 Todo 看板输出入口**：将完整 Todo Progress 看板下沉到 `todo_manage`，直接 `init/update/claim/...` 时也会展示总进度、状态统计、已完成/未完成任务明细；`delegate_task` 改为只输出委托准备和子任务状态，具体看板由子任务触发的 `todo_manage` 变更输出，减少重复全量面板。
 
 ### 2026-06-25
 

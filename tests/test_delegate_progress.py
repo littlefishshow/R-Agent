@@ -66,9 +66,9 @@ def test_delegate_task_prints_snapshots_and_blocks_truncated_in_progress_task(mo
     assert "强制收尾结果" in task["result"]
 
     out = capsys.readouterr().out
-    assert "Delegate 启动前任务快照" in out
-    assert "Sub-Agent 结束后任务快照" in out
-    assert "本轮 delegate_task 完成后的最终任务快照" in out
+    assert "Delegate 准备并发执行" in out
+    assert "Delegate 子任务状态更新：t1 -> truncated" in out
+    assert "Todo Progress" in out
     assert "🕓 未完成任务：" in out
 
 
@@ -127,9 +127,43 @@ def test_delegate_task_final_snapshot_reports_completed_progress(monkeypatch, tm
     state = todo_tool._load_state()
     assert all(task["status"] == "completed" for task in state["tasks"])
     out = capsys.readouterr().out
-    assert "本轮 delegate_task 完成后的最终任务快照" in out
+    assert "Delegate 子任务状态更新：" in out
     assert "完成进度：2/2 (100.0%)" in out
     assert "✅ 已完成任务：" in out
+
+
+def test_todo_manage_update_prints_board_with_completed_and_unfinished_tasks(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    todo_tool.todo_manage(
+        "init",
+        json.dumps(
+            {
+                "tasks": [
+                    {"id": "done", "description": "已经完成"},
+                    {"id": "todo", "description": "还没完成"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+    capsys.readouterr()
+
+    todo_tool.todo_manage(
+        "update",
+        json.dumps({"id": "done", "status": "completed", "result": "done"}, ensure_ascii=False),
+    )
+
+    out = capsys.readouterr().out
+    assert "Todo Progress" in out
+    assert "任务 done 状态更新为 completed" in out
+    assert "✅ 已完成任务：" in out
+    assert "done" in out
+    assert "已经完成" in out
+    assert "completed" in out
+    assert "🕓 未完成任务：" in out
+    assert "todo" in out
+    assert "还没完成" in out
+    assert "pending" in out
 
 
 def test_todo_snapshot_shows_completed_and_unfinished_task_lists(monkeypatch, tmp_path):
@@ -148,7 +182,7 @@ def test_todo_snapshot_shows_completed_and_unfinished_task_lists(monkeypatch, tm
         ),
     )
 
-    text = delegate_tool._todo_snapshot_text("测试快照")
+    text = todo_tool._todo_snapshot_text(todo_tool._load_state(), "测试快照")
 
     assert "✅ 已完成任务：" in text
     assert "- done: 已经完成 [completed]" in text

@@ -393,9 +393,8 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
         valid_jobs.append((i, task))
 
     if valid_jobs:
-        _print_todo_snapshot(
-            f"Delegate 启动前任务快照（准备并发执行 {len(valid_jobs)} 个任务，max_workers={effective_workers}）",
-            scheduled_tasks=[task for _, task in valid_jobs],
+        _print_after_status(
+            f"\n[bold yellow]📋 Delegate 准备并发执行 {len(valid_jobs)} 个任务，max_workers={effective_workers}[/bold yellow]"
         )
 
     with ThreadPoolExecutor(max_workers=effective_workers) as executor:
@@ -418,10 +417,9 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 }
             results.append(item)
             task_id = item.get("task_id") or f"index={item.get('task_index')}"
-            _print_todo_snapshot(f"Sub-Agent 结束后任务快照：{task_id}", scheduled_tasks=[task])
-
-    if valid_jobs:
-        _print_todo_snapshot("本轮 delegate_task 完成后的最终任务快照")
+            _print_after_status(
+                f"[bold yellow]📋 Delegate 子任务状态更新：{task_id} -> {item.get('status')}[/bold yellow]"
+            )
 
     results.sort(key=lambda x: x.get("task_index", 0))
     return json.dumps(results, ensure_ascii=False, indent=2)

@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from tools.registry import registry
 from rich.console import Console
+from rich.panel import Panel
 
 console = Console()
 
@@ -161,6 +162,126 @@ def _ready_tasks(state: Dict[str, Any]) -> List[str]:
     return ready
 
 
+STATUS_LABELS = {
+    "completed": "✅ completed",
+    "in_progress": "🚧 in_progress",
+    "pending": "🕓 pending",
+    "needs_split": "🧩 needs_split",
+    "blocked": "🧱 blocked",
+    "failed": "❌ failed",
+    "cancelled": "🚫 cancelled",
+}
+
+
+def _current_cli_status():
+    """Return the active CLI Rich status exposed by main.py/__main__."""
+    try:
+        import sys
+
+        for module_name in ("__main__", "main"):
+            module = sys.modules.get(module_name)
+            status = getattr(module, "ACTIVE_STATUS", None) if module is not None else None
+            if status is not None:
+                return status
+    except Exception:
+        return None
+    return None
+
+
+def _print_after_status(renderable=None, *args, **kwargs):
+    """Print todo progress without colliding with the parent CLI spinner."""
+    status = _current_cli_status()
+    stopped = False
+    if status is not None:
+        try:
+            status.stop()
+            stopped = True
+        except Exception:
+            stopped = False
+    try:
+        if renderable is None:
+            console.print(*args, **kwargs)
+        else:
+            console.print(renderable, *args, **kwargs)
+    finally:
+        if stopped:
+            try:
+                status.start()
+            except Exception:
+                pass
+
+
+def _shorten(text, limit=90):
+    text = str(text or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _todo_snapshot_text(state: Dict[str, Any], label: str = "当前任务看板") -> str:
+    """Return a user-facing todo board snapshot for direct todo_manage updates."""
+    tasks = state.get("tasks", []) if isinstance(state, dict) else []
+    total = len(tasks)
+    status_order = [
+        "completed",
+        "in_progress",
+        "pending",
+        "needs_split",
+        "blocked",
+        "failed",
+        "cancelled",
+    ]
+    counts = {status: sum(1 for t in tasks if t.get("status") == status) for status in status_order}
+
+    lines = [f"📋 {label}", ""]
+    if total == 0:
+        lines.append("当前 todo list 为空。")
+        return "\n".join(lines)
+
+    completed = counts.get("completed", 0)
+    progress = (completed / total * 100) if total else 0
+    lines.append(f"总任务：{total}，完成进度：{completed}/{total} ({progress:.1f}%)")
+    lines.append("状态统计：" + "，".join(
+        f"{STATUS_LABELS[status]} {counts[status]}" for status in status_order
+    ))
+
+    def format_task_line(t, include_assignment=True):
+        assigned = t.get("assigned_to") or (t.get("claim") or {}).get("worker_id") or "未分配"
+        status = t.get("status") or "unknown"
+        suffix = f" [{status}, {assigned}]" if include_assignment else f" [{status}]"
+        return f"- {t.get('id')}: {_shorten(t.get('description'))}{suffix}"
+
+    def list_tasks(title, filtered, limit=12, include_assignment=True):
+        if not filtered:
+            return
+        lines.append("")
+        lines.append(title)
+        for t in filtered[:limit]:
+            lines.append(format_task_line(t, include_assignment=include_assignment))
+        if len(filtered) > limit:
+            lines.append(f"- … 还有 {len(filtered) - limit} 个")
+
+    completed_tasks = [t for t in tasks if t.get("status") == "completed"]
+    unfinished_tasks = [t for t in tasks if t.get("status") != "completed"]
+    list_tasks("✅ 已完成任务：", completed_tasks, include_assignment=False)
+    list_tasks("🕓 未完成任务：", unfinished_tasks, include_assignment=True)
+    list_tasks("🚧 正在执行：", [t for t in tasks if t.get("status") == "in_progress"])
+    list_tasks("🧭 需要父 Agent 处理：", [t for t in tasks if t.get("status") in {"blocked", "needs_split", "failed"}])
+
+    ready_ids = _ready_tasks(state)
+    if ready_ids:
+        lines.append("")
+        lines.append("Ready 任务：" + "，".join(ready_ids[:10]))
+        if len(ready_ids) > 10:
+            lines.append(f"- … 还有 {len(ready_ids) - 10} 个 ready 任务")
+
+    return "\n".join(lines)
+
+
+def _print_todo_snapshot(state: Dict[str, Any], label: str = "当前任务看板") -> None:
+    _print_after_status(Panel(_todo_snapshot_text(state, label), title="Todo Progress", border_style="yellow", expand=False))
+
+
 def _children_of(state: Dict[str, Any], parent_id: Optional[str]) -> List[Dict[str, Any]]:
     return [t for t in _tasks(state) if t.get("parent_id") == parent_id]
 
@@ -263,7 +384,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
                 return f"Error: {err}"
             state = {"version": 2, "tasks": normalized}
             _save_state(state)
-            console.print("\n[bold yellow]📋 树状任务看板已初始化[/bold yellow]")
+            _print_todo_snapshot(state, "树状任务看板已初始化")
             return "Todo list initialized successfully."
 
         elif action == "add":
@@ -275,6 +396,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             if not ok:
                 return f"Error: {msg}"
             _save_state(state)
+            _print_todo_snapshot(state, "任务已添加")
             return json.dumps({"message": msg, "created_ids": created}, ensure_ascii=False)
 
         elif action == "update":
@@ -295,7 +417,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
                     task[key] = value
             task["updated_at"] = _now()
             _save_state(state)
-            console.print(f"\n[bold yellow]📋 任务 {task_id} 状态更新为 {task.get('status')}[/bold yellow]")
+            _print_todo_snapshot(state, f"任务 {task_id} 状态更新为 {task.get('status')}")
             return f"Task {task_id} updated successfully."
 
         elif action == "claim":
@@ -318,6 +440,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             }
             task["updated_at"] = _now()
             _save_state(state)
+            _print_todo_snapshot(state, f"任务 {task_id} 已领取")
             return json.dumps({"message": "Task claimed.", "task": task}, ensure_ascii=False, indent=2)
 
         elif action == "release":
@@ -330,6 +453,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             task["claim"] = {}
             task["updated_at"] = _now()
             _save_state(state)
+            _print_todo_snapshot(state, f"任务 {task_id} 已释放")
             return f"Task {task_id} released."
 
         elif action == "propose_split":
@@ -349,6 +473,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             }
             task["updated_at"] = _now()
             _save_state(state)
+            _print_todo_snapshot(state, f"任务 {task_id} 提出拆分建议")
             return json.dumps({"message": "Split proposal recorded; parent process must approve or reject.", "task": task}, ensure_ascii=False, indent=2)
 
         elif action == "approve_split":
@@ -368,6 +493,7 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             task["result"] = data.get("result", task.get("result", "拆分已批准，等待子任务完成。"))
             task["updated_at"] = _now()
             _save_state(state)
+            _print_todo_snapshot(state, f"任务 {task_id} 拆分已批准")
             return json.dumps({"message": "Split approved.", "parent_id": task_id, "created_ids": created}, ensure_ascii=False, indent=2)
 
         elif action == "reject_split":
@@ -379,11 +505,13 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             task["result"] = data.get("reason", "拆分建议被父进程拒绝。")
             task["updated_at"] = _now()
             _save_state(state)
+            _print_todo_snapshot(state, f"任务 {task_id} 拆分建议已拒绝")
             return f"Split proposal for task {task_id} rejected."
 
         elif action == "clear":
-            _save_state(_default_state())
-            console.print("\n[bold yellow]📋 任务看板已清空[/bold yellow]")
+            state = _default_state()
+            _save_state(state)
+            _print_todo_snapshot(state, "任务看板已清空")
             return "Todo list cleared."
 
         else:
