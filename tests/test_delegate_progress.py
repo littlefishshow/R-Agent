@@ -69,6 +69,7 @@ def test_delegate_task_prints_snapshots_and_blocks_truncated_in_progress_task(mo
     assert "Delegate 启动前任务快照" in out
     assert "Sub-Agent 结束后任务快照" in out
     assert "本轮 delegate_task 完成后的最终任务快照" in out
+    assert "🕓 未完成任务：" in out
 
 
 class _CompletingAgent:
@@ -128,6 +129,33 @@ def test_delegate_task_final_snapshot_reports_completed_progress(monkeypatch, tm
     out = capsys.readouterr().out
     assert "本轮 delegate_task 完成后的最终任务快照" in out
     assert "完成进度：2/2 (100.0%)" in out
+    assert "✅ 已完成任务：" in out
+
+
+def test_todo_snapshot_shows_completed_and_unfinished_task_lists(monkeypatch, tmp_path):
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    todo_tool.todo_manage(
+        "init",
+        json.dumps(
+            {
+                "tasks": [
+                    {"id": "done", "description": "已经完成", "status": "completed"},
+                    {"id": "todo", "description": "还没完成", "status": "pending"},
+                    {"id": "blocked", "description": "等待处理", "status": "blocked"},
+                ]
+            },
+            ensure_ascii=False,
+        ),
+    )
+
+    text = delegate_tool._todo_snapshot_text("测试快照")
+
+    assert "✅ 已完成任务：" in text
+    assert "- done: 已经完成 [completed]" in text
+    assert "🕓 未完成任务：" in text
+    assert "- todo: 还没完成 [pending" in text
+    assert "- blocked: 等待处理 [blocked" in text
+    assert "🧭 需要父 Agent 处理：" in text
 
 
 def test_print_after_status_stops_and_restarts_active_cli_status(monkeypatch, capsys):

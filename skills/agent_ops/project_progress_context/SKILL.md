@@ -7,10 +7,33 @@ description: "大型功能开发的上下文保护与续接记录"
 
 ## When to Use
 
-- 用户要求开发、重构或升级一个比较大的功能，预计会跨多轮、跨会话或可能中途中断。
-- 当前功能尚未完成，但本轮会话即将结束、即将压缩上下文、达到迭代上限，或用户明确要求“下次继续”。
-- 继续开发某个未完成功能，需要先恢复上次的项目主体、关键代码位置、未完成项和决策上下文。
+### Read / Resume Triggers
+
+读取 `Project_progress/` 只应发生在这些场景：
+
+- 用户明确说“继续上次/恢复某项目/接着做某个未完成功能”。
+- 当前任务属于长期项目、大型功能、跨多轮重构，且需要先恢复项目主体、关键代码位置、未完成项和设计决策。
+- 会话重启后继续维护同一个长期项目，且仅靠当前 git diff / README 不足以恢复上下文。
+- 执行高风险修改前，需要确认上次保存的约束、未完成项或阻塞点。
+
+### Save Triggers
+
+保存 `Project_progress/` 只应发生在这些场景：
+
+- 大型功能/长期项目尚未完成，并且本轮会话即将结束、即将压缩上下文、达到迭代上限，或用户明确要求“下次继续”。
+- 本轮产生了后续继续开发必须知道的关键决策、阻塞点、未完成项、跨文件设计约束。
 - 某个 skill 本身长期承载一类大型项目维护流程，需要在该 skill 下保留本地进展上下文。
+
+### Do Not Use For
+
+以下情况默认**不要**保存 `Project_progress/`：
+
+- 已完成的小功能、小修复、单文件文档修正、一次性排查。
+- 已经通过 git commit / README 更新 / 测试结果充分记录，后续无需恢复上下文的任务。
+- 只有普通执行日志、流水账或可从 git diff 直接看出的修改。
+- 用户没有表达后续续接需求，且任务没有跨会话风险。
+
+若不确定，优先不保存；只在“后续继续开发会因为缺少上下文而明显受阻”时保存。
 
 ## Goal
 
@@ -91,18 +114,19 @@ skills/<category>/<skill_name>/
 
 ## Save Procedure
 
-当大型功能未完成且需要保存上下文时：
+当且仅当满足 Save Triggers 时才保存上下文：
 
-1. 判断当前任务是否属于“大型功能/长期项目”。
-2. 定位对应 skill 目录。
-3. 确保存在：
+1. 先做保存决策：确认任务是“大型功能/长期项目/未完成续接”，而不是已完成的小功能。
+2. 如果任务已完成且 git commit、README 或测试结果足以说明，不保存 `Project_progress/`。
+3. 定位对应 skill 目录。
+4. 确保存在：
 
 ```text
 <ProjectSkill>/Project_progress/
 <ProjectSkill>/scripts/project_progress.py
 ```
 
-4. 使用脚本保存上下文，例如：
+5. 使用脚本保存上下文，例如：
 
 ```bash
 python skills/agent_ops/project_progress_context/scripts/project_progress.py save \
@@ -113,8 +137,8 @@ python skills/agent_ops/project_progress_context/scripts/project_progress.py sav
   --file core/skills.py
 ```
 
-5. 保存后读取一遍确认内容可用。
-6. 最终回复用户时说明上下文保存位置。
+6. 保存后读取一遍确认内容可用。
+7. 最终回复用户时说明上下文保存位置；如果决定不保存，也可简短说明“任务已完成且无需续接上下文”。
 
 ## Load / Resume Procedure
 

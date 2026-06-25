@@ -265,7 +265,10 @@ flowchart LR
 - **消除 Skill 工具重复逻辑**：`skill_create` / `skill_delete` 保留为兼容旧接口，但内部改为委托 `skill_manage(action=create/delete)`，避免新旧入口维护分叉；工具描述标记新代码优先使用 `skill_manage`。
 - **加固 Skill 安全边界**：`core/skills.py` 对同名 skill 多匹配改为拒绝消歧，`create_skill` 默认拒绝覆盖已有 skill 并提供显式 `overwrite`，category 改为单级安全名称，`SKILL.md/...` 子路径被明确拒绝。
 - **补充安全回归测试**：扩展 `tests/test_self_evolution_skill_manage.py`，覆盖旧接口委托、重复 create 拒绝、非法 category、`SKILL.md/child` 拒绝和同名 skill 歧义拒绝。
-- **新增会话 Token 用量提示**：`core/agent.py` 累计本次 Agent 启动以来 LLM 返回的 `response.usage`，`main.py` 在 prompt_toolkit 输入框右侧显示 `tokens: <total>`，无 usage 时显示 `tokens: unavailable`；新增 `tests/test_token_usage_display.py` 覆盖累计和显示格式。
+- **新增会话 Token 用量提示**：`core/agent.py` 累计本次 Agent 启动以来 LLM 返回的 `response.usage`，`main.py` 在 prompt_toolkit 输入框右侧以及 Rich 回复面板右下角显示 `tokens: <total>`，无 usage 时显示 `tokens: unavailable`；新增 `tests/test_token_usage_display.py` 覆盖累计和显示格式。
+- **增强 Todo 看板任务明细可见性**：`delegate_task` 的 Todo Progress 面板新增“✅ 已完成任务”和“🕓 未完成任务”分组，未完成任务会直接列出 pending/in_progress/blocked/needs_split/failed/cancelled 等状态及分配信息，避免只看到总数、状态计数和 ready id 而看不到具体任务内容。
+- **补充 Todo 看板明细回归测试**：扩展 `tests/test_delegate_progress.py`，覆盖已完成/未完成任务列表、blocked 任务提醒以及最终 100% 快照中的任务明细。
+- **停止跟踪 outputs 文本产物**：确认 `outputs/` 已在 `.gitignore` 中，并将历史已跟踪的 outputs 文本/研究产物从 Git 索引移除（保留本地工作区文件），避免运行输出和阶段性研究稿继续进入版本库。
 
 ### 2026-06-25
 

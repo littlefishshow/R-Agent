@@ -89,6 +89,21 @@ def _with_interrupt_status_hint(message: str) -> str:
     return f"{message} {INTERRUPT_STATUS_HINT}"
 
 
+def _format_token_usage_label(agent: RAgent) -> str:
+    """生成本次 Agent 启动以来的 token 使用量文案。"""
+    return f"tokens: {agent.get_token_usage_total()}"
+
+
+def _format_token_usage_rprompt(agent: RAgent) -> HTML:
+    """生成输入框右侧 token 使用量提示。"""
+    return HTML(f'<ansibrightblack>{_format_token_usage_label(agent)}</ansibrightblack>')
+
+
+def _token_usage_panel_subtitle(agent: RAgent) -> str:
+    """生成回复面板右下角 token 使用量提示。"""
+    return f"[dim]{_format_token_usage_label(agent)}[/dim]"
+
+
 def _run_with_esc_interrupt(run_callable, status_message: str, status_ref=None):
     """后台执行 Agent，前台在状态动画期间监听 Esc 并请求中断。"""
     global ACTIVE_STATUS
@@ -398,9 +413,10 @@ def main():
             
             # 获取用户输入
             user_input = session.prompt(
-                HTML('<ansigreen><b>👤 You&gt;</b></ansigreen> '), 
+                HTML('<ansigreen><b>👤 You&gt;</b></ansigreen> '),
                 completer=completer,
-                complete_while_typing=True
+                complete_while_typing=True,
+                rprompt=_format_token_usage_rprompt(agent),
             )
             
             if user_input.lower() in ["exit", "quit"]:
@@ -485,8 +501,10 @@ def main():
             console.print(Panel(
                 Markdown(response),
                 title="[bold blue]🤖 R-Agent[/bold blue]",
+                subtitle=_token_usage_panel_subtitle(agent),
+                subtitle_align="right",
                 border_style="blue",
-                expand=False
+                expand=False,
             ))
             console.print()
 
@@ -498,7 +516,8 @@ def main():
                     "或回车跳过（保留当前结果）。[/bold yellow]"
                 )
                 extra_raw = session.prompt(
-                    HTML('<ansiyellow><b>➕ 扩展轮数&gt;</b></ansiyellow> ')
+                    HTML('<ansiyellow><b>➕ 扩展轮数&gt;</b></ansiyellow> '),
+                    rprompt=_format_token_usage_rprompt(agent),
                 ).strip()
                 if not extra_raw:
                     break
@@ -529,6 +548,8 @@ def main():
                 console.print(Panel(
                     Markdown(response),
                     title="[bold blue]🤖 R-Agent (续跑)[/bold blue]",
+                    subtitle=_token_usage_panel_subtitle(agent),
+                    subtitle_align="right",
                     border_style="blue",
                     expand=False,
                 ))

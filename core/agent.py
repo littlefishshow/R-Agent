@@ -10,6 +10,7 @@ from tools.registry import registry
 # 状态上，CLI 层可据此询问用户是否扩展预算继续推进。
 _TRUNCATED_FLAG = "_truncated"
 _PENDING_USER_MSG = "_pending_user_message"
+TOKEN_USAGE_UNAVAILABLE = "unavailable"
 
 
 class AgentInterrupted(Exception):
@@ -95,6 +96,14 @@ class RAgent:
         # 统一使用 config 模块创建配置好的客户端 (支持 Azure 等)
         self.client = config.create_llm_client()
         self.messages = []
+        # 从本次 Agent 启动开始累计 LLM API 返回的 token usage。
+        # 部分兼容 OpenAI 接口不返回 usage，此时保持 unavailable，用于 UI 优雅降级。
+        self.token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "available": False,
+        }
         # 截断状态：bool。被强制收尾后置 True，下次正常 run 前会自动复位。
         setattr(self, _TRUNCATED_FLAG, False)
         # 软提醒幂等标记：避免在同一段 run 里重复注入 system 提示。
@@ -124,6 +133,44 @@ class RAgent:
             pass
 
     # ------------------------------------------------------------------
+    # Token usage helpers
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _usage_value(usage, name: str) -> int:
+        if usage is None:
+            return 0
+        if isinstance(usage, dict):
+            value = usage.get(name, 0)
+        else:
+            value = getattr(usage, name, 0)
+        try:
+            return int(value or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _record_token_usage(self, response) -> None:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        prompt_tokens = self._usage_value(usage, "prompt_tokens")
+        completion_tokens = self._usage_value(usage, "completion_tokens")
+        total_tokens = self._usage_value(usage, "total_tokens")
+        if not total_tokens:
+            total_tokens = prompt_tokens + completion_tokens
+        if not any((prompt_tokens, completion_tokens, total_tokens)):
+            return
+        self.token_usage["prompt_tokens"] += prompt_tokens
+        self.token_usage["completion_tokens"] += completion_tokens
+        self.token_usage["total_tokens"] += total_tokens
+        self.token_usage["available"] = True
+
+    def get_token_usage_total(self):
+        """返回本次 Agent 启动以来累计 token；无 usage 信息时返回 'unavailable'。"""
+        if not self.token_usage.get("available"):
+            return TOKEN_USAGE_UNAVAILABLE
+        return self.token_usage.get("total_tokens", 0)
+
+    # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
     def _chat_completion_with_retry(self, on_think=None, iteration=None, cancel_event=None, **kwargs):
@@ -142,6 +189,7 @@ class RAgent:
                 response = self.client.chat.completions.create(**kwargs)
                 if _is_cancelled(cancel_event):
                     raise AgentInterrupted()
+                self._record_token_usage(response)
                 return response
             except Exception as e:
                 last_exc = e

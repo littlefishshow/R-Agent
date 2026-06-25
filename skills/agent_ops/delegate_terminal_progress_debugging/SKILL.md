@@ -37,6 +37,7 @@ description: "诊断修复 delegate 看板显示与并发状态问题"
    - 用 fake `RAgent` 模拟子 Agent 并发 claim/update，不依赖真实 LLM。
    - 覆盖截断子 Agent 自动把 `in_progress` 标记为 `blocked`。
    - 覆盖最终快照显示 `完成进度：N/N (100.0%)`。
+   - 覆盖 Todo Progress 面板明确展示“✅ 已完成任务”和“🕓 未完成任务”明细；未完成列表应列出 pending/in_progress/blocked/needs_split/failed/cancelled 等具体任务 id、描述、状态和分配信息，不能只显示总数、状态计数或 ready id。
    - 覆盖 status-safe print 会调用 `stop()` 与 `start()`。
 
 ## Verification

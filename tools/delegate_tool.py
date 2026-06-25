@@ -112,17 +112,19 @@ def _todo_snapshot_text(label="当前任务快照", scheduled_tasks=None):
             f"{STATUS_LABELS[status]} {counts[status]}" for status in status_order
         ))
 
-        def list_tasks(title, filtered, limit=8):
+        def format_task_line(t, include_assignment=True):
+            assigned = t.get("assigned_to") or (t.get("claim") or {}).get("worker_id") or "未分配"
+            status = t.get("status") or "unknown"
+            suffix = f" [{status}, {assigned}]" if include_assignment else f" [{status}]"
+            return f"- {t.get('id')}: {_shorten(t.get('description'))}{suffix}"
+
+        def list_tasks(title, filtered, limit=8, include_assignment=True):
             if not filtered:
                 return
             lines.append("")
             lines.append(title)
             for t in filtered[:limit]:
-                assigned = t.get("assigned_to") or (t.get("claim") or {}).get("worker_id") or "未分配"
-                lines.append(
-                    f"- {t.get('id')}: {_shorten(t.get('description'))}"
-                    f" [{t.get('status')}, {assigned}]"
-                )
+                lines.append(format_task_line(t, include_assignment=include_assignment))
             if len(filtered) > limit:
                 lines.append(f"- … 还有 {len(filtered) - limit} 个")
 
@@ -141,8 +143,14 @@ def _todo_snapshot_text(label="当前任务快照", scheduled_tasks=None):
                 else:
                     lines.append(f"- {task_id}: 未在 todo list 中找到，仅作为普通委托任务执行")
 
-        list_tasks("正在执行：", [t for t in tasks if t.get("status") == "in_progress"])
-        list_tasks("需要父 Agent 处理：", [t for t in tasks if t.get("status") in {"blocked", "needs_split", "failed"}])
+        completed_tasks = [t for t in tasks if t.get("status") == "completed"]
+        unfinished_tasks = [t for t in tasks if t.get("status") != "completed"]
+        list_tasks("✅ 已完成任务：", completed_tasks, limit=12, include_assignment=False)
+        list_tasks("🕓 未完成任务：", unfinished_tasks, limit=12, include_assignment=True)
+
+        # 下面保留重点提醒区，便于父 Agent 调度，不需要用户从明细中再筛选。
+        list_tasks("🚧 正在执行：", [t for t in tasks if t.get("status") == "in_progress"])
+        list_tasks("🧭 需要父 Agent 处理：", [t for t in tasks if t.get("status") in {"blocked", "needs_split", "failed"}])
 
         try:
             from tools import todo_tool
