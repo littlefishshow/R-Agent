@@ -71,6 +71,15 @@ def get_llm_retry_base_delay():
         d = 1.0
     return max(0.0, d)
 
+
+def get_self_evolution_review_interval():
+    """每多少轮用户对话触发一次后台自演进复盘；<=0 表示关闭。"""
+    try:
+        n = int(os.environ.get("SELF_EVOLUTION_REVIEW_INTERVAL", "3"))
+    except ValueError:
+        n = 3
+    return max(0, n)
+
 def create_llm_client(api_key=None):
     """
     根据环境变量统一创建 LLM 客户端。

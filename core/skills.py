@@ -1,21 +1,22 @@
+from __future__ import annotations
+import glob
 import os
-import yaml
+import shutil
+from pathlib import Path
 
 class SkillManager:
-    """
-    技能系统管理器 (对应 hermes-agent 的 skills_hub 和 curator)
-    负责管理技能的渐进式加载：List (Tier 1) -> View (Tier 2) -> Load (Tier 3)
-    """
+    """技能系统管理器：渐进式加载 List -> View，并支持 Hermes 式技能包文件。"""
     CATEGORY_DISPLAY_NAMES = {
+        "agent_ops": "Agent 运维 / 自进化",
         "creative": "创意创作",
         "github": "GitHub / 代码协作",
         "productivity": "生产力 / 办公自动化",
         "uncategorized": "未分类",
     }
+    ALLOWED_SUPPORT_DIRS = {"references", "templates", "scripts", "assets", "Project_progress"}
 
     def __init__(self, skills_dir: str = None):
         if skills_dir is None:
-            # 动态获取 R-Agent 根目录下的 skills 文件夹
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
             self.skills_dir = os.path.join(base_dir, "skills")
         else:
@@ -23,114 +24,114 @@ class SkillManager:
         os.makedirs(self.skills_dir, exist_ok=True)
 
     def _display_category_name(self, category: str) -> str:
-        """返回用于展示的中文类目名称；未知类目保持首字母大写。"""
         return self.CATEGORY_DISPLAY_NAMES.get(category, category.capitalize())
 
-    def list_skills(self) -> str:
-        """获取所有可用技能的名称和简短描述 (Tier 1)，按目录进行分类"""
-        import glob
-        from collections import defaultdict
-        
-        # 使用字典按类别分组技能
-        categorized_skills = defaultdict(list)
-        
-        # 递归搜索所有层级的 SKILL.md
-        search_pattern = os.path.join(self.skills_dir, "**", "SKILL.md")
-        for skill_path in glob.glob(search_pattern, recursive=True):
-            if os.path.isfile(skill_path):
-                # 获取相对路径以便确定分类
-                rel_path = os.path.relpath(skill_path, self.skills_dir)
-                parts = rel_path.split(os.sep)
-                
-                # 如果技能在顶级目录的子目录中（例如 skills/creative/skill_name/SKILL.md）
-                if len(parts) >= 3:
-                    category = parts[0]
-                    skill_name = parts[-2]
-                else:
-                    category = "uncategorized"
-                    skill_name = parts[-2] if len(parts) >= 2 else "unknown"
+    def _validate_skill_name(self, skill_name: str) -> str:
+        if not isinstance(skill_name, str) or not skill_name.strip():
+            raise ValueError("skill_name is required.")
+        name = skill_name.strip()
+        p = Path(name)
+        if p.is_absolute() or ".." in p.parts or any(sep in name for sep in ("/", "\\")):
+            raise ValueError("skill_name must be a simple relative directory name without path traversal.")
+        return name
 
-                try:
-                    with open(skill_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-                        # 尝试从第一行或 frontmatter 中提取描述
-                        desc = content.split('\n')[0] if content else "无描述"
-                        if desc.startswith("---") or desc.startswith("name:"):
-                            # 简单提取 description
-                            for line in content.split('\n'):
-                                if line.startswith("description:"):
-                                    desc = line.replace("description:", "").strip().strip('"\'')
-                                    break
-                        categorized_skills[category].append(f"  - **{skill_name}**: {desc}")
-                except Exception as e:
-                    categorized_skills[category].append(f"  - **{skill_name}**: 加载描述失败 ({str(e)})")
-        
-        if not categorized_skills:
-            return "当前没有任何技能。"
-            
+    def _skill_dirs(self, skill_name: str):
+        name = self._validate_skill_name(skill_name)
+        pattern = os.path.join(self.skills_dir, "**", name, "SKILL.md")
+        return [Path(p).parent for p in glob.glob(pattern, recursive=True) if os.path.isfile(p)]
+
+    def resolve_skill_dir(self, skill_name: str) -> Path:
+        matches = self._skill_dirs(skill_name)
+        if not matches:
+            raise FileNotFoundError(f"技能 '{skill_name}' 不存在。")
+        resolved = sorted(matches, key=lambda p: str(p))[0].resolve()
+        root = Path(self.skills_dir).resolve()
+        resolved.relative_to(root)
+        return resolved
+
+    def _safe_file_path(self, skill_dir: Path, file_path: str | None) -> Path:
+        if not file_path:
+            return skill_dir / "SKILL.md"
+        raw = str(file_path).strip().replace("\\", "/")
+        rel = Path(raw)
+        if rel.is_absolute() or ".." in rel.parts:
+            raise ValueError("file_path must stay inside the skill directory and cannot contain '..'.")
+        parts = [p for p in rel.parts if p not in ("", ".")]
+        if not parts:
+            raise ValueError("file_path is empty.")
+        if parts[0] != "SKILL.md" and parts[0] not in self.ALLOWED_SUPPORT_DIRS:
+            raise ValueError("file_path must be SKILL.md or under one of: " + ", ".join(sorted(self.ALLOWED_SUPPORT_DIRS)))
+        target = (skill_dir / rel).resolve()
+        target.relative_to(skill_dir.resolve())
+        return target
+
+    def list_skills(self) -> str:
+        from collections import defaultdict
+        categorized_skills = defaultdict(list)
+        for skill_path in glob.glob(os.path.join(self.skills_dir, "**", "SKILL.md"), recursive=True):
+            if not os.path.isfile(skill_path): continue
+            rel_path = os.path.relpath(skill_path, self.skills_dir); parts = rel_path.split(os.sep)
+            if len(parts) >= 3: category, skill_name = parts[0], parts[-2]
+            else: category, skill_name = "uncategorized", parts[-2] if len(parts) >= 2 else "unknown"
+            if category.startswith("."): continue
+            try:
+                content = Path(skill_path).read_text(encoding="utf-8")
+                desc = content.split('\n')[0] if content else "无描述"
+                if desc.startswith("---") or desc.startswith("name:"):
+                    for line in content.split('\n'):
+                        if line.startswith("description:"):
+                            desc = line.replace("description:", "").strip().strip('"\''); break
+                categorized_skills[category].append(f"  - **{skill_name}**: {desc}")
+            except Exception as e:
+                categorized_skills[category].append(f"  - **{skill_name}**: 加载描述失败 ({str(e)})")
+        if not categorized_skills: return "当前没有任何技能。"
         result = "可用的技能列表：\n"
         for category, skills in sorted(categorized_skills.items()):
-            result += f"\n### {self._display_category_name(category)}\n"
-            result += "\n".join(skills) + "\n"
-            
+            result += f"\n### {self._display_category_name(category)}\n" + "\n".join(sorted(skills)) + "\n"
         return result
 
-    def view_skill(self, skill_name: str) -> str:
-        """查看指定技能的完整 SKILL.md (Tier 2)"""
-        import glob
-        # 查找该技能的真实路径 (因为它可能在某个分类目录下)
-        search_pattern = os.path.join(self.skills_dir, "**", skill_name, "SKILL.md")
-        matches = glob.glob(search_pattern, recursive=True)
-        
-        if not matches:
-            return f"Error: 技能 '{skill_name}' 不存在。"
-        
-        skill_path = matches[0]
-        with open(skill_path, "r", encoding="utf-8") as f:
-            return f.read()
+    def view_skill(self, skill_name: str, file_path: str = None) -> str:
+        skill_dir = self.resolve_skill_dir(skill_name); target = self._safe_file_path(skill_dir, file_path)
+        if not target.exists() or not target.is_file(): raise FileNotFoundError(f"技能文件不存在: {file_path or 'SKILL.md'}")
+        return target.read_text(encoding="utf-8")
 
     def create_skill(self, skill_name: str, description: str, content: str, category: str = "uncategorized") -> str:
-        """创建一个新技能或更新已有技能"""
-        # 如果提供了分类，则在对应的分类目录下创建
-        if category and category != "uncategorized":
-            skill_folder = os.path.join(self.skills_dir, category, skill_name)
-        else:
-            # 默认为了防止和已有分类冲突，放根目录或者 uncategorized 目录，这里放根目录便于被识别为未分类
-            skill_folder = os.path.join(self.skills_dir, skill_name)
-            
-        os.makedirs(skill_folder, exist_ok=True)
-        
-        skill_path = os.path.join(skill_folder, "SKILL.md")
-        with open(skill_path, "w", encoding="utf-8") as f:
-            # 写入 YAML 前置元数据和主体
-            f.write(f"---\nname: \"{skill_name}\"\ndescription: \"{description}\"\n---\n\n{content}")
-            
-        return f"Successfully created/updated skill: {skill_name} in category: {category}"
+        name = self._validate_skill_name(skill_name); cat = (category or "uncategorized").strip()
+        if Path(cat).is_absolute() or ".." in Path(cat).parts: raise ValueError("category must be a relative directory name.")
+        skill_folder = Path(self.skills_dir) / (cat if cat != "uncategorized" else "") / name
+        skill_folder.mkdir(parents=True, exist_ok=True)
+        body = content if content.lstrip().startswith("---") else f"---\nname: \"{name}\"\ndescription: \"{description}\"\n---\n\n{content}"
+        (skill_folder / "SKILL.md").write_text(body, encoding="utf-8")
+        return f"Successfully created/updated skill: {name} in category: {cat}"
+
+    def edit_skill_file(self, skill_name: str, content: str, file_path: str = None) -> str:
+        skill_dir = self.resolve_skill_dir(skill_name); target = self._safe_file_path(skill_dir, file_path)
+        target.parent.mkdir(parents=True, exist_ok=True); target.write_text(content, encoding="utf-8")
+        return f"Successfully wrote {skill_name}:{file_path or 'SKILL.md'}"
+
+    def patch_skill_file(self, skill_name: str, old_string: str, new_string: str, file_path: str = None) -> str:
+        if old_string is None or new_string is None: raise ValueError("old_string and new_string are required for patch.")
+        skill_dir = self.resolve_skill_dir(skill_name); target = self._safe_file_path(skill_dir, file_path)
+        if not target.exists(): raise FileNotFoundError(f"技能文件不存在: {file_path or 'SKILL.md'}")
+        content = target.read_text(encoding="utf-8"); count = content.count(old_string)
+        if count == 0: raise ValueError("old_string not found.")
+        if count > 1: raise ValueError("old_string ambiguous; appears multiple times.")
+        target.write_text(content.replace(old_string, new_string, 1), encoding="utf-8")
+        return f"Successfully patched {skill_name}:{file_path or 'SKILL.md'}"
+
+    def remove_skill_file(self, skill_name: str, file_path: str) -> str:
+        if not file_path: raise ValueError("file_path is required for remove_file; use delete to remove a whole skill.")
+        skill_dir = self.resolve_skill_dir(skill_name); target = self._safe_file_path(skill_dir, file_path)
+        if target.name == "SKILL.md": raise ValueError("Refusing to remove SKILL.md via remove_file; use delete instead.")
+        if not target.exists(): raise FileNotFoundError(f"技能文件不存在: {file_path}")
+        target.unlink(); return f"Successfully removed {skill_name}:{file_path}"
 
     def delete_skill(self, skill_name: str) -> str:
-        """删除一个技能，并尝试清理空目录"""
-        import shutil
-        import glob
-        
-        # 查找该技能的真实路径 (因为它可能在某个分类目录下)
-        search_pattern = os.path.join(self.skills_dir, "**", skill_name)
-        skill_folders = [p for p in glob.glob(search_pattern, recursive=True) if os.path.isdir(p)]
-        
-        if not skill_folders:
-            return f"Error: 技能 '{skill_name}' 不存在。"
-            
-        skill_folder = skill_folders[0]
-        parent_dir = os.path.dirname(skill_folder)
-        
+        skill_folder = self.resolve_skill_dir(skill_name); parent_dir = skill_folder.parent
+        shutil.rmtree(skill_folder); root = Path(self.skills_dir).resolve()
         try:
-            shutil.rmtree(skill_folder)
-            
-            # 如果父目录不是 skills 根目录，且删除技能后变为空，则顺便删除空分类目录
-            if parent_dir != os.path.abspath(self.skills_dir) and not os.listdir(parent_dir):
-                os.rmdir(parent_dir)
-                
-            return f"Successfully deleted skill: {skill_name}"
-        except Exception as e:
-            return f"Error deleting skill: {str(e)}"
+            if parent_dir.resolve() != root and not any(parent_dir.iterdir()): parent_dir.rmdir()
+        except Exception: pass
+        return f"Successfully deleted skill: {skill_name}"
 
 skill_manager = SkillManager()

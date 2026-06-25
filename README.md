@@ -241,6 +241,30 @@ pip install PyNaCl>=1.5.0
 
 ### 2026-06-25
 
+#### Hermes 自演进机制融入（大版本升级）
+
+```mermaid
+flowchart LR
+    A[前台任务执行] --> B[skill_view / skill_manage]
+    B --> C[skills/.usage.json 遥测]
+    A --> D[archive_subtask]
+    D --> E[压缩 messages 保留摘要]
+    A --> F[self_evolution_review dry-run]
+    F --> G[outputs/self_evolution/latest_review.json]
+    C --> H[deterministic curator]
+    H --> I[active / stale / archived / restore]
+```
+
+- **对齐 Hermes 技能包管理**：`core/skills.py` 支持 `SKILL.md` 与 `references/`、`templates/`、`scripts/`、`assets/`、`Project_progress/` supporting files，`skill_view(file_path=...)` 可安全读取技能包内文件。
+- **新增统一 `skill_manage` 工具**：在 `tools/skills_tool.py` 中支持 `create/patch/edit/delete/write_file/remove_file/usage`，`patch` 要求唯一匹配，避免误改。
+- **新增 Skill Usage Telemetry**：`core/skill_usage.py` 维护 `skills/.usage.json`，记录 view/use/patch 计数、created_by、write_origin、state、pinned、archived_at，并使用锁与 atomic write 降低损坏风险。
+- **补齐真实上下文压缩**：`core/agent.py` 对 `archive_subtask` 做特殊拦截，工具成功后保留 system、归档摘要和最近用户输入，清理中间冗长 tool/assistant 历史。
+- **新增后台复盘雏形**：`tools/self_evolution_tool.py` 提供 `self_evolution_review` dry-run，按周期输出 memory/skill 沉淀建议到 `outputs/self_evolution/latest_review.json`，默认不自动写长期资产。
+- **新增 deterministic curator**：`tools/skill_curator_tool.py` 提供 `skill_curator_status/run/pin/restore`，可按未活跃天数预览或执行 `active → stale → archived` 生命周期维护，pinned skill 会跳过。
+- **增加回归测试**：新增 `tests/test_self_evolution_skill_manage.py`、`tests/test_archive_subtask_compression.py`、`tests/test_skill_curator_tool.py`，覆盖 supporting file、usage telemetry、路径穿越拒绝、archive 压缩与 curator dry-run/stale。
+
+### 2026-06-25
+
 #### 大型功能开发上下文保护 Skill
 
 - **新增项目续接上下文 Skill**：新增 `skills/agent_ops/project_progress_context/`，规定开发较大功能时在对应 skill 目录下维护 `Project_progress/`，用于保存未完成项目的目标、进展、关键代码、文件位置、验证状态和下一步。

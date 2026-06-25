@@ -46,3 +46,6 @@ memories/.memory.lock
 R-Agent/
 repos/
 outputs/
+skills/.usage.json
+skills/.usage.json.lock
+skills/.archive/

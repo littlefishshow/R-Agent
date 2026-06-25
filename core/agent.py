@@ -1,5 +1,7 @@
 import time
 import random
+import json
+import threading
 from core import config
 from tools.registry import registry
 
@@ -97,6 +99,29 @@ class RAgent:
         setattr(self, _TRUNCATED_FLAG, False)
         # 软提醒幂等标记：避免在同一段 run 里重复注入 system 提示。
         self._soft_warned = False
+        self._turns_since_self_review = 0
+
+    def _compress_after_archive(self, summary: str, next_steps: str = ""):
+        system_msgs = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "system"][:1]
+        recent_user = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "user"][-1:]
+        archive_msg = {
+            "role": "system",
+            "content": "【archive_subtask 压缩摘要】\n" + str(summary) + ("\n下一步：" + str(next_steps) if next_steps else ""),
+        }
+        self.messages = system_msgs + [archive_msg] + recent_user
+
+    def _schedule_self_evolution_review(self):
+        try:
+            from tools.self_evolution_tool import self_evolution_review
+            snapshot = [m for m in self.messages[-20:] if isinstance(m, dict)]
+            thread = threading.Thread(
+                target=self_evolution_review,
+                kwargs={"messages_snapshot": snapshot, "mode": "background_review", "dry_run": True},
+                daemon=True,
+            )
+            thread.start()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -218,10 +243,15 @@ class RAgent:
         self._active_exclude_tools = set(exclude_tools or [])
 
         try:
-            return self._loop(start_iteration=0, on_think=on_think,
-                              on_tool_start=on_tool_start, on_tool_end=on_tool_end,
-                              exclude_tools=self._active_exclude_tools,
-                              cancel_event=cancel_event)
+            result = self._loop(start_iteration=0, on_think=on_think,
+                                on_tool_start=on_tool_start, on_tool_end=on_tool_end,
+                                exclude_tools=self._active_exclude_tools,
+                                cancel_event=cancel_event)
+            self._turns_since_self_review += 1
+            if self._turns_since_self_review >= config.get_self_evolution_review_interval():
+                self._turns_since_self_review = 0
+                self._schedule_self_evolution_review()
+            return result
         except AgentInterrupted:
             self.messages = self.messages[:rollback_index]
             setattr(self, _TRUNCATED_FLAG, False)
@@ -364,6 +394,16 @@ class RAgent:
                         "name": func_name,
                         "content": result,
                     })
+                    if func_name == "archive_subtask":
+                        try:
+                            outer = json.loads(result)
+                            inner = outer.get("result", outer) if isinstance(outer, dict) else {}
+                            if isinstance(inner, str):
+                                inner = json.loads(inner)
+                            if isinstance(inner, dict) and inner.get("success"):
+                                self._compress_after_archive(inner.get("recorded_summary", ""), inner.get("next_steps", ""))
+                        except Exception:
+                            pass
                 iteration += 1
                 # 进入下一轮
             else:

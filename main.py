@@ -382,7 +382,7 @@ def main():
     system_prompt = (
         build_system_prompt()
         + "\n\n【重要提示：自我进化能力】\n"
-        + "1. 更新技能(Skills)：你可以使用 `skill_create` 工具随时创建新的技能，或者为现有技能添加新分类。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
+        + "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具创建/修补技能包，也可兼容使用 `skill_create` 创建新技能。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
         + "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
         + "请始终使用中文回复用户。"
         + memory_manager.load_snapshot()
