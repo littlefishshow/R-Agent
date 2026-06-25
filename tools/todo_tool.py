@@ -1,6 +1,8 @@
 import os
 import json
 import time
+import threading
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from tools.registry import registry
 from rich.console import Console
@@ -9,6 +11,8 @@ console = Console()
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TODO_FILE = os.path.join(BASE_DIR, "sandbox", "todo_list.json")
+TODO_LOCK = threading.RLock()
+TODO_LOCK_FILE = f"{TODO_FILE}.lock"
 
 VALID_STATUSES = {
     "pending",        # 等待执行/等待领取
@@ -31,30 +35,53 @@ def _default_state() -> Dict[str, Any]:
     return {"version": 2, "tasks": []}
 
 
+@contextmanager
+def _todo_file_lock():
+    """Serialize todo read-modify-write actions across threads and processes."""
+    with TODO_LOCK:
+        os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
+        lock_path = f"{TODO_FILE}.lock"
+        with open(lock_path, "a", encoding="utf-8") as lock_file:
+            try:
+                import fcntl  # Unix/macOS; unavailable on Windows.
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            except ImportError:
+                yield
+
+
 def _load_state() -> Dict[str, Any]:
-    if os.path.exists(TODO_FILE):
-        try:
-            with open(TODO_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            # v1 兼容：旧版直接是 list
-            if isinstance(data, list):
-                return {"version": 2, "tasks": [_normalize_task(t) for t in data]}
-            if isinstance(data, dict):
-                tasks = data.get("tasks", [])
-                if isinstance(tasks, list):
-                    data["version"] = data.get("version", 2)
-                    data["tasks"] = [_normalize_task(t) for t in tasks]
-                    return data
-        except Exception:
-            pass
-    return _default_state()
+    with TODO_LOCK:
+        if os.path.exists(TODO_FILE):
+            try:
+                with open(TODO_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                # v1 兼容：旧版直接是 list
+                if isinstance(data, list):
+                    return {"version": 2, "tasks": [_normalize_task(t) for t in data]}
+                if isinstance(data, dict):
+                    tasks = data.get("tasks", [])
+                    if isinstance(tasks, list):
+                        data["version"] = data.get("version", 2)
+                        data["tasks"] = [_normalize_task(t) for t in tasks]
+                        return data
+            except Exception:
+                pass
+        return _default_state()
 
 
 def _save_state(state: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
-    state["version"] = 2
-    with open(TODO_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    with TODO_LOCK:
+        os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
+        state["version"] = 2
+        tmp_file = f"{TODO_FILE}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_file, TODO_FILE)
 
 
 def _normalize_task(t: Dict[str, Any]) -> Dict[str, Any]:
@@ -187,8 +214,8 @@ def _add_tasks(state: Dict[str, Any], raw_tasks: List[Dict[str, Any]], default_p
     return True, "Tasks added successfully.", created_ids
 
 
-def todo_manage(action: str, payload: str = "{}") -> str:
-    """管理树状、动态、带拓扑依赖的任务看板。"""
+def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
+    """管理树状、动态、带拓扑依赖的任务看板。调用方必须持有 TODO_LOCK。"""
     state = _load_state()
 
     try:
@@ -364,6 +391,17 @@ def todo_manage(action: str, payload: str = "{}") -> str:
 
     except Exception as e:
         return f"Error: {str(e)}"
+
+
+def todo_manage(action: str, payload: str = "{}") -> str:
+    """管理树状、动态、带拓扑依赖的任务看板。
+
+    delegate_task 会并发运行多个子 Agent；子 Agent 的 todo_manage 调用可能
+    来自多个线程或隔离工具子进程。对完整 action 加线程锁 + 文件锁，避免
+    “读旧 state -> 覆盖新 state”的 JSON 写丢失，保证进度快照稳定。
+    """
+    with _todo_file_lock():
+        return _todo_manage_unlocked(action, payload)
 
 
 registry.register(

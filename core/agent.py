@@ -336,6 +336,12 @@ class RAgent:
 
                     if func_name in excluded:
                         result = f'工具 {func_name} 已在当前上下文中被禁用，未执行。'
+                    elif func_name == "delegate_task":
+                        # delegate_task 是父进程调度器：内部会启动线程/子 Agent，并需要
+                        # 直接向当前终端打印 Rich 看板。若再放进隔离工具进程，容易形成
+                        # “隔离进程 -> 线程池 -> 工具子进程”的嵌套 fork，macOS 下会
+                        # 无返回崩溃，也会让 CLI status 无法正确让出终端行。
+                        result = registry.execute_tool(func_name, func_args)
                     else:
                         result = registry.execute_tool_isolated(
                             func_name,

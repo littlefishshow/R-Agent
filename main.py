@@ -42,6 +42,10 @@ custom_theme = Theme({
 
 console = Console(theme=custom_theme)
 
+# 当前 Rich status 动画对象。工具在精简模式下打印看板前可临时暂停它，
+# 避免 spinner 与工具输出黏在同一终端行。
+ACTIVE_STATUS = None
+
 # 工具输出超过该字符数后会写入缓存日志文件，CLI 中只显示截断 + 展开链接
 TOOL_OUTPUT_TRUNCATE_LIMIT = 2000
 
@@ -87,6 +91,7 @@ def _with_interrupt_status_hint(message: str) -> str:
 
 def _run_with_esc_interrupt(run_callable, status_message: str, status_ref=None):
     """后台执行 Agent，前台在状态动画期间监听 Esc 并请求中断。"""
+    global ACTIVE_STATUS
     cancel_event = threading.Event()
     finished = threading.Event()
     result = {"response": None, "error": None}
@@ -125,6 +130,7 @@ def _run_with_esc_interrupt(run_callable, status_message: str, status_ref=None):
             _with_interrupt_status_hint(status_message),
             spinner="dots",
         ) as status:
+            ACTIVE_STATUS = status
             if status_ref is not None:
                 status_ref["status"] = status
             thread.start()
@@ -145,6 +151,7 @@ def _run_with_esc_interrupt(run_callable, status_message: str, status_ref=None):
                 termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty_attrs)
             except Exception:
                 pass
+        ACTIVE_STATUS = None
         if status_ref is not None:
             status_ref["status"] = None
 

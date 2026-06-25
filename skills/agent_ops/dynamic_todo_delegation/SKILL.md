@@ -224,3 +224,5 @@ else:
 - `delegate_task` 现在支持 `max_workers` 和 `default_max_iterations`。
 - 每个 task 也可单独设置 `max_iterations`。
 - `todo_manage` 已支持树状任务、ready leaf 查询、claim/release、propose_split、approve_split、reject_split。
+- `delegate_task` 会在启动前、每个子 Agent 结束后、全部结束后自动打印 todo 进度快照，展示总任务数、状态统计、正在执行、待父 Agent 处理和 ready 任务。
+- 如果子 Agent 达到 `max_iterations` 并强制收尾，且对应 todo 任务仍为 `in_progress`，`delegate_task` 会自动将其标记为 `blocked` 并写入强制收尾结果，避免任务长期卡在执行中。

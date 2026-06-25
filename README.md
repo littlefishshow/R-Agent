@@ -239,6 +239,37 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-06-25
+
+#### 大型功能开发上下文保护 Skill
+
+- **新增项目续接上下文 Skill**：新增 `skills/agent_ops/project_progress_context/`，规定开发较大功能时在对应 skill 目录下维护 `Project_progress/`，用于保存未完成项目的目标、进展、关键代码、文件位置、验证状态和下一步。
+- **新增 skill-local 进度脚本**：新增 `skills/agent_ops/project_progress_context/scripts/project_progress.py`，支持 `save/list/latest/read`，通过 `run_command` 调用并将上下文保存在 skill-local `Project_progress/`，避免注册为全局工具造成工具面膨胀。
+- **落地首个进度上下文**：为本次 `project_progress_context` skill 创建 `Project_progress/2026-06-25_project-progress-context-skill_context.md`，记录需求、关键文件、验证状态和下一步。
+
+#### Delegate 任务进度可视化增强
+
+- **自动打印 Todo 进度快照**：增强 `delegate_task`，在委托启动前、每个子 Agent 结束后、全部子 Agent 完成后自动输出任务总数、完成进度、各状态计数、正在执行任务、待父 Agent 处理任务和 ready 任务。
+- **防止子任务卡在执行中**：当子 Agent 达到 `max_iterations` 并触发强制收尾时，如果对应 todo 任务仍处于 `in_progress`，自动标记为 `blocked`，并将强制收尾结果写入 `result`，等待父 Agent 决定扩展预算、拆分或人工处理。
+- **修复精简模式看板换行**：`main.py` 暴露当前 Rich status，`delegate_task` 打印 Todo Progress 面板和子 Agent 日志前临时暂停 status，避免精简模式 spinner 与看板黏在同一终端行。
+- **修复 delegate 隔离执行崩溃**：`core/agent.py` 对 `delegate_task` 改为父进程直接执行，避免“隔离工具进程 → 线程池 → 子 Agent → 工具子进程”的嵌套 fork 导致 `Tool process ended without returning a result`。
+- **修复 Todo 并发写覆盖**：`todo_manage` 为完整 action 增加线程锁和文件锁，并使用临时文件 + `os.replace()` 原子保存，避免多个子 Agent 同时 claim/update 时读旧状态覆盖新状态，导致最终看板仍显示 `0/5` 或进度不稳定。
+- **补充回归测试**：新增/扩展 `tests/test_delegate_progress.py`，覆盖截断子 Agent 自动阻塞任务、进度快照输出、status 安全打印和并发完成后最终快照显示 `100%`。
+
+### 2026-06-24
+
+#### run_command 高风险审批 token 跨子进程修复
+
+- **修复隔离工具进程审批失效**：将 `run_command` 的 pending approval 从进程内 `_PENDING_COMMAND_APPROVALS` 扩展为 `sandbox/command_approvals.json` 共享存储，解决 `execute_tool_isolated()` 每次新建子进程导致用户多次同意后 token 仍无法校验的问题。
+- **保持安全边界**：审批 token 仍为随机 nonce，绑定 command/cwd/reasons，保留 10 分钟 TTL，并在命令成功执行后一次性消费；过期和畸形记录会自动清理。
+- **补充回归测试**：新增 `tests/test_run_command_approval_store.py`，覆盖 isolated 子进程审批、同步审批、一次性消费、过期清理和低风险命令不创建审批记录。
+
+#### read_paper 方法细节检查规则补强
+
+- 维护 `read_paper` skill：补强论文方法细节检查规则，明确凡涉及 step label、critique、proxy、reward、verifier、oracle、ground truth、confidence/belief readout、benchmark evaluator signal 等中间监督信号时，必须追踪其来源、取值、计算规则、训练/评测可用阶段和迁移成本。
+- 在 `read_paper` 流程中新增“监督信号来源表”要求，避免只记录抽象公式而遗漏附录里的 task-specific label/critique 构造细节。
+- 强化论文重检查清单：要求专门核查附录中的标签、critique、proxy、reward 构造细节，防止将“easy-to-obtain / rule-based / automatic”笼统表述误写成无需过程监督。
+
 ### 2026-06-23
 
 #### Web 工具 fork 崩溃修复
