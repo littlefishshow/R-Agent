@@ -241,6 +241,14 @@ pip install PyNaCl>=1.5.0
 
 ### 2026-06-26
 
+#### Hermes 自演进 P0：受限后台复盘 Agent
+
+- **升级 `self_evolution_review`**：从纯 heuristic dry-run 扩展为可选受限 forked/background review Agent，支持 `mode="background_review"` 或 `use_forked_agent=true` 启动子 Agent 复盘对话快照。
+- **增加运行时工具白名单**：后台复盘只允许 `memory`、`memory_search`、`memory_get`、`skill_categories`、`skills_by_category`、`skill_view`、`skill_manage`，其它工具即使被模型尝试调用也会被 `tool_call_guard` 拒绝。
+- **保持默认安全 dry-run**：`dry_run=true` 时会拒绝 `memory` 与 `skill_manage` 的写入动作，仅允许只读查询和 `skill_manage(action=usage)`；复盘结果继续写入 `outputs/self_evolution/latest_review.json`，并额外保留带时间戳的历史报告。
+- **避免后台复盘递归**：`RAgent` 新增 `enable_self_review` 开关，复盘子 Agent 默认关闭自复盘调度，避免后台 Agent 再启动后台 Agent。
+- **补充生效测试**：新增 `tests/test_self_evolution_review.py`，覆盖非白名单工具拒绝、heuristic 日志落盘、forked dry-run 写入拒绝。
+
 #### Todo 看板原地刷新
 
 - **支持连续 Todo 看板覆盖上一版**：新增 `tools/progress_render.py` 统一处理 Rich status 暂停、Todo Progress 面板行数记录和 ANSI 清屏；连续打印新的 Todo 看板时会在真实终端中原地覆盖上一块看板，减少历史面板刷屏。

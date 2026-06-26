@@ -87,7 +87,7 @@ class RAgent:
         用户重发问题，也不会丢失上下文。
     """
 
-    def __init__(self, model=None, max_iterations=None):
+    def __init__(self, model=None, max_iterations=None, enable_self_review=True):
         self.model = model or config.get_model()
         self.max_iterations = max_iterations or config.get_max_iterations()
         # 记录默认预算；续跑可以临时扩展，但下一次新对话会恢复，避免预算永久膨胀。
@@ -109,6 +109,7 @@ class RAgent:
         # 软提醒幂等标记：避免在同一段 run 里重复注入 system 提示。
         self._soft_warned = False
         self._turns_since_self_review = 0
+        self._enable_self_review = bool(enable_self_review)
 
     def _compress_after_archive(self, summary: str, next_steps: str = ""):
         system_msgs = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "system"][:1]
@@ -270,7 +271,7 @@ class RAgent:
     # ------------------------------------------------------------------
     def run_conversation(self, user_message: str, system_message: str = None,
                          on_think=None, on_tool_start=None, on_tool_end=None,
-                         exclude_tools=None, cancel_event=None) -> str:
+                         exclude_tools=None, cancel_event=None, tool_call_guard=None, allowed_tools=None) -> str:
         """核心对话循环 (The Agent Loop)。
 
         cancel_event 用于 CLI 的 Esc 中断：一旦置位，当前轮会回滚到本次
@@ -294,9 +295,11 @@ class RAgent:
             result = self._loop(start_iteration=0, on_think=on_think,
                                 on_tool_start=on_tool_start, on_tool_end=on_tool_end,
                                 exclude_tools=self._active_exclude_tools,
-                                cancel_event=cancel_event)
+                                cancel_event=cancel_event,
+                                tool_call_guard=tool_call_guard,
+                                allowed_tools=allowed_tools)
             self._turns_since_self_review += 1
-            if self._turns_since_self_review >= config.get_self_evolution_review_interval():
+            if self._enable_self_review and self._turns_since_self_review >= config.get_self_evolution_review_interval():
                 self._turns_since_self_review = 0
                 self._schedule_self_evolution_review()
             return result
@@ -354,10 +357,11 @@ class RAgent:
     # ------------------------------------------------------------------
     def _loop(self, start_iteration: int, on_think=None,
               on_tool_start=None, on_tool_end=None, exclude_tools=None,
-              cancel_event=None) -> str:
+              cancel_event=None, tool_call_guard=None, allowed_tools=None) -> str:
         soft_threshold = max(1, int(self.max_iterations * config.get_soft_warn_ratio()))
         iteration = start_iteration
         excluded = set(exclude_tools or [])
+        allowed = set(allowed_tools or [])
 
         while iteration < self.max_iterations:
             if _is_cancelled(cancel_event):
@@ -369,6 +373,11 @@ class RAgent:
                 self._soft_warned = True
 
             tools = registry.get_all_schemas()
+            if allowed:
+                tools = [
+                    schema for schema in tools
+                    if schema.get("function", {}).get("name") in allowed
+                ]
             if excluded:
                 tools = [
                     schema for schema in tools
@@ -412,7 +421,16 @@ class RAgent:
                     else:
                         print(f"  [Tool Call] {func_name}({func_args})")
 
-                    if func_name in excluded:
+                    guard_denial = None
+                    if tool_call_guard is not None:
+                        try:
+                            guard_denial = tool_call_guard(func_name, func_args)
+                        except Exception as exc:
+                            guard_denial = f"工具 {func_name} 被安全策略拒绝：{exc}"
+
+                    if guard_denial:
+                        result = guard_denial
+                    elif func_name in excluded:
                         result = f'工具 {func_name} 已在当前上下文中被禁用，未执行。'
                     elif func_name == "delegate_task":
                         # delegate_task 是父进程调度器：内部会启动线程/子 Agent，并需要
