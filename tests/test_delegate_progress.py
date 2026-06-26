@@ -208,3 +208,55 @@ def test_print_after_status_stops_and_restarts_active_cli_status(monkeypatch, ca
 
     assert calls == ["stop", "start"]
     assert "hello status-safe print" in capsys.readouterr().out
+
+
+def test_consecutive_todo_boards_overwrite_previous_panel(monkeypatch, tmp_path):
+    import io
+    from rich.console import Console
+    from tools import progress_render
+
+    output = io.StringIO()
+    monkeypatch.setattr(progress_render, "STATE_FILE", str(tmp_path / "terminal_progress_state.json"))
+    monkeypatch.setattr(progress_render, "console", Console(file=output, force_terminal=True, color_system=None, width=80))
+
+    progress_render.print_after_status("first board", output_kind="todo_board")
+    progress_render.print_after_status("second board", output_kind="todo_board")
+
+    text = output.getvalue()
+    assert "first board" in text
+    assert "second board" in text
+    assert "\x1b[1A\x1b[2K" in text
+
+
+def test_non_board_output_prevents_erasing_logs(monkeypatch, tmp_path):
+    import io
+    from rich.console import Console
+    from tools import progress_render
+
+    output = io.StringIO()
+    monkeypatch.setattr(progress_render, "STATE_FILE", str(tmp_path / "terminal_progress_state.json"))
+    monkeypatch.setattr(progress_render, "console", Console(file=output, force_terminal=True, color_system=None, width=80))
+
+    progress_render.print_after_status("first board", output_kind="todo_board")
+    progress_render.print_after_status("ordinary log")
+    progress_render.print_after_status("second board", output_kind="todo_board")
+
+    assert "\x1b[1A\x1b[2K" not in output.getvalue()
+
+
+def test_stale_todo_board_state_does_not_erase_terminal(monkeypatch, tmp_path):
+    import io
+    import json
+    import time
+    from rich.console import Console
+    from tools import progress_render
+
+    output = io.StringIO()
+    state_file = tmp_path / "terminal_progress_state.json"
+    state_file.write_text(json.dumps({"kind": "todo_board", "line_count": 3, "updated_at": time.time() - 999}), encoding="utf-8")
+    monkeypatch.setattr(progress_render, "STATE_FILE", str(state_file))
+    monkeypatch.setattr(progress_render, "console", Console(file=output, force_terminal=True, color_system=None, width=80))
+
+    progress_render.print_after_status("new board", output_kind="todo_board")
+
+    assert "\x1b[1A\x1b[2K" not in output.getvalue()

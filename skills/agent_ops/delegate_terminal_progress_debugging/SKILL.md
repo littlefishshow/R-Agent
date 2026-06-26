@@ -33,12 +33,19 @@ description: "诊断修复 delegate 看板显示与并发状态问题"
    - 同一进程内使用 `threading.RLock()`，跨隔离工具进程时使用文件锁（Unix/macOS 可用 `fcntl.flock`）。
    - 保存 JSON 时写入临时文件，再用 `os.replace()` 原子替换，避免快照读到半写文件。
 
-5. **补充回归测试**
+5. **Todo 看板原地覆盖刷新**
+   - 把 Rich status 暂停/恢复、Todo Progress 面板行数记录、ANSI 清屏逻辑抽到共享 helper（当前为 `tools/progress_render.py`），避免 `todo_tool` 与 `delegate_tool` 复制实现。
+   - 只对连续 `output_kind='todo_board'` 的看板执行覆盖；任何普通日志输出都应把终端状态标记为 `other`，防止后续看板回退清除中间日志。
+   - 看板覆盖状态应写入 `sandbox/` 下的短期状态文件并带 `updated_at`，设置短期过期保护，避免下一次启动或长时间间隔后误擦除终端内容。
+   - 提供环境变量开关（当前为 `RAGENT_TODO_OVERWRITE=0/false/no/off`）禁用覆盖，便于不支持 ANSI 的终端或日志采集场景回退为普通追加输出。
+
+6. **补充回归测试**
    - 用 fake `RAgent` 模拟子 Agent 并发 claim/update，不依赖真实 LLM。
    - 覆盖截断子 Agent 自动把 `in_progress` 标记为 `blocked`。
    - 覆盖最终快照显示 `完成进度：N/N (100.0%)`。
    - 覆盖 Todo Progress 面板明确展示“✅ 已完成任务”和“🕓 未完成任务”明细；未完成列表应列出 pending/in_progress/blocked/needs_split/failed/cancelled 等具体任务 id、描述、状态和分配信息，不能只显示总数、状态计数或 ready id。
    - 覆盖 status-safe print 会调用 `stop()` 与 `start()`。
+   - 覆盖连续 Todo 看板会输出 ANSI 清屏序列，普通日志和陈旧状态会阻止覆盖。
 
 ## Verification
 

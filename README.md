@@ -239,6 +239,14 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-06-26
+
+#### Todo 看板原地刷新
+
+- **支持连续 Todo 看板覆盖上一版**：新增 `tools/progress_render.py` 统一处理 Rich status 暂停、Todo Progress 面板行数记录和 ANSI 清屏；连续打印新的 Todo 看板时会在真实终端中原地覆盖上一块看板，减少历史面板刷屏。
+- **避免误删普通日志和陈旧终端状态**：非看板输出会把终端状态标记为 ordinary output，后续 Todo 看板不会回退清除这些日志；看板状态还带有短期有效期，避免下一次启动或长时间间隔后误擦除终端内容。
+- **补充回归测试**：扩展 `tests/test_delegate_progress.py`，覆盖连续看板输出包含清屏序列、普通日志和陈旧状态会阻止覆盖，以及原有 status stop/start 行为继续有效。
+
 ### 2026-06-25
 
 #### Hermes 自演进机制融入（大版本升级）

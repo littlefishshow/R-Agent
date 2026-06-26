@@ -5,10 +5,8 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
 from tools.registry import registry
-from rich.console import Console
 from rich.panel import Panel
-
-console = Console()
+from tools import progress_render
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TODO_FILE = os.path.join(BASE_DIR, "sandbox", "todo_list.json")
@@ -173,42 +171,9 @@ STATUS_LABELS = {
 }
 
 
-def _current_cli_status():
-    """Return the active CLI Rich status exposed by main.py/__main__."""
-    try:
-        import sys
-
-        for module_name in ("__main__", "main"):
-            module = sys.modules.get(module_name)
-            status = getattr(module, "ACTIVE_STATUS", None) if module is not None else None
-            if status is not None:
-                return status
-    except Exception:
-        return None
-    return None
-
-
-def _print_after_status(renderable=None, *args, **kwargs):
+def _print_after_status(renderable=None, *args, output_kind: str = "other", **kwargs):
     """Print todo progress without colliding with the parent CLI spinner."""
-    status = _current_cli_status()
-    stopped = False
-    if status is not None:
-        try:
-            status.stop()
-            stopped = True
-        except Exception:
-            stopped = False
-    try:
-        if renderable is None:
-            console.print(*args, **kwargs)
-        else:
-            console.print(renderable, *args, **kwargs)
-    finally:
-        if stopped:
-            try:
-                status.start()
-            except Exception:
-                pass
+    progress_render.print_after_status(renderable, *args, output_kind=output_kind, **kwargs)
 
 
 def _shorten(text, limit=90):
@@ -279,7 +244,7 @@ def _todo_snapshot_text(state: Dict[str, Any], label: str = "当前任务看板"
 
 
 def _print_todo_snapshot(state: Dict[str, Any], label: str = "当前任务看板") -> None:
-    _print_after_status(Panel(_todo_snapshot_text(state, label), title="Todo Progress", border_style="yellow", expand=False))
+    _print_after_status(Panel(_todo_snapshot_text(state, label), title="Todo Progress", border_style="yellow", expand=False), output_kind="todo_board")
 
 
 def _children_of(state: Dict[str, Any], parent_id: Optional[str]) -> List[Dict[str, Any]]:

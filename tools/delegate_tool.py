@@ -1,53 +1,23 @@
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tools.registry import registry
-from rich.console import Console
 from rich.panel import Panel
-
-console = Console()
+from tools import progress_render
 
 
 def _current_cli_status():
-    """Return the active CLI Rich status exposed by main.py/__main__."""
-    try:
-        import sys
-
-        for module_name in ("__main__", "main"):
-            module = sys.modules.get(module_name)
-            status = getattr(module, "ACTIVE_STATUS", None) if module is not None else None
-            if status is not None:
-                return status
-    except Exception:
-        return None
-    return None
+    return progress_render._current_cli_status()
 
 
-def _print_after_status(renderable=None, *args, **kwargs):
-    """Print tool progress without colliding with the parent CLI status line.
-
-    In concise mode the parent CLI keeps a Rich status spinner active while tool
-    code writes directly to stdout. Pausing the status before printing prevents
-    panels from being rendered on the same physical terminal line as the spinner.
-    """
-    status = _current_cli_status()
-    stopped = False
-    if status is not None:
-        try:
-            status.stop()
-            stopped = True
-        except Exception:
-            stopped = False
-    try:
-        if renderable is None:
-            console.print(*args, **kwargs)
-        else:
-            console.print(renderable, *args, **kwargs)
-    finally:
-        if stopped:
-            try:
-                status.start()
-            except Exception:
-                pass
+def _print_after_status(renderable=None, *args, output_kind: str = "other", **kwargs):
+    """Print tool progress without colliding with the parent CLI status line."""
+    progress_render.print_after_status(
+        renderable,
+        *args,
+        status_getter=_current_cli_status,
+        output_kind=output_kind,
+        **kwargs,
+    )
 
 
 TRUNCATION_MARKER = "已达迭代上限"
@@ -168,7 +138,7 @@ def _todo_snapshot_text(label="当前任务快照", scheduled_tasks=None):
 
 
 def _print_todo_snapshot(label="当前任务快照", scheduled_tasks=None):
-    _print_after_status(Panel(_todo_snapshot_text(label, scheduled_tasks), title="Todo Progress", border_style="yellow", expand=False))
+    _print_after_status(Panel(_todo_snapshot_text(label, scheduled_tasks), title="Todo Progress", border_style="yellow", expand=False), output_kind="todo_board")
 
 
 def _get_todo_task(task_id):
