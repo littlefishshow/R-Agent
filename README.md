@@ -36,11 +36,111 @@ OPENAI_API_KEY="你的_API_KEY"
 LLM_MODEL="gpt-4o"
 ```
 
-## 3. Gateway 服务模式：本地启动与微信/飞书/QQ 接入
+## 3. `/bbb` 语音输入：本地 whisper.cpp 转写
+
+本项目已开启 `/bbb` 语音输入入口：在 CLI 聊天框输入 `/bbb` 后开始录音，按 `Enter` 停止并转写，按 `Esc` 取消。
+
+转写后端由 `.env` 决定。作为开源项目的默认推荐配置，R-Agent 建议使用 **本地 `whisper.cpp`** 后端：
+
+- 不需要 OpenAI Audio Transcriptions API；
+- 不需要为语音转写支付在线 API 费用；
+- 录音默认仅作为临时文件处理，转写结束后清理；
+- 需要用户自行安装 `whisper.cpp` 并下载本地模型文件。
+
+如果你不想使用本地语音输入，可以不配置以下 `VOICE_INPUT_*` 项；如需改回在线 OpenAI/Azure 兼容转写，可把 `VOICE_INPUT_STT_BACKEND` 改为 `online`、`openai` 或 `azure`，并配置对应 API Key/Base URL。
+
+### 3.1 安装 whisper.cpp
+
+macOS 推荐使用 Homebrew：
+
+```bash
+brew install whisper-cpp
+```
+
+安装后确认命令可用：
+
+```bash
+whisper-cli --help
+```
+
+如果你的系统不是 macOS，或不使用 Homebrew，请参考 whisper.cpp 官方仓库安装/编译：
+
+```text
+https://github.com/ggml-org/whisper.cpp
+```
+
+### 3.2 下载本地模型
+
+模型文件不提交到 git。建议把模型放在项目本地 `models/whisper.cpp/` 下，该目录已被 `.gitignore` 忽略。
+
+下载 `base` 模型示例：
+
+```bash
+mkdir -p models/whisper.cpp
+curl -L --fail -o models/whisper.cpp/ggml-base.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+```
+
+模型选择建议：
+
+| 模型 | 速度 | 准确率 | 适合场景 |
+|---|---:|---:|---|
+| `ggml-tiny.bin` | 最快 | 较低 | 功能测试 |
+| `ggml-base.bin` | 快 | 一般 | 默认推荐起步 |
+| `ggml-small.bin` | 中等 | 较好 | 中文日常使用 |
+| `ggml-medium.bin` | 较慢 | 更好 | 对准确率要求更高 |
+
+更多模型可在这里获取：
+
+```text
+https://huggingface.co/ggerganov/whisper.cpp/tree/main
+https://ggml.ggerganov.com/
+```
+
+### 3.3 `.env` 配置
+
+复制 `.env.example` 为 `.env` 后，确认或填写以下配置：
+
+```env
+# 启用本地 whisper.cpp 转写，避免在线语音转写费用
+VOICE_INPUT_STT_BACKEND="whispercpp"
+VOICE_INPUT_LANGUAGE="zh"
+VOICE_INPUT_STT_TIMEOUT="120"
+
+# 如果 whisper-cli 已在 PATH 中，可直接写 whisper-cli；也可以写绝对路径
+VOICE_INPUT_WHISPERCPP_BIN="whisper-cli"
+VOICE_INPUT_WHISPERCPP_MODEL="models/whisper.cpp/ggml-base.bin"
+VOICE_INPUT_WHISPERCPP_THREADS="4"
+VOICE_INPUT_WHISPERCPP_EXTRA_ARGS=""
+```
+
+如果 `whisper-cli` 不在 PATH 中，macOS Homebrew 常见路径是：
+
+```env
+VOICE_INPUT_WHISPERCPP_BIN="/opt/homebrew/bin/whisper-cli"
+```
+
+### 3.4 验证 whisper.cpp 转写
+
+安装和模型下载完成后，可先用任意 WAV 文件验证：
+
+```bash
+whisper-cli -m models/whisper.cpp/ggml-base.bin -f your-audio.wav -l zh -otxt -of sandbox/whisper-test
+```
+
+验证通过后，重启 R-Agent，在聊天框输入：
+
+```text
+/bbb
+```
+
+即可开始本地语音输入。
+
+## 4. Gateway 服务模式：本地启动与微信/飞书/QQ 接入
 
 R-Agent 现在可以通过 `gateway/` 作为 HTTP 服务运行，并接入飞书 Bot、微信公众号，或通过 QQ 官方/中间层机器人方案接入 QQ。
 
-### 3.1 本地启动 Gateway
+### 4.1 本地启动 Gateway
 
 安装依赖：
 
@@ -91,7 +191,7 @@ curl -X POST http://127.0.0.1:8080/v1/chat \
 
 如果返回 `answer` 字段，说明 Gateway 已经正常调用 R-Agent。
 
-### 3.2 暴露公网 HTTPS 地址
+### 4.2 暴露公网 HTTPS 地址
 
 飞书、微信和 QQ 平台回调都需要公网 HTTPS 地址，不能直接填写 `127.0.0.1`。
 
@@ -115,7 +215,7 @@ cloudflared tunnel --url http://localhost:8080
 # QQ 当前建议先通过中间层调用 /v1/chat；若实现 QQ webhook adapter，可使用 /webhook/qq
 ```
 
-### 3.3 接入飞书 Bot
+### 4.3 接入飞书 Bot
 
 飞书推荐先开启异步 webhook，避免 R-Agent 思考时间过长导致回调超时：
 
@@ -152,7 +252,7 @@ python3 -m gateway.server --host 0.0.0.0 --port 8080
 7. 在权限管理中添加机器人接收消息、发送消息相关权限，并发布/安装应用。
 8. 私聊机器人或在群里 @机器人即可测试。
 
-### 3.4 接入微信公众号
+### 4.4 接入微信公众号
 
 > 个人微信没有官方 Bot webhook，不建议使用非官方个人微信协议。当前 Gateway 支持的是微信公众号明文 XML 回调的最小接入。
 
@@ -229,7 +329,7 @@ pip install PyNaCl>=1.5.0
 
 `requirements.txt` 已包含该依赖。QQ 官方对 AIGC 接入有合规要求，请遵守平台规则；不建议使用非官方个人 QQ 协议。
 
-### 3.6 常见问题
+### 4.6 常见问题
 
 - **本地能访问，飞书/微信访问不到**：需要公网 HTTPS，使用 ngrok/cloudflared 或正式服务器域名。
 - **飞书不回复**：检查 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN`、事件订阅、权限和应用是否已发布。
@@ -238,6 +338,26 @@ pip install PyNaCl>=1.5.0
 - **需要更完整部署说明**：参考 `gateway/docs/DEPLOYMENT.md`；更详细平台接入说明见 `gateway/docs/CONNECTORS.md`。
 
 ## 更新日志
+
+### 2026-06-27
+
+
+#### CLI /project_list 项目进度载入
+
+- **新增 `/project_list` 本地命令**：扫描 `skills/**/Project_progress/` 下除 `README.md` 外的项目进度文件，在终端列出项目名、所属 skill、更新时间和文件名。
+- **支持手动选择载入上下文**：用户可输入单个编号或逗号分隔的多个编号；选中的进度文件会作为 system 上下文追加到当前 Agent 会话，便于恢复长期/未完成项目上下文。
+- **保留安全提醒**：载入内容明确标注来自旧进度文件，后续仍需结合当前工作区真实文件和 git diff 判断，避免只依赖陈旧上下文。
+
+#### CLI /bbb 语音输入聊天
+
+- **新增 `/bbb` 本地语音输入命令**：在终端聊天框输入 `/bbb` 后进入麦克风监听流程；按 `Enter` 停止监听并转写为文字，按 `Esc` 取消本次监听并返回聊天框。
+- **识别结果按正常用户输入进入 Agent**：语音转写成功后会在终端显示为 `👤 You>`，并继续走原有 `agent.run_conversation()` 对话链路，不作为普通斜杠命令吞掉。
+- **补全与帮助同步更新**：启动欢迎信息、`/help` 文案、斜杠命令补全均加入 `/bbb`。
+- **明确交互提示与取消语义**：开始监听、`Enter` 停止识别、`Esc` 取消、识别中、空音频/空文本等所有需要用户操作或等待的位置都会给出终端提示。
+- **录音/转写实现**：优先使用可选 Python 录音后端 `sounddevice`，未安装时降级尝试系统 `sox`/`rec`/`arecord`/`ffmpeg`；`ffmpeg` 后端可用 `VOICE_INPUT_FFMPEG_DEVICE` 指定录音设备；转写默认调用 OpenAI 兼容 Audio Transcriptions 接口，默认模型 `whisper-1`，可通过 `VOICE_INPUT_STT_MODEL` 与 `VOICE_INPUT_LANGUAGE` 配置。
+- **新增本地 whisper.cpp 转写后端**：可设置 `VOICE_INPUT_STT_BACKEND="whispercpp"`，让 `/bbb` 录音后调用本机 `whisper.cpp` CLI 转写，不再依赖 OpenAI/Azure API Key；README 已补充是否启用该功能、`.env`/`.env.example` 配置项、Homebrew 安装方式和模型下载命令；需配置 `VOICE_INPUT_WHISPERCPP_BIN` 指向 `whisper-cli`，并配置 `VOICE_INPUT_WHISPERCPP_MODEL` 指向本地 ggml/gguf 模型文件，可用 `VOICE_INPUT_WHISPERCPP_THREADS`、`VOICE_INPUT_STT_TIMEOUT` 和 `VOICE_INPUT_WHISPERCPP_EXTRA_ARGS` 调整性能与参数。
+- **增强 `/bbb` 错误诊断**：转写前会校验 WAV 是否为空、过短或损坏；遇到 `unexpected end of JSON input` / 400 类转写错误时，会提示单独配置支持音频转写的 `VOICE_INPUT_BASE_URL`、`VOICE_INPUT_API_KEY`、`VOICE_INPUT_STT_MODEL`，并检查 `VOICE_INPUT_FFMPEG_DEVICE`；本地 whisper.cpp 后端会提示检查 `VOICE_INPUT_WHISPERCPP_BIN`、`VOICE_INPUT_WHISPERCPP_MODEL` 与超时配置。
+- **补充回归测试**：新增 `tests/test_voice_input_cli.py`，覆盖 `/bbb` 命令识别、转写结果兼容处理、取消时不转写、成功转写后清理临时音频并回显用户输入、ffmpeg 后端命令、音频校验、转写错误提示、whisper.cpp 命令构造/输出解析/无 API Key 本地转写和 `/project_list` 项目载入。新增根目录 `pytest.ini`，默认排除 `sandbox/` 测试副本，避免全量 pytest 收集到本地验证产物。
 
 ### 2026-06-26
 

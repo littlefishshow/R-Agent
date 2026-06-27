@@ -43,7 +43,7 @@ def get_max_iterations():
     try:
         return int(os.environ.get("MAX_ITERATIONS", "30"))
     except ValueError:
-        return 30
+        return 50
 
 def get_soft_warn_ratio():
     """软提醒阈值占 max_iterations 的比例（达到此比例后注入提醒）。"""
