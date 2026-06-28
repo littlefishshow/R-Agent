@@ -36,7 +36,78 @@ OPENAI_API_KEY="你的_API_KEY"
 LLM_MODEL="gpt-4o"
 ```
 
-## 3. `/bbb` 语音输入：本地 whisper.cpp 转写
+## 3. R-Agent Cockpit 可视化窗口界面
+
+R-Agent 现在提供一个浏览器版可视化驾驶舱 **R-Agent Cockpit**，用于在非终端窗口中聊天，并查看“当前如果继续对话，会塞给大模型的上下文”。
+
+### 3.1 一键启动
+
+在项目根目录执行：
+
+```bash
+bash scripts/start_cockpit.sh
+```
+
+脚本会自动：
+
+1. 检查 `python3` 与 `npm`；
+2. 首次启动时在 `app_gui_frontend/` 下执行 `npm install`；
+3. 启动后端 API：`http://127.0.0.1:8765`；
+4. 启动前端页面：`http://127.0.0.1:5173`；
+5. 在 macOS 上自动打开浏览器；
+6. 按 `Ctrl+C` 时同时停止前端和后端。
+
+可选端口配置：
+
+```bash
+R_AGENT_COCKPIT_PORT=8765 R_AGENT_COCKPIT_FRONTEND_PORT=5173 bash scripts/start_cockpit.sh
+```
+
+### 3.2 手动启动
+
+如果你想分别启动后端和前端，可打开两个终端。
+
+终端 1：
+
+```bash
+cd /path/to/R-Agent
+PYTHONPATH=. python3 -m app_gui.server
+```
+
+终端 2：
+
+```bash
+cd /path/to/R-Agent/app_gui_frontend
+npm install
+npm run dev
+```
+
+然后访问：
+
+```text
+http://127.0.0.1:5173
+```
+
+### 3.3 当前 Cockpit 能看到什么
+
+当前界面采用三栏布局：
+
+- 左侧：`Current Model Context`，展示当前下一轮请求会直接发给模型的上下文模块；
+- 中间：只展示 assistant 最后一条回复；
+- 右侧：点击左侧上下文叶子项后查看具体内容，长文本默认按块折叠为最多四行，可展开。
+
+上下文树目前区分：
+
+- **LLM Visible**：会直接发给模型的内容，包括 system prompt、当前 conversation messages、tools schema；
+- **Available by Tool / Notes**：默认不全文发给模型，但可通过工具读取或影响未来会话的内容，例如 skills 和 live memory 说明。
+
+### 3.4 常见问题
+
+- 如果页面报 `session is already running`，说明当前会话的上一条消息仍在运行；请等待、点击 `Stop`，或重启后端。
+- 如果前端页面连接不上，先检查后端：`http://127.0.0.1:8765/health`。
+- 如果首次启动前端依赖失败，可进入 `app_gui_frontend/` 手动执行 `npm install`。
+
+## 4. `/bbb` 语音输入：本地 whisper.cpp 转写
 
 本项目已开启 `/bbb` 语音输入入口：在 CLI 聊天框输入 `/bbb` 后开始录音，按 `Enter` 停止并转写，按 `Esc` 取消。
 
@@ -49,7 +120,7 @@ LLM_MODEL="gpt-4o"
 
 如果你不想使用本地语音输入，可以不配置以下 `VOICE_INPUT_*` 项；如需改回在线 OpenAI/Azure 兼容转写，可把 `VOICE_INPUT_STT_BACKEND` 改为 `online`、`openai` 或 `azure`，并配置对应 API Key/Base URL。
 
-### 3.1 安装 whisper.cpp
+### 4.1 安装 whisper.cpp
 
 macOS 推荐使用 Homebrew：
 
@@ -69,7 +140,7 @@ whisper-cli --help
 https://github.com/ggml-org/whisper.cpp
 ```
 
-### 3.2 下载本地模型
+### 4.2 下载本地模型
 
 模型文件不提交到 git。建议把模型放在项目本地 `models/whisper.cpp/` 下，该目录已被 `.gitignore` 忽略。
 
@@ -346,6 +417,53 @@ pip install PyNaCl>=1.5.0
 - **修复后台工具日志污染输入行**：后台自演进复盘 Agent 现在显式传入 no-op `on_think` / `on_tool_start` / `on_tool_end` 回调，避免在主 CLI 已显示 `You>` 后继续输出 `[Tool Call]` / `[Tool Result]`。
 - **核心 Agent 默认静默**：移除 `core/agent.py` 在无 UI 回调路径下的裸 `print` fallback；思考状态、工具调用和工具结果只应由 CLI 层或调用方回调负责展示。
 - **降低 Rich/prompt_toolkit 输出串线风险**：后台复盘仍写入 `outputs/self_evolution/latest_review.json` 等日志，但不直接写用户终端，避免与右侧 token 提示和输入提示混排。
+
+#### Project Progress 上下文合并与清理
+
+- **增强 `/project_list` 清理能力**：在项目进度列表中继续支持直接输入编号载入上下文，同时新增 `1,2 del` / `delete` / `rm` / `remove` 后缀删除选中文件，便于清理已经合并或不再需要的旧上下文。
+- **默认保存时合并压缩旧上下文**：`project_progress.py save` 现在默认读取同日同项目旧文件，将最近 entry 的关键字段压缩到 `Prior Context Considered` 后覆盖写入当前 entry，避免新对话载入旧上下文后再次保存造成旧+新重复膨胀。
+- **保留显式追加模式**：只有确实需要完整历史流水时才使用 `--append`；新增脚本级 `delete/remove/rm` 子命令，用于安全删除 `Project_progress/` 内的指定文件或最新文件。
+- **同步更新 Skill 文档**：`skills/agent_ops/project_progress_context/SKILL.md` 与 `Project_progress/README.md` 补充了默认合并策略、删除入口和注意事项。
+
+#### `/bbb` 录音稳定性与退出卡死修复
+
+- **修复录音命令 stderr 阻塞风险**：`/bbb` 通过 `ffmpeg` / `sox` / `arecord` 等系统命令录音时不再把 stderr 接到未消费的 PIPE，避免日志缓冲区填满后导致录音进程卡住、按 Enter 后没有可用录音。
+- **增强录音停止兜底**：录音线程停止后会检查线程是否仍存活；若录音后端未能在超时时间内释放麦克风/退出进程，会明确提示“录音后端停止超时”，避免继续转写半写入或空 WAV 文件。
+- **修复 `SELF_EVOLUTION_REVIEW_INTERVAL=0` 关闭语义**：后台自演进复盘现在只有 interval 大于 0 时才会自动调度，避免配置为 0 时反而每轮触发后台复盘。
+- **降低 `exit` 卡死风险**：`RAgent` 增加后台任务跟踪、shutdown event 与 `shutdown_background_tasks()`；CLI 在 `exit` / `quit` / Ctrl-C / EOF 退出前会请求后台任务停止并短暂等待。
+- **降低后台自演进复杂度**：CLI 自动后台复盘默认改为 heuristic dry-run，不再在后台线程中启动受限 review Agent 与隔离工具子进程，避免 macOS 多线程 fork / multiprocessing 清理阶段与主 CLI 退出竞争。
+- **补充回归测试**：覆盖自演进 interval=0 不触发、interval>0 调度后台复盘、后台任务 shutdown、录音线程停止超时、录音进程无法终止兜底、stderr 使用 DEVNULL，以及 CLI 退出时调用后台任务清理。
+
+#### R-Agent Cockpit 可视化界面 Phase 0/1
+
+- **新增 GUI 上下文事件基础模块**：新增 `app_gui/` 包，提供 `schemas.py`、`normalizer.py`、`event_bus.py`、`snapshot_store.py`，为非终端可视化窗口界面建立统一事件、消息规范化、长 payload 引用和 JSONL 事件保存基础。
+- **Agent Loop 增加可选观测埋点**：`RAgent.run_conversation()` 与续跑路径新增可选 `event_sink`，在不影响现有 CLI 的前提下发送 `message_appended`、`llm_request_snapshot`、`llm_response_received`、`tool_call_started`、`tool_call_finished`、`tool_result_appended`、`truncation_forced` 等事件。
+- **支持展示模型实际可见上下文**：新增 LLM request snapshot，用于 GUI 后续展示每轮实际发给模型的 `messages + tools schema`，为“所有上下文可视化”提供数据源。
+- **新增长内容懒加载基础**：`ContextSnapshotStore` 可把大段工具结果、文件内容或 prompt 保存为 payload 文件，事件中只保留 preview、size、truncated 和 payload id，便于前端折叠/点击展开。
+- **补充 GUI 事件流测试**：新增 `tests/test_gui_context_events.py`，覆盖 SDK-like message/tool_calls 规范化、payload ref 保存与读取、LLM request snapshot，以及 fake tool call 下 Agent 事件顺序和工具结果捕获。
+
+#### R-Agent Cockpit Phase 2：本地后端服务
+
+- **新增 GUI Runtime Service**：新增 `app_gui/runtime.py`，提供 `AgentRuntimeService` 与 `GuiSession`，支持创建会话、构造并记录 system prompt / memory snapshot、发送消息、后台运行、interrupt、shutdown、事件查询和 payload 查询。
+- **新增 FastAPI 服务入口**：新增 `app_gui/server.py`，定义 `/health`、`/sessions`、`/sessions/{id}/send`、`/sessions/{id}/interrupt`、`/sessions/{id}/events`、`/sessions/{id}/payloads/{payload_id}` 与 WebSocket `/sessions/{id}/ws`，为后续 Tauri/React 前端提供本地 API。
+- **可选依赖显式化**：`requirements.txt` 增加 `fastapi` 与 `uvicorn`；未安装 GUI 服务依赖时模块仍可导入，启动服务会给出清晰错误。
+- **补充 Runtime 测试**：新增 `tests/test_gui_runtime.py`，覆盖 session 创建时的 prompt/memory 事件、同步发送消息事件落盘、interrupt 状态和 server 模块导入兼容。
+
+#### R-Agent Cockpit Phase 3：React 三栏前端 MVP
+
+- **新增前端 MVP 脚手架**：新增 `app_gui_frontend/`，使用 Vite + React + TypeScript，提供 `ContextTree`、`ChatPane`、`Inspector`、`Timeline` 四块核心 UI，形成左侧上下文矩阵、中间聊天、右侧详情检查器、底部事件时间线的三栏 HUD 布局。
+- **实现基础 API 客户端**：`src/api.ts` 支持创建 session、发送消息、interrupt、拉取 events、拉取 payload、连接 WebSocket，为前端实时展示 Agent 上下文事件打通入口。
+- **支持 payload 点击展开**：Inspector 能递归查找事件中的 `payload_ref`，展示 preview，并通过 `/payloads/{payload_id}` 拉取完整内容，支撑长 prompt/工具结果/文件内容折叠展开。
+- **增强后端前端集成**：`app_gui/server.py` 增加 CORS、`/frontend` 状态接口、构建产物 `/app` 静态挂载；WebSocket 循环改为带 receive timeout 的轮询，避免客户端断开后服务端无感知地长期空转。
+- **补充前端结构测试**：新增 `tests/test_gui_frontend_structure.py`，在不依赖 npm install 的情况下验证前端关键文件、三栏布局、API 路径和后端静态挂载/CORS 入口。
+
+#### R-Agent Cockpit Phase 4：资源上下文面板
+
+- **新增资源快照接口**：`GuiSession.resources()` 与 `/sessions/{session_id}/resources` 汇总 tools schema、skills 列表、frozen/live memory 以及 `outputs/self_evolution/latest_review.json`，为前端提供除实时事件流外的全局上下文入口。
+- **前端 Context Matrix 增加 Resources 分组**：左侧上下文矩阵新增 Tools、Skills、Memory、Self Evolution 资源节点，点击后可在 Inspector 中查看对应 JSON 和 payload preview。
+- **Memory/Skill 长内容继续走 payload_ref**：skills 列表、frozen memory、live memory 和 self-evolution review 会写入 `ContextSnapshotStore` payload，前端可复用“点击展开完整 Payload”能力。
+- **补充资源接口与前端结构测试**：扩展 `tests/test_gui_runtime.py` 与 `tests/test_gui_frontend_structure.py`，覆盖 resources 返回结构、前端资源节点、`/resources` API 路径和后端路由存在性。
+
 
 ### 2026-06-27
 

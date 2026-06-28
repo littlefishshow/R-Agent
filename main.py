@@ -261,7 +261,9 @@ def _record_audio_with_command(path: str, stop_event: threading.Event, sample_ra
         recorder,
         stdin=subprocess.PIPE if is_ffmpeg else subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
+        # 录音期间不读取 PIPE 容易被 ffmpeg/sox stderr 填满后阻塞；
+        # 这里保持静默，启动失败会由后续音频文件校验给出友好提示。
+        stderr=subprocess.DEVNULL,
         text=True,
     )
     try:
@@ -285,14 +287,12 @@ def _record_audio_with_command(path: str, stop_event: threading.Event, sample_ra
                     proc.wait(timeout=2)
                 except subprocess.TimeoutExpired:
                     proc.kill()
-                    proc.wait(timeout=2)
+                    try:
+                        proc.wait(timeout=2)
+                    except subprocess.TimeoutExpired as exc:
+                        raise RuntimeError("录音进程无法终止，请检查系统录音后端。") from exc
     if proc.returncode not in (0, -15, 143, None) and not os.path.exists(path):
-        stderr = ""
-        try:
-            stderr = proc.stderr.read() if proc.stderr else ""
-        except Exception:
-            pass
-        raise RuntimeError(f"系统录音命令执行失败: {stderr.strip()}")
+        raise RuntimeError(f"系统录音命令执行失败，退出码: {proc.returncode}")
 
 
 def _record_audio_until_keypress(console, path: str) -> bool:
@@ -355,6 +355,8 @@ def _record_audio_until_keypress(console, path: str) -> bool:
                 pass
         thread.join(timeout=5)
 
+    if thread.is_alive():
+        raise RuntimeError("录音后端停止超时，请检查麦克风权限或系统录音命令。")
     if result["error"] is not None:
         raise result["error"]
     return not cancelled
@@ -472,8 +474,37 @@ def _project_progress_choice_label(path: Path) -> str:
     return f"{project} | skill={skill_name} | {mtime} | {path.name}"
 
 
+def _parse_project_progress_selection(raw: str, total: int) -> tuple[list[int], bool, list[str]]:
+    """解析 /project_list 输入。支持 `1,2` 载入与 `1,2 del` 删除。"""
+    raw = (raw or "").strip()
+    delete_selected = False
+    match = re.search(r"(?:^|\s)(del|delete|rm|remove)\s*$", raw, flags=re.IGNORECASE)
+    if match:
+        delete_selected = True
+        raw = raw[: match.start()].strip()
+
+    selected: list[int] = []
+    bad: list[str] = []
+    seen: set[int] = set()
+    for part in raw.replace("，", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if not part.isdigit():
+            bad.append(part)
+            continue
+        idx = int(part)
+        if 1 <= idx <= total:
+            if idx not in seen:
+                selected.append(idx)
+                seen.add(idx)
+        else:
+            bad.append(part)
+    return selected, delete_selected, bad
+
+
 def load_project_progress_context(console, session: PromptSession, agent: RAgent, system_prompt: str) -> bool:
-    """交互式列出项目进度并载入选中文件到当前 Agent 上下文。"""
+    """交互式列出项目进度，并载入或删除选中文件。"""
     files = _find_project_progress_files()
     if not files:
         console.print("[bold yellow]当前没有找到 Project_progress 项目进度文件。[/bold yellow]")
@@ -482,7 +513,7 @@ def load_project_progress_context(console, session: PromptSession, agent: RAgent
     lines = ["**可载入的项目进度:**\n"]
     for i, path in enumerate(files, 1):
         lines.append(f"{i}. `{_project_progress_choice_label(path)}`")
-    lines.append("\n请输入要载入的项目编号；可用逗号选择多个；直接回车取消。")
+    lines.append("\n请输入要载入的项目编号；可用逗号选择多个；直接回车取消。若要删除选中文件，输入如 `1,2 del`。")
     console.print(Panel(Markdown("\n".join(lines)), title="📌 Project Progress", border_style="cyan", expand=False))
 
     raw = session.prompt(
@@ -493,25 +524,34 @@ def load_project_progress_context(console, session: PromptSession, agent: RAgent
         console.print("[yellow]已取消载入项目进度，返回聊天框。[/yellow]")
         return True
 
-    selected = []
-    bad = []
-    for part in raw.replace("，", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if not part.isdigit():
-            bad.append(part)
-            continue
-        idx = int(part)
-        if 1 <= idx <= len(files):
-            selected.append(files[idx - 1])
-        else:
-            bad.append(part)
+    indexes, delete_selected, bad = _parse_project_progress_selection(raw, len(files))
     if bad:
-        console.print(f"[bold red]无效编号：{', '.join(bad)}。已取消载入。[/bold red]")
+        action = "删除" if delete_selected else "载入"
+        console.print(f"[bold red]无效编号：{', '.join(bad)}。已取消{action}。[/bold red]")
         return True
-    if not selected:
+    if not indexes:
         console.print("[yellow]没有选择任何项目，返回聊天框。[/yellow]")
+        return True
+
+    selected = [files[idx - 1] for idx in indexes]
+
+    if delete_selected:
+        deleted = []
+        failed = []
+        for path in selected:
+            try:
+                path.unlink()
+                deleted.append(path)
+            except Exception as exc:  # pragma: no cover - defensive terminal feedback
+                failed.append((path, exc))
+        if deleted:
+            console.print(f"[bold green]🗑️ 已删除 {len(deleted)} 个项目进度文件。[/bold green]")
+            for path in deleted:
+                console.print(f"[dim]- {path}[/dim]")
+        if failed:
+            console.print(f"[bold red]有 {len(failed)} 个文件删除失败：[/bold red]")
+            for path, exc in failed:
+                console.print(f"[dim]- {path}: {exc}[/dim]")
         return True
 
     if not any(m.get("role") == "system" for m in agent.messages):
@@ -991,6 +1031,16 @@ def handle_slash_command(command_str: str, console) -> bool:
     console.print(f"[bold red]未知的命令: {cmd}[/bold red]")
     return True
 
+def _shutdown_agent(agent: RAgent, console, timeout: float = 1.0) -> None:
+    """退出 CLI 前收敛 Agent 后台任务，避免 exit 时与后台复盘竞争资源。"""
+    try:
+        alive = agent.shutdown_background_tasks(timeout=timeout)
+        if alive:
+            console.print(f"[dim yellow]仍有 {alive} 个后台任务未及时结束，已请求停止并继续退出。[/dim yellow]")
+    except Exception:
+        pass
+
+
 def main():
     display_welcome_banner()
     
@@ -1020,7 +1070,8 @@ def main():
                 rprompt=_format_token_usage_rprompt(agent),
             )
             
-            if user_input.lower() in ["exit", "quit"]:
+            if user_input.strip().lower() in ["exit", "quit"]:
+                _shutdown_agent(agent, console)
                 console.print("\n[bold yellow]👋 再见！[/bold yellow]")
                 break
             if not user_input.strip():
@@ -1168,6 +1219,7 @@ def main():
                 console.print()
             
         except (KeyboardInterrupt, EOFError):
+            _shutdown_agent(agent, console)
             console.print("\n[bold yellow]👋 再见！[/bold yellow]")
             break
         except Exception as e:

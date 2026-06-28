@@ -4,6 +4,16 @@ import json
 import threading
 from core import config
 from tools.registry import registry
+from app_gui.normalizer import build_llm_request_snapshot, normalize_message
+from app_gui.schemas import (
+    EVENT_LLM_REQUEST_SNAPSHOT,
+    EVENT_LLM_RESPONSE_RECEIVED,
+    EVENT_MESSAGE_APPENDED,
+    EVENT_TOOL_CALL_FINISHED,
+    EVENT_TOOL_CALL_STARTED,
+    EVENT_TOOL_RESULT_APPENDED,
+    EVENT_TRUNCATION_FORCED,
+)
 
 
 # 标记：当一次 run 因迭代上限而被强制收尾时，agent 把这个标记记到自身
@@ -16,6 +26,24 @@ TOKEN_USAGE_UNAVAILABLE = "unavailable"
 class AgentInterrupted(Exception):
     """用户主动中断当前 Agent 运行。"""
 
+
+
+
+def _emit_event(event_sink, event_type: str, payload=None, **kwargs) -> None:
+    if event_sink is None:
+        return
+    data = dict(payload or {})
+    data.update(kwargs)
+    try:
+        if hasattr(event_sink, "emit"):
+            event_sink.emit(event_type, data)
+        else:
+            event_sink(event_type, data)
+    except TypeError:
+        event_sink({"event_type": event_type, "payload": data})
+    except Exception:
+        # Observability must never break the core Agent loop.
+        pass
 
 def _is_cancelled(cancel_event=None) -> bool:
     """兼容 threading.Event 等带 is_set() 的取消信号。"""
@@ -110,6 +138,10 @@ class RAgent:
         self._soft_warned = False
         self._turns_since_self_review = 0
         self._enable_self_review = bool(enable_self_review)
+        self._background_threads = []
+        self._background_lock = threading.Lock()
+        self._shutdown_event = threading.Event()
+        self._background_errors = []
 
     def _compress_after_archive(self, summary: str, next_steps: str = ""):
         system_msgs = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "system"][:1]
@@ -120,18 +152,61 @@ class RAgent:
         }
         self.messages = system_msgs + [archive_msg] + recent_user
 
+    def _run_self_evolution_review(self, snapshot):
+        from tools.self_evolution_tool import self_evolution_review
+
+        # CLI 自动后台复盘默认使用 heuristic，避免在后台线程中再启动
+        # review Agent / 隔离工具子进程，降低 exit 与 macOS fork 卡死风险。
+        return self_evolution_review(
+            messages_snapshot=snapshot,
+            mode="heuristic",
+            dry_run=True,
+            use_forked_agent=False,
+        )
+
     def _schedule_self_evolution_review(self):
+        if self._shutdown_event.is_set():
+            return
         try:
-            from tools.self_evolution_tool import self_evolution_review
             snapshot = [m for m in self.messages[-20:] if isinstance(m, dict)]
+
+            def _worker():
+                try:
+                    if self._shutdown_event.is_set():
+                        return
+                    self._run_self_evolution_review(snapshot)
+                except Exception as exc:
+                    self._background_errors.append(str(exc))
+                finally:
+                    current = threading.current_thread()
+                    with self._background_lock:
+                        self._background_threads = [t for t in self._background_threads if t is not current]
+
             thread = threading.Thread(
-                target=self_evolution_review,
-                kwargs={"messages_snapshot": snapshot, "mode": "background_review", "dry_run": True},
+                target=_worker,
+                name="r-agent-self-evolution-review",
                 daemon=True,
             )
+            with self._background_lock:
+                self._background_threads.append(thread)
             thread.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            self._background_errors.append(str(exc))
+
+    def shutdown_background_tasks(self, timeout: float = 1.0) -> int:
+        """请求后台任务停止，并短暂等待；返回仍存活的后台线程数。"""
+        self._shutdown_event.set()
+        deadline = time.monotonic() + max(0.0, float(timeout or 0.0))
+        with self._background_lock:
+            threads = list(self._background_threads)
+        for thread in threads:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(timeout=remaining)
+        with self._background_lock:
+            self._background_threads = [t for t in self._background_threads if t.is_alive()]
+            return len(self._background_threads)
 
     # ------------------------------------------------------------------
     # Token usage helpers
@@ -269,7 +344,8 @@ class RAgent:
     # ------------------------------------------------------------------
     def run_conversation(self, user_message: str, system_message: str = None,
                          on_think=None, on_tool_start=None, on_tool_end=None,
-                         exclude_tools=None, cancel_event=None, tool_call_guard=None, allowed_tools=None) -> str:
+                         exclude_tools=None, cancel_event=None, tool_call_guard=None, allowed_tools=None,
+                         event_sink=None) -> str:
         """核心对话循环 (The Agent Loop)。
 
         cancel_event 用于 CLI 的 Esc 中断：一旦置位，当前轮会回滚到本次
@@ -277,9 +353,13 @@ class RAgent:
         抛出 AgentInterrupted。
         """
         if system_message and not any(m.get("role") == "system" for m in self.messages):
-            self.messages.append({"role": "system", "content": system_message})
+            system_msg = {"role": "system", "content": system_message}
+            self.messages.append(system_msg)
+            _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(system_msg)})
 
-        self.messages.append({"role": "user", "content": user_message})
+        user_msg = {"role": "user", "content": user_message}
+        self.messages.append(user_msg)
+        _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(user_msg)})
         rollback_index = len(self.messages)
 
         # 新一轮 run，复位截断/软提醒标记，并恢复默认预算。
@@ -295,9 +375,16 @@ class RAgent:
                                 exclude_tools=self._active_exclude_tools,
                                 cancel_event=cancel_event,
                                 tool_call_guard=tool_call_guard,
-                                allowed_tools=allowed_tools)
+                                allowed_tools=allowed_tools,
+                                event_sink=event_sink)
             self._turns_since_self_review += 1
-            if self._enable_self_review and self._turns_since_self_review >= config.get_self_evolution_review_interval():
+            review_interval = config.get_self_evolution_review_interval()
+            if (
+                self._enable_self_review
+                and review_interval > 0
+                and self._turns_since_self_review >= review_interval
+                and not self._shutdown_event.is_set()
+            ):
                 self._turns_since_self_review = 0
                 self._schedule_self_evolution_review()
             return result
@@ -310,7 +397,7 @@ class RAgent:
     def continue_after_truncation(self, extra_iterations: int,
                                   on_think=None, on_tool_start=None,
                                   on_tool_end=None, exclude_tools=None,
-                                  cancel_event=None) -> str:
+                                  cancel_event=None, event_sink=None) -> str:
         """
         在被强制截断后，由 CLI 询问用户并扩展预算后调用，直接续跑。
         不会让用户重新输入问题，messages 历史完整保留。
@@ -321,13 +408,15 @@ class RAgent:
         rollback_index = len(self.messages)
 
         # 在历史中追加一条 user 风格的指令：让模型继续推进未完成事项
-        self.messages.append({
+        resume_msg = {
             "role": "user",
             "content": (
                 f"【用户决定扩展 {extra_iterations} 轮思考预算】"
                 "请基于上面的「未完成事项」继续推进；如已无可推进事项，请直接给出最终答复。"
             ),
-        })
+        }
+        self.messages.append(resume_msg)
+        _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(resume_msg)})
         self.max_iterations += extra_iterations
         setattr(self, _TRUNCATED_FLAG, False)
         self._soft_warned = False
@@ -340,7 +429,8 @@ class RAgent:
             return self._loop(start_iteration=used_before, on_think=on_think,
                               on_tool_start=on_tool_start, on_tool_end=on_tool_end,
                               exclude_tools=active_exclude_tools,
-                              cancel_event=cancel_event)
+                              cancel_event=cancel_event,
+                              event_sink=event_sink)
         except AgentInterrupted:
             self.messages = self.messages[:rollback_index]
             setattr(self, _TRUNCATED_FLAG, False)
@@ -355,7 +445,7 @@ class RAgent:
     # ------------------------------------------------------------------
     def _loop(self, start_iteration: int, on_think=None,
               on_tool_start=None, on_tool_end=None, exclude_tools=None,
-              cancel_event=None, tool_call_guard=None, allowed_tools=None) -> str:
+              cancel_event=None, tool_call_guard=None, allowed_tools=None, event_sink=None) -> str:
         soft_threshold = max(1, int(self.max_iterations * config.get_soft_warn_ratio()))
         iteration = start_iteration
         excluded = set(exclude_tools or [])
@@ -385,6 +475,13 @@ class RAgent:
             if tools:
                 kwargs["tools"] = tools
 
+            _emit_event(event_sink, EVENT_LLM_REQUEST_SNAPSHOT, build_llm_request_snapshot(
+                model=self.model,
+                messages=self.messages,
+                tools=tools,
+                iteration=iteration,
+            ))
+
             if on_think:
                 on_think(iteration)
 
@@ -403,7 +500,9 @@ class RAgent:
             if _is_cancelled(cancel_event):
                 raise AgentInterrupted()
             message = response.choices[0].message
+            _emit_event(event_sink, EVENT_LLM_RESPONSE_RECEIVED, {"message": normalize_message(message)})
             self.messages.append(message)
+            _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(message)})
 
             if message.tool_calls:
                 for tool_call in message.tool_calls:
@@ -412,6 +511,11 @@ class RAgent:
                     func_name = tool_call.function.name
                     func_args = tool_call.function.arguments
 
+                    _emit_event(event_sink, EVENT_TOOL_CALL_STARTED, {
+                        "call_id": getattr(tool_call, "id", None),
+                        "name": func_name,
+                        "arguments": func_args,
+                    })
                     if on_tool_start:
                         on_tool_start(func_name, func_args)
 
@@ -430,8 +534,20 @@ class RAgent:
                         # delegate_task 是父进程调度器：内部会启动线程/子 Agent，并需要
                         # 直接向当前终端打印 Rich 看板。若再放进隔离工具进程，容易形成
                         # “隔离进程 -> 线程池 -> 工具子进程”的嵌套 fork，macOS 下会
-                        # 无返回崩溃，也会让 CLI status 无法正确让出终端行。
-                        result = registry.execute_tool(func_name, func_args)
+                        # 无返回崩溃，也会让 CLI status 无法正确让出终端行。GUI 模式下
+                        # 额外注入 event_sink，用于捕获子 Agent 上下文。
+                        if event_sink is not None:
+                            try:
+                                delegate_args = json.loads(func_args or "{}")
+                                if isinstance(delegate_args, dict):
+                                    delegate_args["event_sink"] = event_sink
+                                    result = registry._tools[func_name]["handler"](**delegate_args)
+                                else:
+                                    result = registry.execute_tool(func_name, func_args)
+                            except Exception as exc:
+                                result = json.dumps({"error": str(exc)}, ensure_ascii=False)
+                        else:
+                            result = registry.execute_tool(func_name, func_args)
                     else:
                         result = registry.execute_tool_isolated(
                             func_name,
@@ -443,15 +559,25 @@ class RAgent:
                     if _is_cancelled(cancel_event):
                         raise AgentInterrupted()
 
+                    _emit_event(event_sink, EVENT_TOOL_CALL_FINISHED, {
+                        "call_id": getattr(tool_call, "id", None),
+                        "name": func_name,
+                        "arguments": func_args,
+                        "result": result,
+                    })
                     if on_tool_end:
                         on_tool_end(func_name, result)
 
-                    self.messages.append({
+                    tool_msg = {
                         "role": "tool",
                         "tool_call_id": tool_call.id,
                         "name": func_name,
                         "content": result,
-                    })
+                    }
+                    self.messages.append(tool_msg)
+                    normalized_tool_msg = normalize_message(tool_msg)
+                    _emit_event(event_sink, EVENT_TOOL_RESULT_APPENDED, {"message": normalized_tool_msg})
+                    _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalized_tool_msg})
                     if func_name == "archive_subtask":
                         try:
                             outer = json.loads(result)
@@ -472,6 +598,7 @@ class RAgent:
         finalized = self._force_finalize(iteration, self.max_iterations, on_think=on_think,
                                          cancel_event=cancel_event)
         setattr(self, _TRUNCATED_FLAG, True)
+        _emit_event(event_sink, EVENT_TRUNCATION_FORCED, {"used": iteration, "max_iterations": self.max_iterations})
 
         prefix = (
             f"⚠️ **已达迭代上限 ({self.max_iterations} 轮)，以下为强制收尾结果。"

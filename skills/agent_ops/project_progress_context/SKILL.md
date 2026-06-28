@@ -126,7 +126,7 @@ skills/<category>/<skill_name>/
 <ProjectSkill>/scripts/project_progress.py
 ```
 
-5. 使用脚本保存上下文，例如：
+5. 使用脚本保存上下文。默认保存策略不是无脑追加：如果同一天同项目文件已存在，脚本会读取旧内容，提取最近一次 entry 的关键字段，写入 `Prior Context Considered`，然后用当前压缩后的 entry 覆盖旧文件，避免“载入旧上下文后又把旧+新全部保存”导致文件越来越冗余。例如：
 
 ```bash
 python skills/agent_ops/project_progress_context/scripts/project_progress.py save \
@@ -137,8 +137,9 @@ python skills/agent_ops/project_progress_context/scripts/project_progress.py sav
   --file core/skills.py
 ```
 
-6. 保存后读取一遍确认内容可用。
-7. 最终回复用户时说明上下文保存位置；如果决定不保存，也可简短说明“任务已完成且无需续接上下文”。
+6. 只有确实需要保留完整历史流水时，才显式加 `--append` 追加旧文件；默认不要使用 `--append`。
+7. 保存后读取一遍确认内容可用。
+8. 最终回复用户时说明上下文保存位置；如果决定不保存，也可简短说明“任务已完成且无需续接上下文”。
 
 ## Load / Resume Procedure
 
@@ -160,8 +161,9 @@ python skills/agent_ops/project_progress_context/scripts/project_progress.py rea
    - 关键文件；
    - 验证状态。
 
-4. 再检查当前工作区真实文件和 git diff，避免只相信旧进度文档。
-5. 继续执行用户的新要求。
+4. 如果通过 CLI `/project_list` 手动载入，可直接输入编号载入；输入 `1,2 del`（也支持 `delete/rm/remove` 后缀）会删除选中的 Project_progress 文件，用于清理已被合并或不再需要的旧上下文。删除分支不会把内容载入当前 Agent messages。
+5. 再检查当前工作区真实文件和 git diff，避免只相信旧进度文档。
+6. 继续执行用户的新要求。
 
 ## Verification
 
@@ -178,7 +180,7 @@ python <skill_dir>/scripts/project_progress.py read --latest --project <project>
 ## Pitfalls
 
 - 不要把 `Project_progress/` 当成长期 Memory。它保存的是项目续接上下文，不应该注入每轮 system prompt。
-- 不要把所有会话流水账都保存进去，只保存后续继续开发所需信息。
+- 不要把所有会话流水账都保存进去，只保存后续继续开发所需信息；保存时应把旧上下文合并压缩为当前可续接状态，而不是把旧上下文原样再次保存。
 - 不要只写“做了一些修改”，必须包含文件路径、关键函数/类、验证状态和下一步。
 - 后续继续时不要只读进度文档，还要重新检查当前文件内容和 git diff。
 - 如果一个功能横跨多个 skill，应在主负责 skill 的 `Project_progress/` 中保存总览，并引用其它 skill 的相关路径。

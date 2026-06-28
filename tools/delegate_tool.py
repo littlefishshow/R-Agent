@@ -1,6 +1,8 @@
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tools.registry import registry
+from app_gui.normalizer import normalize_messages
+from app_gui.schemas import EVENT_DELEGATE_SUBAGENT_STARTED, EVENT_DELEGATE_SUBAGENT_FINISHED
 from rich.panel import Panel
 from tools import progress_render
 
@@ -32,6 +34,19 @@ STATUS_LABELS = {
     "failed": "❌ failed",
     "cancelled": "🚫 cancelled",
 }
+
+
+
+def _emit_delegate_event(event_sink, event_type, payload):
+    if event_sink is None:
+        return
+    try:
+        if hasattr(event_sink, "emit"):
+            event_sink.emit(event_type, payload, source="delegate_task")
+        else:
+            event_sink(event_type, payload)
+    except Exception:
+        pass
 
 
 def _task_id_of(task):
@@ -200,7 +215,7 @@ def _is_truncated_result(result, sub_agent=None):
     return TRUNCATION_MARKER in str(result or "")
 
 
-def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: int = 30) -> str:
+def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: int = 30, event_sink=None) -> str:
     """生成隔离上下文子智能体并行处理任务。
 
     tasks 是 JSON 字符串，元素可以是：
@@ -271,6 +286,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 f"开始执行普通委托任务(max_iterations={max_iters}): {goal[:500]}"
             )
         sub_agent = RAgent(max_iterations=max_iters)
+        run_id = f"delegate-{task_index}-{task_id or 'adhoc'}"
 
         system_prompt = (
             "你是一个专注的子智能体，负责完成被委托的具体子任务。\n\n"
@@ -293,6 +309,15 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
 
         def on_tool_end(func_name, result):
             pass
+
+        _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_STARTED, {
+            "run_id": run_id,
+            "task_index": task_index,
+            "task_id": task_id,
+            "goal": task.get("goal") or task.get("description") or "",
+            "max_iterations": max_iters,
+            "system_prompt": system_prompt,
+        })
 
         try:
             # 禁止子智能体再次委托，避免递归爆炸；禁止 memory 持久写用户记忆。
@@ -318,7 +343,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                         f"{_shorten(blocked_update, 220)}"
                     )
             _print_after_status(f"[bold green]✅ [Sub-Agent {task_index}][/bold green] 子任务执行完毕")
-            return {
+            item = {
                 "task_index": task_index,
                 "task_id": task_id,
                 "goal": task.get("goal") or task.get("description") or "",
@@ -327,10 +352,13 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 "truncated": truncated,
                 "blocked_update": blocked_update,
                 "result": result,
+                "sub_agent_messages": normalize_messages(getattr(sub_agent, "messages", []), source=run_id),
             }
+            _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_FINISHED, item)
+            return item
         except Exception as e:
             _print_after_status(f"[bold red]❌ [Sub-Agent {task_index}][/bold red] 子任务执行失败: {e}")
-            return {
+            item = {
                 "task_index": task_index,
                 "task_id": task_id,
                 "goal": task.get("goal") or task.get("description") or "",
@@ -338,7 +366,10 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 "status": "error",
                 "truncated": False,
                 "result": str(e),
+                "sub_agent_messages": normalize_messages(getattr(sub_agent, "messages", []), source=run_id),
             }
+            _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_FINISHED, item)
+            return item
 
     if len(task_list) == 0:
         return json.dumps({"error": "No valid tasks provided."}, ensure_ascii=False)
@@ -423,6 +454,10 @@ registry.register(
             "default_max_iterations": {
                 "type": "integer",
                 "description": "未在单个任务中指定 max_iterations 时使用的默认最大思考轮数，默认 30。"
+            },
+            "event_sink": {
+                "type": "object",
+                "description": "内部 GUI 事件接收器；模型不应手动设置。"
             }
         },
         "required": ["tasks"]

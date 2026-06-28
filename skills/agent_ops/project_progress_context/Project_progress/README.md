@@ -27,3 +27,9 @@ YYYY-MM-DD_<project>_debug.log
 - 不保存无筛选的大段终端输出。
 - 不把这里当作长期 Memory；这里只服务于项目续接。
 - 后续继续开发时，应先读取这里的上下文，再检查真实文件内容和 git diff。
+
+## 上下文合并与清理
+
+- `project_progress.py save` 默认会在同日同项目文件存在时读取旧 entry，将旧摘要、状态、关键文件、决策、验证和下一步压缩进 `Prior Context Considered`，再写入当前 entry；这样下次保存不会反复复制旧上下文。
+- 只有需要完整保留历史流水时才使用 `--append`。
+- CLI `/project_list` 中可输入普通编号载入上下文；输入 `1,2 del` 可删除选中的上下文文件，用于清理已经合并或不再需要的旧文件。

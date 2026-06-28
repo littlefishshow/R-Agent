@@ -50,3 +50,7 @@ skills/.usage.json
 skills/.usage.json.lock
 skills/.archive/
 models/
+# Frontend dependencies/build artifacts
+app_gui_frontend/node_modules/
+app_gui_frontend/dist/
+app_gui/package-lock.json

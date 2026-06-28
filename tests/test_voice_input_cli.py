@@ -241,3 +241,138 @@ def test_load_project_progress_context_selects_file(monkeypatch, tmp_path):
     assert "Demo Project" in agent.messages[1]["content"]
     assert any("已载入" in message for message in console.messages)
 
+
+def test_project_progress_selection_parser_supports_delete_suffix():
+    assert main._parse_project_progress_selection("1,2 del", 3) == ([1, 2], True, [])
+    assert main._parse_project_progress_selection("2，3 remove", 3) == ([2, 3], True, [])
+    assert main._parse_project_progress_selection("1,1", 3) == ([1], False, [])
+    assert main._parse_project_progress_selection("4 del", 3) == ([], True, ["4"])
+
+
+def test_load_project_progress_context_deletes_selected_file(monkeypatch, tmp_path):
+    progress = tmp_path / "skills" / "agent_ops" / "demo_skill" / "Project_progress"
+    progress.mkdir(parents=True)
+    file_path = progress / "2026-06-27_demo_context.md"
+    file_path.write_text("# Demo\n\n### Project\n\nDemo Project\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    class FakeSession:
+        def prompt(self, *args, **kwargs):  # noqa: ARG002
+            return "1 del"
+
+    class FakeAgent:
+        def __init__(self):
+            self.messages = []
+
+        def get_token_usage_total(self):
+            return "unavailable"
+
+    console = _DummyConsole()
+    agent = FakeAgent()
+
+    assert main.load_project_progress_context(console, FakeSession(), agent, "system") is True
+    assert not file_path.exists()
+    assert agent.messages == []
+    assert any("已删除" in message for message in console.messages)
+
+
+
+def test_record_audio_command_uses_devnull_stderr_and_handles_kill_timeout(monkeypatch):
+    def fake_which(name):
+        return "/usr/bin/sox" if name == "sox" else None
+
+    class FakeProc:
+        returncode = None
+
+        def __init__(self):
+            self.terminated = 0
+            self.killed = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated += 1
+
+        def kill(self):
+            self.killed = True
+
+        def wait(self, timeout=None):  # noqa: ARG002
+            raise main.subprocess.TimeoutExpired(cmd="sox", timeout=timeout)
+
+    captured = {}
+
+    def fake_popen(cmd, **kwargs):  # noqa: ARG001
+        captured.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(main.shutil, "which", fake_which)
+    monkeypatch.setattr(main.subprocess, "Popen", fake_popen)
+    stop_event = main.threading.Event()
+    stop_event.set()
+
+    try:
+        main._record_audio_with_command("/tmp/test.wav", stop_event)
+    except RuntimeError as exc:
+        assert "录音进程无法终止" in str(exc)
+    else:  # pragma: no cover - should raise
+        raise AssertionError("expected RuntimeError")
+    assert captured["stderr"] == main.subprocess.DEVNULL
+
+
+def test_record_audio_until_keypress_raises_when_worker_does_not_stop(monkeypatch):
+    console = _DummyConsole()
+
+    class FakeThread:
+        def __init__(self, target, daemon=None):  # noqa: ARG002
+            self._alive = True
+
+        def start(self):
+            return None
+
+        def join(self, timeout=None):  # noqa: ARG002
+            return None
+
+        def is_alive(self):
+            return self._alive
+
+    class FakeStdin:
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 0
+
+        def read(self, n):  # noqa: ARG002
+            return "\n"
+
+    monkeypatch.setattr(main.threading, "Thread", FakeThread)
+    monkeypatch.setattr(main.sys, "stdin", FakeStdin())
+    monkeypatch.setattr(main.termios, "tcgetattr", lambda fd: "attrs")
+    monkeypatch.setattr(main.termios, "tcsetattr", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.tty, "setcbreak", lambda fd: None)
+    monkeypatch.setattr(main.select, "select", lambda *args, **kwargs: ([main.sys.stdin], [], []))
+
+    try:
+        main._record_audio_until_keypress(console, "/tmp/test.wav")
+    except RuntimeError as exc:
+        assert "停止超时" in str(exc)
+    else:  # pragma: no cover - should raise
+        raise AssertionError("expected RuntimeError")
+
+
+def test_shutdown_agent_calls_agent_shutdown_and_is_quiet_when_clean():
+    console = _DummyConsole()
+
+    class FakeAgent:
+        def __init__(self):
+            self.called = False
+
+        def shutdown_background_tasks(self, timeout=1.0):  # noqa: ARG002
+            self.called = True
+            return 0
+
+    agent = FakeAgent()
+    main._shutdown_agent(agent, console, timeout=0.01)
+    assert agent.called is True
+    assert console.messages == []

@@ -99,3 +99,57 @@ def test_self_evolution_forked_review_dry_run_blocks_memory_write(monkeypatch, t
     assert result["use_forked_agent"] is True
     assert "dry_run" in json.dumps(result["tool_actions"], ensure_ascii=False)
     assert (tmp_path / "latest_review.json").exists()
+
+
+def test_self_review_interval_zero_disables_background_review(monkeypatch):
+    monkeypatch.setenv("SELF_EVOLUTION_REVIEW_INTERVAL", "0")
+    agent = RAgent(model="test", max_iterations=1, enable_self_review=True)
+    agent.client = _FakeClient([_response(_message(content="ok", tool_calls=None))])
+
+    called = {"value": False}
+
+    def fake_schedule():
+        called["value"] = True
+
+    monkeypatch.setattr(agent, "_schedule_self_evolution_review", fake_schedule)
+
+    assert agent.run_conversation("hello") == "ok"
+    assert called["value"] is False
+
+
+def test_self_review_interval_positive_schedules_heuristic_background(monkeypatch):
+    monkeypatch.setenv("SELF_EVOLUTION_REVIEW_INTERVAL", "1")
+    agent = RAgent(model="test", max_iterations=1, enable_self_review=True)
+    agent.client = _FakeClient([_response(_message(content="ok", tool_calls=None))])
+
+    captured = {}
+
+    def fake_run_review(snapshot):
+        captured["snapshot"] = snapshot
+        return "{}"
+
+    monkeypatch.setattr(agent, "_run_self_evolution_review", fake_run_review)
+
+    assert agent.run_conversation("hello") == "ok"
+    assert agent.shutdown_background_tasks(timeout=1.0) == 0
+    assert agent._background_errors == []
+    assert any(isinstance(msg, dict) and msg.get("content") == "hello" for msg in captured["snapshot"])
+
+
+def test_shutdown_background_tasks_sets_shutdown_and_joins():
+    agent = RAgent(model="test", max_iterations=1, enable_self_review=False)
+    released = []
+
+    def worker():
+        while not agent._shutdown_event.is_set():
+            import time
+            time.sleep(0.01)
+        released.append(True)
+
+    thread = __import__("threading").Thread(target=worker, daemon=True)
+    with agent._background_lock:
+        agent._background_threads.append(thread)
+    thread.start()
+
+    assert agent.shutdown_background_tasks(timeout=1.0) == 0
+    assert released == [True]
