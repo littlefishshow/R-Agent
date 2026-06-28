@@ -117,6 +117,11 @@ def _tool_guard(dry_run: bool):
     return guard
 
 
+def _noop_callback(*args, **kwargs) -> None:
+    """后台 Agent 的 UI 回调：显式静默，避免污染主 CLI 输入行。"""
+    return None
+
+
 def _run_review_agent(messages_snapshot: Sequence[Dict[str, Any]], *, dry_run: bool, max_iterations: int) -> Tuple[str, List[Dict[str, Any]]]:
     from core.agent import RAgent
 
@@ -131,6 +136,9 @@ def _run_review_agent(messages_snapshot: Sequence[Dict[str, Any]], *, dry_run: b
         system_message=REVIEW_SYSTEM_PROMPT,
         allowed_tools=SAFE_REVIEW_TOOLS,
         tool_call_guard=_tool_guard(dry_run),
+        on_think=_noop_callback,
+        on_tool_start=_noop_callback,
+        on_tool_end=_noop_callback,
     )
     return result, list(review_agent.messages)
 

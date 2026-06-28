@@ -207,9 +207,7 @@ class RAgent:
                     except TypeError:
                         # 旧版 on_think 不支持额外 kwargs，退化到普通调用
                         on_think(iteration)
-                else:
-                    print(f"[retry {attempt + 1}/{max_retries}] 模型瞬时错误: "
-                          f"{_format_llm_error(e)}，{delay:.1f}s 后重试...")
+
                 deadline = time.monotonic() + delay
                 while time.monotonic() < deadline:
                     if _is_cancelled(cancel_event):
@@ -389,8 +387,6 @@ class RAgent:
 
             if on_think:
                 on_think(iteration)
-            else:
-                print(f"[{iteration}] 正在思考 (请求大模型)...")
 
             try:
                 response = self._chat_completion_with_retry(
@@ -418,8 +414,6 @@ class RAgent:
 
                     if on_tool_start:
                         on_tool_start(func_name, func_args)
-                    else:
-                        print(f"  [Tool Call] {func_name}({func_args})")
 
                     guard_denial = None
                     if tool_call_guard is not None:
@@ -451,8 +445,6 @@ class RAgent:
 
                     if on_tool_end:
                         on_tool_end(func_name, result)
-                    else:
-                        print(f"  [Tool Result] {result}")
 
                     self.messages.append({
                         "role": "tool",

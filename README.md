@@ -339,6 +339,14 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-06-28
+
+#### CLI 输出边界与后台 Agent 静默
+
+- **修复后台工具日志污染输入行**：后台自演进复盘 Agent 现在显式传入 no-op `on_think` / `on_tool_start` / `on_tool_end` 回调，避免在主 CLI 已显示 `You>` 后继续输出 `[Tool Call]` / `[Tool Result]`。
+- **核心 Agent 默认静默**：移除 `core/agent.py` 在无 UI 回调路径下的裸 `print` fallback；思考状态、工具调用和工具结果只应由 CLI 层或调用方回调负责展示。
+- **降低 Rich/prompt_toolkit 输出串线风险**：后台复盘仍写入 `outputs/self_evolution/latest_review.json` 等日志，但不直接写用户终端，避免与右侧 token 提示和输入提示混排。
+
 ### 2026-06-27
 
 
