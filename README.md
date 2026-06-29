@@ -101,7 +101,23 @@ http://127.0.0.1:5173
 - **LLM Visible**：会直接发给模型的内容，包括 system prompt、当前 conversation messages、tools schema；
 - **Available by Tool / Notes**：默认不全文发给模型，但可通过工具读取或影响未来会话的内容，例如 skills 和 live memory 说明。
 
-### 3.4 常见问题
+### 3.4 Cockpit 本地命令
+
+Cockpit 输入框支持一组本地斜杠命令，用于快速切换当前上下文视图或新建会话：
+
+- `/new`：创建新对话 / 新 session；
+- `/help`：显示 Cockpit 命令说明；
+- `/context`：选中 System Prompt 上下文；
+- `/messages`：选中当前 Conversation Messages；
+- `/tools`：选中 Tool Schemas；
+- `/skills`：选中 Skills 说明；
+- `/memory`：选中 Live Memory 说明；
+- `/reviews`：提示 self-evolution review 当前接入状态；
+- `/bbb`：当前仍只在终端 CLI 中支持，Cockpit 会给出提示。
+
+输入框键入 `/` 时会出现命令快捷菜单。
+
+### 3.5 常见问题
 
 - 如果页面报 `session is already running`，说明当前会话的上一条消息仍在运行；请等待、点击 `Stop`，或重启后端。
 - 如果前端页面连接不上，先检查后端：`http://127.0.0.1:8765/health`。
@@ -168,7 +184,7 @@ https://huggingface.co/ggerganov/whisper.cpp/tree/main
 https://ggml.ggerganov.com/
 ```
 
-### 3.3 `.env` 配置
+### 4.3 `.env` 配置
 
 复制 `.env.example` 为 `.env` 后，确认或填写以下配置：
 
@@ -191,7 +207,7 @@ VOICE_INPUT_WHISPERCPP_EXTRA_ARGS=""
 VOICE_INPUT_WHISPERCPP_BIN="/opt/homebrew/bin/whisper-cli"
 ```
 
-### 3.4 验证 whisper.cpp 转写
+### 4.4 验证 whisper.cpp 转写
 
 安装和模型下载完成后，可先用任意 WAV 文件验证：
 
@@ -207,11 +223,11 @@ whisper-cli -m models/whisper.cpp/ggml-base.bin -f your-audio.wav -l zh -otxt -o
 
 即可开始本地语音输入。
 
-## 4. Gateway 服务模式：本地启动与微信/飞书/QQ 接入
+## 5. Gateway 服务模式：本地启动与微信/飞书/QQ 接入
 
 R-Agent 现在可以通过 `gateway/` 作为 HTTP 服务运行，并接入飞书 Bot、微信公众号，或通过 QQ 官方/中间层机器人方案接入 QQ。
 
-### 4.1 本地启动 Gateway
+### 5.1 本地启动 Gateway
 
 安装依赖：
 
@@ -262,7 +278,7 @@ curl -X POST http://127.0.0.1:8080/v1/chat \
 
 如果返回 `answer` 字段，说明 Gateway 已经正常调用 R-Agent。
 
-### 4.2 暴露公网 HTTPS 地址
+### 5.2 暴露公网 HTTPS 地址
 
 飞书、微信和 QQ 平台回调都需要公网 HTTPS 地址，不能直接填写 `127.0.0.1`。
 
@@ -286,7 +302,7 @@ cloudflared tunnel --url http://localhost:8080
 # QQ 当前建议先通过中间层调用 /v1/chat；若实现 QQ webhook adapter，可使用 /webhook/qq
 ```
 
-### 4.3 接入飞书 Bot
+### 5.3 接入飞书 Bot
 
 飞书推荐先开启异步 webhook，避免 R-Agent 思考时间过长导致回调超时：
 
@@ -323,7 +339,7 @@ python3 -m gateway.server --host 0.0.0.0 --port 8080
 7. 在权限管理中添加机器人接收消息、发送消息相关权限，并发布/安装应用。
 8. 私聊机器人或在群里 @机器人即可测试。
 
-### 4.4 接入微信公众号
+### 5.4 接入微信公众号
 
 > 个人微信没有官方 Bot webhook，不建议使用非官方个人微信协议。当前 Gateway 支持的是微信公众号明文 XML 回调的最小接入。
 
@@ -352,7 +368,7 @@ python3 -m gateway.server --host 0.0.0.0 --port 8080
 4. 验证通过后，关注公众号并发送文本消息即可测试。
 
 
-### 3.5 接入 QQ 官方机器人
+### 5.5 接入 QQ 官方机器人
 
 R-Agent Gateway 已内置 QQ 官方机器人 Webhook 最小适配，路由为：
 
@@ -400,7 +416,7 @@ pip install PyNaCl>=1.5.0
 
 `requirements.txt` 已包含该依赖。QQ 官方对 AIGC 接入有合规要求，请遵守平台规则；不建议使用非官方个人 QQ 协议。
 
-### 4.6 常见问题
+### 5.6 常见问题
 
 - **本地能访问，飞书/微信访问不到**：需要公网 HTTPS，使用 ngrok/cloudflared 或正式服务器域名。
 - **飞书不回复**：检查 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`、`FEISHU_VERIFICATION_TOKEN`、事件订阅、权限和应用是否已发布。
@@ -463,6 +479,13 @@ pip install PyNaCl>=1.5.0
 - **前端 Context Matrix 增加 Resources 分组**：左侧上下文矩阵新增 Tools、Skills、Memory、Self Evolution 资源节点，点击后可在 Inspector 中查看对应 JSON 和 payload preview。
 - **Memory/Skill 长内容继续走 payload_ref**：skills 列表、frozen memory、live memory 和 self-evolution review 会写入 `ContextSnapshotStore` payload，前端可复用“点击展开完整 Payload”能力。
 - **补充资源接口与前端结构测试**：扩展 `tests/test_gui_runtime.py` 与 `tests/test_gui_frontend_structure.py`，覆盖 resources 返回结构、前端资源节点、`/resources` API 路径和后端路由存在性。
+
+#### R-Agent Cockpit 交互完善：新对话与斜杠菜单
+
+- **新增 New Chat**：顶部栏新增 `New Chat` 按钮，可直接创建新的 GUI session、清空输入/选择/错误提示并切换到全新对话。
+- **新增 Cockpit 斜杠菜单**：输入框键入 `/` 时显示 `/new`、`/help`、`/context`、`/messages`、`/tools`、`/skills`、`/memory` 等快捷命令，用于快速切换当前上下文视图或新建话题。
+- **明确未接入能力提示**：`/bbb` 等终端 CLI 专属能力在 Cockpit 中会提示暂未接入，避免用户误以为无响应。
+- **补充前端结构测试**：测试覆盖 New Chat 按钮、slash command 关键词与菜单样式。
 
 
 ### 2026-06-27
