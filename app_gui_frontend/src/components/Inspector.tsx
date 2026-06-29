@@ -68,6 +68,15 @@ function buildDisplay(payload: any): { title: string, visible: string, descripti
       })) : [{ title: '当前对话历史', text: '当前还没有对话历史。' }],
     }
   }
+  if (payload.kind === 'payload') {
+    return {
+      title,
+      visible,
+      description,
+      text: payload.payload_ref?.preview || '点击下方按钮载入完整 Payload。',
+      blocks: [],
+    }
+  }
   if (payload.kind === 'json') {
     const items = payload.items || []
     if (Array.isArray(items)) {

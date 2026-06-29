@@ -1,37 +1,58 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { fetchPayload, type ContextEvent } from '../api'
 
+type ChatItem = {
+  id: string
+  role: 'user' | 'assistant'
+  content: any
+}
+
 export function ChatPane({ events, sessionId }: { events: ContextEvent[], sessionId: string }) {
-  const last = events.length ? events[events.length - 1] : null
-  const [fullPayload, setFullPayload] = useState<string | null>(null)
+  const chatItems = useMemo(() => buildChatItems(events), [events])
+  const [loadedPayloads, setLoadedPayloads] = useState<Record<string, string>>({})
 
   useEffect(() => {
     let cancelled = false
-    async function load() {
-      setFullPayload(null)
-      const content = last?.payload?.message?.content
-      const ref = content?.payload_ref
-      if (sessionId && ref?.id) {
+    async function loadLongAssistantPayloads() {
+      const refs = chatItems
+        .filter(item => item.role === 'assistant')
+        .map(item => ({ id: item.id, ref: item.content?.payload_ref }))
+        .filter(item => item.ref?.id && !loadedPayloads[item.id])
+      for (const item of refs) {
+        if (!sessionId) continue
         try {
-          const text = await fetchPayload(sessionId, ref.id)
-          if (!cancelled) setFullPayload(text)
+          const text = await fetchPayload(sessionId, item.ref.id)
+          if (!cancelled) setLoadedPayloads(prev => ({ ...prev, [item.id]: text }))
         } catch {
-          if (!cancelled) setFullPayload(renderContent(content))
+          if (!cancelled) setLoadedPayloads(prev => ({ ...prev, [item.id]: renderContent({ payload_ref: item.ref }) }))
         }
       }
     }
-    load()
+    loadLongAssistantPayloads()
     return () => { cancelled = true }
-  }, [last?.event_id, sessionId])
+  }, [chatItems, sessionId])
 
-  const content = fullPayload ?? (last ? renderContent(last.payload?.message?.content) : '')
   return <div className="chat-pane">
-    {!last && <div className="empty-state">这里仅展示 Assistant 的最后回复。完整上下文请看左侧 Current Model Context。</div>}
-    {last && <div className="bubble assistant last-answer">
-      <div className="bubble-role">assistant 最后回复</div>
-      <pre>{content || '(assistant 暂无文本结果，可能仍在工具调用中)'}</pre>
-    </div>}
+    {!chatItems.length && <div className="empty-state">这里会显示本轮对话的 user 输入和 assistant 回复。完整上下文请看左侧 Current Model Context。</div>}
+    {chatItems.map(item => <div key={item.id} className={`bubble ${item.role}${item.role === 'assistant' ? ' last-answer' : ''}`}>
+      <div className="bubble-role">{item.role === 'user' ? 'user 输入' : 'assistant 回复'}</div>
+      <pre>{(loadedPayloads[item.id] ?? renderContent(item.content)) || (item.role === 'assistant' ? '(assistant 暂无文本结果，可能仍在工具调用中)' : '(空输入)')}</pre>
+    </div>)}
   </div>
+}
+
+function buildChatItems(events: ContextEvent[]): ChatItem[] {
+  const items: ChatItem[] = []
+  for (const event of events) {
+    if (event.event_type === 'user_input_received') {
+      items.push({ id: event.event_id, role: 'user', content: event.payload?.content || '' })
+      continue
+    }
+    if (event.event_type === 'message_appended' && event.payload?.message?.role === 'assistant') {
+      items.push({ id: event.event_id, role: 'assistant', content: event.payload?.message?.content })
+    }
+  }
+  return items
 }
 
 function renderContent(value: any): string {

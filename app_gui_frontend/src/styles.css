@@ -49,3 +49,10 @@ button.wide { width: 100%; padding: 10px; margin-top: 10px; }
 .tiny-toggle { padding: 4px 8px; font-size: 11px; border: 1px solid rgba(103,232,249,.24); background: rgba(15,23,42,.86); color: #a5f3fc; border-radius: 8px; }
 .block-text.collapsed { display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; overflow: hidden; max-height: 6em; }
 .block-text.expanded { max-height: none; overflow: visible; }
+
+.top-action { margin-left: auto; padding: 8px 12px; }
+.notice-banner { position: fixed; top: 118px; left: 24px; right: 24px; z-index: 10; border: 1px solid rgba(103,232,249,.45); background: rgba(8,47,73,.94); padding: 10px 16px; border-radius: 12px; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.composer-wrap { display: grid; grid-template-rows: auto 1fr; gap: 8px; padding-top: 14px; border-top: 1px solid rgba(103,232,249,.14); }
+.composer-wrap .composer { padding-top: 0; border-top: 0; }
+.slash-menu { display: flex; gap: 8px; flex-wrap: wrap; padding: 8px; border: 1px solid rgba(103,232,249,.18); border-radius: 12px; background: rgba(2,6,23,.7); }
+.slash-menu button { padding: 6px 10px; font-size: 12px; border: 1px solid rgba(103,232,249,.22); background: rgba(15,23,42,.86); color: #a5f3fc; }
