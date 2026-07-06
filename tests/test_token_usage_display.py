@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 from core.agent import RAgent
@@ -73,16 +74,16 @@ def test_agent_token_usage_unavailable_when_response_has_no_usage():
     agent._record_token_usage(SimpleNamespace())
 
     assert agent.get_token_usage_total() == "unavailable"
-    assert _format_token_usage_label(agent) == "last/session tokens: unavailable/unavailable"
-    assert _token_usage_panel_subtitle(agent) == "[dim]last/session tokens: unavailable/unavailable[/dim]"
+    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: unavailable/unavailable/unavailable/unavailable"
+    assert _token_usage_panel_subtitle(agent) == "[dim]last/parent/children/total tokens: unavailable/unavailable/unavailable/unavailable[/dim]"
 
 
 def test_token_usage_label_and_panel_subtitle_show_total_tokens():
     agent = RAgent(model="test", max_iterations=1)
     agent._record_token_usage(_response_with_usage({"total_tokens": 42}))
 
-    assert _format_token_usage_label(agent) == "last/session tokens: 42/42"
-    assert _token_usage_panel_subtitle(agent) == "[dim]last/session tokens: 42/42[/dim]"
+    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: 42/42/unavailable/42"
+    assert _token_usage_panel_subtitle(agent) == "[dim]last/parent/children/total tokens: 42/42/unavailable/42[/dim]"
 
 
 def test_large_single_message_completion_tokens_prints_warning(capsys):
@@ -158,3 +159,36 @@ def test_loop_context_length_failure_returns_saved_path(tmp_path, monkeypatch):
     assert "已保存最长的 3 条 message 到" in result
     assert len(list(tmp_path.glob("*_summary.json"))) == 1
     assert len(list(tmp_path.glob("*_rank*.json"))) == 2
+
+
+def test_agent_merges_delegated_token_usage_from_delegate_tool_result():
+    agent = RAgent(model="test", max_iterations=1)
+    agent._record_token_usage(_response_with_usage({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}))
+    result = {
+        "success": True,
+        "result": {
+            "tasks": [],
+            "delegated_token_usage": {
+                "prompt_tokens": 3,
+                "completion_tokens": 2,
+                "total_tokens": 5,
+                "available": True,
+            },
+        },
+    }
+
+    assert agent._merge_delegated_token_usage_from_tool_result(json.dumps(result)) is True
+
+    assert agent.get_token_usage_total() == 15
+    assert agent.get_delegated_token_usage_total() == 5
+    assert agent.get_total_token_usage_including_children() == 20
+    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: 15/15/5/20"
+
+
+def test_agent_keeps_delegated_token_usage_unavailable_without_child_usage():
+    agent = RAgent(model="test", max_iterations=1)
+
+    assert agent.merge_delegated_token_usage({"available": False, "total_tokens": 9}) is False
+
+    assert agent.get_delegated_token_usage_total() == "unavailable"
+    assert agent.get_total_token_usage_including_children() == "unavailable"

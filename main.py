@@ -27,6 +27,7 @@ from tools.registry import registry
 from core.skills import skill_manager
 from core.memory import memory_manager
 from core.prompt_builder import build_system_prompt
+from core.sandbox_cleanup import maybe_cleanup_sandbox
 
 # 导入 rich 相关库
 from rich.console import Console
@@ -97,10 +98,15 @@ def _with_interrupt_status_hint(message: str) -> str:
 
 
 def _format_token_usage_label(agent: RAgent) -> str:
-    """生成最近一次与累计 token 使用量文案，避免把累计量误读成单轮上下文。"""
+    """生成 token 使用量文案，区分父会话、子 Agent 与总量。"""
     get_last = getattr(agent, "get_last_token_usage_total", None)
+    get_children = getattr(agent, "get_delegated_token_usage_total", None)
+    get_total = getattr(agent, "get_total_token_usage_including_children", None)
     last = get_last() if callable(get_last) else "unavailable"
-    return f"last/session tokens: {last}/{agent.get_token_usage_total()}"
+    parent = agent.get_token_usage_total()
+    children = get_children() if callable(get_children) else "unavailable"
+    total = get_total() if callable(get_total) else parent
+    return f"last/parent/children/total tokens: {last}/{parent}/{children}/{total}"
 
 
 def _format_token_usage_rprompt(agent: RAgent) -> HTML:
@@ -836,40 +842,70 @@ def update_env_var(key: str, value: str):
     
     os.environ[key] = value
 
+def _terminal_safe_banner_line(parts):
+    """Build one styled banner line without emoji width edge cases.
+
+    Rich 的 Panel 会按 Unicode cell width 计算填充；但部分终端/字体对 emoji
+    variation selector（例如 ⌨️、✨）的实际宽度和 Rich 计算不一致，长行右边框
+    就可能看起来错一列。欢迎 banner 使用纯文本标签作为左侧提示符，避免
+    把不稳定宽度字符放进用于确定面板宽度的内容行。
+    """
+    line = Text()
+    for value, style in parts:
+        line.append(value, style=style)
+    return line
+
+
+def _build_welcome_banner_text(model_name: str, key_status: str, client_type: str) -> Text:
+    lines = [
+        _terminal_safe_banner_line([("欢迎使用 R-Agent CLI", "bold magenta")]),
+        Text(""),
+        _terminal_safe_banner_line([
+            ("模型: ", "info"),
+            (model_name, "bold cyan"),
+            (f" (API Key {key_status}, Client: {client_type.upper()})", "info"),
+        ]),
+        _terminal_safe_banner_line([
+            ("命令: 输入 ", "info"),
+            ("/", "bold yellow"),
+            (" 触发自动补全菜单（如 ", "info"),
+            ("/skill", "bold green"),
+            ("、", "info"),
+            ("/tool", "bold green"),
+            (" 等）。也可输入 ", "info"),
+            ("/bbb", "bold green"),
+            (" 使用语音输入。", "info"),
+        ]),
+        _terminal_safe_banner_line([
+            ("退出: 输入 ", "info"),
+            ("'exit'", "bold green"),
+            (" 或 ", "info"),
+            ("'quit'", "bold green"),
+            (" 退出。", "info"),
+        ]),
+    ]
+
+    banner_text = Text()
+    for index, line in enumerate(lines):
+        banner_text.append_text(line)
+        if index != len(lines) - 1:
+            banner_text.append("\n")
+    return banner_text
+
+
 def display_welcome_banner():
     model_name = config.get_model()
     api_key = config.get_api_key()
     key_status = "已配置" if api_key else "未配置"
     client_type = config.get_client_type()
 
-    banner_text = Text()
-    banner_text.append("✨ 欢迎使用 R-Agent CLI ✨\n", style="bold magenta")
-    banner_text.append("\n", style="default")
-    banner_text.append("💡 当前模型: ", style="info")
-    banner_text.append(f"{model_name}", style="bold cyan")
-    banner_text.append(f" (API Key {key_status}, Client: {client_type.upper()})\n", style="info")
-    
-    banner_text.append("⌨️  命令: 输入 ", style="info")
-    banner_text.append("/", style="bold yellow")
-    banner_text.append(" 触发自动补全菜单（如 ", style="info")
-    banner_text.append("/skill", style="bold green")
-    banner_text.append("、", style="info")
-    banner_text.append("/tool", style="bold green")
-    banner_text.append(" 等）。也可输入 ", style="info")
-    banner_text.append("/bbb", style="bold green")
-    banner_text.append(" 使用语音输入。\n", style="info")
+    banner_text = _build_welcome_banner_text(model_name, key_status, client_type)
 
-    banner_text.append("🚪 退出: 输入 ", style="info")
-    banner_text.append("'exit'", style="bold green")
-    banner_text.append(" 或 ", style="info")
-    banner_text.append("'quit'", style="bold green")
-    banner_text.append(" 退出。\n", style="info")
-    
     panel = Panel(
         banner_text,
         title="[bold blue]R-Agent[/bold blue]",
         border_style="blue",
-        expand=False
+        expand=False,
     )
     console.print(panel)
     console.print()
@@ -1044,6 +1080,7 @@ def _shutdown_agent(agent: RAgent, console, timeout: float = 1.0) -> None:
 
 
 def main():
+    maybe_cleanup_sandbox()
     display_welcome_banner()
     
     cli_session_id = f"cli-{uuid.uuid4().hex[:12]}"

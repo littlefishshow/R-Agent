@@ -54,7 +54,9 @@ def test_delegate_task_passes_session_id_to_subagent_and_todo(monkeypatch, tmp_p
         default_wall_timeout_seconds=5,
     ))
 
-    assert payload[0]["status"] == "success"
+    assert payload["tasks"][0]["status"] == "success"
+    assert "sub_agent_messages" not in payload["tasks"][0]
+    assert payload["todo_digest"]["status_counts"]["completed"] == 1
     state = json.loads(todo_tool.todo_manage("view", "{}", session_id="deleg-s"))
     assert state["todo_list"][0]["status"] == "completed"
 
@@ -72,3 +74,44 @@ def test_reap_stale_claims_blocks_expired_task(monkeypatch, tmp_path):
     state = json.loads(todo_tool.todo_manage("view", "{}", session_id="lease"))
     assert state["todo_list"][0]["status"] == "blocked"
     assert state["todo_list"][0]["metadata"]["blocked_reason"] == "stale_claim_reaped"
+
+
+class _FailingAgent:
+    def __init__(self, max_iterations=None, session_id=None):
+        self.max_iterations = max_iterations
+        self.session_id = session_id
+        self.messages = [{"role": "user", "content": "private subagent context"}]
+
+    def run_conversation(self, **kwargs):
+        text = kwargs["user_message"]
+        task_id = text.split("task_id: ", 1)[1].split("\n", 1)[0]
+        worker_id = text.split("worker_id: ", 1)[1].split("\n", 1)[0]
+        todo_tool.todo_manage("claim", json.dumps({"id": task_id, "worker_id": worker_id}), session_id=self.session_id)
+        return "模型请求失败: context_length_exceeded"
+
+    def is_truncated(self):
+        return False
+
+
+def test_delegate_saves_failed_context_by_artifact_only(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    monkeypatch.setattr(todo_tool, "TODO_LIST_DIR", str(tmp_path / "todo_lists"))
+    monkeypatch.setattr(core.agent, "RAgent", _FailingAgent)
+    todo_tool.todo_manage("init", json.dumps({"tasks": [{"id": "bad", "description": "bad"}]}), session_id="ctx-s")
+
+    payload = json.loads(delegate_tool.delegate_task(
+        tasks=json.dumps([{"task_id": "bad", "goal": "fail"}]),
+        max_workers=1,
+        session_id="ctx-s",
+        default_wall_timeout_seconds=5,
+    ))
+
+    item = payload["tasks"][0]
+    assert item["status"] == "error"
+    assert "sub_agent_messages" not in item
+    assert item["context_artifact_path"]
+    assert (tmp_path / item["context_artifact_path"]).exists()
+    digest_task = payload["todo_digest"]["tasks"][0]
+    assert digest_task["status"] == "blocked"
+    assert digest_task["context_artifact_path"] == item["context_artifact_path"]

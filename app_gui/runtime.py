@@ -223,8 +223,13 @@ class GuiSession:
             "event_count": len(self.event_bus.events),
             "last_response": self.last_response,
             "last_error": self.last_error,
+            # Backward compatible fields: token_usage remains the parent Agent session total.
             "token_usage": self.agent.get_token_usage_total(),
             "last_token_usage": self.agent.get_last_token_usage_total(),
+            "parent_session_token_usage": self.agent.get_token_usage_total(),
+            "children_token_usage": self.agent.get_delegated_token_usage_total(),
+            "total_token_usage_including_children": self.agent.get_total_token_usage_including_children(),
+            "token_usage_breakdown": self.agent.get_token_usage_summary(include_children=True),
         }
 
 

@@ -1,10 +1,10 @@
 import json
 import time
 import threading
+from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from tools.registry import registry
 from core import config
-from app_gui.normalizer import normalize_messages
 from app_gui.schemas import EVENT_DELEGATE_SUBAGENT_STARTED, EVENT_DELEGATE_SUBAGENT_FINISHED
 from rich.panel import Panel
 from tools import progress_render
@@ -52,12 +52,235 @@ def _emit_delegate_event(event_sink, event_type, payload):
         pass
 
 
+def _agent_token_usage_summary(agent):
+    if agent is None:
+        return {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "last_prompt_tokens": 0,
+            "last_completion_tokens": 0,
+            "last_total_tokens": 0,
+            "available": False,
+        }
+    getter = getattr(agent, "get_token_usage_summary", None)
+    if callable(getter):
+        try:
+            summary = getter(include_children=True)
+            if isinstance(summary, dict):
+                return summary
+        except TypeError:
+            try:
+                summary = getter()
+                if isinstance(summary, dict):
+                    return summary
+            except Exception:
+                pass
+        except Exception:
+            pass
+    usage = getattr(agent, "token_usage", {}) or {}
+    return {
+        "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
+        "completion_tokens": int(usage.get("completion_tokens", 0) or 0),
+        "total_tokens": int(usage.get("total_tokens", 0) or 0),
+        "last_prompt_tokens": int(usage.get("last_prompt_tokens", 0) or 0),
+        "last_completion_tokens": int(usage.get("last_completion_tokens", 0) or 0),
+        "last_total_tokens": int(usage.get("last_total_tokens", 0) or 0),
+        "available": bool(usage.get("available")),
+    }
+
+
+def _usage_int(usage, key):
+    if not isinstance(usage, dict):
+        return 0
+    try:
+        return int(usage.get(key, 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _usage_total_for_aggregation(summary):
+    if not isinstance(summary, dict):
+        return {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "available": False}
+    parent_available = bool(summary.get("available"))
+    parent_prompt = _usage_int(summary, "prompt_tokens") if parent_available else 0
+    parent_completion = _usage_int(summary, "completion_tokens") if parent_available else 0
+    parent_total = _usage_int(summary, "total_tokens") if parent_available else 0
+    delegated = summary.get("delegated_token_usage") if isinstance(summary.get("delegated_token_usage"), dict) else {}
+    child_available = bool(delegated.get("available"))
+    child_prompt = _usage_int(delegated, "prompt_tokens") if child_available else 0
+    child_completion = _usage_int(delegated, "completion_tokens") if child_available else 0
+    child_total = _usage_int(delegated, "total_tokens") if child_available else 0
+    total = parent_total + child_total
+    prompt = parent_prompt + child_prompt
+    completion = parent_completion + child_completion
+    available = parent_available or child_available
+    if not total:
+        total = prompt + completion
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "available": bool(available and any((prompt, completion, total))),
+    }
+
+
+def _sum_token_usage(items):
+    total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "available": False}
+    for item in items or []:
+        usage = item.get("token_usage") if isinstance(item, dict) else None
+        aggregate = _usage_total_for_aggregation(usage)
+        if not aggregate.get("available"):
+            continue
+        total["prompt_tokens"] += _usage_int(aggregate, "prompt_tokens")
+        total["completion_tokens"] += _usage_int(aggregate, "completion_tokens")
+        total["total_tokens"] += _usage_int(aggregate, "total_tokens")
+        total["available"] = True
+    return total
+
+
 def _task_id_of(task):
     return task.get("task_id") or task.get("id")
 
 
 def _shorten(text, limit=90):
     text = str(text or "").replace("\n", " ").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _context_dir(session_id=None):
+    safe = str(session_id or "default").replace("/", "_").replace("..", "_")[:80] or "default"
+    path = Path("sandbox") / "delegate_contexts" / safe
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _plain_message(message):
+    if message is None or isinstance(message, (str, int, float, bool)):
+        return message
+    if isinstance(message, dict):
+        return {str(k): _plain_message(v) for k, v in message.items()}
+    if isinstance(message, (list, tuple)):
+        return [_plain_message(v) for v in message]
+    if hasattr(message, "model_dump"):
+        try:
+            return _plain_message(message.model_dump())
+        except Exception:
+            pass
+    if hasattr(message, "to_dict"):
+        try:
+            return _plain_message(message.to_dict())
+        except Exception:
+            pass
+    if hasattr(message, "__dict__"):
+        public = {k: v for k, v in vars(message).items() if not k.startswith("_")}
+        if public:
+            return _plain_message(public)
+    return str(message)
+
+
+def _save_subagent_context(task_id, sub_agent, reason, *, session_id=None, run_id=""):
+    """Persist sub-agent context only for unfinished/error cases; never return it inline."""
+    if sub_agent is None:
+        return None
+    try:
+        messages = getattr(sub_agent, "messages", [])
+        stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
+        safe_task = "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in str(task_id or "adhoc"))[:80]
+        path = _context_dir(session_id) / f"{stamp}_{safe_task}_{reason}.json"
+        payload = {
+            "task_id": task_id,
+            "run_id": run_id,
+            "reason": reason,
+            "saved_at": time.time(),
+            "message_count": len(messages or []),
+            "messages": [_plain_message(m) for m in (messages or [])],
+        }
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+        return str(path)
+    except Exception:
+        return None
+
+
+def _clear_subagent_context(sub_agent):
+    try:
+        sub_agent.messages = []
+    except Exception:
+        pass
+
+
+def _delete_context_artifact(path):
+    if not path:
+        return False
+    try:
+        candidate = Path(path)
+        if not candidate.is_absolute():
+            candidate = Path.cwd() / candidate
+        candidate = candidate.resolve()
+        root = (Path.cwd() / "sandbox" / "delegate_contexts").resolve()
+        if root in candidate.parents and candidate.is_file():
+            candidate.unlink()
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _clear_task_context_metadata(task, *, session_id=None, delete_file=True):
+    if not task:
+        return False
+    metadata = dict((task or {}).get("metadata") or {})
+    path = metadata.pop("context_artifact_path", None)
+    metadata.pop("context_saved_reason", None)
+    deleted = _delete_context_artifact(path) if delete_file else False
+    if path or deleted:
+        try:
+            from tools.todo_tool import todo_manage
+            todo_manage(
+                "update",
+                json.dumps({"id": str(task.get("id")), "metadata": metadata}, ensure_ascii=False),
+                session_id=session_id or "",
+            )
+        except Exception:
+            pass
+    return deleted
+
+
+def _all_tasks_completed(session_id=None):
+    try:
+        state = _load_todo_state(session_id)
+        tasks = state.get("tasks", []) if isinstance(state, dict) else []
+        return bool(tasks) and all(t.get("status") == "completed" for t in tasks)
+    except Exception:
+        return False
+
+
+def _cleanup_all_completed_contexts(session_id=None):
+    """When the whole todo is successful, delete every saved child context together."""
+    if not _all_tasks_completed(session_id):
+        return 0
+    deleted = 0
+    try:
+        state = _load_todo_state(session_id)
+        for task in state.get("tasks", []):
+            if _clear_task_context_metadata(task, session_id=session_id, delete_file=True):
+                deleted += 1
+        # Remove any orphan files for this session as a best-effort cleanup.
+        ctx_dir = _context_dir(session_id)
+        for path in list(ctx_dir.glob("*.json")):
+            try:
+                path.unlink()
+                deleted += 1
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return deleted
+
+def _summarize_delegate_result(result, limit=600):
+    text = str(result or "").replace("\n", " ").strip()
     if len(text) <= limit:
         return text
     return text[: limit - 1] + "…"
@@ -305,6 +528,9 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
             )
         return goal
 
+    subagent_refs = {}
+    subagent_refs_lock = threading.Lock()
+
     def _run_subagent(task_index, task, cancel_event=None):
         goal = _format_goal(task)
         max_iters = task.get("max_iterations", default_max_iterations)
@@ -335,6 +561,8 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 pass
         cancel_event = cancel_event or threading.Event()
         run_id = f"delegate-{task_index}-{task_id or 'adhoc'}"
+        with subagent_refs_lock:
+            subagent_refs[(task_index, str(task_id or ""))] = sub_agent
 
         system_prompt = (
             "你是一个专注的子智能体，负责完成被委托的具体子任务。\n\n"
@@ -401,6 +629,48 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                         f"[bold yellow]📌 task_id={task_id} 已按预算耗尽保护处理：[/bold yellow] "
                         f"{_shorten(blocked_update, 220)}"
                     )
+            context_artifact_path = None
+            todo_task_after_run = _get_todo_task(task_id, session_id=session_id)
+            todo_status_after_run = (todo_task_after_run or {}).get("status")
+            # Keep every child context until the whole todo succeeds.  Even a
+            # successful leaf task may be needed while sibling/parent tasks remain
+            # unfinished; it is saved as an artifact and removed only when all
+            # tasks in this session are completed.
+            should_keep_context = True
+            context_reason = status if (status != "success" or truncated) else "success_waiting_overall"
+            context_artifact_path = _save_subagent_context(task_id, sub_agent, context_reason, session_id=session_id, run_id=run_id)
+            if context_artifact_path:
+                if todo_status_after_run == "in_progress":
+                    _mark_task_blocked(
+                        task_id,
+                        f"子 Agent 未可靠完成；上下文已保存到 {context_artifact_path}",
+                        session_id=session_id,
+                        metadata={"context_artifact_path": context_artifact_path, "context_saved_reason": context_reason},
+                    )
+                elif todo_task_after_run is not None:
+                    try:
+                        from tools.todo_tool import todo_manage
+                        todo_manage(
+                            "update",
+                            json.dumps({
+                                "id": str(task_id),
+                                "metadata": {
+                                    **(todo_task_after_run.get("metadata") or {}),
+                                    "context_artifact_path": context_artifact_path,
+                                    "context_saved_reason": context_reason,
+                                },
+                            }, ensure_ascii=False),
+                            session_id=session_id or "",
+                        )
+                    except Exception:
+                        pass
+            token_usage_summary = _agent_token_usage_summary(sub_agent)
+            # Do not discard successful child context here. It is cleaned in one
+            # batch at the end of delegate_task if and only if the whole todo has
+            # succeeded. In-memory messages can be cleared after artifacting to
+            # avoid returning/holding them in the parent context.
+            _clear_subagent_context(sub_agent)
+
             _print_after_status(f"[bold green]✅ [Sub-Agent {task_index}][/bold green] 子任务执行完毕")
             item = {
                 "task_index": task_index,
@@ -410,8 +680,8 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 "status": status,
                 "truncated": truncated,
                 "blocked_update": blocked_update,
-                "result": result,
-                "sub_agent_messages": normalize_messages(getattr(sub_agent, "messages", []), source=run_id),
+                "context_artifact_path": context_artifact_path,
+                "token_usage": token_usage_summary,
             }
             _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_FINISHED, item)
             return item
@@ -423,6 +693,15 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 session_id=session_id,
                 metadata={"blocked_reason": "subagent_exception", "max_iterations": max_iters},
             )
+            token_usage_summary = _agent_token_usage_summary(locals().get("sub_agent"))
+            context_artifact_path = _save_subagent_context(task_id, locals().get("sub_agent"), "error", session_id=session_id, run_id=run_id)
+            if context_artifact_path:
+                _mark_task_blocked(
+                    task_id,
+                    f"子 Agent 执行异常；上下文已保存到 {context_artifact_path}",
+                    session_id=session_id,
+                    metadata={"context_artifact_path": context_artifact_path, "context_saved_reason": "error"},
+                )
             item = {
                 "task_index": task_index,
                 "task_id": task_id,
@@ -431,8 +710,8 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 "status": "error",
                 "truncated": False,
                 "blocked_update": blocked_update,
-                "result": str(e),
-                "sub_agent_messages": normalize_messages(getattr(sub_agent, "messages", []), source=run_id),
+                "context_artifact_path": context_artifact_path,
+                "token_usage": token_usage_summary,
             }
             _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_FINISHED, item)
             return item
@@ -452,10 +731,10 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
     valid_jobs = []
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
-            results.append({"task_index": i, "status": "error", "result": "Each task must be an object."})
+            results.append({"task_index": i, "status": "error", "result": "Each task must be an object.", "token_usage": _agent_token_usage_summary(None)})
             continue
         if not (task.get("goal") or task.get("description") or task.get("task_id") or task.get("id")):
-            results.append({"task_index": i, "status": "error", "result": "Missing goal/description/task_id in task."})
+            results.append({"task_index": i, "status": "error", "result": "Missing goal/description/task_id in task.", "token_usage": _agent_token_usage_summary(None)})
             continue
         valid_jobs.append((i, task))
 
@@ -492,7 +771,8 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                         "status": "error",
                         "truncated": False,
                         "blocked_update": blocked_update,
-                        "result": str(exc),
+                        "context_artifact_path": None,
+                        "token_usage": _agent_token_usage_summary(None),
                     }
                 results.append(item)
                 task_id = item.get("task_id") or f"index={item.get('task_index')}"
@@ -516,12 +796,16 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 except Exception:
                     pass
                 future.cancel()
+                with subagent_refs_lock:
+                    timed_sub_agent = subagent_refs.get((i, str(task_id or "")))
+                context_artifact_path = _save_subagent_context(task_id, timed_sub_agent, "timeout", session_id=session_id, run_id=f"delegate-{i}-{task_id or 'adhoc'}")
                 blocked_update = _mark_task_blocked(
                     task_id,
-                    f"子 Agent 超过墙钟超时 {timeout_value:g}s，任务自动标记为 blocked；后台请求如仍在运行会被取消信号要求停止。",
+                    f"子 Agent 超过墙钟超时 {timeout_value:g}s，任务自动标记为 blocked；后台请求如仍在运行会被取消信号要求停止。" + (f" 上下文已保存到 {context_artifact_path}" if context_artifact_path else ""),
                     session_id=session_id,
-                    metadata={"blocked_reason": "subagent_wall_timeout", "wall_timeout_seconds": timeout_value},
+                    metadata={"blocked_reason": "subagent_wall_timeout", "wall_timeout_seconds": timeout_value, **({"context_artifact_path": context_artifact_path, "context_saved_reason": "timeout"} if context_artifact_path else {})},
                 )
+                timed_token_usage = _agent_token_usage_summary(timed_sub_agent)
                 item = {
                     "task_index": i,
                     "task_id": task_id,
@@ -529,7 +813,8 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                     "status": "timeout",
                     "truncated": False,
                     "blocked_update": blocked_update,
-                    "result": f"subagent wall timeout after {timeout_value:g}s",
+                    "context_artifact_path": context_artifact_path,
+                    "token_usage": timed_token_usage,
                 }
                 results.append(item)
                 pending.remove(future)
@@ -540,7 +825,25 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
         executor.shutdown(wait=False, cancel_futures=True)
 
     results.sort(key=lambda x: x.get("task_index", 0))
-    return json.dumps(results, ensure_ascii=False, indent=2)
+    delegated_token_usage = _sum_token_usage(results)
+    whole_todo_completed = _all_tasks_completed(session_id)
+    cleaned_context_artifacts = _cleanup_all_completed_contexts(session_id)
+    if whole_todo_completed:
+        for item in results:
+            item["context_artifact_path"] = None
+    todo_digest = None
+    try:
+        from tools.todo_tool import todo_manage
+        todo_digest = json.loads(todo_manage("digest", "{}", session_id=session_id or ""))
+    except Exception:
+        todo_digest = None
+    return json.dumps({
+        "tasks": results,
+        "delegated_token_usage": delegated_token_usage,
+        "todo_digest": todo_digest,
+        "cleaned_context_artifacts": cleaned_context_artifacts,
+        "note": "delegate_task only returns task status and todo digest; sub-agent message history is not returned inline. Child contexts are retained as artifacts until the whole todo succeeds, then cleaned together. If a task saved context_artifact_path in todo metadata, the parent may explicitly inspect it."
+    }, ensure_ascii=False, indent=2)
 
 
 registry.register(
@@ -550,9 +853,11 @@ registry.register(
         "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考。\n"
         "支持动态 todo list 协议：传入 task_id/id 时，子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
+        "返回值只包含每个子任务状态、token_usage、可选 context_artifact_path、delegated_token_usage 汇总和 todo_digest；不会把子 Agent 完整 messages 回灌给父进程。\n"
+        "子 Agent 上下文不会回灌给父进程；会以 artifact 形式保留到整个 todo 成功完成后再统一清理，失败/超时/未完成时父进程可通过 context_artifact_path 显式读取。\n"
         "如果子 Agent 达到 max_iterations 并强制收尾，且对应 todo 任务仍是 in_progress，会自动标记为 blocked，避免任务长期卡住。\n"
         "父进程应先用 todo_manage 查看 ready 任务，基于拓扑依赖决定并发子进程数量，再调用本工具。\n"
-        "注意：子智能体对父进程对话历史一无所知，因此 goal/context_summary 必须完整、自包含。"
+        "注意：子智能体对父进程对话历史一无所知，因此 goal/context_summary 必须完整、自包含；父进程默认只读 todo_manage digest。"
     ),
     parameters={
         "type": "object",

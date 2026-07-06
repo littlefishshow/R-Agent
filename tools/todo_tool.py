@@ -227,6 +227,48 @@ def _shorten(text, limit=90):
     return text[: limit - 1] + "…"
 
 
+
+def _task_digest(task: Dict[str, Any]) -> Dict[str, Any]:
+    metadata = task.get("metadata") or {}
+    digest = {
+        "id": task.get("id"),
+        "description": task.get("description"),
+        "parent_id": task.get("parent_id"),
+        "dependencies": task.get("dependencies", []),
+        "status": task.get("status"),
+        "assigned_to": task.get("assigned_to", ""),
+        "deliverable": task.get("deliverable", ""),
+        "updated_at": task.get("updated_at"),
+    }
+    if task.get("split_proposal"):
+        proposal = task.get("split_proposal") or {}
+        digest["split_proposal"] = {
+            "rationale": proposal.get("rationale", ""),
+            "task_count": len(proposal.get("tasks", []) or []),
+            "tasks": proposal.get("tasks", []),
+        }
+    if metadata.get("blocked_reason"):
+        digest["blocked_reason"] = metadata.get("blocked_reason")
+    if metadata.get("context_artifact_path"):
+        digest["context_artifact_path"] = metadata.get("context_artifact_path")
+    result = str(task.get("result") or "").strip()
+    if result:
+        digest["result_summary"] = result[:600] + ("…" if len(result) > 600 else "")
+    return digest
+
+
+def _todo_digest(state: Dict[str, Any]) -> Dict[str, Any]:
+    tasks = _tasks(state)
+    status_counts = {s: sum(1 for t in tasks if t.get("status") == s) for s in sorted(VALID_STATUSES)}
+    return {
+        "version": state.get("version", 2),
+        "session_id": state.get("session_id", _current_session_id()),
+        "total": len(tasks),
+        "status_counts": status_counts,
+        "ready_to_execute": _ready_tasks(state),
+        "tasks": [_task_digest(t) for t in tasks],
+    }
+
 def _todo_snapshot_text(state: Dict[str, Any], label: str = "当前任务看板") -> str:
     """Return a user-facing todo board snapshot for direct todo_manage updates."""
     tasks = state.get("tasks", []) if isinstance(state, dict) else []
@@ -385,6 +427,9 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
         if isinstance(data, dict) and data.get("session_id"):
             # Wrapper normally sets session before loading; keep payload session for diagnostics only.
             state["session_id"] = _current_session_id(data.get("session_id")) or state.get("session_id")
+
+        if action == "digest":
+            return json.dumps(_todo_digest(state), ensure_ascii=False, indent=2)
 
         if action == "view":
             include_tree = True if not isinstance(data, dict) else data.get("include_tree", True)
@@ -603,6 +648,7 @@ registry.register(
         "操作(action)包括：\n"
         "- 'init': 初始化看板，payload 为任务数组或 {tasks:[...]}。任务字段可含 id, description, parent_id, dependencies, context_summary, acceptance_criteria, deliverable。\n"
         "- 'view': 查看任务、树结构、状态统计和 ready_to_execute。payload 可含 include_tree/status/parent_id。\n"
+        "- 'digest': 返回任务看板梗概，包含任务状态、摘要、错误和可选 context_artifact_path，不返回子进程完整上下文。\n"
         "- 'ready': 只返回依赖已满足、没有子任务、可立即领取的 pending 任务。\n"
         "- 'get': 查看单个任务及其子树，payload {id}。\n"
         "- 'add': 追加任务，payload 为任务数组或 {parent_id, tasks:[...]}。\n"
@@ -620,7 +666,7 @@ registry.register(
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["init", "view", "ready", "get", "add", "update", "claim", "release", "propose_split", "approve_split", "reject_split", "reap_stale_claims", "clear"],
+                "enum": ["init", "view", "digest", "ready", "get", "add", "update", "claim", "release", "propose_split", "approve_split", "reject_split", "reap_stale_claims", "clear"],
                 "description": "要执行的操作类型"
             },
             "payload": {

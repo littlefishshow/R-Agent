@@ -428,6 +428,41 @@ pip install PyNaCl>=1.5.0
 
 ### 2026-07-06
 
+#### 启动时自动清理 sandbox
+
+- **启动即扫描 sandbox**：新增 `core/sandbox_cleanup.py`，R-Agent CLI 启动和 `RAgent` 会话创建时都会机会式执行清理，默认保留最近 3 天内创建的运行态文件。
+- **递归清理所有 sandbox 内容**：清理范围从顶层条目扩展为 `sandbox/` 下所有文件和目录；旧文件/符号链接会直接删除，旧目录采用自底向上处理，仅在目录为空时删除，避免误删仍包含新文件的目录。
+- **可配置且可关闭**：支持 `R_AGENT_SANDBOX_RETENTION_DAYS` 调整保留天数，`R_AGENT_SANDBOX_CLEANUP_INTERVAL_SECONDS` 调整同一进程内清理间隔，`R_AGENT_SANDBOX_CLEANUP_DISABLED=1` 关闭自动清理。
+- **补充回归测试**：新增 `tests/test_sandbox_cleanup.py`，覆盖嵌套文件清理、保留新文件、创建时间/ctime fallback、间隔限制、禁用开关和 `RAgent` 构造触发清理。
+
+#### 子 Agent Token Usage 汇总与 Cockpit 展示
+
+- **父子 Agent token usage 合并**：子 Agent 执行结束后会汇总自身 LLM `usage`，并在父 Agent 侧合并统计，避免委派任务的 token 消耗只停留在子进程内部而无法被主会话感知。
+- **区分最近一次、父进程、子进程与总量**：Token 用量展示从单一累计值升级为 `last / parent / children / total` 口径，其中 `last` 表示最近一次模型响应，`parent` 表示父 Agent 自身消耗，`children` 表示委派子 Agent 消耗，`total` 为父子合计。
+- **Cockpit Resources 暴露完整用量字段**：GUI resources 增加 `parent_token_usage`、`children_token_usage`、`total_token_usage` 等字段，并保留 `last_token_usage`，便于前端资源面板查看父子任务整体资源消耗。
+- **前端同步显示 token 细分**：R-Agent Cockpit 在界面中展示 `last / parent / children / total tokens`，让用户能直接区分当前回复、父 Agent 调度和子 Agent 执行分别消耗了多少 token。
+- **delegate_task 返回委派用量**：`delegate_task` 返回结构新增 `delegated_token_usage`，父进程可在 digest/调度结果中读取本轮委派任务的 token 汇总，并用于后续合并与展示。
+
+#### CLI 欢迎 Banner 对齐修复
+
+- **规避 emoji 宽度差异**：`main.py` 的欢迎 banner 不再在内容行左侧使用 `✨`、`💡`、`⌨️`、`🚪` 等 emoji 前缀，避免 Rich 计算宽度与具体终端/字体实际显示宽度不一致导致右边框看起来错位。
+- **抽出 banner 文本构造函数**：新增 `_build_welcome_banner_text()` 和 `_terminal_safe_banner_line()`，保留原有命令提示、模型信息与样式，同时让后续验证可以直接构造 banner 内容。
+- **完成最小验证**：使用 Rich 渲染包含 `gpt-5.5-2026-04-24`、`AZURE` 与“使用语音输入”的欢迎面板，逐行 `cell_len` 均为 86，确认边框和内容行显示宽度一致。
+
+### 2026-07-06
+
+#### 父子任务上下文最小化与 Todo Digest 调度
+
+- **先提交安全检查点**：在本轮重构前已创建 git commit `bfeb470 checkpoint before delegated todo context refactor`，保存上一阶段 todo session 隔离、超时保护和大工具输出治理改动。
+- **父进程不再接收子进程完整上下文**：`delegate_task` 返回结构改为 `{tasks, todo_digest, note}`，每个子任务只返回状态、截断/超时标记和可选 `context_artifact_path`；不再返回 `sub_agent_messages`，避免父进程上下文被子进程完整轨迹撑爆。
+- **子进程上下文延迟统一清理**：子 Agent 完成后不会把完整上下文回灌给父进程；其上下文会先保存为 `sandbox/delegate_contexts/<session>/...json` artifact，直到整个 todo tree 全部 completed 后才统一删除并清理 `context_artifact_path` 元数据。
+- **失败/超时/未完成保留可诊断上下文**：当子 Agent 模型失败、异常、超时、截断或返回 success 但 todo 未 completed 时，`context_artifact_path` 会继续保留在 todo metadata / digest 中，父进程可按需显式读取；成功任务的上下文也只在整个任务成功后统一清理。
+- **新增 Todo Digest**：`todo_manage` 新增 `digest` action，返回任务状态、依赖、ready 列表、result 摘要、blocked_reason、split proposal 摘要和可选 context artifact 路径，不返回子进程完整上下文。
+- **系统提示强化调度策略**：`core/prompt_builder.py` 新增 Delegated todo context policy，要求复杂/需工具任务优先使用 todo_manage + delegate_task，父进程只做任务发布、依赖调度、拆分审批和 digest 汇总，子进程只接收任务相关上下文。
+- **补充回归测试**：更新 `tests/test_delegate_progress.py` 和 `tests/test_todo_session_isolation.py`，验证 delegate 不再回灌 `sub_agent_messages`、子上下文保留到整体成功后统一清理、失败任务仅通过 context artifact 暴露上下文；全量测试已通过 `211 passed, 8 skipped`。
+
+### 2026-07-06
+
 #### Todo 会话隔离与父子调度防卡死
 
 - **Todo List 按 session_id 隔离**：`todo_manage` 新增 `session_id` 参数；提供后任务看板写入 `sandbox/todo_lists/todo_list_<session_id>.json`，并使用对应 `.lock` 文件加锁，避免多个终端/GUI 会话同时读写同一个 `sandbox/todo_list.json` 造成覆盖。

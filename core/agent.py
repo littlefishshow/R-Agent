@@ -6,6 +6,7 @@ from pathlib import Path
 from core import config
 from tools.registry import registry
 from core.context.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
+from core.sandbox_cleanup import maybe_cleanup_sandbox
 from app_gui.normalizer import build_llm_request_snapshot, normalize_message
 from app_gui.schemas import (
     EVENT_LLM_REQUEST_SNAPSHOT,
@@ -242,6 +243,7 @@ class RAgent:
     """
 
     def __init__(self, model=None, max_iterations=None, enable_self_review=True, session_id=None):
+        maybe_cleanup_sandbox()
         self.model = model or config.get_model()
         self.session_id = session_id or ""
         self.max_iterations = max_iterations or config.get_max_iterations()
@@ -260,6 +262,14 @@ class RAgent:
             "last_prompt_tokens": 0,
             "last_completion_tokens": 0,
             "last_total_tokens": 0,
+            "available": False,
+        }
+        # 子 Agent / delegate_task 汇总回来的 token usage。与 self.token_usage
+        # 分开记录，避免把父 Agent 本轮会话用量和被委托子会话用量混在一起。
+        self.delegated_token_usage = {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
             "available": False,
         }
         # 截断状态：bool。被强制收尾后置 True，下次正常 run 前会自动复位。
@@ -381,16 +391,99 @@ class RAgent:
             )
 
     def get_token_usage_total(self):
-        """返回本次 Agent 启动以来累计 token；无 usage 信息时返回 'unavailable'。"""
+        """返回本次父 Agent 启动以来自身累计 token；无 usage 信息时返回 'unavailable'。"""
         if not self.token_usage.get("available"):
             return TOKEN_USAGE_UNAVAILABLE
         return self.token_usage.get("total_tokens", 0)
 
     def get_last_token_usage_total(self):
-        """返回最近一次 LLM 响应 token；无 usage 信息时返回 'unavailable'。"""
+        """返回最近一次父 Agent LLM 响应 token；无 usage 信息时返回 'unavailable'。"""
         if not self.token_usage.get("available"):
             return TOKEN_USAGE_UNAVAILABLE
         return self.token_usage.get("last_total_tokens", 0)
+
+    def get_delegated_token_usage_total(self):
+        """返回已合并的子 Agent token；没有子 usage 时返回 'unavailable'。"""
+        if not self.delegated_token_usage.get("available"):
+            return TOKEN_USAGE_UNAVAILABLE
+        return self.delegated_token_usage.get("total_tokens", 0)
+
+    def get_total_token_usage_including_children(self):
+        """返回父 Agent 自身 + 子 Agent 累计 token；两者都无 usage 时返回 'unavailable'。"""
+        parent_available = bool(self.token_usage.get("available"))
+        child_available = bool(self.delegated_token_usage.get("available"))
+        if not parent_available and not child_available:
+            return TOKEN_USAGE_UNAVAILABLE
+        return (self.token_usage.get("total_tokens", 0) if parent_available else 0) + (
+            self.delegated_token_usage.get("total_tokens", 0) if child_available else 0
+        )
+
+    def get_token_usage_summary(self, include_children: bool = False) -> dict:
+        """返回可 JSON 化的 token usage 摘要；默认只包含当前 Agent 自身会话。"""
+        summary = {
+            "prompt_tokens": self.token_usage.get("prompt_tokens", 0),
+            "completion_tokens": self.token_usage.get("completion_tokens", 0),
+            "total_tokens": self.token_usage.get("total_tokens", 0),
+            "last_prompt_tokens": self.token_usage.get("last_prompt_tokens", 0),
+            "last_completion_tokens": self.token_usage.get("last_completion_tokens", 0),
+            "last_total_tokens": self.token_usage.get("last_total_tokens", 0),
+            "available": bool(self.token_usage.get("available")),
+        }
+        if include_children:
+            delegated = {
+                "prompt_tokens": self.delegated_token_usage.get("prompt_tokens", 0),
+                "completion_tokens": self.delegated_token_usage.get("completion_tokens", 0),
+                "total_tokens": self.delegated_token_usage.get("total_tokens", 0),
+                "available": bool(self.delegated_token_usage.get("available")),
+            }
+            summary["delegated_token_usage"] = delegated
+            summary["total_including_children"] = self.get_total_token_usage_including_children()
+        return summary
+
+    def merge_delegated_token_usage(self, usage) -> bool:
+        """把 delegate_task 返回的 delegated_token_usage 合并到当前父 Agent。
+
+        返回 True 表示成功合并了至少一个非零 usage；无 usage/不可解析时保持
+        unavailable 语义并返回 False。
+        """
+        if not isinstance(usage, dict) or not usage.get("available"):
+            return False
+        prompt_tokens = self._usage_value(usage, "prompt_tokens")
+        completion_tokens = self._usage_value(usage, "completion_tokens")
+        total_tokens = self._usage_value(usage, "total_tokens")
+        if not total_tokens:
+            total_tokens = prompt_tokens + completion_tokens
+        if not any((prompt_tokens, completion_tokens, total_tokens)):
+            return False
+        self.delegated_token_usage["prompt_tokens"] += prompt_tokens
+        self.delegated_token_usage["completion_tokens"] += completion_tokens
+        self.delegated_token_usage["total_tokens"] += total_tokens
+        self.delegated_token_usage["available"] = True
+        return True
+
+    def _merge_delegated_token_usage_from_tool_result(self, result: str) -> bool:
+        """解析 delegate_task 的工具返回，并合并其中的 delegated_token_usage。
+
+        兼容两种既有返回形态：直接调用 delegate_task 得到的 JSON，以及
+        registry.execute_tool 包装后的 {success,result} JSON。若工具结果因过大
+        被持久化替换，则调用方应在持久化前调用此 helper。
+        """
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            return False
+        if isinstance(payload, dict) and "result" in payload:
+            inner = payload.get("result")
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except Exception:
+                    inner = None
+            if isinstance(inner, dict):
+                payload = inner
+        if not isinstance(payload, dict):
+            return False
+        return self.merge_delegated_token_usage(payload.get("delegated_token_usage"))
 
     # ------------------------------------------------------------------
     # 内部工具
@@ -738,6 +831,9 @@ class RAgent:
 
                     if _is_cancelled(cancel_event):
                         raise AgentInterrupted()
+
+                    if func_name == "delegate_task":
+                        self._merge_delegated_token_usage_from_tool_result(result)
 
                     result = maybe_persist_tool_result(
                         content=result,
