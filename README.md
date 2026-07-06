@@ -428,6 +428,16 @@ pip install PyNaCl>=1.5.0
 
 ### 2026-07-06
 
+#### Skill 工具入口压缩与生命周期治理统一
+
+- **压缩 Skill 查询入口**：新增统一 `skill_search` 工具，通过 `action=categories/by_category/search` 覆盖原 `skill_categories`、`skills_by_category` 与关键词检索场景，并默认跳过 `.archive` 等隐藏类目，减少全局工具 schema 数量。
+- **保留精准阅读与管理入口**：继续保留 `skill_view` 读取 `SKILL.md` / supporting files，`skill_manage` 统一处理 `create/patch/edit/delete/write_file/remove_file/usage`，旧 `skills_list`、`skill_create`、`skill_delete` 不再默认注册。
+- **统一生命周期治理入口**：新增 `skill_curator_manage(action=status/run/pin/restore)`，替代默认注册的 `skill_curator_status/run/pin/restore` 多入口，集中管理 stale/archive dry-run、pin/unpin 与 restore。
+- **保留分类维护能力**：继续保留 `skill_relocate` 作为动态调整 skill 类目的专用入口，与 `skill_search` 形成“查找/查看/管理/迁移/治理”五个核心 Skill 工具。
+- **补充验证覆盖**：新增 `tests/test_skill_core_tools.py`，覆盖五个核心工具注册、统一查询行为、隐藏归档目录过滤、旧入口不再默认注册，以及 curator manage 的 action 分发。
+
+### 2026-07-06
+
 - 降低父子 Agent 调度的默认 token 回灌：`todo_manage ready` 默认仅返回 ready task id，`include_tasks=true` 时才返回 compact task。
 - `todo_manage digest` 新增 `include_completed`、`result_summary_chars`、`include_artifacts` 参数，用于按需裁剪已完成任务、结果摘要和 artifact 路径。
 - `delegate_task` 新增 `return_mode=compact` 默认返回模式，以及 `include_todo_digest`、`include_goal`、`include_token_detail`、`include_context_artifacts` 控制项；`return_mode=full` 保留旧完整结构。

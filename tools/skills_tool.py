@@ -93,13 +93,6 @@ def skill_manage_tool(action: str, skill_name: str = "", description: str = "", 
 
 
 registry.register(
-    name="skills_list",
-    description="列出当前 Agent 拥有的所有可用技能 (返回按类别划分的名称和描述)。",
-    parameters={"type": "object", "properties": {}},
-    handler=skills_list_tool,
-)
-
-registry.register(
     name="skill_view",
     description="阅读某个具体技能的完整说明 (SKILL.md) 或技能目录内 supporting file。在执行复杂任务前，必须先阅读对应的技能文档。",
     parameters={
@@ -111,29 +104,6 @@ registry.register(
         "required": ["skill_name"],
     },
     handler=skill_view_tool,
-)
-
-registry.register(
-    name="skill_create",
-    description="兼容旧接口：创建一个新技能。新代码优先使用 skill_manage(action=create)。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "skill_name": {"type": "string", "description": "技能名称，使用小写字母和下划线，例如 'git_workflow'"},
-            "description": {"type": "string", "description": "一句简短的描述 (<=60字符)"},
-            "content": {"type": "string", "description": "技能的主体内容，必须包含 Markdown 标题如 '## When to Use', '## Procedure' 等"},
-            "category": {"type": "string", "description": "技能的分类名称，例如 agent_ops、github、productivity"},
-        },
-        "required": ["skill_name", "description", "content"],
-    },
-    handler=skill_create_tool,
-)
-
-registry.register(
-    name="skill_delete",
-    description="兼容旧接口：删除一个技能。新代码优先使用 skill_manage(action=delete)。",
-    parameters={"type": "object", "properties": {"skill_name": {"type": "string", "description": "要删除的技能名称"}}, "required": ["skill_name"]},
-    handler=skill_delete_tool,
 )
 
 registry.register(
