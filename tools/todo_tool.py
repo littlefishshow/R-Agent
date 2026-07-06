@@ -228,7 +228,7 @@ def _shorten(text, limit=90):
 
 
 
-def _task_digest(task: Dict[str, Any]) -> Dict[str, Any]:
+def _task_digest(task: Dict[str, Any], *, result_summary_chars: int = 600, include_artifacts: bool = True) -> Dict[str, Any]:
     metadata = task.get("metadata") or {}
     digest = {
         "id": task.get("id"),
@@ -249,24 +249,39 @@ def _task_digest(task: Dict[str, Any]) -> Dict[str, Any]:
         }
     if metadata.get("blocked_reason"):
         digest["blocked_reason"] = metadata.get("blocked_reason")
-    if metadata.get("context_artifact_path"):
+    if include_artifacts and metadata.get("context_artifact_path"):
         digest["context_artifact_path"] = metadata.get("context_artifact_path")
     result = str(task.get("result") or "").strip()
-    if result:
-        digest["result_summary"] = result[:600] + ("…" if len(result) > 600 else "")
+    try:
+        result_summary_chars = int(result_summary_chars)
+    except Exception:
+        result_summary_chars = 600
+    result_summary_chars = max(0, result_summary_chars)
+    if result and result_summary_chars > 0:
+        digest["result_summary"] = result[:result_summary_chars] + ("…" if len(result) > result_summary_chars else "")
     return digest
 
 
-def _todo_digest(state: Dict[str, Any]) -> Dict[str, Any]:
-    tasks = _tasks(state)
-    status_counts = {s: sum(1 for t in tasks if t.get("status") == s) for s in sorted(VALID_STATUSES)}
+def _todo_digest(
+    state: Dict[str, Any],
+    *,
+    include_completed: bool = True,
+    result_summary_chars: int = 600,
+    include_artifacts: bool = True,
+) -> Dict[str, Any]:
+    all_tasks = _tasks(state)
+    tasks = all_tasks if include_completed else [t for t in all_tasks if t.get("status") != "completed"]
+    status_counts = {s: sum(1 for t in all_tasks if t.get("status") == s) for s in sorted(VALID_STATUSES)}
     return {
         "version": state.get("version", 2),
         "session_id": state.get("session_id", _current_session_id()),
-        "total": len(tasks),
+        "total": len(all_tasks),
         "status_counts": status_counts,
         "ready_to_execute": _ready_tasks(state),
-        "tasks": [_task_digest(t) for t in tasks],
+        "tasks": [
+            _task_digest(t, result_summary_chars=result_summary_chars, include_artifacts=include_artifacts)
+            for t in tasks
+        ],
     }
 
 def _todo_snapshot_text(state: Dict[str, Any], label: str = "当前任务看板") -> str:
@@ -429,7 +444,19 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             state["session_id"] = _current_session_id(data.get("session_id")) or state.get("session_id")
 
         if action == "digest":
-            return json.dumps(_todo_digest(state), ensure_ascii=False, indent=2)
+            include_completed = True if not isinstance(data, dict) else data.get("include_completed", True)
+            result_summary_chars = 600 if not isinstance(data, dict) else data.get("result_summary_chars", 600)
+            include_artifacts = True if not isinstance(data, dict) else data.get("include_artifacts", True)
+            return json.dumps(
+                _todo_digest(
+                    state,
+                    include_completed=bool(include_completed),
+                    result_summary_chars=result_summary_chars,
+                    include_artifacts=bool(include_artifacts),
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
 
         if action == "view":
             include_tree = True if not isinstance(data, dict) else data.get("include_tree", True)
@@ -452,8 +479,18 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
 
         elif action == "ready":
             ready_ids = _ready_tasks(state)
-            tmap = _task_map(state)
-            return json.dumps({"ready_to_execute": ready_ids, "tasks": [tmap[i] for i in ready_ids]}, ensure_ascii=False, indent=2)
+            result = {"ready_to_execute": ready_ids}
+            include_tasks = bool(data.get("include_tasks")) if isinstance(data, dict) else False
+            if include_tasks:
+                tmap = _task_map(state)
+                result_summary_chars = data.get("result_summary_chars", 600) if isinstance(data, dict) else 600
+                include_artifacts = data.get("include_artifacts", True) if isinstance(data, dict) else True
+                result["tasks"] = [
+                    _task_digest(tmap[i], result_summary_chars=result_summary_chars, include_artifacts=bool(include_artifacts))
+                    for i in ready_ids
+                    if i in tmap
+                ]
+            return json.dumps(result, ensure_ascii=False, indent=2)
 
         elif action == "get":
             task_id = str(data.get("id"))
@@ -648,8 +685,8 @@ registry.register(
         "操作(action)包括：\n"
         "- 'init': 初始化看板，payload 为任务数组或 {tasks:[...]}。任务字段可含 id, description, parent_id, dependencies, context_summary, acceptance_criteria, deliverable。\n"
         "- 'view': 查看任务、树结构、状态统计和 ready_to_execute。payload 可含 include_tree/status/parent_id。\n"
-        "- 'digest': 返回任务看板梗概，包含任务状态、摘要、错误和可选 context_artifact_path，不返回子进程完整上下文。\n"
-        "- 'ready': 只返回依赖已满足、没有子任务、可立即领取的 pending 任务。\n"
+        "- 'digest': 返回任务看板梗概，payload 可含 include_completed(default true)、result_summary_chars(default 600)、include_artifacts(default true)；包含任务状态、摘要、错误和可选 context_artifact_path，不返回子进程完整上下文。\n"
+        "- 'ready': 默认只返回 {ready_to_execute:[ids]}；payload include_tasks=true 时返回对应 compact/digest 任务（非完整 task），也支持 result_summary_chars/include_artifacts。\n"
         "- 'get': 查看单个任务及其子树，payload {id}。\n"
         "- 'add': 追加任务，payload 为任务数组或 {parent_id, tasks:[...]}。\n"
         "- 'update': 更新任务字段或状态，status 可选 pending/in_progress/needs_split/blocked/completed/failed/cancelled。\n"
@@ -671,7 +708,7 @@ registry.register(
             },
             "payload": {
                 "type": "string",
-                "description": "操作对应的数据 JSON 字符串；view/ready/clear 可为空 '{}'"
+                "description": "操作对应的数据 JSON 字符串；view/ready/clear 可为空 '{}'；digest 支持 include_completed/result_summary_chars/include_artifacts；ready 支持 include_tasks"
             },
             "session_id": {
                 "type": "string",

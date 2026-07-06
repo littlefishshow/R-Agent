@@ -115,3 +115,31 @@ def test_delegate_saves_failed_context_by_artifact_only(monkeypatch, tmp_path):
     digest_task = payload["todo_digest"]["tasks"][0]
     assert digest_task["status"] == "blocked"
     assert digest_task["context_artifact_path"] == item["context_artifact_path"]
+
+
+def test_todo_ready_defaults_to_ids_and_digest_params(monkeypatch, tmp_path):
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    monkeypatch.setattr(todo_tool, "TODO_LIST_DIR", str(tmp_path / "todo_lists"))
+    long_result = "x" * 50
+    todo_tool.todo_manage("init", json.dumps({"tasks": [
+        {"id": "done", "description": "Done", "status": "completed", "result": long_result, "metadata": {"context_artifact_path": "sandbox/delegate_contexts/s/a.json"}},
+        {"id": "ready", "description": "Ready", "result": "ready-result", "metadata": {"context_artifact_path": "sandbox/delegate_contexts/s/b.json"}},
+    ]}), session_id="compact")
+
+    ready_default = json.loads(todo_tool.todo_manage("ready", "{}", session_id="compact"))
+    assert ready_default == {"ready_to_execute": ["ready"]}
+
+    ready_with_tasks = json.loads(todo_tool.todo_manage("ready", json.dumps({"include_tasks": True, "include_artifacts": False}), session_id="compact"))
+    assert ready_with_tasks["ready_to_execute"] == ["ready"]
+    assert ready_with_tasks["tasks"][0]["id"] == "ready"
+    assert "claim" not in ready_with_tasks["tasks"][0]
+    assert "context_artifact_path" not in ready_with_tasks["tasks"][0]
+
+    digest = json.loads(todo_tool.todo_manage("digest", json.dumps({
+        "include_completed": False,
+        "result_summary_chars": 10,
+        "include_artifacts": False,
+    }), session_id="compact"))
+    assert [t["id"] for t in digest["tasks"]] == ["ready"]
+    assert digest["tasks"][0]["result_summary"] == "ready-resu…"
+    assert "context_artifact_path" not in digest["tasks"][0]

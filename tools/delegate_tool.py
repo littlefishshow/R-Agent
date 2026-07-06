@@ -125,6 +125,35 @@ def _usage_total_for_aggregation(summary):
     }
 
 
+
+def _compact_token_usage(usage):
+    aggregate = _usage_total_for_aggregation(usage)
+    return {
+        "prompt_tokens": _usage_int(aggregate, "prompt_tokens"),
+        "completion_tokens": _usage_int(aggregate, "completion_tokens"),
+        "total_tokens": _usage_int(aggregate, "total_tokens"),
+        "available": bool(aggregate.get("available")),
+    }
+
+
+def _compact_delegate_item(item, *, include_context_artifacts=True, include_token_detail=False, include_goal=False):
+    compact = {
+        "task_index": item.get("task_index"),
+        "task_id": item.get("task_id"),
+        "status": item.get("status"),
+        "truncated": bool(item.get("truncated")),
+        "max_iterations": item.get("max_iterations"),
+    }
+    if include_goal and "goal" in item:
+        compact["goal"] = item.get("goal")
+    if include_context_artifacts and item.get("context_artifact_path"):
+        compact["context_artifact_path"] = item.get("context_artifact_path")
+    if include_token_detail:
+        compact["token_usage"] = item.get("token_usage") or _agent_token_usage_summary(None)
+    else:
+        compact["token_usage"] = _compact_token_usage(item.get("token_usage"))
+    return compact
+
 def _sum_token_usage(items):
     total = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "available": False}
     for item in items or []:
@@ -470,7 +499,19 @@ def _mark_task_blocked(task_id, reason, *, session_id=None, metadata=None):
     except Exception as exc:
         return f"Error: failed to mark task {task_id} blocked: {exc}"
 
-def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: int = 30, session_id: str = "", default_wall_timeout_seconds=None, event_sink=None) -> str:
+def delegate_task(
+    tasks: str,
+    max_workers: int = None,
+    default_max_iterations: int = 30,
+    session_id: str = "",
+    default_wall_timeout_seconds=None,
+    event_sink=None,
+    return_mode: str = "compact",
+    include_todo_digest: bool = True,
+    include_goal: bool = False,
+    include_token_detail: bool = False,
+    include_context_artifacts: bool = True,
+) -> str:
     """生成隔离上下文子智能体并行处理任务。
 
     tasks 是 JSON 字符串，元素可以是：
@@ -479,6 +520,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
 
     若提供 task_id，子智能体会被提示使用 todo_manage claim/get/propose_split/update 来遵循动态任务看板协议。
     delegate_task 会在启动、单个子 Agent 结束和整体结束时自动打印 todo 进度快照。
+    默认 return_mode=compact 只返回任务状态、简表 token_usage、可选 todo_digest/context_artifact_path；return_mode=full 保留旧完整结构。
     """
     try:
         task_list = json.loads(tasks)
@@ -488,6 +530,13 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
         return json.dumps({"error": "tasks must be a valid JSON string."}, ensure_ascii=False)
 
     session_id = str(session_id or "")
+    return_mode = str(return_mode or "compact").lower()
+    if return_mode not in {"compact", "full"}:
+        return_mode = "compact"
+    include_todo_digest = bool(include_todo_digest)
+    include_goal = bool(include_goal)
+    include_token_detail = bool(include_token_detail)
+    include_context_artifacts = bool(include_context_artifacts)
     if default_wall_timeout_seconds is None:
         default_wall_timeout_seconds = config.get_delegate_task_wall_timeout()
     try:
@@ -731,10 +780,10 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
     valid_jobs = []
     for i, task in enumerate(task_list):
         if not isinstance(task, dict):
-            results.append({"task_index": i, "status": "error", "result": "Each task must be an object.", "token_usage": _agent_token_usage_summary(None)})
+            results.append({"task_index": i, "task_id": None, "max_iterations": default_max_iterations, "status": "error", "truncated": False, "result": "Each task must be an object.", "token_usage": _agent_token_usage_summary(None)})
             continue
         if not (task.get("goal") or task.get("description") or task.get("task_id") or task.get("id")):
-            results.append({"task_index": i, "status": "error", "result": "Missing goal/description/task_id in task.", "token_usage": _agent_token_usage_summary(None)})
+            results.append({"task_index": i, "task_id": None, "max_iterations": default_max_iterations, "status": "error", "truncated": False, "result": "Missing goal/description/task_id in task.", "token_usage": _agent_token_usage_summary(None)})
             continue
         valid_jobs.append((i, task))
 
@@ -768,6 +817,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                         "task_index": i,
                         "task_id": _task_id_of(task),
                         "goal": task.get("goal") or task.get("description") or "",
+                        "max_iterations": task.get("max_iterations", default_max_iterations),
                         "status": "error",
                         "truncated": False,
                         "blocked_update": blocked_update,
@@ -834,16 +884,40 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
     todo_digest = None
     try:
         from tools.todo_tool import todo_manage
-        todo_digest = json.loads(todo_manage("digest", "{}", session_id=session_id or ""))
+        if include_todo_digest:
+            todo_digest = json.loads(todo_manage(
+                "digest",
+                json.dumps({"include_completed": False, "result_summary_chars": 200}, ensure_ascii=False),
+                session_id=session_id or "",
+            ))
     except Exception:
         todo_digest = None
-    return json.dumps({
-        "tasks": results,
-        "delegated_token_usage": delegated_token_usage,
-        "todo_digest": todo_digest,
-        "cleaned_context_artifacts": cleaned_context_artifacts,
-        "note": "delegate_task only returns task status and todo digest; sub-agent message history is not returned inline. Child contexts are retained as artifacts until the whole todo succeeds, then cleaned together. If a task saved context_artifact_path in todo metadata, the parent may explicitly inspect it."
-    }, ensure_ascii=False, indent=2)
+    if return_mode == "full":
+        payload = {
+            "tasks": results,
+            "delegated_token_usage": delegated_token_usage,
+            "todo_digest": todo_digest,
+            "cleaned_context_artifacts": cleaned_context_artifacts,
+            "note": "delegate_task only returns task status and todo digest; sub-agent message history is not returned inline. Child contexts are retained as artifacts until the whole todo succeeds, then cleaned together. If a task saved context_artifact_path in todo metadata, the parent may explicitly inspect it."
+        }
+    else:
+        compact_tasks = [
+            _compact_delegate_item(
+                item,
+                include_context_artifacts=include_context_artifacts,
+                include_token_detail=include_token_detail,
+                include_goal=include_goal,
+            )
+            for item in results
+        ]
+        payload = {
+            "tasks": compact_tasks,
+            "delegated_token_usage": (delegated_token_usage if include_token_detail else _compact_token_usage(delegated_token_usage)),
+            "cleaned_context_artifacts": cleaned_context_artifacts,
+        }
+        if include_todo_digest:
+            payload["todo_digest"] = todo_digest
+    return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
 registry.register(
@@ -853,7 +927,7 @@ registry.register(
         "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考。\n"
         "支持动态 todo list 协议：传入 task_id/id 时，子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
-        "返回值只包含每个子任务状态、token_usage、可选 context_artifact_path、delegated_token_usage 汇总和 todo_digest；不会把子 Agent 完整 messages 回灌给父进程。\n"
+        "默认 return_mode=compact：返回 tasks 中每项仅含 task_index/task_id/status/truncated/max_iterations、简表 token_usage、可选 context_artifact_path，并可附 todo_digest；不返回 goal/note。return_mode=full 保留旧完整结构。\n"
         "子 Agent 上下文不会回灌给父进程；会以 artifact 形式保留到整个 todo 成功完成后再统一清理，失败/超时/未完成时父进程可通过 context_artifact_path 显式读取。\n"
         "如果子 Agent 达到 max_iterations 并强制收尾，且对应 todo 任务仍是 in_progress，会自动标记为 blocked，避免任务长期卡住。\n"
         "父进程应先用 todo_manage 查看 ready 任务，基于拓扑依赖决定并发子进程数量，再调用本工具。\n"
@@ -888,6 +962,27 @@ registry.register(
             "event_sink": {
                 "type": "object",
                 "description": "内部 GUI 事件接收器；模型不应手动设置。"
+            },
+            "return_mode": {
+                "type": "string",
+                "enum": ["compact", "full"],
+                "description": "返回模式。默认 compact 仅返回任务状态简表；full 保留旧完整结构。"
+            },
+            "include_todo_digest": {
+                "type": "boolean",
+                "description": "是否在返回中包含 todo_digest；默认 true。digest 使用 include_completed=false,result_summary_chars=200 以降低 token。"
+            },
+            "include_goal": {
+                "type": "boolean",
+                "description": "compact 模式是否在每个任务结果中包含 goal；默认 false。"
+            },
+            "include_token_detail": {
+                "type": "boolean",
+                "description": "compact 模式是否返回完整 token_usage；默认 false，仅返回 prompt/completion/total/available 简表。"
+            },
+            "include_context_artifacts": {
+                "type": "boolean",
+                "description": "compact 模式是否包含 context_artifact_path；默认 true。"
             }
         },
         "required": ["tasks"]

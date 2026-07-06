@@ -428,6 +428,14 @@ pip install PyNaCl>=1.5.0
 
 ### 2026-07-06
 
+- 降低父子 Agent 调度的默认 token 回灌：`todo_manage ready` 默认仅返回 ready task id，`include_tasks=true` 时才返回 compact task。
+- `todo_manage digest` 新增 `include_completed`、`result_summary_chars`、`include_artifacts` 参数，用于按需裁剪已完成任务、结果摘要和 artifact 路径。
+- `delegate_task` 新增 `return_mode=compact` 默认返回模式，以及 `include_todo_digest`、`include_goal`、`include_token_detail`、`include_context_artifacts` 控制项；`return_mode=full` 保留旧完整结构。
+- `delegate_task` 默认使用 compact todo digest（不含 completed，结果摘要 200 字符）以减少父进程上下文占用。
+
+
+### 2026-07-06
+
 #### 启动时自动清理 sandbox
 
 - **启动即扫描 sandbox**：新增 `core/sandbox_cleanup.py`，R-Agent CLI 启动和 `RAgent` 会话创建时都会机会式执行清理，默认保留最近 3 天内创建的运行态文件。
