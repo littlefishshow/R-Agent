@@ -72,6 +72,31 @@ def get_llm_retry_base_delay():
     return max(0.0, d)
 
 
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def get_llm_request_timeout():
+    """LLM 单次请求超时时间（秒）；防止子 Agent 卡在 provider 请求上。"""
+    return _env_float("LLM_REQUEST_TIMEOUT", 120.0, minimum=1.0)
+
+
+def get_tool_execution_timeout():
+    """隔离工具单次执行超时时间（秒）；<=0 时禁用超时。"""
+    value = _env_float("TOOL_EXECUTION_TIMEOUT", 300.0, minimum=0.0)
+    return None if value <= 0 else value
+
+
+def get_delegate_task_wall_timeout():
+    """单个 delegate 子任务默认墙钟超时时间（秒）；<=0 时禁用。"""
+    value = _env_float("DELEGATE_TASK_WALL_TIMEOUT", 900.0, minimum=0.0)
+    return None if value <= 0 else value
+
 def get_self_evolution_review_interval():
     """每多少轮用户对话触发一次后台自演进复盘；<=0 表示关闭。"""
     try:
@@ -95,12 +120,13 @@ def create_llm_client(api_key=None):
             api_key=key,
             api_version=get_azure_api_version(),
             azure_endpoint=get_azure_endpoint(),
-            default_headers={"X-TT-LOGID": uuid.uuid4().hex}
+            default_headers={"X-TT-LOGID": uuid.uuid4().hex},
+            timeout=get_llm_request_timeout(),
         )
     else:
         from openai import OpenAI
         base_url = get_openai_base_url()
-        kwargs = {"api_key": key}
+        kwargs = {"api_key": key, "timeout": get_llm_request_timeout()}
         if base_url:
             kwargs["base_url"] = base_url
         return OpenAI(**kwargs)

@@ -55,3 +55,27 @@ def test_cockpit_frontend_current_context_nodes_present():
     assert "LLM Visible" in tree
     assert "Available by Tool" in tree
     assert "fetchCurrentContext" in app
+
+
+def test_cockpit_frontend_new_chat_and_slash_commands_present():
+    app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
+    styles = Path("app_gui_frontend/src/styles.css").read_text(encoding="utf-8")
+
+    assert "New Chat" in app
+    assert "async function newChat" in app
+    for command in ["/new", "/help", "/context", "/messages", "/tools", "/skills", "/memory", "/bbb"]:
+        assert command in app
+    assert "slash-menu" in styles
+    assert "notice-banner" in styles
+
+
+def test_cockpit_chat_pane_renders_user_and_assistant_events():
+    chat = Path("app_gui_frontend/src/components/ChatPane.tsx").read_text(encoding="utf-8")
+    app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
+
+    assert "user_input_received" in chat
+    assert "user 输入" in chat
+    assert "assistant 回复" in chat
+    assert "buildChatItems" in chat
+    assert "<ChatPane events={events}" in app
+    assert "assistantEvents" not in app

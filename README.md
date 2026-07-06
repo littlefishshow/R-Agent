@@ -426,6 +426,39 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-07-06
+
+#### Todo 会话隔离与父子调度防卡死
+
+- **Todo List 按 session_id 隔离**：`todo_manage` 新增 `session_id` 参数；提供后任务看板写入 `sandbox/todo_lists/todo_list_<session_id>.json`，并使用对应 `.lock` 文件加锁，避免多个终端/GUI 会话同时读写同一个 `sandbox/todo_list.json` 造成覆盖。
+- **父子 Agent 自动继承会话编号**：`RAgent` 新增 `session_id` 字段；CLI 启动时生成 `cli-<uuid>` 并注入 `R_AGENT_SESSION_ID`，GUI 使用 `GuiSession.session_id`；`delegate_task` 会把同一 `session_id` 传给子 `RAgent` 和子进程内的 `todo_manage`，保证父进程、子进程读写同一隔离 todo 文件。
+- **补充 stale claim 回收**：`todo_manage` 新增 `reap_stale_claims` action，可将超过 `lease_minutes` 的 `in_progress` 任务自动标记为 `blocked`（或按 mode 释放回 pending），防止子进程异常退出后父进程长期等待。
+- **增加子任务墙钟超时**：`delegate_task` 新增 `default_wall_timeout_seconds` 与单任务 `wall_timeout_seconds`，超时会尝试取消子任务并把对应 todo 标记为 `blocked`，返回 `timeout`，避免 `as_completed()` 永久等待。
+- **模型/工具超时保护**：新增 `LLM_REQUEST_TIMEOUT`、`TOOL_EXECUTION_TIMEOUT`、`DELEGATE_TASK_WALL_TIMEOUT` 配置读取；LLM client 创建时设置请求超时，普通隔离工具调用传入执行超时，降低网络请求或工具进程卡死风险。
+- **模型失败状态回写**：`delegate_task` 现在识别子 Agent 返回的“模型请求失败/上下文长度失败”等文本，并在 todo 仍处于 `in_progress` 时自动标记 `blocked`，同时异常分支也会回写 blocked，避免任务状态悬挂。
+- **补充回归测试**：新增 `tests/test_todo_session_isolation.py`，覆盖 session_id 文件隔离、delegate 父子会话传递、过期 claim 回收；全量测试已通过 `210 passed, 8 skipped`。
+
+### 2026-06-29
+
+#### 大模型单次返回 token 告警与累计 token 误读修正
+
+- **新增超大返回告警**：`core/agent.py` 在记录 LLM usage 时，如果单次响应的 `completion_tokens` 大于 50,000，会立即在终端打印告警，包含本次 `completion_tokens`、阈值、`prompt_tokens` 和 `total_tokens`，方便发现异常长回复或上下文压缩风险。
+- **区分最近一次与会话累计 token**：`RAgent` 现在同时记录 `last_prompt_tokens/last_completion_tokens/last_total_tokens` 与累计 token；CLI 右侧提示改为 `last/session tokens: <last>/<session>`，避免把启动以来累计 900k 误读成单次上下文长度。GUI resources 也新增 `last_token_usage`。
+- **保存超长上下文诊断样本**：当 LLM 请求因 context/token 长度过大失败时，`core/agent.py` 会将当前 `messages` 中序列化长度最大的 3 条 message 保存到 `outputs/long_context/`，并写入 summary，便于定位是 tool result、tool call arguments 还是 assistant/user 内容撑爆上下文。
+- **降低每轮自动新增 skill 倾向**：弱化 system prompt 与 GUI/CLI 自演进提示中的“复杂任务后创建 skill”措辞，默认优先 patch 现有 skill；只有用户明确要求或确有高复用且无现有承载时才创建新 skill。
+- **补充回归测试**：`tests/test_token_usage_display.py` 新增超过阈值打印告警、等于阈值不告警、最近一次 token 与累计 token 区分、context length 失败保存最长 3 条 message 的用例，确保该功能不影响既有累计 token 统计。
+
+#### 大工具输出外置化与 artifact 二次检索
+
+- **借鉴 Hermes-agent 三层防线**：新增 `core/context/budget_config.py` 与 `core/context/tool_result_storage.py`，把大 tool 输出治理拆成工具自身限流、单结果持久化和单轮聚合预算预留，避免超大工具结果直接塞入模型上下文。
+- **新增 `<persisted-output>` 外置化格式**：`core/agent.py` 在工具结果写回 `messages` 前调用 `maybe_persist_tool_result()`；超阈值结果会完整保存到 `sandbox/tool_outputs/`，上下文中只保留大小、摘要、预览、artifact 路径和下一步检索建议。
+- **保留原始命令/脚本输出**：`run_command` 与 `run_python` 不再把 `stdout` / `stderr` 固定截断到 4000 字符，改由统一持久化层决定是否落盘，确保完整输出可通过 artifact 后续查询。
+- **新增 artifact 二次提取工具**：新增 `artifact_inspect`、`artifact_search`、`artifact_slice`，支持查看大输出规模与样本、按正则检索命中上下文、按行号安全读取局部片段；`artifact_slice` 有硬上限，避免 persisted output 被整份读回上下文。
+- **防止读取循环和上下文反弹**：`read_file` 与 `artifact_*` 工具阈值固定为无限大，避免 `persist -> read_file/artifact_slice -> persist` 循环；persisted 输出提示优先使用 artifact 工具进行目标驱动提取。
+- **接入单轮聚合预算执行**：`core/agent.py` 在同一轮 `tool_calls` 全部执行后，先收集本轮 tool messages 并调用 `enforce_turn_budget()`，当多个中等工具结果合计超过 `R_AGENT_TOOL_TURN_BUDGET_CHARS` 时，按 largest-first 自动把最大的几个结果落盘到 `sandbox/tool_outputs/`。
+- **保留单结果与聚合双层治理**：单个超大结果仍由 `maybe_persist_tool_result()` 先行外置化；聚合预算只处理未外置化的本轮工具结果，并在预算满足后停止，避免无谓落盘和 persisted-output 循环。
+- **补充回归测试**：新增/更新 `tests/test_tool_result_storage.py`、`tests/test_artifact_tools.py`、`tests/test_agent_large_tool_output.py`，覆盖大结果落盘、路径与预览、artifact 检索/切片、workspace 边界、Agent Loop 工具结果回填外置化，以及同轮多个中等工具结果聚合超预算时 largest-first 落盘。
+
 ### 2026-06-28
 
 #### CLI 输出边界与后台 Agent 静默

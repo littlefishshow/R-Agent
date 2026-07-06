@@ -564,8 +564,8 @@ def run_command_tool(
         output = {
             "command": command,
             "returncode": result.returncode,
-            "stdout": result.stdout[:4000],  # Truncate to avoid huge outputs
-            "stderr": result.stderr[:4000],
+            "stdout": result.stdout,
+            "stderr": result.stderr,
             "risk_assessment": assessment,
         }
         return json.dumps(output, ensure_ascii=False)
@@ -612,8 +612,8 @@ def run_python_tool(code: str, timeout: int = 30, allow_dangerous_code: bool = F
 
         output = {
             "returncode": result.returncode,
-            "stdout": result.stdout[:4000],
-            "stderr": result.stderr[:4000]
+            "stdout": result.stdout,
+            "stderr": result.stderr
         }
         return json.dumps(output, ensure_ascii=False)
     except subprocess.TimeoutExpired:

@@ -97,8 +97,10 @@ def _with_interrupt_status_hint(message: str) -> str:
 
 
 def _format_token_usage_label(agent: RAgent) -> str:
-    """生成本次 Agent 启动以来的 token 使用量文案。"""
-    return f"tokens: {agent.get_token_usage_total()}"
+    """生成最近一次与累计 token 使用量文案，避免把累计量误读成单轮上下文。"""
+    get_last = getattr(agent, "get_last_token_usage_total", None)
+    last = get_last() if callable(get_last) else "unavailable"
+    return f"last/session tokens: {last}/{agent.get_token_usage_total()}"
 
 
 def _format_token_usage_rprompt(agent: RAgent) -> HTML:
@@ -1044,11 +1046,14 @@ def _shutdown_agent(agent: RAgent, console, timeout: float = 1.0) -> None:
 def main():
     display_welcome_banner()
     
-    agent = RAgent()
+    cli_session_id = f"cli-{uuid.uuid4().hex[:12]}"
+    os.environ["R_AGENT_SESSION_ID"] = cli_session_id
+    console.print(f"[dim]Todo session: {cli_session_id}[/dim]")
+    agent = RAgent(session_id=cli_session_id)
     system_prompt = (
         build_system_prompt()
         + "\n\n【重要提示：自我进化能力】\n"
-        + "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具创建/修补技能包，也可兼容使用 `skill_create` 创建新技能。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
+        + "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具维护技能包；默认优先 patch 现有技能。只有当用户明确要求或发现高度可复用且现有技能无法承载的稳定工作流时，才创建新技能，避免每轮任务都新增 skill。\n"
         + "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
         + "请始终使用中文回复用户。"
         + memory_manager.load_snapshot()

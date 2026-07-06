@@ -1,6 +1,9 @@
 import json
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from tools.registry import registry
+from core import config
 from app_gui.normalizer import normalize_messages
 from app_gui.schemas import EVENT_DELEGATE_SUBAGENT_STARTED, EVENT_DELEGATE_SUBAGENT_FINISHED
 from rich.panel import Panel
@@ -60,19 +63,19 @@ def _shorten(text, limit=90):
     return text[: limit - 1] + "…"
 
 
-def _load_todo_state():
+def _load_todo_state(session_id=None):
     """Best-effort load of the shared todo state for progress snapshots."""
     try:
         from tools import todo_tool
 
-        return todo_tool._load_state()
+        return todo_tool._load_state(session_id)
     except Exception:
         return {"version": 2, "tasks": []}
 
 
-def _todo_snapshot_text(label="当前任务快照", scheduled_tasks=None):
+def _todo_snapshot_text(label="当前任务快照", scheduled_tasks=None, session_id=None):
     """Return a compact, user-facing todo progress snapshot."""
-    state = _load_todo_state()
+    state = _load_todo_state(session_id)
     tasks = state.get("tasks", []) if isinstance(state, dict) else []
     total = len(tasks)
     status_order = [
@@ -152,27 +155,27 @@ def _todo_snapshot_text(label="当前任务快照", scheduled_tasks=None):
     return "\n".join(lines)
 
 
-def _print_todo_snapshot(label="当前任务快照", scheduled_tasks=None):
-    _print_after_status(Panel(_todo_snapshot_text(label, scheduled_tasks), title="Todo Progress", border_style="yellow", expand=False), output_kind="todo_board")
+def _print_todo_snapshot(label="当前任务快照", scheduled_tasks=None, session_id=None):
+    _print_after_status(Panel(_todo_snapshot_text(label, scheduled_tasks, session_id=session_id), title="Todo Progress", border_style="yellow", expand=False), output_kind="todo_board")
 
 
-def _get_todo_task(task_id):
+def _get_todo_task(task_id, session_id=None):
     if not task_id:
         return None
     try:
         from tools import todo_tool
 
-        state = todo_tool._load_state()
+        state = todo_tool._load_state(session_id)
         return todo_tool._find_task(state, str(task_id))
     except Exception:
         return None
 
 
-def _mark_truncated_task_blocked(task_id, result, max_iters):
+def _mark_truncated_task_blocked(task_id, result, max_iters, session_id=None):
     """Avoid leaving a claimed todo task stuck in in_progress after sub-agent truncation."""
     if not task_id:
         return None
-    task = _get_todo_task(task_id)
+    task = _get_todo_task(task_id, session_id=session_id)
     if not task or task.get("status") != "in_progress":
         return None
 
@@ -199,6 +202,7 @@ def _mark_truncated_task_blocked(task_id, result, max_iters):
                 },
                 ensure_ascii=False,
             ),
+            session_id=session_id or "",
         )
         return update_result
     except Exception as exc:
@@ -215,7 +219,35 @@ def _is_truncated_result(result, sub_agent=None):
     return TRUNCATION_MARKER in str(result or "")
 
 
-def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: int = 30, event_sink=None) -> str:
+
+def _is_model_failure_result(result) -> bool:
+    text = str(result or "")
+    markers = ("模型请求失败", "模型强制收尾失败", "context_length_exceeded", "maximum context length", "too many tokens")
+    return any(marker in text for marker in markers)
+
+
+def _mark_task_blocked(task_id, reason, *, session_id=None, metadata=None):
+    if not task_id:
+        return None
+    task = _get_todo_task(task_id, session_id=session_id)
+    if not task or task.get("status") != "in_progress":
+        return None
+    try:
+        from tools.todo_tool import todo_manage
+        return todo_manage(
+            "update",
+            json.dumps({
+                "id": str(task_id),
+                "status": "blocked",
+                "result": str(reason),
+                "metadata": {**(task.get("metadata") or {}), **(metadata or {})},
+            }, ensure_ascii=False),
+            session_id=session_id or "",
+        )
+    except Exception as exc:
+        return f"Error: failed to mark task {task_id} blocked: {exc}"
+
+def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: int = 30, session_id: str = "", default_wall_timeout_seconds=None, event_sink=None) -> str:
     """生成隔离上下文子智能体并行处理任务。
 
     tasks 是 JSON 字符串，元素可以是：
@@ -231,6 +263,14 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
             return json.dumps({"error": "tasks must be a JSON array of objects."}, ensure_ascii=False)
     except json.JSONDecodeError:
         return json.dumps({"error": "tasks must be a valid JSON string."}, ensure_ascii=False)
+
+    session_id = str(session_id or "")
+    if default_wall_timeout_seconds is None:
+        default_wall_timeout_seconds = config.get_delegate_task_wall_timeout()
+    try:
+        default_wall_timeout_seconds = None if default_wall_timeout_seconds is None else float(default_wall_timeout_seconds)
+    except Exception:
+        default_wall_timeout_seconds = config.get_delegate_task_wall_timeout()
 
     if default_max_iterations is None:
         default_max_iterations = 30
@@ -265,7 +305,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
             )
         return goal
 
-    def _run_subagent(task_index, task):
+    def _run_subagent(task_index, task, cancel_event=None):
         goal = _format_goal(task)
         max_iters = task.get("max_iterations", default_max_iterations)
         try:
@@ -285,7 +325,15 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 f"\n[bold blue]🚀 [Sub-Agent {task_index}][/bold blue] "
                 f"开始执行普通委托任务(max_iterations={max_iters}): {goal[:500]}"
             )
-        sub_agent = RAgent(max_iterations=max_iters)
+        try:
+            sub_agent = RAgent(max_iterations=max_iters, session_id=session_id)
+        except TypeError:
+            sub_agent = RAgent(max_iterations=max_iters)
+            try:
+                setattr(sub_agent, "session_id", session_id)
+            except Exception:
+                pass
+        cancel_event = cancel_event or threading.Event()
         run_id = f"delegate-{task_index}-{task_id or 'adhoc'}"
 
         system_prompt = (
@@ -327,16 +375,27 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 on_think=on_think,
                 on_tool_start=on_tool_start,
                 on_tool_end=on_tool_end,
-                exclude_tools=["delegate_task", "memory"]
+                exclude_tools=["delegate_task", "memory"],
+                cancel_event=cancel_event,
             )
             truncated = _is_truncated_result(result, sub_agent)
             blocked_update = None
+            if _is_model_failure_result(result):
+                blocked_update = _mark_task_blocked(
+                    task_id,
+                    "子 Agent 模型请求失败，任务自动标记为 blocked。\n\n" + str(result),
+                    session_id=session_id,
+                    metadata={"blocked_reason": "subagent_model_request_failed", "max_iterations": max_iters},
+                )
+                status = "error"
+            else:
+                status = "truncated" if truncated else "success"
             if truncated:
                 _print_after_status(
                     f"[bold yellow]⚠️ [Sub-Agent {task_index}][/bold yellow] "
                     f"达到 max_iterations={max_iters}，已强制收尾"
                 )
-                blocked_update = _mark_truncated_task_blocked(task_id, result, max_iters)
+                blocked_update = _mark_truncated_task_blocked(task_id, result, max_iters, session_id=session_id)
                 if blocked_update:
                     _print_after_status(
                         f"[bold yellow]📌 task_id={task_id} 已按预算耗尽保护处理：[/bold yellow] "
@@ -348,7 +407,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 "task_id": task_id,
                 "goal": task.get("goal") or task.get("description") or "",
                 "max_iterations": max_iters,
-                "status": "truncated" if truncated else "success",
+                "status": status,
                 "truncated": truncated,
                 "blocked_update": blocked_update,
                 "result": result,
@@ -358,6 +417,12 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
             return item
         except Exception as e:
             _print_after_status(f"[bold red]❌ [Sub-Agent {task_index}][/bold red] 子任务执行失败: {e}")
+            blocked_update = _mark_task_blocked(
+                task_id,
+                f"子 Agent 执行异常，任务自动标记为 blocked：{e}",
+                session_id=session_id,
+                metadata={"blocked_reason": "subagent_exception", "max_iterations": max_iters},
+            )
             item = {
                 "task_index": task_index,
                 "task_id": task_id,
@@ -365,6 +430,7 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
                 "max_iterations": max_iters,
                 "status": "error",
                 "truncated": False,
+                "blocked_update": blocked_update,
                 "result": str(e),
                 "sub_agent_messages": normalize_messages(getattr(sub_agent, "messages", []), source=run_id),
             }
@@ -398,29 +464,80 @@ def delegate_task(tasks: str, max_workers: int = None, default_max_iterations: i
             f"\n[bold yellow]📋 Delegate 准备并发执行 {len(valid_jobs)} 个任务，max_workers={effective_workers}[/bold yellow]"
         )
 
-    with ThreadPoolExecutor(max_workers=effective_workers) as executor:
-        future_to_job = {
-            executor.submit(_run_subagent, i, task): (i, task)
-            for i, task in valid_jobs
-        }
-        for future in as_completed(future_to_job):
-            i, task = future_to_job[future]
-            try:
-                item = future.result()
-            except Exception as exc:
+    executor = ThreadPoolExecutor(max_workers=effective_workers)
+    future_to_job = {}
+    for i, task in valid_jobs:
+        cancel_event = threading.Event()
+        future = executor.submit(_run_subagent, i, task, cancel_event)
+        future_to_job[future] = (i, task, time.monotonic(), cancel_event)
+    pending = set(future_to_job)
+    try:
+        while pending:
+            done, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in done:
+                i, task, _started, _cancel_event = future_to_job[future]
+                try:
+                    item = future.result()
+                except Exception as exc:
+                    blocked_update = _mark_task_blocked(
+                        _task_id_of(task),
+                        f"delegate future 异常，任务自动标记为 blocked：{exc}",
+                        session_id=session_id,
+                        metadata={"blocked_reason": "delegate_future_exception"},
+                    )
+                    item = {
+                        "task_index": i,
+                        "task_id": _task_id_of(task),
+                        "goal": task.get("goal") or task.get("description") or "",
+                        "status": "error",
+                        "truncated": False,
+                        "blocked_update": blocked_update,
+                        "result": str(exc),
+                    }
+                results.append(item)
+                task_id = item.get("task_id") or f"index={item.get('task_index')}"
+                _print_after_status(
+                    f"[bold yellow]📋 Delegate 子任务状态更新：{task_id} -> {item.get('status')}[/bold yellow]"
+                )
+
+            now = time.monotonic()
+            for future in list(pending):
+                i, task, started, cancel_event = future_to_job[future]
+                timeout_value = task.get("wall_timeout_seconds", default_wall_timeout_seconds)
+                try:
+                    timeout_value = None if timeout_value is None else float(timeout_value)
+                except Exception:
+                    timeout_value = default_wall_timeout_seconds
+                if timeout_value is None or timeout_value <= 0 or now - started < timeout_value:
+                    continue
+                task_id = _task_id_of(task)
+                try:
+                    cancel_event.set()
+                except Exception:
+                    pass
+                future.cancel()
+                blocked_update = _mark_task_blocked(
+                    task_id,
+                    f"子 Agent 超过墙钟超时 {timeout_value:g}s，任务自动标记为 blocked；后台请求如仍在运行会被取消信号要求停止。",
+                    session_id=session_id,
+                    metadata={"blocked_reason": "subagent_wall_timeout", "wall_timeout_seconds": timeout_value},
+                )
                 item = {
                     "task_index": i,
-                    "task_id": _task_id_of(task),
+                    "task_id": task_id,
                     "goal": task.get("goal") or task.get("description") or "",
-                    "status": "error",
+                    "status": "timeout",
                     "truncated": False,
-                    "result": str(exc),
+                    "blocked_update": blocked_update,
+                    "result": f"subagent wall timeout after {timeout_value:g}s",
                 }
-            results.append(item)
-            task_id = item.get("task_id") or f"index={item.get('task_index')}"
-            _print_after_status(
-                f"[bold yellow]📋 Delegate 子任务状态更新：{task_id} -> {item.get('status')}[/bold yellow]"
-            )
+                results.append(item)
+                pending.remove(future)
+                _print_after_status(
+                    f"[bold red]⏱️ Delegate 子任务超时：{task_id or i} -> timeout[/bold red]"
+                )
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     results.sort(key=lambda x: x.get("task_index", 0))
     return json.dumps(results, ensure_ascii=False, indent=2)
@@ -430,7 +547,7 @@ registry.register(
     name="delegate_task",
     description=(
         "生成一个或多个具有隔离上下文的子智能体来并行处理任务。\n"
-        "支持为每个子任务设置 max_iterations，避免子进程无限或过长思考。\n"
+        "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考。\n"
         "支持动态 todo list 协议：传入 task_id/id 时，子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
         "如果子 Agent 达到 max_iterations 并强制收尾，且对应 todo 任务仍是 in_progress，会自动标记为 blocked，避免任务长期卡住。\n"
@@ -443,7 +560,7 @@ registry.register(
             "tasks": {
                 "type": "string",
                 "description": (
-                    "JSON 格式任务列表字符串。每个任务可包含：goal/description、task_id/id、worker_id、max_iterations。"
+                    "JSON 格式任务列表字符串。每个任务可包含：goal/description、task_id/id、worker_id、max_iterations、wall_timeout_seconds。"
                     "示例：'[{\"task_id\":\"t1\",\"goal\":\"完成 t1，背景...\",\"max_iterations\":20}]'"
                 )
             },
@@ -454,6 +571,14 @@ registry.register(
             "default_max_iterations": {
                 "type": "integer",
                 "description": "未在单个任务中指定 max_iterations 时使用的默认最大思考轮数，默认 30。"
+            },
+            "session_id": {
+                "type": "string",
+                "description": "可选会话编号；父子 Agent 会使用同一个 session_id 读写隔离 todo list。"
+            },
+            "default_wall_timeout_seconds": {
+                "type": "number",
+                "description": "单个子任务默认墙钟超时时间；超时后标记 blocked 并让 delegate_task 返回。"
             },
             "event_sink": {
                 "type": "object",

@@ -110,12 +110,13 @@ MEMORY_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Use skills as reusable workflow assets, but keep the skill set compact. "
+    "Prefer patching an existing relevant skill with skill_manage(action='patch') when "
+    "you discover a stable improvement. Create a new skill only when the user asks for "
+    "it or when a broadly reusable workflow cannot fit any existing skill; do not create "
+    "a new skill after every complex task by default.\n"
+    "When using a skill and finding it outdated, incomplete, or wrong, patch it rather "
+    "than creating a duplicate. Skills that aren't maintained become liabilities."
 )
 
 SOUL_MAX_CHARS = 12000

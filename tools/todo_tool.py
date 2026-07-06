@@ -2,7 +2,9 @@ import os
 import json
 import time
 import threading
+import re
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Tuple
 from tools.registry import registry
 from rich.panel import Panel
@@ -10,8 +12,39 @@ from tools import progress_render
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TODO_FILE = os.path.join(BASE_DIR, "sandbox", "todo_list.json")
+TODO_LIST_DIR = os.path.join(BASE_DIR, "sandbox", "todo_lists")
 TODO_LOCK = threading.RLock()
 TODO_LOCK_FILE = f"{TODO_FILE}.lock"
+_ACTIVE_SESSION_ID: ContextVar[str] = ContextVar("todo_session_id", default="")
+
+
+def _safe_session_id(session_id: Optional[str]) -> str:
+    raw = str(session_id or "").strip()
+    if not raw or raw == "default":
+        return ""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._")
+    return safe[:80] or ""
+
+
+def _current_session_id(session_id: Optional[str] = None) -> str:
+    return _safe_session_id(session_id or _ACTIVE_SESSION_ID.get() or os.environ.get("R_AGENT_SESSION_ID", ""))
+
+
+def _todo_file_path(session_id: Optional[str] = None) -> str:
+    sid = _current_session_id(session_id)
+    if not sid:
+        return TODO_FILE
+    return os.path.join(TODO_LIST_DIR, f"todo_list_{sid}.json")
+
+
+@contextmanager
+def _todo_session(session_id: Optional[str] = None):
+    sid = _current_session_id(session_id)
+    token = _ACTIVE_SESSION_ID.set(sid)
+    try:
+        yield sid
+    finally:
+        _ACTIVE_SESSION_ID.reset(token)
 
 VALID_STATUSES = {
     "pending",        # 等待执行/等待领取
@@ -35,11 +68,17 @@ def _default_state() -> Dict[str, Any]:
 
 
 @contextmanager
-def _todo_file_lock():
-    """Serialize todo read-modify-write actions across threads and processes."""
+def _todo_file_lock(session_id: Optional[str] = None):
+    """Serialize todo read-modify-write actions across threads and processes.
+
+    The file path is scoped by session_id so multiple terminals / GUI sessions do
+    not overwrite the same sandbox/todo_list.json unless they explicitly share a
+    session id.
+    """
+    todo_file = _todo_file_path(session_id)
     with TODO_LOCK:
-        os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
-        lock_path = f"{TODO_FILE}.lock"
+        os.makedirs(os.path.dirname(todo_file), exist_ok=True)
+        lock_path = f"{todo_file}.lock"
         with open(lock_path, "a", encoding="utf-8") as lock_file:
             try:
                 import fcntl  # Unix/macOS; unavailable on Windows.
@@ -53,11 +92,12 @@ def _todo_file_lock():
                 yield
 
 
-def _load_state() -> Dict[str, Any]:
+def _load_state(session_id: Optional[str] = None) -> Dict[str, Any]:
+    todo_file = _todo_file_path(session_id)
     with TODO_LOCK:
-        if os.path.exists(TODO_FILE):
+        if os.path.exists(todo_file):
             try:
-                with open(TODO_FILE, "r", encoding="utf-8") as f:
+                with open(todo_file, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 # v1 兼容：旧版直接是 list
                 if isinstance(data, list):
@@ -73,14 +113,18 @@ def _load_state() -> Dict[str, Any]:
         return _default_state()
 
 
-def _save_state(state: Dict[str, Any]) -> None:
+def _save_state(state: Dict[str, Any], session_id: Optional[str] = None) -> None:
+    todo_file = _todo_file_path(session_id)
     with TODO_LOCK:
-        os.makedirs(os.path.dirname(TODO_FILE), exist_ok=True)
+        os.makedirs(os.path.dirname(todo_file), exist_ok=True)
         state["version"] = 2
-        tmp_file = f"{TODO_FILE}.tmp"
+        sid = _current_session_id(session_id)
+        if sid:
+            state["session_id"] = sid
+        tmp_file = f"{todo_file}.tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_file, TODO_FILE)
+        os.replace(tmp_file, todo_file)
 
 
 def _normalize_task(t: Dict[str, Any]) -> Dict[str, Any]:
@@ -300,12 +344,47 @@ def _add_tasks(state: Dict[str, Any], raw_tasks: List[Dict[str, Any]], default_p
     return True, "Tasks added successfully.", created_ids
 
 
+
+def _reap_stale_claims(state: Dict[str, Any], *, mode: str = "blocked") -> List[str]:
+    """Mark expired in_progress claims so parent schedulers do not wait forever."""
+    now = time.time()
+    changed = []
+    for task in _tasks(state):
+        if task.get("status") != "in_progress":
+            continue
+        claim = task.get("claim") or {}
+        claimed_at = int(claim.get("claimed_at") or task.get("updated_at") or now)
+        lease_minutes = claim.get("lease_minutes", 60)
+        try:
+            lease_seconds = max(0.001, float(lease_minutes) * 60.0)
+        except Exception:
+            lease_seconds = 3600
+        if now - claimed_at <= lease_seconds:
+            continue
+        if mode == "pending":
+            task["status"] = "pending"
+            task["assigned_to"] = ""
+            task["claim"] = {}
+        else:
+            task["status"] = "blocked"
+            task["result"] = (
+                f"任务 claim 已超过 lease_minutes={lease_minutes}，自动标记为 blocked；"
+                "等待父 Agent 判断是否重试、释放或拆分。"
+            )
+            task["metadata"] = {**(task.get("metadata") or {}), "blocked_reason": "stale_claim_reaped"}
+        task["updated_at"] = now
+        changed.append(task["id"])
+    return changed
+
 def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
     """管理树状、动态、带拓扑依赖的任务看板。调用方必须持有 TODO_LOCK。"""
     state = _load_state()
 
     try:
         data = _parse_payload(payload)
+        if isinstance(data, dict) and data.get("session_id"):
+            # Wrapper normally sets session before loading; keep payload session for diagnostics only.
+            state["session_id"] = _current_session_id(data.get("session_id")) or state.get("session_id")
 
         if action == "view":
             include_tree = True if not isinstance(data, dict) else data.get("include_tree", True)
@@ -473,6 +552,14 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
             _print_todo_snapshot(state, f"任务 {task_id} 拆分建议已拒绝")
             return f"Split proposal for task {task_id} rejected."
 
+        elif action == "reap_stale_claims":
+            mode = data.get("mode", "blocked") if isinstance(data, dict) else "blocked"
+            changed = _reap_stale_claims(state, mode=mode)
+            if changed:
+                _save_state(state)
+                _print_todo_snapshot(state, "已回收过期 claim")
+            return json.dumps({"reaped": changed, "mode": mode, "session_id": state.get("session_id", _current_session_id())}, ensure_ascii=False, indent=2)
+
         elif action == "clear":
             state = _default_state()
             _save_state(state)
@@ -486,15 +573,27 @@ def _todo_manage_unlocked(action: str, payload: str = "{}") -> str:
         return f"Error: {str(e)}"
 
 
-def todo_manage(action: str, payload: str = "{}") -> str:
+def _session_from_payload(payload: str) -> str:
+    try:
+        data = _parse_payload(payload)
+        if isinstance(data, dict):
+            return _current_session_id(data.get("session_id"))
+    except Exception:
+        pass
+    return ""
+
+
+def todo_manage(action: str, payload: str = "{}", session_id: str = "") -> str:
     """管理树状、动态、带拓扑依赖的任务看板。
 
-    delegate_task 会并发运行多个子 Agent；子 Agent 的 todo_manage 调用可能
-    来自多个线程或隔离工具子进程。对完整 action 加线程锁 + 文件锁，避免
-    “读旧 state -> 覆盖新 state”的 JSON 写丢失，保证进度快照稳定。
+    session_id 会把 todo 文件隔离到 sandbox/todo_lists/todo_list_<session>.json；
+    CLI/GUI/父子 Agent 会自动注入同一个 session_id，避免多个终端互相覆盖。
+    未提供 session_id 时保留旧 sandbox/todo_list.json 兼容直接工具调用和旧测试。
     """
-    with _todo_file_lock():
-        return _todo_manage_unlocked(action, payload)
+    sid = _current_session_id(session_id) or _session_from_payload(payload)
+    with _todo_session(sid):
+        with _todo_file_lock(sid):
+            return _todo_manage_unlocked(action, payload)
 
 
 registry.register(
@@ -513,7 +612,7 @@ registry.register(
         "- 'propose_split': 记录拆分建议但不执行拆分，payload {id, rationale, proposal:[...]}，会置为 needs_split。\n"
         "- 'approve_split': 父进程批准拆分，payload {id} 使用已有提案，或 {id,tasks:[...]}；新增子任务并默认把父任务置为 blocked。\n"
         "- 'reject_split': 父进程拒绝拆分，payload {id, reason, set_status}。\n"
-        "- 'clear': 清空看板。\n"
+        "- 'reap_stale_claims': 回收超过 lease_minutes 的 in_progress 任务，默认标记 blocked。\n- 'clear': 清空看板。\n"
         "注意：payload 必须是合法 JSON 字符串。"
     ),
     parameters={
@@ -521,12 +620,16 @@ registry.register(
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["init", "view", "ready", "get", "add", "update", "claim", "release", "propose_split", "approve_split", "reject_split", "clear"],
+                "enum": ["init", "view", "ready", "get", "add", "update", "claim", "release", "propose_split", "approve_split", "reject_split", "reap_stale_claims", "clear"],
                 "description": "要执行的操作类型"
             },
             "payload": {
                 "type": "string",
                 "description": "操作对应的数据 JSON 字符串；view/ready/clear 可为空 '{}'"
+            },
+            "session_id": {
+                "type": "string",
+                "description": "可选会话编号；提供后 todo list 隔离到 sandbox/todo_lists/todo_list_<session_id>.json"
             }
         },
         "required": ["action"]

@@ -25,7 +25,7 @@ from tools.registry import registry
 
 SELF_EVOLUTION_PROMPT = (
     "\n\n【重要提示：自我进化能力】\n"
-    "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具创建/修补技能包，也可兼容使用 `skill_create` 创建新技能。如果你发现现有技能不足以完成任务，请自主提炼总结并创建为新技能。\n"
+    "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具维护技能包；默认优先 patch 现有技能。只有当用户明确要求或发现高度可复用且现有技能无法承载的稳定工作流时，才创建新技能，避免每轮任务都新增 skill。\n"
     "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
     "请始终使用中文回复用户。"
 )
@@ -36,7 +36,8 @@ class GuiSession:
         self.session_id = session_id
         self.store = ContextSnapshotStore(Path(store_root) / session_id)
         self.event_bus = ContextEventBus(store=self.store, session_id=session_id)
-        self.agent = agent or RAgent()
+        self.agent = agent or RAgent(session_id=session_id)
+        self.agent.session_id = session_id
         self.cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -79,6 +80,7 @@ class GuiSession:
     def _run_message(self, text: str) -> str:
         try:
             self.agent.model = config.get_model()
+            self.agent.session_id = self.session_id
             self.agent.client = config.create_llm_client()
             response = self.agent.run_conversation(
                 text,
@@ -222,6 +224,7 @@ class GuiSession:
             "last_response": self.last_response,
             "last_error": self.last_error,
             "token_usage": self.agent.get_token_usage_total(),
+            "last_token_usage": self.agent.get_last_token_usage_total(),
         }
 
 
