@@ -28,6 +28,20 @@ def _print_after_status(renderable=None, *args, output_kind: str = "other", **kw
 TRUNCATION_MARKER = "已达迭代上限"
 
 
+# 子 Agent 继承全局工具，但显式排除不适合在委派上下文中使用的工具：
+# - delegate_task: 防止递归委托爆炸
+# - memory: 防止子进程写入长期记忆
+# - speak_text/text_to_speech: 防止子进程产生语音播放或音频副作用
+# - self_evolution_review: 后台自演进应只由父进程/主会话触发
+DELEGATE_CHILD_EXCLUDED_TOOLS = [
+    "delegate_task",
+    "memory",
+    "speak_text",
+    "text_to_speech",
+    "self_evolution_review",
+]
+
+
 STATUS_LABELS = {
     "completed": "✅ completed",
     "in_progress": "🚧 in_progress",
@@ -645,14 +659,14 @@ def delegate_task(
         })
 
         try:
-            # 禁止子智能体再次委托，避免递归爆炸；禁止 memory 持久写用户记忆。
+            # 禁止子智能体再次委托、写长期记忆、触发语音/音频副作用或启动后台自演进。
             result = sub_agent.run_conversation(
                 user_message=goal,
                 system_message=system_prompt,
                 on_think=on_think,
                 on_tool_start=on_tool_start,
                 on_tool_end=on_tool_end,
-                exclude_tools=["delegate_task", "memory"],
+                exclude_tools=DELEGATE_CHILD_EXCLUDED_TOOLS,
                 cancel_event=cancel_event,
             )
             truncated = _is_truncated_result(result, sub_agent)

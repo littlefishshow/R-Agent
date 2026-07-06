@@ -432,6 +432,7 @@ pip install PyNaCl>=1.5.0
 - `todo_manage digest` 新增 `include_completed`、`result_summary_chars`、`include_artifacts` 参数，用于按需裁剪已完成任务、结果摘要和 artifact 路径。
 - `delegate_task` 新增 `return_mode=compact` 默认返回模式，以及 `include_todo_digest`、`include_goal`、`include_token_detail`、`include_context_artifacts` 控制项；`return_mode=full` 保留旧完整结构。
 - `delegate_task` 默认使用 compact todo digest（不含 completed，结果摘要 200 字符）以减少父进程上下文占用。
+- `delegate_task` 子 Agent 工具排除列表新增 `speak_text`、`text_to_speech`、`self_evolution_review`，避免委派子进程触发语音/音频副作用或后台自演进流程。
 
 
 ### 2026-07-06

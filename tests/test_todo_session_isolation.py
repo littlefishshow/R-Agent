@@ -143,3 +143,41 @@ def test_todo_ready_defaults_to_ids_and_digest_params(monkeypatch, tmp_path):
     assert [t["id"] for t in digest["tasks"]] == ["ready"]
     assert digest["tasks"][0]["result_summary"] == "ready-resu…"
     assert "context_artifact_path" not in digest["tasks"][0]
+
+class _CapturingExcludeAgent:
+    captured_kwargs = None
+
+    def __init__(self, max_iterations=None, session_id=None):
+        self.max_iterations = max_iterations
+        self.session_id = session_id
+        self.messages = []
+
+    def run_conversation(self, **kwargs):
+        type(self).captured_kwargs = kwargs
+        return "done"
+
+    def is_truncated(self):
+        return False
+
+
+def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
+    _CapturingExcludeAgent.captured_kwargs = None
+    monkeypatch.setattr(core.agent, "RAgent", _CapturingExcludeAgent)
+
+    payload = json.loads(delegate_tool.delegate_task(
+        tasks=json.dumps([{"goal": "capture exclude tools"}]),
+        max_workers=1,
+        default_max_iterations=1,
+        default_wall_timeout_seconds=5,
+    ))
+
+    assert payload["tasks"][0]["status"] == "success"
+    excluded = set(_CapturingExcludeAgent.captured_kwargs["exclude_tools"])
+    assert {
+        "delegate_task",
+        "memory",
+        "speak_text",
+        "text_to_speech",
+        "self_evolution_review",
+    }.issubset(excluded)
+
