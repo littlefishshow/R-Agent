@@ -1,7 +1,7 @@
 import json
 import re
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 WORKSPACE = Path.cwd().resolve()
 DEFAULT_PAPERS_ROOT = Path("outputs/papers")
@@ -70,7 +70,14 @@ def _is_caption_text(text: str, include_tables: bool = True) -> bool:
 
 
 def _looks_like_body_paragraph(text: str, bbox) -> bool:
-    """Heuristic separator: prose/section blocks should not be merged into table crops."""
+    """Heuristic separator: prose/section blocks should not be merged into table crops.
+
+    This is deliberately conservative for table rows: numeric / math-heavy rows
+    are allowed through, while prose paragraphs and section headings stop table
+    expansion.  Appendix headings such as "C Evaluation Metric" are also
+    treated as separators; otherwise a below-caption table may accidentally crop
+    the next appendix section instead of the table above the caption.
+    """
     txt = (text or "").strip()
     if not txt:
         return False
@@ -79,16 +86,30 @@ def _looks_like_body_paragraph(text: str, bbox) -> bool:
     spaces = txt.count(" ")
     alpha = sum(ch.isalpha() for ch in txt)
     digits = sum(ch.isdigit() for ch in txt)
+    # Section headings such as "4.1. Experimental Testbed" are compact but
+    # should stop expansion before numeric/table-row exemptions are applied.
+    if (re.match(r"^\d+(?:\.\d+)+\.?\s*[A-Z][A-Za-z]", txt)
+            or re.match(r"^\d+\.?\s+[A-Z][A-Za-z]", txt)):
+        return True
     # Table rows are often indented relative to prose and contain formulas,
     # brackets, percentages, or compact metric tokens.  Do not stop on such
     # blocks even if PyMuPDF extracts them as long strings with spaces.
     mathish = bool(re.search(r"[𝑃𝐺Í∑∈𝜎𝜖𝛼𝜌]|[=+−–×/%\[\]{}]|arg max|top-", txt))
+    # Wide compact rows with several answer/metric columns are table content
+    # even if they contain many alphabetic words.
+    if (x1 - x0) > 300 and digits > 0 and not re.search(r"[.!?;:]\s+[A-Z]", txt):
+        return False
     if x0 > 85 and (mathish or digits > 0):
         return False
-    # Section headings such as "4.1. Experimental Testbed" are compact but
-    # should stop table expansion just like prose paragraphs.
-    if re.match(r"^\d+(?:\.\d+)*\.?\s+[A-Z][A-Za-z]", txt):
+    # Appendix/letter headings such as "C Evaluation Metric".  Require a
+    # short title-like block and no digits/math to avoid rejecting normal table
+    # headers containing metrics or values.
+    if re.match(r"^[A-Z]\s+[A-Z][A-Za-z]\w*(?:\s+[A-Z][A-Za-z]\w*){0,5}$", txt) and digits == 0 and not mathish:
         return True
+    # Subfigure labels like "(a) Cognitive islands.(b) Shared ..." are figure
+    # content rather than prose separators.
+    if re.search(r"\([a-z]\)", txt):
+        return False
     if len(txt) <= 80 and spaces >= 1 and alpha > digits and re.search(r"[A-Z][a-z]{3,}", txt) and not re.search(r"[%𝜌=×]", txt):
         # Table headers often contain several words plus metric names; do not
         # classify them as prose unless there is sentence-like punctuation.
@@ -98,7 +119,7 @@ def _looks_like_body_paragraph(text: str, bbox) -> bool:
     # body prose has many word spaces and long sentence-like lines.
     if h >= 18 and len(txt) >= 70 and spaces >= 6 and alpha > digits * 2:
         return True
-    if h >= 45 and spaces >= 3 and alpha > digits:
+    if h >= 45 and alpha > digits:
         return True
     return False
 
@@ -156,6 +177,71 @@ def _candidate_table_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, directi
         rect = rect | fitz.Rect(*map(float, b["bbox"]))
     return (rect + (-margin, -margin, margin, margin)) & page.rect
 
+
+
+def _candidate_figure_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction: str, margin: float = 8.0):
+    """Tight crop for vector/text figures adjacent to a caption.
+
+    Some PDF figures are not image blocks; PyMuPDF exposes axis labels, legends
+    and diagram labels as text.  Row projection alone may bridge through nearby
+    body paragraphs or previous captions.  This routine walks compact,
+    non-prose text blocks in the target direction and stops at prose/section text
+    or another caption.
+    """
+    cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    cap_rect = fitz.Rect(cx0, cy0, cx1, cy1)
+    win_w = max(1.0, wx1 - wx0)
+    blocks = []
+    for b in _text_blocks(page):
+        bx0, by0, bx1, by1 = map(float, b["bbox"])
+        bw = bx1 - bx0
+        center = (bx0 + bx1) / 2.0
+        if center < wx0 - margin or center > wx1 + margin:
+            continue
+        if _horizontal_overlap_ratio((bx0, by0, bx1, by1), (wx0, 0, wx1, page.rect.height)) < 0.18:
+            continue
+        # Full-width title/author/prose blocks that merely cross the column are
+        # not figure content.  The current caption itself is handled separately.
+        if bw > win_w * 1.35 and not _segment_intersects((by0, by1), cy0, cy1):
+            continue
+        blocks.append(b)
+    blocks.sort(key=lambda b: (float(b["bbox"][1]), float(b["bbox"][0])))
+
+    selected = []
+    if direction == "above":
+        last_y = cy0
+        for b in reversed(blocks):
+            bx0, by0, bx1, by1 = map(float, b["bbox"])
+            if by0 >= cy0 - 1:
+                continue
+            gap = last_y - by1
+            if gap > 52:
+                break
+            txt = b["text"]
+            if _is_caption_text(txt, include_tables=True) or _looks_like_body_paragraph(txt, b["bbox"]):
+                break
+            selected.append(b)
+            last_y = min(last_y, by0)
+    else:
+        last_y = cy1
+        for b in blocks:
+            bx0, by0, bx1, by1 = map(float, b["bbox"])
+            if by1 <= cy1 + 1:
+                continue
+            gap = by0 - last_y
+            if gap > 52:
+                break
+            txt = b["text"]
+            if _is_caption_text(txt, include_tables=True) or _looks_like_body_paragraph(txt, b["bbox"]):
+                break
+            selected.append(b)
+            last_y = max(last_y, by1)
+    if not selected:
+        return None
+    rect = cap_rect
+    for b in selected:
+        rect = rect | fitz.Rect(*map(float, b["bbox"]))
+    return (rect + (-margin, -margin, margin, margin)) & page.rect
 
 def _caption_blocks(page, include_tables: bool = True):
     d = page.get_text("dict")
@@ -302,6 +388,9 @@ def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str,
             for ib in imgs:
                 rect = rect | fitz.Rect(*ib)
             return (rect + (-margin, -margin, margin, margin)) & page.rect
+        text_rect = _candidate_figure_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction, margin=margin)
+        if text_rect is not None:
+            return text_rect
     if kind == "table":
         text_rect = _candidate_table_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction, margin=margin)
         if text_rect is not None:
@@ -379,14 +468,25 @@ def _horizontal_overlap_ratio(a, b) -> float:
 
 
 def _image_blocks_between(page, cap_bbox, wx0, wx1, direction: str, max_gap: float = 70.0):
-    """Find raster image blocks adjacent to a caption in the target direction."""
+    """Find raster image blocks adjacent to a caption in the target direction.
+
+    Require overlap with the caption as well as the crop window.  On pages with
+    several nearby subfigures this avoids a lower caption swallowing the previous
+    figure in the same column.
+    """
     cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    cap_w = max(1.0, cx1 - cx0)
     out = []
     for b in page.get_text("dict").get("blocks", []):
         if b.get("type") != 1 or not b.get("bbox"):
             continue
         x0, y0, x1, y1 = map(float, b["bbox"])
-        if _horizontal_overlap_ratio((x0, y0, x1, y1), (wx0, 0, wx1, page.rect.height)) < 0.35:
+        ib = (x0, y0, x1, y1)
+        if _horizontal_overlap_ratio(ib, (wx0, 0, wx1, page.rect.height)) < 0.35:
+            continue
+        # If the caption is not full-column/full-width, the image should overlap
+        # the caption x-range; this filters adjacent panels from other captions.
+        if cap_w < (wx1 - wx0) * 0.88 and _horizontal_overlap_ratio(ib, (cx0, 0, cx1, page.rect.height)) < 0.25:
             continue
         if direction == "above" and y1 <= cy0 and cy0 - y1 <= max_gap:
             out.append((x0, y0, x1, y1))
@@ -400,16 +500,123 @@ def _same_row(a, b, tol: float = 12.0) -> bool:
     return max(ay0, by0) <= min(ay1, by1) + tol
 
 
+
+def _estimate_column_windows(page, margin: float = 8.0) -> List[Tuple[float, float]]:
+    """Estimate one/two main text-column x windows from text blocks.
+
+    Many ACL-style PDFs are two-column.  A single full text window makes a
+    right-column caption crop union the unrelated left-column paragraphs/figures.
+    We infer columns from non-caption, non-tiny text block centers; if no clear
+    split exists we keep the legacy full content window.
+    """
+    page_w = float(page.rect.width)
+    candidates = []
+    for b in _text_blocks(page):
+        x0, y0, x1, y1 = map(float, b["bbox"])
+        txt = b["text"].strip()
+        width = x1 - x0
+        if width < 30 or re.fullmatch(r"\d+", txt):
+            continue
+        if x0 < page_w * 0.08 or x1 > page_w * 0.96:
+            # page numbers, arXiv side marks, marginal artifacts
+            continue
+        if _is_caption_text(txt, include_tables=True):
+            continue
+        if width > page_w * 0.62:
+            # title/author/full-width display blocks are not column evidence
+            continue
+        candidates.append((x0, x1, (x0 + x1) / 2.0, width))
+    if len(candidates) < 6:
+        return [_page_text_window_x(page, margin=margin)]
+
+    centers = sorted(c[2] for c in candidates)
+    # Find a center gap close to the page middle.  In two-column papers this gap
+    # is much larger than within-column jitter.
+    best = None
+    for a, b in zip(centers, centers[1:]):
+        gap = b - a
+        mid = (a + b) / 2.0
+        if page_w * 0.38 <= mid <= page_w * 0.62 and gap > page_w * 0.12:
+            if best is None or gap > best[0]:
+                best = (gap, mid)
+    if best is None:
+        return [_page_text_window_x(page, margin=margin)]
+
+    split = best[1]
+    left = [(x0, x1) for x0, x1, c, _ in candidates if c < split]
+    right = [(x0, x1) for x0, x1, c, _ in candidates if c >= split]
+    if len(left) < 3 or len(right) < 3:
+        return [_page_text_window_x(page, margin=margin)]
+
+    def win(items, hard0, hard1):
+        return (max(0.0, min(x0 for x0, _ in items) - margin, hard0),
+                min(page_w, max(x1 for _, x1 in items) + margin, hard1))
+
+    return [win(left, 0.0, split + margin), win(right, split - margin, page_w)]
+
+
+def _caption_column_window_x(page, cap, margin: float = 8.0) -> Tuple[float, float]:
+    """Return the inferred column window containing the caption center."""
+    x0, _, x1, _ = map(float, cap["bbox"])
+    center = (x0 + x1) / 2.0
+    windows = _estimate_column_windows(page, margin=margin)
+    for wx0, wx1 in windows:
+        if wx0 - margin <= center <= wx1 + margin:
+            return wx0, wx1
+    return min(windows, key=lambda w: min(abs(center - w[0]), abs(center - w[1])))
+
+
+def _clip_rect_to_caption_column(fitz, page, rect, cap, margin: float = 8.0, kind: str = "figure"):
+    """Clip suspicious crops to the caption column, but preserve full-width tables.
+
+    Two-column papers often need column clipping for figures and column-local
+    tables.  However, centered table captions can belong to a full-width table
+    spanning both columns; if text-block detection already found such a wide
+    table, clipping it back to the caption's inferred column cuts the table in
+    half.
+    """
+    if kind == "table" and float(rect.width) > float(page.rect.width) * 0.60:
+        return rect
+    wx0, wx1 = _caption_column_window_x(page, cap, margin=margin)
+    if (wx1 - wx0) < page.rect.width * 0.72:
+        return rect & fitz.Rect(wx0, 0, wx1, page.rect.height)
+    return rect
+
+
+def _vertical_gap_to_caption(rect, cap_bbox, direction: str) -> float:
+    cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    if direction == "above":
+        return max(0.0, cy0 - float(rect.y1))
+    return max(0.0, float(rect.y0) - cy1)
+
+
+def _extra_height_on_side(rect, cap_bbox, direction: str) -> float:
+    cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    if direction == "above":
+        return max(0.0, cy0 - float(rect.y0))
+    return max(0.0, float(rect.y1) - cy1)
+
+
+
+
 def _caption_window_x(page, cap, all_caps, margin: float = 8.0):
-    """Split side-by-side captions into columns; otherwise use full page width."""
+    """Estimate x-window for a caption crop.
+
+    Backward-compatible behavior is preserved for full-width captions/tables, but
+    isolated captions in two-column papers now use the caption's own column.
+    This prevents row-projection/pixel refinement from unioning unrelated content
+    in the opposite column (common for ACL two-column layouts).
+    """
     x0, y0, x1, y1 = map(float, cap["bbox"])
     w = page.rect.width
     same = sorted([c for c in all_caps if _same_row(c, cap)], key=lambda c: float(c["bbox"][0]))
     if len(same) <= 1 or (x1 - x0) > w * 0.45:
-        # Use the main text/content window, not just the caption width.  A table
-        # caption is often narrower than the table itself; using only caption x
-        # clips right-side columns (e.g. RAGEN2 Table 3).  We still avoid full
-        # physical page width so marginal artifacts are less likely to bridge in.
+        col_wx0, col_wx1 = _caption_column_window_x(page, cap, margin=margin)
+        # A wide caption likely belongs to a full-width object; otherwise prefer
+        # the inferred column window.  If no clear two-column split is found,
+        # _caption_column_window_x returns the legacy main content window.
+        if (col_wx1 - col_wx0) < w * 0.72 and (x1 - x0) <= w * 0.55:
+            return col_wx0, col_wx1
         return _page_text_window_x(page, margin=margin)
     idx = same.index(cap)
     left = 0.0
@@ -437,24 +644,47 @@ def _smart_caption_rect(fitz, page, cap, all_caps=None, margin: float = 8.0, con
     x0, y0, x1, y1 = map(float, cap["bbox"])
     wx0, wx1 = _caption_window_x(page, cap, all_caps, margin=margin)
     kind = _caption_kind(cap.get("text", ""))
-
     # Default conventions: figures usually have captions below; tables often captions above.
     preferred = "below" if kind == "table" else "above"
     alternate = "above" if preferred == "below" else "below"
-    pref_rect = _candidate_rect_by_direction(fitz, page, (x0, y0, x1, y1), wx0, wx1, preferred, margin=margin, kind=kind)
+    cap_bbox = (x0, y0, x1, y1)
+    pref_rect = _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, preferred, margin=margin, kind=kind)
+    pref_rect = _clip_rect_to_caption_column(fitz, page, pref_rect, cap, margin=margin, kind=kind)
 
     # Direction sanity check: if preferred side contains almost no object besides caption,
-    # try the other side and choose it when it has much more content area.
-    alt_rect = _candidate_rect_by_direction(fitz, page, (x0, y0, x1, y1), wx0, wx1, alternate, margin=margin, kind=kind)
+    # try the other side and choose it when it has much more plausible adjacent content.
+    alt_rect = _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, alternate, margin=margin, kind=kind)
+    alt_rect = _clip_rect_to_caption_column(fitz, page, alt_rect, cap, margin=margin, kind=kind)
     cap_h = max(1.0, y1 - y0)
-    pref_extra_h = max(0.0, pref_rect.height - cap_h - 2 * margin)
-    alt_extra_h = max(0.0, alt_rect.height - cap_h - 2 * margin)
+    pref_extra_h = _extra_height_on_side(pref_rect, cap_bbox, preferred)
+    alt_extra_h = _extra_height_on_side(alt_rect, cap_bbox, alternate)
+    pref_gap = _vertical_gap_to_caption(pref_rect, cap_bbox, preferred)
+    alt_gap = _vertical_gap_to_caption(alt_rect, cap_bbox, alternate)
+
+    # For tables, captions are often below the actual table in appendix/main text
+    # despite the common "caption above" convention.  If the preferred below
+    # side is just prose/section text, prefer a compact table block above.
+    if kind == "table":
+        # A table may appear above a below-caption, especially in appendices or
+        # when a long caption is laid out under a table.  Prefer the alternate
+        # side when it is a substantial nearby block and the preferred side is
+        # either tiny or suspiciously continues into prose below the caption.
+        if pref_extra_h < cap_h * 1.2 and alt_extra_h > pref_extra_h * 1.5:
+            return alt_rect
+        if alt_extra_h >= 18 and alt_gap <= 90 and (pref_extra_h < 55 or _rect_area(pref_rect) > _rect_area(alt_rect) * 1.8):
+            return alt_rect
+        if preferred == "below" and alt_extra_h >= cap_h * 2.0 and alt_extra_h >= pref_extra_h * 0.55:
+            return alt_rect
+
     if pref_extra_h < cap_h * 1.2 and alt_extra_h > pref_extra_h * 2.0:
         return alt_rect
     # For figures, strongly avoid returning caption + below paragraph when above has content.
     if kind == "figure" and pref_rect.y0 <= y0 and pref_extra_h >= cap_h * 1.2:
         return pref_rect
-    if _rect_area(alt_rect) > _rect_area(pref_rect) * 2.8 and pref_extra_h < 40:
+    # If the default figure-above crop is essentially only caption / partial
+    # labels, do not switch to a huge below paragraph just because it has more
+    # area.  Returning the preferred side is a safer failure mode.
+    if kind != "figure" and _rect_area(alt_rect) > _rect_area(pref_rect) * 2.8 and pref_extra_h < 40:
         return alt_rect
     return pref_rect
 

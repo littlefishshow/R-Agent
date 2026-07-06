@@ -426,6 +426,18 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-07-07
+
+#### `read_paper` PDF 图表截图裁剪修复
+
+- 更新 `skills/productivity/read_paper/scripts/pdf_snapshot.py` 的 PDF 截图裁剪启发式：
+  - 为双栏论文新增 caption 所在列窗口估计，避免 Figure/Table 截入另一栏正文或文章大标题。
+  - 增加矢量/文本型 Figure 的邻近文本块裁剪，减少图表与正文/其他图的错位。
+  - 优化 Table 的上下方向判定，支持 caption 在表格下方的情况，降低误截正文或漏截表格的概率。
+  - 保护跨双栏/全宽 Table 候选区域，避免居中短 caption 被误归入单栏后只截取半张表。
+  - 增强正文/章节标题与表格行的启发式区分，降低双栏正文被并入图表截图的概率。
+- 同步整理 README 更新日志，将本次 `read_paper` 截图裁剪修复记录到当日日期下，便于准备 git push 前审阅。
+
 ### 2026-07-06
 
 #### Skill 工具入口压缩与生命周期治理统一
