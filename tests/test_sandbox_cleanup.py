@@ -51,14 +51,8 @@ def test_cleanup_deletes_old_nested_files_and_empty_dirs_but_keeps_fresh_childre
     assert result["errors"] == []
 
 
-def test_cleanup_uses_st_birthtime_when_available_and_falls_back_to_st_ctime():
-    class DummyPath:
-        def __init__(self, stat_result):
-            self._stat_result = stat_result
-
-        def stat(self, follow_symlinks=False):
-            assert follow_symlinks is False
-            return self._stat_result
+def test_cleanup_uses_st_birthtime_when_available_and_falls_back_to_st_ctime(monkeypatch):
+    calls = []
 
     class WithBirth:
         st_birthtime = 123.0
@@ -67,8 +61,38 @@ def test_cleanup_uses_st_birthtime_when_available_and_falls_back_to_st_ctime():
     class WithoutBirth:
         st_ctime = 789.0
 
-    assert sandbox_cleanup._entry_created_timestamp(DummyPath(WithBirth())) == 123.0
-    assert sandbox_cleanup._entry_created_timestamp(DummyPath(WithoutBirth())) == 789.0
+    stat_results = [WithBirth(), WithoutBirth()]
+
+    def fake_stat(path, *, follow_symlinks=True):
+        calls.append((path, follow_symlinks))
+        return stat_results.pop(0)
+
+    monkeypatch.setattr(sandbox_cleanup.os, "stat", fake_stat)
+
+    first = Path("first")
+    second = Path("second")
+    assert sandbox_cleanup._entry_created_timestamp(first) == 123.0
+    assert sandbox_cleanup._entry_created_timestamp(second) == 789.0
+    assert calls == [(first, False), (second, False)]
+
+
+def test_cleanup_with_real_pathlib_path_deletes_old_file(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    old_file = sandbox / "old.txt"
+    old_file.write_text("old", encoding="utf-8")
+
+    created_at = sandbox_cleanup._entry_created_timestamp(old_file)
+    result = sandbox_cleanup.cleanup_sandbox_by_creation_time(
+        sandbox_dir=sandbox,
+        retention_days=0,
+        now=created_at + 1,
+    )
+
+    assert sandbox.exists()
+    assert not old_file.exists()
+    assert str(old_file) in result["deleted"]
+    assert result["errors"] == []
 
 
 def test_maybe_cleanup_respects_interval_and_disable_env(monkeypatch):

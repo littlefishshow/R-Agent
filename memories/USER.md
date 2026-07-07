@@ -2,3 +2,4 @@
 
 * 如果用户正在维护 R-Agent 项目；当用户要求进行升级换代/准备 git push 时，需要将本次升级过的内容整理保存到 README.md 中，方便用户实时查看更新了哪些内容。用户要求：每次维护 Agent 项目进行升级/重构/准备 git push 时，需要在 README.md 中按日期记录更新日志，包含具体更新内容。
 - 用户希望 R-Agent 增加非终端可视化窗口界面：能查看所有上下文（system prompt、messages、tools、skills、memory、工具结果、后台/子 Agent 上下文等），长内容可折叠并点击展开；同时保留正常输入框和对话界面；视觉风格偏高级/高科技。
+- 用户偏好：当用户要求调研/寻找/推荐关于某个方向（xxx 方向）的论文时，使用 `paper_research_scout` skill 来进行论文调研与筛选；当用户要求保存当前项目进度时，使用 `project_progress_context` skill。

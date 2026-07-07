@@ -60,7 +60,7 @@ def _entry_created_timestamp(path: Path) -> float:
     metadata timestamp. On Unix this is inode metadata-change time, not creation
     time, so recently touched/renamed entries may be retained longer.
     """
-    stat_result = path.stat(follow_symlinks=False)
+    stat_result = os.stat(path, follow_symlinks=False)
     return float(getattr(stat_result, "st_birthtime", stat_result.st_ctime))
 
 
