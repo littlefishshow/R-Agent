@@ -438,6 +438,28 @@ pip install PyNaCl>=1.5.0
   - 增强正文/章节标题与表格行的启发式区分，降低双栏正文被并入图表截图的概率。
 - 同步整理 README 更新日志，将本次 `read_paper` 截图裁剪修复记录到当日日期下，便于准备 git push 前审阅。
 
+### 2026-07-07
+
+#### auto_research 专用 Agent Loop MVP
+
+- **新增专用运行时骨架**：新增 `core/autoresearch_loop.py`，提供 `AutoResearchSettings`、`AutoResearchAction`、`AutoResearchObservation`、`AutoResearchLoop`、`AutoResearchContextManager`、`AutoResearchArtifactStore`、`ProjectBoundary` 与 `ProjectConfinedCommandRunner`，用于承载面向 autoresearch 的轻量 Agent Loop。
+- **围绕 `program.md` 控制父上下文**：父 loop 每轮只读取 `program.md`、`.autoresearch/state.json` 和最近 observations，并通过 `context_char_budget`、`program_char_budget`、`summary_char_budget` 严格裁剪，避免普通对话式 messages 无限膨胀。
+- **原始输出外置归档**：shell、file、web、note 等 action 的 raw output 统一写入 `.autoresearch/artifacts/`，文件名包含 `timestamp_project_id_trial_rationale_kind`；父上下文只保留 compact summary 与 artifact path。
+- **项目内快速命令执行**：新增 `ProjectConfinedCommandRunner`，不调用全局 `run_command` 审批门，允许 autoresearch 在项目目录内快速执行实验命令；同时拒绝 `~`、绝对路径越界和 `../` 逃逸，避免放宽全局工具安全策略。
+- **支持可插拔规划与总结**：`AutoResearchLoop` 支持注入 planner/summarizer，当前 MVP 默认执行安全 bootstrap inspect，后续可接入轻量 LLM planner，根据 `program.md` 自动提出实验、运行、总结和更新状态。
+- **接入 R-Agent 子进程工具**：新增 `tools/autoresearch_tool.py` 并注册 `auto_research_run`，R-Agent 调用该工具时会通过现有 isolated tool process 运行 auto_research loop，使其成为主 Agent 可直接调度的子进程型运行时。
+- **固定 auto_research workflow 骨架**：新增 `AutoResearchWorkflowStep` 与 `FixedAutoResearchPlanner`，默认分步执行 `inspect_project`、`read_program`、`plan_change`、`run_eval_if_available`、`summarize_result`，每步声明允许的 action/tool surface 并在 loop 内校验，避免无边界工具调用。
+- **模块化上下文 buckets**：新增 `DEFAULT_CONTEXT_BUCKETS` 与 `ContextBucket`，按 `project_understanding`、`current_changes`、`experiment_results`、`conclusions`、`modification_plans`、`open_questions`、`raw_observations` 分类保存上下文，每个 bucket 由 `bucket_max_items` 与 `bucket_item_char_budget` 控制长度，父上下文输出 `modular_context`。
+- **引入每 step 的 LLM 子 Agent**：新增 `AutoResearchStepAgent` 与 `AutoResearchStepResult`，在 `use_llm_step_agents=true` 时，每个固定 workflow step 会把 bounded parent context、step 定义和 allowed tools 发给独立 LLM 子 Agent，要求返回结构化 JSON action 与 bucket updates；父 loop 继续负责校验、执行和归档。
+- **保留 deterministic fallback**：LLM step agent 返回非法 JSON、越出 allowed_tools、请求失败或缺少可用 client 时，`AutoResearchLoop` 会记录 `step_agent_errors`，把错误压入 `raw_observations`，并自动回退到 `FixedAutoResearchPlanner` 的 deterministic action，保证 autoresearch loop 稳定可运行。
+- **增强 step prompt 与 JSON 解析**：为各 workflow step 增加专业 guidance，并新增 `extract_json_object()` 支持原始 JSON、```json fenced block 和正文内嵌 JSON object 提取，降低 LLM 输出格式轻微偏移导致失败的概率。
+- **扩展实验循环骨架**：默认 workflow 扩展为 `inspect_project/read_program/plan_change/baseline_eval/summarize_baseline/propose_experiment/apply_change/run_experiment_if_available/parse_metric_and_decide/record_decision`，并新增 `parse_primary_metric()`、`decide_experiment()`、`extract_progress_percent()`，为 baseline、单一假设、训练/eval、指标解析、keep/discard 记录打基础；自动 commit 默认关闭，仅记录 would-commit 决策。
+- **增加安全 apply-change / patch 能力**：新增 `apply_patch` action 与 `apply_unified_patch_limited()`，支持项目目录内最小 unified diff 创建/修改文本文件，并拒绝删除、binary patch、绝对路径和 `../` 越界；默认 `apply_change` step 只有在 LLM step agent 生成安全 patch 时才应用，否则 fallback 为 note skip。
+- **结构化记录实验指标**：shell/read/note action 会自动解析 `primary_metric` / `primary_metric_name` / `higher_is_better`，写入 `.autoresearch/state.json` 的 `metrics` / `baseline_metric`，并追加 `results.tsv`，记录 timestamp、rationale、metric、decision、artifact_path 和 status。
+- **新增文字可视化进度界面**：新增 `AutoResearchProgressView`，持续写入 `.autoresearch/progress.md`，用纯文本进度条展示 Overall、Experiment/Train progress、ETA、当前修改计划、实验结论、最近日志 Tail、已完成部分和 artifacts，便于在后台运行时直观看进度。
+- **支持后台非阻塞运行**：`auto_research_run(background=true)` 会立即返回 `run_id/progress_path/status_path`，并用独立 Python 子进程后台运行 auto_research；新增 `auto_research_status` 查询状态文件和 progress.md 预览，避免长实验阻塞 R-Agent 主进程。
+- **补充回归测试**：新增/扩展 `tests/test_autoresearch_loop.py` 与 `tests/test_autoresearch_tool.py`，覆盖 raw output 归档、父上下文预算、项目内 `rm` 不触发全局审批、越界命令拒绝、write action 项目内写入、固定 workflow buckets、工具注册运行、模块化上下文输出、fake LLM step agent 成功覆盖 action、越权 action fallback、JSON fence 提取、metric/progress 解析、progress.md 写入和后台 run/status。
+
 ### 2026-07-06
 
 #### Skill 工具入口压缩与生命周期治理统一
