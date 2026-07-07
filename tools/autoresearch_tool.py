@@ -5,7 +5,7 @@ import time
 import uuid
 from pathlib import Path
 
-from core.autoresearch_loop import AutoResearchLoop, AutoResearchSettings
+from core.autoresearch_loop import AutoResearchLoop, AutoResearchSettings, normalize_versioning_policy
 from tools.registry import registry
 
 
@@ -22,6 +22,12 @@ def _make_settings(
     command_timeout_seconds: int = 300,
     use_llm_step_agents: bool = False,
     llm_model: str = "",
+    max_experiments: int = 4,
+    max_active_context_chars: int = 8000,
+    max_pareto_items: int = 8,
+    max_useful_failures: int = 3,
+    use_git_versioning: bool = True,
+    versioning_policy: str = "artifact_only",
 ) -> AutoResearchSettings:
     return AutoResearchSettings(
         project_dir=project_dir,
@@ -36,6 +42,12 @@ def _make_settings(
         command_timeout_seconds=command_timeout_seconds,
         use_llm_step_agents=use_llm_step_agents,
         llm_model=llm_model or None,
+        max_experiments=max_experiments,
+        max_active_context_chars=max_active_context_chars,
+        max_pareto_items=max_pareto_items,
+        max_useful_failures=max_useful_failures,
+        use_git_versioning=use_git_versioning,
+        versioning_policy=versioning_policy,
     )
 
 
@@ -62,6 +74,12 @@ def _settings_payload(settings: AutoResearchSettings, progress_path: str) -> dic
         "llm_temperature": settings.llm_temperature,
         "progress_path": progress_path,
         "auto_commit": settings.auto_commit,
+        "max_experiments": settings.max_experiments,
+        "max_active_context_chars": settings.max_active_context_chars,
+        "max_pareto_items": settings.max_pareto_items,
+        "max_useful_failures": settings.max_useful_failures,
+        "use_git_versioning": settings.use_git_versioning,
+        "versioning_policy": normalize_versioning_policy(settings.versioning_policy),
     }
 
 
@@ -85,6 +103,7 @@ status = {
     "project_id": settings_data["project_id"],
     "progress_path": settings_data["progress_path"],
     "status_path": str(status_path),
+    "versioning_policy": settings_data.get("versioning_policy", "artifact_only"),
 }
 status_path.parent.mkdir(parents=True, exist_ok=True)
 status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -111,6 +130,12 @@ def auto_research_run_tool(
     command_timeout_seconds: int = 300,
     use_llm_step_agents: bool = False,
     llm_model: str = "",
+    max_experiments: int = 4,
+    max_active_context_chars: int = 8000,
+    max_pareto_items: int = 8,
+    max_useful_failures: int = 3,
+    use_git_versioning: bool = True,
+    versioning_policy: str = "artifact_only",
     background: bool = False,
 ) -> str:
     """Run the dedicated autoresearch loop for a project."""
@@ -128,6 +153,12 @@ def auto_research_run_tool(
             command_timeout_seconds=command_timeout_seconds,
             use_llm_step_agents=use_llm_step_agents,
             llm_model=llm_model,
+            max_experiments=max_experiments,
+            max_active_context_chars=max_active_context_chars,
+            max_pareto_items=max_pareto_items,
+            max_useful_failures=max_useful_failures,
+            use_git_versioning=use_git_versioning,
+            versioning_policy=versioning_policy,
         )
         if background:
             run_id = f"ar-{uuid.uuid4().hex[:10]}"
@@ -143,6 +174,7 @@ def auto_research_run_tool(
                 "progress_path": progress_path,
                 "status_path": status_path,
                 "created_at": time.time(),
+                "versioning_policy": normalize_versioning_policy(settings.versioning_policy),
             }
             Path(status_path).parent.mkdir(parents=True, exist_ok=True)
             Path(status_path).write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -197,6 +229,12 @@ def _common_properties():
         "command_timeout_seconds": {"type": "integer", "description": "单个项目内命令超时时间。", "default": 300},
         "use_llm_step_agents": {"type": "boolean", "description": "是否启用每个固定 workflow step 的 LLM 子 Agent；失败会降级 deterministic fallback。", "default": False},
         "llm_model": {"type": "string", "description": "LLM step agent 使用的模型；为空则使用默认模型。", "default": ""},
+        "max_experiments": {"type": "integer", "description": "最多记录/执行多少个实际 trial/run_experiment 轮次。", "default": 4},
+        "max_active_context_chars": {"type": "integer", "description": "active_context.md 压缩上下文字符预算。", "default": 8000},
+        "max_pareto_items": {"type": "integer", "description": "pareto_front.json 最多保留候选数。", "default": 8},
+        "max_useful_failures": {"type": "integer", "description": "active context/state 中保留的失败/无用轮次摘要数。", "default": 3},
+        "use_git_versioning": {"type": "boolean", "description": "在已有 git 仓库中记录 base commit/status/diff；非 git 安全降级且不会 git init。", "default": True},
+        "versioning_policy": {"type": "string", "description": "中间版本生命周期策略：artifact_only(默认，仅保存 patch/manifest)、commit_pareto、commit_all_trials、branch_per_trial。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 时立即返回 run_id 和 progress_path。", "default": False},
     }
 

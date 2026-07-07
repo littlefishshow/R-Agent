@@ -248,3 +248,94 @@ def test_progress_markdown_includes_log_tail_and_eta(tmp_path):
     assert "ETA:" in text
     assert "## 最近日志 Tail" in text
     assert "train 80%" in text or "primary_metric" in text
+
+
+
+def test_apply_patch_uses_git_apply_for_new_file(tmp_path):
+    from core.autoresearch_loop import AutoResearchAction
+
+    patch = """diff --git a/new_file.txt b/new_file.txt
+new file mode 100644
+index 0000000..3e75765
+--- /dev/null
++++ b/new_file.txt
+@@ -0,0 +1 @@
++created by git apply
+"""
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+
+    obs = loop.execute_action(AutoResearchAction(type="apply_patch", rationale="git_apply_new", patch=patch))
+
+    assert obs.status == "ok"
+    assert (tmp_path / "new_file.txt").read_text(encoding="utf-8") == "created by git apply\n"
+    raw = json.loads(Path(obs.artifact_path).read_text(encoding="utf-8"))
+    assert raw["apply_engine"] == "git apply"
+    assert "new_file.txt" in raw["changed_files"]
+
+
+def test_git_apply_rejects_escape_and_failed_check_without_modifying(tmp_path):
+    from core.autoresearch_loop import AutoResearchAction
+
+    target = tmp_path / "safe.txt"
+    target.write_text("old\n", encoding="utf-8")
+    escape_patch = """diff --git a/../evil.txt b/../evil.txt
+--- a/../evil.txt
++++ b/../evil.txt
+@@ -0,0 +1 @@
++evil
+"""
+    loop = AutoResearchLoop(AutoResearchSettings(project_dir=tmp_path, max_rounds=0))
+    obs = loop.execute_action(AutoResearchAction(type="apply_patch", rationale="escape", patch=escape_patch))
+    assert obs.status == "failed"
+    assert not (tmp_path.parent / "evil.txt").exists()
+
+    bad_patch = """diff --git a/safe.txt b/safe.txt
+--- a/safe.txt
++++ b/safe.txt
+@@ -1 +1 @@
+-not-present
++new
+"""
+    obs = loop.execute_action(AutoResearchAction(type="apply_patch", rationale="bad_context", patch=bad_patch))
+    assert obs.status == "failed"
+    assert target.read_text(encoding="utf-8") == "old\n"
+
+
+def test_auto_research_run_schema_exposes_versioning_policy_enum_and_tool_passes_setting(tmp_path, monkeypatch):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    registry.reload_all()
+    tool = registry._tools["auto_research_run"]
+    versioning = tool["schema"]["function"]["parameters"]["properties"]["versioning_policy"]
+    assert versioning["enum"] == ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"]
+    assert versioning["default"] == "artifact_only"
+
+    captured = {}
+
+    class _FakeLoop:
+        def __init__(self, settings):
+            captured["versioning_policy"] = settings.versioning_policy
+            captured["use_git_versioning"] = settings.use_git_versioning
+            captured["max_experiments"] = settings.max_experiments
+
+        def run(self):
+            return {
+                "project_id": "schema",
+                "rounds_completed": 0,
+                "versioning_policy": captured["versioning_policy"],
+                "use_git_versioning": captured["use_git_versioning"],
+            }
+
+    monkeypatch.setattr("tools.autoresearch_tool.AutoResearchLoop", _FakeLoop)
+    payload = json.loads(auto_research_run_tool(
+        str(tmp_path),
+        project_id="schema",
+        rounds=0,
+        versioning_policy="branch_per_trial",
+        use_git_versioning=False,
+        max_experiments=2,
+    ))
+
+    assert payload["success"] is True
+    assert captured == {"versioning_policy": "branch_per_trial", "use_git_versioning": False, "max_experiments": 2}
+    assert payload["versioning_policy"] == "branch_per_trial"

@@ -17,9 +17,38 @@ R-Agent 当前主要包含以下能力：
 - **长期记忆系统**：使用 `memories/USER.md` 和 `memories/MEMORY.md` 区分用户偏好与项目/环境事实，并在启动时注入 Agent 上下文。
 - **Skill 系统**：将稳定、可复用的工作流程保存为 `skills/**/SKILL.md`，让 Agent 能复用已有经验，而不是每次从零规划。
 - **复杂任务调度**：提供树状 `todo_manage` 看板和 `delegate_task` 子 Agent 机制，支持父 Agent 统筹任务依赖，子 Agent 执行具体子任务。
+- **auto_research 专用运行时**：提供 `auto_research_run` / `auto_research_status`，用于在项目目录内围绕 `program.md` 执行固定 workflow、归档实验输出，并通过 `.autoresearch/` 保存 bounded context、progress 和候选结果。
 - **自我维护能力**：Agent 可以在授权边界内创建/修改工具、维护技能、更新项目文档，并通过安全审批机制控制高风险操作。
 
 本项目围绕个人使用场景逐步演进的本地 Agent 框架。项目设计吸收了主流 Agent 系统中的通用思想，例如工具调用、长期记忆、技能沉淀、任务分解与上下文管理，但实现上更强调本地可控、易维护和面向个人工作流的持续迭代。
+
+### 1.1 auto_research 使用说明
+
+`auto_research_run` 是 R-Agent 内部用于研究/实验型项目的轻量子进程运行时，适合项目根目录已有明确 `program.md`、需要分步检查项目、运行可用 eval/train、记录实验指标和保留压缩上下文的场景。它不是通用“自动完成所有研究”的承诺；当前实现以固定 workflow、可选每 step LLM 子 Agent 和 deterministic fallback 为边界。
+
+基本调用参数：
+
+- `project_dir`：必填，必须位于当前工作区内。
+- `program_path`：相对 `project_dir` 的研究说明文件，默认 `program.md`。
+- `rounds`：最多执行多少个固定 workflow step。
+- `background=true`：后台非阻塞运行，返回 `run_id`、`progress_path`、`status_path`；之后可用 `auto_research_status` 查看 `.autoresearch/progress.md` 预览。
+- `use_llm_step_agents=true`：为每个固定 workflow step 启用独立 LLM 子 Agent 生成结构化 action；若 JSON 非法、越权或调用失败，会降级到 deterministic fallback。
+- 上下文/实验治理参数：`context_char_budget`、`program_char_budget`、`summary_char_budget`、`bucket_item_char_budget`、`bucket_max_items`、`max_experiments`、`max_active_context_chars`、`max_pareto_items`、`max_useful_failures`。
+- `use_git_versioning`：默认开启；仅在已有 git 仓库中记录 base commit、status、changed files 和 diff artifact。非 git 项目会安全降级，不会自动 `git init`。
+- `versioning_policy`：中间版本生命周期策略，默认 `artifact_only`。R-Agent 默认不频繁自动 commit；建议仅在已有 git 仓库、base 工作区干净，并且实验结果达到 best/Pareto 等值得保留的标准时再提交。可选策略语义：
+  - `artifact_only`：只把 trial 的 diff patch、实验记录/manifest（写入 `.autoresearch/state.json`、`results.tsv`、`active_context.md` 等）和 raw artifact 保存在 `.autoresearch/`，不自动 commit，也不回滚用户工作区。
+  - `commit_pareto`：只对当前 best 或非支配 Pareto 候选等被保留的有效 trial 尝试 commit；失败、无指标、无效或被支配的 trial 保留 patch/manifest，随后仅在 base 工作区干净且可安全归因时回滚 tracked changes。
+  - `commit_all_trials`：对每个有效且可评价的 trial 尝试 commit；失败或无效 trial 仍保留 patch/manifest，并在安全条件满足时回滚。该策略会产生更多中间 commit，一般不建议作为默认日常策略。
+  - `branch_per_trial`：为每个有效 trial 创建/记录 `autoresearch/<experiment_id>` 分支；失败或无效 trial 仍保留 patch/manifest，并在安全条件满足时回滚。
+  - 对所有策略，非 git 项目不会自动初始化仓库；回滚只针对可安全归因的 tracked changes，未跟踪文件会保留，相关 action/status 会写入实验记录，便于人工审阅。
+
+运行产物主要保存在项目内 `.autoresearch/`：
+
+- `state.json`：保存 observations、metrics、experiments、best/pareto 等结构化状态。
+- `artifacts/`：保存 shell/file/web/note/apply_patch 等 raw output，父上下文只保留摘要和路径。
+- `progress.md`：文字进度面板，供后台运行时快速查看状态。
+- `active_context.md`：按预算压缩后的工作上下文，汇总当前最佳候选、Pareto front、近期结论和有用失败。
+- `best.json` / `pareto_front.json`：在有可解析实验指标时记录当前最佳实验和多目标 Pareto 候选；若无指标，只会保留空或待补充状态，不虚构结果。
 
 ## 2. 环境配置
 
@@ -426,7 +455,21 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-07-08
+
+#### auto_research 中间版本管理说明
+
+- 更新“1.1 auto_research 使用说明”，补充 `versioning_policy` 的四种策略语义：`artifact_only`、`commit_pareto`、`commit_all_trials`、`branch_per_trial`。
+- 明确默认不频繁自动 commit：非 git 项目不会自动 `git init`，日常推荐先保存 patch/manifest，只有已有 git 仓库中达到 best/Pareto 等值得保留标准的 trial 才建议提交。
+- 补充失败、无效或被支配 trial 的治理方式：保留 diff patch、实验记录/manifest 与 artifact；仅在 base 工作区干净且可安全归因时回滚 tracked changes，未跟踪文件保留供人工审阅。
+
 ### 2026-07-07
+
+#### sandbox 自动清理兼容性修复
+
+- 修复 sandbox 自动清理在 Python 3.9 环境下调用 `Path.stat()` / `Path.lstat()` 时不兼容 `follow_symlinks` 参数的问题，改为兼容 pathlib 真实行为的 stat/lstat 清理逻辑。
+- 补充基于真实 `pathlib.Path` 的回归测试，覆盖清理逻辑在 Python 3.9 兼容路径下的行为，避免仅依赖 mock 掩盖接口差异。
+- 清理错误不再因 `follow_symlinks` 触发的 `TypeError` 被静默吞掉而导致旧 sandbox 文件保留，确保异常可见并避免过期文件残留。
 
 #### `read_paper` PDF 图表截图裁剪修复
 
@@ -437,8 +480,6 @@ pip install PyNaCl>=1.5.0
   - 保护跨双栏/全宽 Table 候选区域，避免居中短 caption 被误归入单栏后只截取半张表。
   - 增强正文/章节标题与表格行的启发式区分，降低双栏正文被并入图表截图的概率。
 - 同步整理 README 更新日志，将本次 `read_paper` 截图裁剪修复记录到当日日期下，便于准备 git push 前审阅。
-
-### 2026-07-07
 
 #### auto_research 专用 Agent Loop MVP
 
@@ -454,10 +495,14 @@ pip install PyNaCl>=1.5.0
 - **保留 deterministic fallback**：LLM step agent 返回非法 JSON、越出 allowed_tools、请求失败或缺少可用 client 时，`AutoResearchLoop` 会记录 `step_agent_errors`，把错误压入 `raw_observations`，并自动回退到 `FixedAutoResearchPlanner` 的 deterministic action，保证 autoresearch loop 稳定可运行。
 - **增强 step prompt 与 JSON 解析**：为各 workflow step 增加专业 guidance，并新增 `extract_json_object()` 支持原始 JSON、```json fenced block 和正文内嵌 JSON object 提取，降低 LLM 输出格式轻微偏移导致失败的概率。
 - **扩展实验循环骨架**：默认 workflow 扩展为 `inspect_project/read_program/plan_change/baseline_eval/summarize_baseline/propose_experiment/apply_change/run_experiment_if_available/parse_metric_and_decide/record_decision`，并新增 `parse_primary_metric()`、`decide_experiment()`、`extract_progress_percent()`，为 baseline、单一假设、训练/eval、指标解析、keep/discard 记录打基础；自动 commit 默认关闭，仅记录 would-commit 决策。
-- **增加安全 apply-change / patch 能力**：新增 `apply_patch` action 与 `apply_unified_patch_limited()`，支持项目目录内最小 unified diff 创建/修改文本文件，并拒绝删除、binary patch、绝对路径和 `../` 越界；默认 `apply_change` step 只有在 LLM step agent 生成安全 patch 时才应用，否则 fallback 为 note skip。
+- **增加完整 `git apply` patch 能力**：新增 `apply_patch` action，并将执行引擎升级为 `apply_patch_with_git()`：先扫描 patch 头部路径并拒绝绝对路径、`~` 与 `../` 越界，再在项目目录内执行 `git apply --check --whitespace=nowarn -`，校验通过后执行 `git apply --whitespace=nowarn -`；保留 `apply_unified_patch_limited()` 作为受限后备 helper。默认 `apply_change` step 只有在 LLM step agent 生成安全 patch 时才应用，否则 fallback 为 note skip。
 - **结构化记录实验指标**：shell/read/note action 会自动解析 `primary_metric` / `primary_metric_name` / `higher_is_better`，写入 `.autoresearch/state.json` 的 `metrics` / `baseline_metric`，并追加 `results.tsv`，记录 timestamp、rationale、metric、decision、artifact_path 和 status。
 - **新增文字可视化进度界面**：新增 `AutoResearchProgressView`，持续写入 `.autoresearch/progress.md`，用纯文本进度条展示 Overall、Experiment/Train progress、ETA、当前修改计划、实验结论、最近日志 Tail、已完成部分和 artifacts，便于在后台运行时直观看进度。
 - **支持后台非阻塞运行**：`auto_research_run(background=true)` 会立即返回 `run_id/progress_path/status_path`，并用独立 Python 子进程后台运行 auto_research；新增 `auto_research_status` 查询状态文件和 progress.md 预览，避免长实验阻塞 R-Agent 主进程。
+- **补充演化式版本管理产物**：实验型 run 会在 `.autoresearch/state.json` 记录 experiments，并在可解析指标时维护 `best_experiment` 与多目标 `pareto_front`；同步写出 `.autoresearch/best.json`、`.autoresearch/pareto_front.json` 和 `.autoresearch/active_context.md`，用于保留当前最佳候选、Pareto 候选、近期结论和有用失败。
+- **git 版本信息安全降级**：新增 `use_git_versioning` 开关，默认仅在已有 git 仓库中记录 base commit、status、changed files 和 diff artifact；非 git 项目不会自动初始化仓库，相关字段安全留空，自动 commit 仍默认关闭。
+- **新增 auto_research 参数**：工具 schema 补充 `max_experiments`、`max_active_context_chars`、`max_pareto_items`、`max_useful_failures`、`use_git_versioning`、`versioning_policy`，便于限制实验轮次、active context 长度、Pareto 候选数量、失败/丢弃轮次摘要数量以及中间版本生命周期策略。
+- **补充 README 使用说明**：在“1.1 auto_research 使用说明”中记录适用边界、常用参数和 `.autoresearch/` 产物，明确当前是固定 workflow + 可选 step agent + fallback 的实现，不夸大为完全自主科研系统。
 - **补充回归测试**：新增/扩展 `tests/test_autoresearch_loop.py` 与 `tests/test_autoresearch_tool.py`，覆盖 raw output 归档、父上下文预算、项目内 `rm` 不触发全局审批、越界命令拒绝、write action 项目内写入、固定 workflow buckets、工具注册运行、模块化上下文输出、fake LLM step agent 成功覆盖 action、越权 action fallback、JSON fence 提取、metric/progress 解析、progress.md 写入和后台 run/status。
 
 ### 2026-07-06

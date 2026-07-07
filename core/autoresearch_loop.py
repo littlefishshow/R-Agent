@@ -43,6 +43,17 @@ class AutoResearchSettings:
     llm_temperature: float = 0.0
     progress_path: str | Path = ".autoresearch/progress.md"
     auto_commit: bool = False
+    max_experiments: int = 4
+    max_active_context_chars: int = 8_000
+    max_pareto_items: int = 8
+    max_useful_failures: int = 3
+    use_git_versioning: bool = True
+    versioning_policy: str = "artifact_only"
+
+    def __post_init__(self) -> None:
+        # Normalize early so tools, background payloads, state, progress, and
+        # active_context all report the same supported lifecycle policy.
+        self.versioning_policy = normalize_versioning_policy(self.versioning_policy)
 
     def root(self) -> Path:
         return Path(self.project_dir).expanduser().resolve()
@@ -349,6 +360,73 @@ def apply_unified_patch_limited(project_dir: str | Path, patch_text: str) -> dic
     return {"changed_files": changed}
 
 
+def _normalize_patch_path(label: str) -> str | None:
+    label = (label or "").strip()
+    if not label or label == "/dev/null":
+        return None
+    # Drop optional timestamps after paths in ---/+++ lines.
+    label = label.split("	", 1)[0].split(" ", 1)[0]
+    if label.startswith("a/") or label.startswith("b/"):
+        label = label[2:]
+    return label
+
+
+def _scan_patch_paths_for_safety(patch_text: str) -> list[str]:
+    paths = []
+    for line in patch_text.splitlines():
+        candidates = []
+        if line.startswith("diff --git "):
+            parts = shlex.split(line)
+            if len(parts) >= 4:
+                candidates.extend([parts[2], parts[3]])
+        elif line.startswith("--- ") or line.startswith("+++ "):
+            candidates.append(line[4:].strip())
+        elif line.startswith(("rename from ", "rename to ", "copy from ", "copy to ")):
+            candidates.append(line.split(" ", 2)[2].strip())
+        for raw in candidates:
+            normalized = _normalize_patch_path(raw)
+            if normalized is None:
+                continue
+            if normalized.startswith("/") or normalized.startswith("~") or _contains_parent_escape(normalized):
+                raise AutoResearchSafetyError(f"patch path escapes project: {normalized}")
+            paths.append(normalized)
+    if not paths:
+        raise AutoResearchSafetyError("patch contains no file paths")
+    return sorted(set(paths))
+
+
+def apply_patch_with_git(project_dir: str | Path, patch_text: str) -> dict:
+    """Apply a full git-compatible patch inside project_dir using git apply."""
+    if not patch_text or not patch_text.strip():
+        raise AutoResearchSafetyError("empty patch")
+    if "GIT binary patch" in patch_text:
+        raise AutoResearchSafetyError("binary git patches are not allowed")
+    boundary = ProjectBoundary(project_dir)
+    changed_files = _scan_patch_paths_for_safety(patch_text)
+    workdir = boundary.ensure_inside(boundary.project_dir)
+    check = subprocess.run(
+        ["git", "apply", "--check", "--whitespace=nowarn", "-"],
+        input=patch_text,
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if check.returncode != 0:
+        raise AutoResearchSafetyError("git apply --check failed: " + (check.stderr or check.stdout).strip())
+    applied = subprocess.run(
+        ["git", "apply", "--whitespace=nowarn", "-"],
+        input=patch_text,
+        cwd=str(workdir),
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    if applied.returncode != 0:
+        raise AutoResearchSafetyError("git apply failed: " + (applied.stderr or applied.stdout).strip())
+    return {"changed_files": changed_files, "apply_engine": "git apply"}
+
+
 class ProjectBoundary:
     """Project-directory confinement helper."""
 
@@ -476,6 +554,12 @@ class AutoResearchContextManager:
             "summary": "",
             "observations": [],
             "buckets": {name: [] for name in DEFAULT_CONTEXT_BUCKETS},
+            "experiments": [],
+            "pareto_front": [],
+            "best_experiment": None,
+            "useful_failures": [],
+            "versioning_policy": normalize_versioning_policy(self.settings.versioning_policy),
+            "use_git_versioning": bool(self.settings.use_git_versioning),
         }
 
     def load_state(self) -> dict:
@@ -490,6 +574,12 @@ class AutoResearchContextManager:
             return self.default_state()
         data.setdefault("summary", "")
         data.setdefault("observations", [])
+        data.setdefault("experiments", [])
+        data.setdefault("pareto_front", [])
+        data.setdefault("best_experiment", None)
+        data.setdefault("useful_failures", [])
+        data["versioning_policy"] = normalize_versioning_policy(self.settings.versioning_policy)
+        data["use_git_versioning"] = bool(self.settings.use_git_versioning)
         buckets = data.setdefault("buckets", {})
         for name in DEFAULT_CONTEXT_BUCKETS:
             buckets.setdefault(name, [])
@@ -507,6 +597,8 @@ class AutoResearchContextManager:
         state["buckets"][bucket_name] = bucket.compact()
 
     def save_state(self, state: dict) -> None:
+        state["versioning_policy"] = normalize_versioning_policy(self.settings.versioning_policy)
+        state["use_git_versioning"] = bool(self.settings.use_git_versioning)
         path = self.boundary.ensure_inside(self.settings.state_file())
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -528,6 +620,12 @@ class AutoResearchContextManager:
             "context_policy": {
                 "max_chars": self.settings.context_char_budget,
                 "raw_outputs": "archived separately; parent sees summaries and artifact paths only",
+            },
+            "versioning": {
+                "policy": normalize_versioning_policy(self.settings.versioning_policy),
+                "use_git_versioning": bool(self.settings.use_git_versioning),
+                "best_experiment": state.get("best_experiment"),
+                "pareto_count": len(state.get("pareto_front") or []),
             },
         }
         return self._truncate_middle(json.dumps(payload, ensure_ascii=False, indent=2), self.settings.context_char_budget)
@@ -770,6 +868,260 @@ class AutoResearchStepAgent:
         return AutoResearchStepResult(action=action, bucket_updates=normalized, raw_response=raw)
 
 
+
+
+def _run_git(project_dir: str | Path, args: list[str], timeout: int = 30) -> dict:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=str(Path(project_dir).expanduser().resolve()),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {"returncode": completed.returncode, "stdout": completed.stdout, "stderr": completed.stderr}
+    except Exception as exc:
+        return {"returncode": None, "stdout": "", "stderr": str(exc)}
+
+
+def git_snapshot(project_dir: str | Path, *, enabled: bool = True) -> dict:
+    """Return safe git repository metadata; never initializes or mutates repos."""
+    if not enabled:
+        return {"git_available": False, "reason": "disabled"}
+    probe = _run_git(project_dir, ["rev-parse", "--is-inside-work-tree"])
+    if probe.get("returncode") != 0 or probe.get("stdout", "").strip() != "true":
+        return {"git_available": False, "reason": "not_git_repo"}
+    root = _run_git(project_dir, ["rev-parse", "--show-toplevel"]).get("stdout", "").strip()
+    head = _run_git(project_dir, ["rev-parse", "HEAD"])
+    status = _run_git(project_dir, ["status", "--porcelain=v1"])
+    return {
+        "git_available": True,
+        "repo_root": root,
+        "head": head.get("stdout", "").strip() if head.get("returncode") == 0 else "",
+        "status": status.get("stdout", "") if status.get("returncode") == 0 else "",
+    }
+
+
+def git_changed_files(project_dir: str | Path) -> list[str]:
+    status = _run_git(project_dir, ["status", "--porcelain=v1"])
+    if status.get("returncode") != 0:
+        return []
+    files = []
+    for line in status.get("stdout", "").splitlines():
+        if not line:
+            continue
+        path = line[3:] if len(line) > 3 else line.strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        if path:
+            files.append(path)
+    return sorted(set(files))
+
+
+def save_project_diff(project_dir: str | Path, artifacts: AutoResearchArtifactStore, rationale: str, *, git_available: bool) -> str:
+    if git_available:
+        diff = _run_git(project_dir, ["diff", "--no-ext-diff", "--binary"]).get("stdout", "")
+        staged = _run_git(project_dir, ["diff", "--cached", "--no-ext-diff", "--binary"]).get("stdout", "")
+        status = _run_git(project_dir, ["status", "--porcelain=v1"]).get("stdout", "")
+        content = "# git status --porcelain\n" + status + "\n# git diff\n" + diff + "\n# git diff --cached\n" + staged
+        if content.strip():
+            return artifacts.save(kind="diff", rationale=rationale, content=content, extension="diff")
+        return ""
+    # Non-git safe degradation: record manifest only, do not invent repository history.
+    root = Path(project_dir).expanduser().resolve()
+    rows = []
+    for path in sorted(root.rglob("*")):
+        if ".autoresearch" in path.parts or path.is_dir():
+            continue
+        try:
+            rel = str(path.relative_to(root))
+            rows.append({"path": rel, "size": path.stat().st_size, "mtime": path.stat().st_mtime})
+        except Exception:
+            continue
+        if len(rows) >= 500:
+            break
+    return artifacts.save(kind="manifest", rationale=rationale, content=json.dumps({"files": rows}, ensure_ascii=False, indent=2), extension="json")
+
+
+
+
+VERSIONING_POLICIES = {"artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"}
+
+
+def normalize_versioning_policy(policy: str | None) -> str:
+    value = str(policy or "artifact_only").strip().lower()
+    return value if value in VERSIONING_POLICIES else "artifact_only"
+
+
+def _git_worktree_clean(snapshot: dict) -> bool:
+    return bool(isinstance(snapshot, dict) and snapshot.get("git_available") and not str(snapshot.get("status") or "").strip())
+
+
+def _sanitize_branch_component(value: str, default: str = "trial") -> str:
+    slug = _safe_slug(value, default, 80).replace("_", "-")
+    return slug.strip(".-/") or default
+
+
+def git_commit_trial(project_dir: str | Path, experiment_id: str, rationale: str, *, branch_name: str = "") -> dict:
+    """Commit current trial changes in an existing git repo; never initializes repos."""
+    status = _run_git(project_dir, ["status", "--porcelain=v1"])
+    if status.get("returncode") != 0:
+        return {"action": "commit_failed", "commit_sha": "", "branch": branch_name, "error": status.get("stderr") or status.get("stdout")}
+    if not str(status.get("stdout") or "").strip():
+        return {"action": "no_changes", "commit_sha": "", "branch": branch_name, "error": ""}
+    add = _run_git(project_dir, ["add", "-A", "--", "."])
+    if add.get("returncode") != 0:
+        return {"action": "commit_failed", "commit_sha": "", "branch": branch_name, "error": add.get("stderr") or add.get("stdout")}
+    staged = _run_git(project_dir, ["diff", "--cached", "--quiet"])
+    if staged.get("returncode") == 0:
+        return {"action": "no_staged_changes", "commit_sha": "", "branch": branch_name, "error": ""}
+    message = f"auto_research {experiment_id}: {str(rationale or '')[:120]}"
+    commit = _run_git(project_dir, ["-c", "user.name=auto_research", "-c", "user.email=auto_research@example.invalid", "commit", "-m", message], timeout=60)
+    if commit.get("returncode") != 0:
+        return {"action": "commit_failed", "commit_sha": "", "branch": branch_name, "error": commit.get("stderr") or commit.get("stdout")}
+    sha = _run_git(project_dir, ["rev-parse", "HEAD"]).get("stdout", "").strip()
+    if branch_name:
+        branch = _run_git(project_dir, ["branch", "-f", branch_name, sha])
+        if branch.get("returncode") != 0:
+            return {"action": "committed_branch_failed", "commit_sha": sha, "branch": branch_name, "error": branch.get("stderr") or branch.get("stdout")}
+    return {"action": "committed" if not branch_name else "committed_branch_recorded", "commit_sha": sha, "branch": branch_name, "error": ""}
+
+
+def git_branch_trial(project_dir: str | Path, experiment_id: str, rationale: str, base_ref: str = "") -> dict:
+    """Safely commit a trial on a per-trial branch and return to the original branch/ref."""
+    branch_name = "autoresearch/" + _sanitize_branch_component(experiment_id)
+    current = _run_git(project_dir, ["symbolic-ref", "--quiet", "--short", "HEAD"])
+    original_ref = current.get("stdout", "").strip() if current.get("returncode") == 0 else (base_ref or "HEAD")
+    create = _run_git(project_dir, ["checkout", "-b", branch_name], timeout=60)
+    if create.get("returncode") != 0:
+        return {"action": "branch_failed", "commit_sha": "", "branch": branch_name, "rollback_status": "not_needed", "error": create.get("stderr") or create.get("stdout")}
+    result = git_commit_trial(project_dir, experiment_id, rationale, branch_name="")
+    sha = result.get("commit_sha", "")
+    back = _run_git(project_dir, ["checkout", original_ref], timeout=60)
+    rollback_status = "returned_to_base" if back.get("returncode") == 0 else "return_failed"
+    if sha:
+        _run_git(project_dir, ["branch", "-f", branch_name, sha])
+    action = "branched" if sha and rollback_status == "returned_to_base" else result.get("action", "branch_failed")
+    error = result.get("error", "") or (back.get("stderr") or back.get("stdout") if back.get("returncode") != 0 else "")
+    return {"action": action, "commit_sha": sha, "branch": branch_name, "rollback_status": rollback_status, "error": error}
+
+
+def git_safe_rollback_to_base(project_dir: str | Path, base_commit: str) -> dict:
+    """Rollback tracked/staged trial changes only; intentionally preserves untracked files."""
+    if not base_commit:
+        return {"status": "skipped_no_base", "error": ""}
+    restore_staged = _run_git(project_dir, ["restore", "--staged", "--", "."], timeout=60)
+    restore_worktree = _run_git(project_dir, ["restore", "--worktree", "--source", base_commit, "--", "."], timeout=60)
+    status = _run_git(project_dir, ["status", "--porcelain=v1"])
+    if restore_staged.get("returncode") != 0 or restore_worktree.get("returncode") != 0:
+        return {"status": "failed", "error": (restore_staged.get("stderr") or "") + (restore_worktree.get("stderr") or "")}
+    remaining = str(status.get("stdout") or "")
+    untracked = [line for line in remaining.splitlines() if line.startswith("??")]
+    tracked = [line for line in remaining.splitlines() if line and not line.startswith("??")]
+    if tracked:
+        return {"status": "partial_tracked_remaining", "error": "tracked changes remain"}
+    if untracked:
+        return {"status": "rolled_back_tracked_untracked_preserved", "error": ""}
+    return {"status": "rolled_back", "error": ""}
+
+def _metric_direction(name: str, default_higher: bool = True) -> bool:
+    lowered = (name or "").lower()
+    if any(token in lowered for token in ("loss", "error", "wer", "cer", "latency", "time", "cost", "perplexity")):
+        return False
+    if any(token in lowered for token in ("accuracy", "acc", "f1", "auc", "score", "precision", "recall", "success", "pass")):
+        return True
+    return default_higher
+
+
+def extract_metrics_from_text(text: str, program_text: str = "") -> tuple[dict[str, float], dict[str, bool]]:
+    """Best-effort multi-metric parser from JSON/log text plus program hints."""
+    metrics: dict[str, float] = {}
+    directions: dict[str, bool] = {}
+    primary = parse_primary_metric(text)
+    if primary.get("metric") is not None:
+        name = str(primary.get("metric_name") or "primary_metric")
+        metrics[name] = float(primary["metric"])
+        directions[name] = bool(primary.get("higher_is_better", _metric_direction(name)))
+    for pattern in (
+        r"\b([A-Za-z][A-Za-z0-9_.-]*(?:accuracy|acc|f1|auc|score|loss|error|latency|time|cost|metric)[A-Za-z0-9_.-]*)\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+        r"\b(accuracy|acc|f1|auc|score|loss|error|latency|time|cost)\s*[:=]\s*(-?\d+(?:\.\d+)?)",
+    ):
+        for name, value in re.findall(pattern, text or "", flags=re.I):
+            try:
+                metrics[str(name)] = float(value)
+            except ValueError:
+                continue
+    # Parse simple JSON metrics/results files embedded as raw action output.
+    try:
+        data = json.loads(text)
+        candidates = []
+        if isinstance(data, dict):
+            candidates.append(data)
+            for key in ("metrics", "results"):
+                if isinstance(data.get(key), dict):
+                    candidates.append(data[key])
+        for candidate in candidates:
+            for key, value in candidate.items():
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    metrics[str(key)] = float(value)
+    except Exception:
+        pass
+    default_higher = not re.search(r"\b(minimi[sz]e|lower is better|reduce|loss|error|cost)\b", program_text or "", flags=re.I)
+    for name in list(metrics):
+        directions.setdefault(name, _metric_direction(name, default_higher))
+    return metrics, directions
+
+
+def _dominates(a: dict, b: dict, directions: dict[str, bool]) -> bool:
+    a_metrics = a.get("metrics") or {}
+    b_metrics = b.get("metrics") or {}
+    common = [k for k in a_metrics if k in b_metrics and isinstance(a_metrics.get(k), (int, float)) and isinstance(b_metrics.get(k), (int, float))]
+    if not common:
+        return False
+    better_or_equal = True
+    strictly_better = False
+    for key in common:
+        higher = directions.get(key, _metric_direction(key))
+        av = float(a_metrics[key]); bv = float(b_metrics[key])
+        if higher:
+            better_or_equal = better_or_equal and av >= bv
+            strictly_better = strictly_better or av > bv
+        else:
+            better_or_equal = better_or_equal and av <= bv
+            strictly_better = strictly_better or av < bv
+    return better_or_equal and strictly_better
+
+
+def pareto_front(experiments: list[dict], directions: dict[str, bool], max_items: int) -> list[dict]:
+    candidates = [e for e in experiments if e.get("metrics") and e.get("status") != "failed"]
+    front = []
+    for candidate in candidates:
+        if any(_dominates(other, candidate, directions) for other in candidates if other is not candidate):
+            continue
+        front.append(candidate)
+    front.sort(key=lambda e: e.get("created_at", 0), reverse=True)
+    return front[: max(1, int(max_items or 1))]
+
+
+def choose_best_experiment(experiments: list[dict], directions: dict[str, bool], primary_name: str | None = None) -> dict | None:
+    candidates = [e for e in experiments if e.get("metrics") and e.get("status") != "failed"]
+    if not candidates:
+        return None
+    if not primary_name:
+        for e in reversed(candidates):
+            if e.get("primary_metric_name"):
+                primary_name = e.get("primary_metric_name")
+                break
+    if not primary_name:
+        primary_name = next(iter(candidates[-1].get("metrics") or {}), None)
+    if not primary_name:
+        return candidates[-1]
+    higher = directions.get(primary_name, _metric_direction(primary_name))
+    with_metric = [e for e in candidates if isinstance((e.get("metrics") or {}).get(primary_name), (int, float))]
+    if not with_metric:
+        return candidates[-1]
+    return sorted(with_metric, key=lambda e: float(e["metrics"][primary_name]), reverse=higher)[0]
+
 class AutoResearchProgressView:
     """Text-only visual progress dashboard for autoresearch."""
 
@@ -808,12 +1160,16 @@ class AutoResearchProgressView:
         errors = step_agent_errors or []
         eta = self._eta_text(observations, round_index, total)
         log_tail = self._log_tail(observations)
+        recent_experiments = (state.get("experiments") or []) if isinstance(state, dict) else []
+        last_version = recent_experiments[-1].get("version_summary", "") if recent_experiments else ""
         lines = [
             f"# auto_research Progress — {self.settings.project_id}",
             "",
             f"Updated: {time.strftime('%F %T')}",
             f"Status: **{status}**",
             f"Current step: `{current_step}`",
+            f"Versioning policy: `{normalize_versioning_policy(self.settings.versioning_policy)}`",
+            f"Last version action: {last_version or '(none yet)'}",
             "",
             f"Overall: {overall}% `{self._bar(overall)}`",
             f"Experiment/Train progress: {experiment_percent}% `{self._bar(experiment_percent)}`",
@@ -828,6 +1184,14 @@ class AutoResearchProgressView:
         lines.extend(completed if completed else ["- (no completed step yet)"])
         lines.extend(["", "## 最近日志 Tail"])
         lines.extend([f"```text", log_tail or "(no log tail yet)", "```"])
+        best = state.get("best_experiment") if isinstance(state, dict) else None
+        pareto = state.get("pareto_front") if isinstance(state, dict) else []
+        lines.extend(["", "## Evolution summary"])
+        if best:
+            lines.append(f"- Best: `{best.get('experiment_id')}` decision={best.get('decision')} metrics={json.dumps(best.get('metrics') or {}, ensure_ascii=False)}")
+        else:
+            lines.append("- Best: (no metric-bearing experiment yet)")
+        lines.append(f"- Pareto candidates: {len(pareto or [])}")
         lines.extend(["", "## Artifacts", f"- `{artifact_dir}`"])
         if errors:
             lines.extend(["", "## Step Agent Fallback / Errors", *(f"- {e}" for e in errors[-5:])])
@@ -885,6 +1249,7 @@ class AutoResearchLoop:
         self._observations: list[AutoResearchObservation] = []
         self._step_agent_errors: list[str] = []
         self.progress = AutoResearchProgressView(settings)
+        self._experiment_count = 0
 
     def run(self, rounds: Optional[int] = None) -> dict:
         max_rounds = max(0, int(rounds if rounds is not None else self.settings.max_rounds))
@@ -898,12 +1263,25 @@ class AutoResearchLoop:
             action = step_result.action
             self._validate_step_tool_scope(action, round_index)
             self._apply_bucket_updates(step_result.bucket_updates)
-            observation = self.execute_action(action)
+            if self._is_experiment_action(action, step_name) and self._experiment_count >= max(0, int(self.settings.max_experiments)):
+                observation = AutoResearchObservation(
+                    "experiment_budget",
+                    f"Skipped trial because max_experiments={self.settings.max_experiments} was reached",
+                    "",
+                    "skipped",
+                )
+                self._archive_useful_failure({"summary": observation.summary, "status": "skipped_budget"})
+                base_git = {}
+            else:
+                base_git = git_snapshot(self.settings.root(), enabled=self.settings.use_git_versioning)
+                observation = self.execute_action(action)
             self._observations.append(observation)
             self._persist_observation(observation)
+            self._maybe_record_experiment(action, observation, base_git, step_name)
             self._write_progress("running", step_name, round_index + 1, max_rounds)
             if action.type == "stop":
                 break
+        self._write_evolution_artifacts(self.context.load_state())
         self._write_progress("completed", "done", max_rounds, max_rounds)
         return {
             "project_id": self.settings.project_id,
@@ -912,6 +1290,11 @@ class AutoResearchLoop:
             "state_path": str(self.settings.state_file()),
             "artifact_dir": str(self.settings.artifacts_root()),
             "progress_path": str(self.settings.progress_file()),
+            "best_path": str(self.settings.root() / ".autoresearch" / "best.json"),
+            "pareto_front_path": str(self.settings.root() / ".autoresearch" / "pareto_front.json"),
+            "active_context_path": str(self.settings.root() / ".autoresearch" / "active_context.md"),
+            "versioning_policy": normalize_versioning_policy(self.settings.versioning_policy),
+            "use_git_versioning": bool(self.settings.use_git_versioning),
             "step_agent_errors": list(self._step_agent_errors),
         }
 
@@ -1003,7 +1386,7 @@ class AutoResearchLoop:
                 artifact = self.artifacts.save(kind="write", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("write", self.summarizer(action, raw), artifact, "ok")
             if action.type == "apply_patch":
-                result = apply_unified_patch_limited(self.settings.root(), action.patch or action.content)
+                result = apply_patch_with_git(self.settings.root(), action.patch or action.content)
                 raw = json.dumps(result, ensure_ascii=False, indent=2)
                 artifact = self.artifacts.save(kind="apply_patch", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("apply_patch", self.summarizer(action, raw), artifact, "ok")
@@ -1082,6 +1465,244 @@ class AutoResearchLoop:
         self.context.save_state(state)
 
     @staticmethod
+    def _is_experiment_action(action: AutoResearchAction, step_name: str = "") -> bool:
+        text = f"{step_name} {action.rationale} {action.command}".lower()
+        return action.type == "run" and any(token in text for token in ("trial", "experiment", "run_experiment"))
+
+    def _maybe_record_experiment(self, action: AutoResearchAction, obs: AutoResearchObservation, base_git: dict, step_name: str) -> None:
+        if not self._is_experiment_action(action, step_name):
+            return
+        if self._experiment_count >= max(0, int(self.settings.max_experiments)):
+            self._archive_useful_failure({
+                "summary": f"Skipped experiment record because max_experiments={self.settings.max_experiments} was reached",
+                "action": action.__dict__,
+                "status": "skipped_budget",
+            })
+            return
+        self._experiment_count += 1
+        state = self.context.load_state()
+        existing = list(state.get("experiments") or [])
+        experiment_id = f"exp-{len(existing) + 1:04d}-{int(time.time())}"
+        raw = ""
+        if obs.artifact_path and Path(obs.artifact_path).exists():
+            raw = Path(obs.artifact_path).read_text(encoding="utf-8", errors="replace")
+        program_text = self.context.read_program()
+        metrics, directions = extract_metrics_from_text(raw, program_text)
+        file_metrics, file_directions = self._collect_metric_files()
+        metrics.update(file_metrics)
+        directions.update(file_directions)
+        primary = parse_primary_metric(raw)
+        primary_name = primary.get("metric_name") if primary.get("metric") is not None else (next(iter(metrics), None))
+        primary_metric = metrics.get(primary_name) if primary_name else None
+        baseline = state.get("baseline_metric")
+        decision = decide_experiment(primary_metric, baseline, directions.get(str(primary_name), True)) if primary_name else ("failed" if obs.status == "failed" else "needs_metrics")
+        policy = normalize_versioning_policy(self.settings.versioning_policy)
+        git_after = git_snapshot(self.settings.root(), enabled=self.settings.use_git_versioning)
+        git_available = bool(git_after.get("git_available"))
+        changed_files = git_changed_files(self.settings.root()) if git_available else []
+        diff_path = save_project_diff(self.settings.root(), self.artifacts, experiment_id, git_available=git_available)
+        base_commit = base_git.get("head", "") if isinstance(base_git, dict) else ""
+        base_clean = _git_worktree_clean(base_git)
+        record = {
+            "experiment_id": experiment_id,
+            "created_at": time.time(),
+            "timestamp": time.strftime("%F %T"),
+            "hypothesis": action.rationale,
+            "summary": obs.summary[:1200],
+            "metrics": metrics,
+            "metric_directions": directions,
+            "primary_metric_name": primary_name,
+            "status": obs.status,
+            "decision": decision,
+            "changed_files": changed_files,
+            "diff_path": diff_path,
+            "artifact_path": obs.artifact_path,
+            "git_commit": "",
+            "commit_sha": "",
+            "branch": "",
+            "base_commit": base_commit,
+            "git_available": git_available,
+            "git_status_before": base_git.get("status", "") if isinstance(base_git, dict) else "",
+            "git_status_after": git_after.get("status", "") if isinstance(git_after, dict) else "",
+            "version_policy": policy,
+            "version_action": "artifact_only",
+            "rollback_status": "not_needed",
+            "version_error": "",
+        }
+        existing.append(record)
+        state["experiments"] = existing[-max(1, int(self.settings.max_experiments)) :]
+
+        # Recompute multi-objective governance artifacts before version decisions so
+        # commit_pareto can use the same best/Pareto view written to state.
+        all_directions = {}
+        for exp in state.get("experiments") or []:
+            all_directions.update(exp.get("metric_directions") or {})
+        front = pareto_front(state.get("experiments") or [], all_directions, self.settings.max_pareto_items)
+        best = choose_best_experiment(state.get("experiments") or [], all_directions, primary_name)
+        state["pareto_front"] = front
+        state["best_experiment"] = best
+
+        front_ids = {str(item.get("experiment_id")) for item in front or []}
+        best_id = str((best or {}).get("experiment_id") or "")
+        has_metrics = bool(metrics)
+        invalid = obs.status == "failed" or decision in {"needs_metrics", "failed"} or not has_metrics
+        # commit_pareto is intentionally strict: only the current best or
+        # non-dominated Pareto candidates are committed. A merely improved but
+        # dominated trial stays as a patch artifact and is rolled back below.
+        pareto_kept = experiment_id in front_ids or experiment_id == best_id
+        should_commit = False
+        should_branch = False
+        should_rollback = False
+        if not git_available or not self.settings.use_git_versioning:
+            record["version_action"] = "artifact_only_disabled" if not self.settings.use_git_versioning else "artifact_only_no_git"
+            record["rollback_status"] = "skipped_no_git"
+        elif policy == "artifact_only":
+            record["version_action"] = "artifact_only"
+            record["rollback_status"] = "skipped_artifact_only"
+        elif not base_clean:
+            record["version_action"] = "artifact_only_dirty_base"
+            record["rollback_status"] = "skipped_dirty_base"
+        else:
+            if policy == "commit_all_trials":
+                should_commit = not invalid
+                should_rollback = invalid
+            elif policy == "commit_pareto":
+                should_commit = (not invalid) and pareto_kept
+                should_rollback = not should_commit
+            elif policy == "branch_per_trial":
+                should_branch = not invalid
+                should_rollback = invalid
+            if should_commit:
+                result = git_commit_trial(self.settings.root(), experiment_id, action.rationale)
+                record["version_action"] = result.get("action", "commit_attempted")
+                record["commit_sha"] = result.get("commit_sha", "")
+                record["git_commit"] = record["commit_sha"]
+                record["branch"] = result.get("branch", "")
+                record["version_error"] = result.get("error", "")
+                if result.get("action") in {"commit_failed", "committed_branch_failed"}:
+                    should_rollback = True
+            elif should_branch:
+                result = git_branch_trial(self.settings.root(), experiment_id, action.rationale, base_commit)
+                record["version_action"] = result.get("action", "branch_attempted")
+                record["commit_sha"] = result.get("commit_sha", "")
+                record["git_commit"] = record["commit_sha"]
+                record["branch"] = result.get("branch", "")
+                record["rollback_status"] = result.get("rollback_status", "not_needed")
+                record["version_error"] = result.get("error", "")
+                should_rollback = False
+            else:
+                record["version_action"] = "artifact_only_not_selected"
+            if should_rollback:
+                rollback = git_safe_rollback_to_base(self.settings.root(), base_commit)
+                record["rollback_status"] = rollback.get("status", "unknown")
+                record["version_error"] = record.get("version_error", "") or rollback.get("error", "")
+
+        git_final = git_snapshot(self.settings.root(), enabled=self.settings.use_git_versioning)
+        record["git_status_final"] = git_final.get("status", "") if isinstance(git_final, dict) else ""
+        record["version_summary"] = f"policy={policy} action={record.get('version_action')} rollback={record.get('rollback_status')} commit={record.get('commit_sha','')} branch={record.get('branch','')}"
+
+        if obs.status == "failed" or decision in {"discard", "needs_metrics", "failed"}:
+            self._archive_useful_failure(record, state=state)
+        self.context.add_to_bucket(state, "current_changes", f"Versioning: {record['version_summary']} diff={diff_path}")
+        self.context.save_state(state)
+        self._write_evolution_artifacts(state)
+
+    def _collect_metric_files(self) -> tuple[dict[str, float], dict[str, bool]]:
+        root = self.settings.root()
+        metrics: dict[str, float] = {}
+        directions: dict[str, bool] = {}
+        candidates = [root / "metrics.json", root / "results.json", root / "state.json", root / ".autoresearch" / "metrics.json"]
+        for path in candidates:
+            if not path.exists() or not path.is_file():
+                continue
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")[:200_000]
+            except Exception:
+                continue
+            parsed, dirs = extract_metrics_from_text(text, self.context.read_program())
+            metrics.update(parsed)
+            directions.update(dirs)
+        results_tsv = root / "results.tsv"
+        if results_tsv.exists():
+            try:
+                parsed, dirs = extract_metrics_from_text(results_tsv.read_text(encoding="utf-8", errors="replace")[-100_000:], self.context.read_program())
+                metrics.update(parsed); directions.update(dirs)
+            except Exception:
+                pass
+        return metrics, directions
+
+    def _archive_useful_failure(self, record: dict, state: dict | None = None) -> None:
+        own_state = state if state is not None else self.context.load_state()
+        failure = {
+            "experiment_id": record.get("experiment_id", ""),
+            "timestamp": record.get("timestamp", time.strftime("%F %T")),
+            "summary": str(record.get("summary") or record.get("hypothesis") or record.get("status") or "")[:800],
+            "decision": record.get("decision", record.get("status", "failed")),
+            "artifact_path": record.get("artifact_path", ""),
+            "diff_path": record.get("diff_path", ""),
+            "version_policy": record.get("version_policy", ""),
+            "version_action": record.get("version_action", ""),
+            "commit_sha": record.get("commit_sha", record.get("git_commit", "")),
+            "branch": record.get("branch", ""),
+            "rollback_status": record.get("rollback_status", ""),
+        }
+        useful = list(own_state.get("useful_failures") or [])
+        useful.append(failure)
+        own_state["useful_failures"] = useful[-max(0, int(self.settings.max_useful_failures)) :]
+        if state is None:
+            self.context.save_state(own_state)
+
+    def _write_evolution_artifacts(self, state: dict) -> None:
+        root = self.settings.root() / ".autoresearch"
+        root.mkdir(parents=True, exist_ok=True)
+        best = state.get("best_experiment")
+        front = state.get("pareto_front") or []
+        (root / "best.json").write_text(json.dumps(best or {}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (root / "pareto_front.json").write_text(json.dumps(front, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        self._write_active_context(state)
+
+    def _write_active_context(self, state: dict) -> None:
+        root = self.settings.root() / ".autoresearch"
+        budget = max(1000, int(self.settings.max_active_context_chars or 8000))
+        recent_experiments = state.get("experiments") or []
+        last_version = recent_experiments[-1].get("version_summary", "") if recent_experiments else ""
+        lines = [
+            f"# Active autoresearch context — {self.settings.project_id}",
+            "",
+            "This is a compressed working context. Raw logs and full history stay in artifacts/state.",
+            "",
+            "## Versioning",
+            f"- policy: `{normalize_versioning_policy(self.settings.versioning_policy)}`",
+            f"- last action: {last_version or '(none yet)'}",
+            "",
+        ]
+        best = state.get("best_experiment") or {}
+        if best:
+            lines.extend([
+                "## Best experiment",
+                f"- id: {best.get('experiment_id')}",
+                f"- decision/status: {best.get('decision')} / {best.get('status')}",
+                f"- metrics: {json.dumps(best.get('metrics') or {}, ensure_ascii=False)}",
+                f"- diff: {best.get('diff_path', '')}",
+                "",
+            ])
+        lines.append("## Pareto front")
+        for item in (state.get("pareto_front") or [])[: self.settings.max_pareto_items]:
+            lines.append(f"- {item.get('experiment_id')}: decision={item.get('decision')} metrics={json.dumps(item.get('metrics') or {}, ensure_ascii=False)} diff={item.get('diff_path','')} version={item.get('version_summary') or item.get('version_action','')}")
+        if not (state.get("pareto_front") or []):
+            lines.append("- (no metric-bearing Pareto candidates yet)")
+        lines.extend(["", "## Useful failures / discarded rounds"])
+        for item in (state.get("useful_failures") or [])[-self.settings.max_useful_failures :]:
+            lines.append(f"- {item.get('experiment_id','')}: {item.get('decision')} — {item.get('summary','')[:240]} artifact={item.get('artifact_path','')} version={item.get('version_action','')} rollback={item.get('rollback_status','')}")
+        lines.extend(["", "## Recent conclusions"])
+        for item in ((state.get("buckets") or {}).get("conclusions") or [])[-3:]:
+            lines.append(f"- {item}")
+        text = "\n".join(lines).strip() + "\n"
+        if len(text) > budget:
+            text = text[: budget - 40].rstrip() + "\n...<active context clipped>...\n"
+        (root / "active_context.md").write_text(text, encoding="utf-8")
+
+    @staticmethod
     def _bucket_for_observation(obs: AutoResearchObservation) -> str:
         text = f"{obs.kind} {obs.summary}".lower()
         if "conclusion" in text or "summary" in text:
@@ -1143,6 +1764,7 @@ __all__ = [
     "extract_progress_percent",
     "parse_primary_metric",
     "apply_unified_patch_limited",
+    "apply_patch_with_git",
     "AutoResearchSafetyError",
     "AutoResearchSettings",
     "ProjectBoundary",
