@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+.env
+.venv
+
+
+# IDEs and Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Logs and Data
+*.log
+sandbox/
+.pytest_cache/
+# Local pre-clone backup of flat autoresearch files (not part of the repo history)
+_legacy_flat/
+# Test artifacts (keep tests/ source directory trackable)
+test-output/
+test_outputs/
+tmp_test*/
+# Runtime/local agent state
+memories/.memory.lock
+# Deprecated nested project directory (old accidental R-Agent/R-Agent/* paths)
+R-Agent/
+repos/
+outputs/
+skills/.usage.json
+skills/.usage.json.lock
+skills/.archive/
+models/
+# Frontend dependencies/build artifacts
+app_gui_frontend/node_modules/
+app_gui_frontend/dist/
+app_gui/package-lock.json
