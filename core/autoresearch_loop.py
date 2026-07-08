@@ -953,13 +953,23 @@ class AutoResearchStepAgent:
             "This is your choice; pick it when the task is a search/optimization loop, so you do not need to think "
             "once per evaluation. Specify target files, expected metric direction, risk, rollback."
         ),
-        "baseline_eval": "Run or prepare baseline evaluation; focus on machine-parseable metrics and failure diagnosis.",
+        "baseline_eval": (
+            "Run or prepare baseline evaluation; focus on machine-parseable metrics and failure diagnosis. "
+            "Use python3 (never bare 'python') for any inline/summary script. Judge success by the parsed metric "
+            "and the train/eval logs, NOT by the exit code of a summary wrapper — do not let a summary step's "
+            "failure make you exit nonzero when train/eval actually produced a valid metric."
+        ),
         "summarize_baseline": "Summarize baseline evidence and whether metrics are sufficient for comparison.",
         "propose_experiment": (
             "Produce a single minimal modification plan; do not combine unrelated ideas. For search/optimization "
             "tasks, a strong single plan is to (re)write an allowed train-side script that internally loops over "
             "many candidates and calls the eval harness each time, returning the best. That amortizes one LLM "
-            "decision over many cheap evaluations instead of one candidate per round."
+            "decision over many cheap evaluations instead of one candidate per round. "
+            "IMPROVE ACROSS ROUNDS: read the previous round's best metric and search history from context; if the "
+            "objective is not yet reached or still improving, REWRITE the search script to do better — widen the "
+            "search range to cover the whole plausible domain from program.md, increase the sample budget, and/or "
+            "switch algorithm (e.g. coarse global scan then local refinement). Do NOT anchor the search solely on "
+            "the existing submission.json; always run an independent global search each round."
         ),
         "apply_change": (
             "Make the planned train-side change. Two safe options: (a) emit apply_patch with a unified diff when you "
@@ -967,8 +977,16 @@ class AutoResearchStepAgent:
             "'write' action (path + complete new content) rather than skipping — a self-contained search script is a "
             "good fit for 'write'. Only skip if no safe change can be expressed. Never touch forbidden eval files."
         ),
-        "run_experiment_if_available": "Run the configured experiment/eval command; prefer bounded commands and preserve logs.",
-        "parse_metric_and_decide": "Parse metrics, compare against baseline if present, and decide keep/discard/needs_metrics.",
+        "run_experiment_if_available": (
+            "Run the configured experiment/eval command; prefer bounded commands and preserve logs. Use python3 for "
+            "any inline summary; base the run's success on the parsed metric and logs, not on a summary script's exit "
+            "code."
+        ),
+        "parse_metric_and_decide": (
+            "Parse metrics, compare against baseline if present, and decide keep/discard/needs_metrics. If the target "
+            "is not reached and the budget allows, prefer 'needs_metrics'/continue so the loop can propose an "
+            "improved search script next round, rather than stopping at a mediocre local result."
+        ),
         "record_decision": "Record final decision, completed parts, artifacts, next steps, and what would be committed.",
     }
 
@@ -1824,6 +1842,12 @@ class AutoResearchLoop:
                 raw = json.dumps(result, ensure_ascii=False, indent=2)
                 artifact = self.artifacts.save(kind="shell", rationale=action.rationale, content=raw, extension="json")
                 status = "ok" if result.get("returncode") == 0 else "failed"
+                # Robustness: a baseline/trial wrapper (often LLM-generated) may exit
+                # nonzero because of a broken *summary* step even though train/eval
+                # produced a valid metric. Do not let that mask a good experiment:
+                # if a primary metric is parseable from the output, recover to ok.
+                if status == "failed" and self._run_has_valid_metric(result, action):
+                    status = "ok_metric_recovered"
                 self._record_metric(action, raw, artifact, status)
                 return AutoResearchObservation("shell", self.summarizer(action, raw), artifact, status)
             if action.type == "read":
@@ -1866,6 +1890,24 @@ class AutoResearchLoop:
             raw = json.dumps({"error": str(exc), "action": action.__dict__}, ensure_ascii=False, indent=2, default=str)
             artifact = self.artifacts.save(kind="error", rationale=action.rationale or action.type, content=raw, extension="json")
             return AutoResearchObservation(action.type, f"Action failed: {exc}", artifact, "failed")
+
+    def _run_has_valid_metric(self, result: dict, action: AutoResearchAction) -> bool:
+        """True if a baseline/trial run yielded a parseable primary metric.
+
+        Used to recover a nonzero-exit run whose failure was only in a summary
+        wrapper (e.g. a broken inline python) while train/eval + metrics were
+        fine. Scoped to explicit baseline/trial roles so a generic run that
+        exits nonzero still surfaces as failed even if it happened to print a
+        metric-looking line.
+        """
+        role = getattr(action, "role", "")
+        if role not in {"baseline", "trial"}:
+            return False
+        text = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
+        if parse_primary_metric(text).get("metric") is not None:
+            return True
+        file_metrics, _ = self._collect_metric_files()
+        return bool(file_metrics)
 
     def _record_metric(self, action: AutoResearchAction, raw: str, artifact_path: str, status: str) -> None:
         info = parse_primary_metric(raw)
@@ -2086,8 +2128,55 @@ class AutoResearchLoop:
         if obs.status == "failed" or decision in {"discard", "needs_metrics", "failed"}:
             self._archive_useful_failure(record, state=state)
         self.context.add_to_bucket(state, "current_changes", f"Versioning: {record['version_summary']} diff={diff_path}")
+        feedback = self._search_feedback_digest()
+        if feedback:
+            self.context.add_to_bucket(state, "experiment_results", feedback)
         self.context.save_state(state)
         self._write_evolution_artifacts(state)
+
+    def _search_feedback_digest(self) -> str:
+        """Compact digest of a train-side search's own summary/history, if present.
+
+        A self-iterating search script (the pattern we now encourage) tends to
+        write outputs/train_search_summary.json + train_search_history.jsonl.
+        Surfacing best_z, best point, eval_count and the sampled range back into
+        the experiment_results bucket is what lets the NEXT round's planner see
+        "range too small / stuck at boundary" and rewrite a better script.
+        """
+        root = self.settings.root()
+        summary_path = root / "outputs" / "train_search_summary.json"
+        if not summary_path.exists():
+            return ""
+        try:
+            s = json.loads(summary_path.read_text(encoding="utf-8"))
+        except Exception:
+            return ""
+        parts = []
+        for k in ("best_z", "best_x", "best_y", "eval_count", "status"):
+            if k in s:
+                parts.append(f"{k}={s[k]}")
+        # Add sampled x/y range from history so the planner can judge coverage.
+        hist_path = root / "outputs" / "train_search_history.jsonl"
+        if hist_path.exists():
+            try:
+                xs, ys = [], []
+                for line in hist_path.read_text(encoding="utf-8").splitlines()[-2000:]:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    r = json.loads(line)
+                    if isinstance(r.get("x"), (int, float)):
+                        xs.append(float(r["x"]))
+                    if isinstance(r.get("y"), (int, float)):
+                        ys.append(float(r["y"]))
+                if xs and ys:
+                    parts.append(f"sampled_x_range=[{min(xs):g},{max(xs):g}]")
+                    parts.append(f"sampled_y_range=[{min(ys):g},{max(ys):g}]")
+            except Exception:
+                pass
+        if not parts:
+            return ""
+        return "Search feedback: " + " ".join(parts) + " (if not converged, widen range/increase budget/refine locally next round)"
 
     def _collect_metric_files(self) -> tuple[dict[str, float], dict[str, bool]]:
         root = self.settings.root()

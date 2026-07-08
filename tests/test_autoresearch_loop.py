@@ -712,3 +712,66 @@ def test_apply_change_allows_write_scope():
     apply_round = [s.name for s in planner.steps].index("apply_change")
     assert "write" in planner.allowed_tools_for_round(apply_round)
 
+
+def test_trial_nonzero_exit_recovers_when_metric_is_valid(tmp_path):
+    """A trial whose summary wrapper exits nonzero but produced a valid metric must not be marked failed."""
+    (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="recover", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    # eval prints a valid metric, then a broken summary step exits 1.
+    cmd = "printf 'primary_metric: 3.0\\nmetric_name: z\\n'; exit 1"
+    obs = loop.execute_action(AutoResearchAction(type="run", rationale="experiment_result_trial", command=cmd, role="trial"))
+    assert obs.status == "ok_metric_recovered"
+
+
+def test_generic_nonzero_run_still_fails(tmp_path):
+    """A non-baseline/trial run with no metric must still report failed."""
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="run", rationale="inspect", command="echo hi; exit 1"))
+    assert obs.status == "failed"
+
+
+def test_baseline_nonzero_exit_recovers_from_metrics_file(tmp_path):
+    """Baseline whose wrapper fails but metrics.json is valid should recover."""
+    (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
+    (tmp_path / "metrics.json").write_text('{"z": 2.0, "primary_metric": 2.0}', encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="base-rec", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    # No metric on stdout; broken summary exits 1; metrics.json carries the result.
+    obs = loop.execute_action(AutoResearchAction(type="run", rationale="experiment_result_baseline", command="exit 1", role="baseline"))
+    assert obs.status == "ok_metric_recovered"
+
+
+def test_search_feedback_digest_surfaces_range_and_best(tmp_path):
+    """After a trial, the search summary/history should be digested into experiment_results."""
+    (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "train_search_summary.json").write_text(
+        json.dumps({"best_z": 126.9, "best_x": 50.0, "best_y": -77.8, "eval_count": 160, "status": "ok"}),
+        encoding="utf-8",
+    )
+    (outputs / "train_search_history.jsonl").write_text(
+        "\n".join(json.dumps({"x": x, "y": y, "z": 1.0}) for x, y in [(-100, -100), (100, 100), (50, -77.8)]),
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="feedback", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    digest = loop._search_feedback_digest()
+    assert "best_z=126.9" in digest
+    assert "sampled_x_range=[-100,100]" in digest
+    assert "sampled_y_range=[-100,100]" in digest
+    assert "widen range" in digest
+
+
+def test_step_guidance_mentions_python3_and_cross_round_improvement():
+    from core.autoresearch_loop import AutoResearchStepAgent
+
+    g = AutoResearchStepAgent.STEP_GUIDANCE
+    assert "python3" in g["baseline_eval"]
+    assert "python3" in g["run_experiment_if_available"]
+    assert "IMPROVE ACROSS ROUNDS" in g["propose_experiment"]
+    assert "submission.json" in g["propose_experiment"]
+
