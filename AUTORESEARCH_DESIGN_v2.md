@@ -240,3 +240,54 @@ BudgetGate: 有预算且未收敛 → Gate ; 触顶或 plateau → Pause(通知�
 
 - 现有 40 个测试全程保持绿；新行为通过新参数/新相位开关启用，默认 `planner_kind="fixed"` 行为不变。
 - v2 通过 `planner_kind="phase"`（或等价开关）启用，逐阶段接入。
+
+---
+
+## 9. 实现状态（已落地）
+
+全部 5 阶段已实现并测试通过（89 个 autoresearch 测试全绿）。
+
+### 模块地图
+
+| 模块 | 职责 | 关键导出 |
+|---|---|---|
+| `core/autoresearch_budget.py` | 成本闸门 | `BudgetLedger`(usd/token 上限, degrade/exhaust), `MeteredLLMClient`, `ModelTiers` |
+| `core/autoresearch_memory.py` | 分层记忆 | `split_program`/`update_belief`(L0/L1), `read_phase`/`write_phase`(L2), `.auto` 读写+`gc_auto_dir`(L3), `append_lesson`/`read_lessons`(扛 rollback) |
+| `core/autoresearch_phases.py` | 相位状态机 | 纯转移 `phase_gate`/`budget_gate`/`next_phase`, `PhaseController`, `run_phase_loop`(v2 入口) |
+| `core/autoresearch_phase_handlers.py` | 确定性相位 | P1 `survey_project`, P5 evaluate(+lessons), P6 compress, `default_handlers()` |
+| `core/autoresearch_personas.py` | P2 多性格 | `PlanDebate`(预算感知性格数), `DIVERGENT`/`PRAGMATIC`/`LEADER`, `make_plan_handler` |
+| `core/autoresearch_execution.py` | P3/P4 | `make_execute_handler`(验证硬约束), `make_run_handler`(有界 autofix) |
+| `tools/autoresearch_tool.py` | 工具入口 | `auto_research_run`(legacy fixed/evolutionary), `auto_research_run_v2`(相位机) |
+
+### 运行方式
+
+```python
+from tools.autoresearch_tool import auto_research_run_v2_tool
+auto_research_run_v2_tool(
+    "/path/to/project",
+    max_steps=24,
+    use_llm_step_agents=True,          # False = 全确定性、无模型调用
+    max_usd=5.0,                        # 预算硬上限, 0=无限
+    model_tier_plan="strong-model",     # 辩论用强模型
+    model_tier_util="cheap-model",      # survey/压缩用便宜模型
+    plateau_patience=3,                 # 收敛信号 K
+)
+```
+
+### 成本可控 / 无限运行落点回顾
+
+- **成本**：`BudgetLedger` 触 `degrade_ratio` 先减性格数(`DebateConfig.degrade_personas`)/降级；触上限则 `budget_gate` → `pause`。模型分级把贵的只放在 P2。survey 只采 schema/head。
+- **无限**：每相位 = `f(files)->files`，`PhaseController.step()` 读 `project.md` 的 phase → 跑 handler → 写回 → 释放上下文；进程重启从 phase 续跑（幂等/可恢复）。
+- **收敛**：`plateau_counter >= plateau_patience` 且 Pareto 未动 → 暂停通知用户，不无脑烧钱。
+
+### 与 legacy 的关系
+
+- `auto_research_run`（fixed / evolutionary）保持原样，未改行为。
+- `auto_research_run_v2` 是新的相位机入口；两者共用 `AutoResearchLoop` 的 runner/artifact/git/Pareto 资产。
+- 默认 handlers 无 LLM 也能完整跑通（确定性 fallback），便于测试与冒烟。
+
+### 后续可选增强（未做，属超范围）
+
+- P4 训练类项目的真·后台 job + 事件驱动监控（当前 Run 用 confined runner 同步执行）。
+- P6 用便宜模型做真·语义压缩（当前是确定性 belief 截断）。
+- P3 接真实 `delegate_task` 子 Agent（当前 execute_fn 为确定性 py_compile 验证，接口已留）。
