@@ -937,6 +937,7 @@ def get_completions():
         "/autoresearch": {
             "run": None,
             "show": None,
+            "kill": None,
         },
         "/skill": skills_dict,
         "/tool": tools_dict,
@@ -975,6 +976,83 @@ def _recall_autoresearch_dir() -> str | None:
         return data.get("project_dir")
     except Exception:
         return None
+
+
+def _find_autoresearch_processes() -> list[dict]:
+    """Discover running autoresearch child processes via ps (no psutil dependency).
+
+    Both engines are launched as `python3 -c <CHILD_CODE> <payload> <run_id> ...`;
+    the child code imports run_phase_loop (v2) or AutoResearchLoop (legacy), so we
+    match on those markers in the command line and skip our own pid.
+    """
+    self_pid = os.getpid()
+    procs: list[dict] = []
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,etime=,args="],
+            capture_output=True, text=True, timeout=10,
+        ).stdout
+    except Exception:
+        return procs
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_str, etime, args = parts
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        is_v2 = "run_phase_loop" in args
+        is_legacy = ("AutoResearchLoop" in args or "auto_research" in args) and "run_phase_loop" not in args
+        if not (is_v2 or is_legacy):
+            continue
+        # Best-effort run_id: it is passed as an argv token like arv2-xxxx / ar-xxxx.
+        run_id = ""
+        m = re.search(r"\b(arv2-[0-9a-f]+|ar-[0-9a-f]+)\b", args)
+        if m:
+            run_id = m.group(1)
+        procs.append({
+            "pid": pid,
+            "etime": etime,
+            "run_kind": "v2" if is_v2 else "legacy",
+            "run_id": run_id or "?",
+        })
+    return procs
+
+
+def _kill_pid(pid: int) -> bool:
+    """SIGTERM then SIGKILL a pid; return True if it is gone afterward."""
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    for _ in range(6):
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    return False
 
 
 def _handle_autoresearch_command(args: list[str], console) -> None:
@@ -1022,11 +1100,33 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
         console.print(Panel(monitor_text, title=f"🔬 AutoResearch 进度: {project_dir}", border_style="cyan", expand=False))
         return
 
+    if sub == "kill":
+        procs = _find_autoresearch_processes()
+        if not procs:
+            console.print("[dim]没有发现正在运行的 autoresearch 进程。[/dim]")
+            return
+        lines = [f"发现 {len(procs)} 个 autoresearch 进程:"]
+        for p in procs:
+            lines.append(f"- pid {p['pid']}  {p['run_kind']}  run_id={p['run_id']}  elapsed={p['etime']}")
+        console.print(Panel("\n".join(lines), title="🛑 待终止的 AutoResearch 进程", border_style="yellow", expand=False))
+        killed, failed = [], []
+        for p in procs:
+            if _kill_pid(p["pid"]):
+                killed.append(p["pid"])
+            else:
+                failed.append(p["pid"])
+        msg = f"✅ 已终止 {len(killed)} 个进程: {killed}" if killed else "未终止任何进程。"
+        if failed:
+            msg += f"\n[bold red]无法终止: {failed}[/bold red]"
+        console.print(msg)
+        return
+
     console.print(
         "[bold red]未知子命令。[/bold red]\n"
         "用法:\n"
         "  /autoresearch run <项目文件夹>   # 后台启动，主进程不阻塞\n"
-        "  /autoresearch show [项目文件夹]  # 查看进度（缺省用最近一次）"
+        "  /autoresearch show [项目文件夹]  # 查看进度（缺省用最近一次）\n"
+        "  /autoresearch kill              # 列出并终止所有正在运行的 autoresearch 进程"
     )
 
 
@@ -1045,7 +1145,7 @@ def handle_slash_command(command_str: str, console) -> bool:
             "- `/help`: 显示此帮助信息\n"
             "- `/bbb`: 开始语音输入；按 Enter 停止并识别，按 Esc 取消\n"
             "- `/project_list`: 列出项目进度，并手动选择载入当前上下文\n"
-            "- `/autoresearch [run <目录>|show [目录]]`: 后台启动 autoresearch(不阻塞)或查看进度\n"
+            "- `/autoresearch [run <目录>|show [目录]|kill]`: 后台启动 autoresearch(不阻塞)、查看进度或终止运行中的进程\n"
             "- `/skill [list|name]`: 列出或查看技能\n"
             "- `/tool [list|name]`: 列出或查看基础工具\n"
             "- `/mem [list|USER|MEMORY]`: 查看环境记忆与用户偏好\n"

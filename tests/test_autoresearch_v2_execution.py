@@ -97,6 +97,64 @@ def test_execute_default_fn_verifies_via_py_compile(tmp_path):
     assert "1/1 verified" in result.summary
 
 
+def test_execute_apply_patch_false_success_downgraded_to_failed(tmp_path):
+    """git apply reporting ok but writing nothing must NOT count as a real change."""
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            # apply_patch action whose "changed" file never lands on disk
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="apply_patch", rationale="phantom edit",
+                                          patch="", content="")
+            )
+
+    # Fake execute_action: mimic a successful git-apply that lists a file which
+    # was never actually written (the exact bug seen in nested/gitignored dirs).
+    import core.autoresearch_execution as ex
+
+    class Obs:
+        status = "ok"
+        summary = "git apply ok"
+        artifact_path = str(tmp_path / "art.json")
+
+    (tmp_path / "art.json").write_text(json.dumps({"changed_files": ["train/search.py"]}), encoding="utf-8")
+    loop.step_agent = Agent()
+    loop.execute_action = lambda action: Obs()
+    write_auto_note(tmp_path, "plan", "1. create search.py\n")
+
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    # nothing verified -> not counted as done, and (single item, none pending) -> major_error
+    assert "0/1 verified" in result.summary
+    assert result.signals_update.get("major_error") is True
+
+
+def test_execute_prefers_write_action_surface(tmp_path):
+    """The execute step must offer 'write' ahead of the fragile 'apply_patch'."""
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    captured = {}
+
+    class Agent:
+        def plan_step(self, *, step, fallback_action, parent_context, round_index):
+            captured["allowed"] = list(step.allowed_tools)
+            captured["ctx"] = parent_context
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="write", rationale="w", path="train/s.py", content="y = 2\n")
+            )
+
+    loop.step_agent = Agent()
+    write_auto_note(tmp_path, "plan", "1. build search\n")
+    make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert captured["allowed"][0] == "write"
+    assert captured["allowed"].index("write") < captured["allowed"].index("apply_patch")
+    assert "PREFER a full-file 'write'" in captured["ctx"]
+
+
 # --------------------------------------------------------------------------- #
 # P4 Run — bounded autofix
 # --------------------------------------------------------------------------- #

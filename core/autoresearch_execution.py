@@ -106,8 +106,17 @@ def _default_execute_fn(item: str, ctx: PhaseContext) -> dict:
                         "note": f"execute step agent chose non-mutating action {action.type}; no change applied"}
         obs = loop.execute_action(action)
         verified = _verify_action_effect(loop, obs, action)
-        return {"item": item, "status": obs.status, "verification": verified,
-                "note": obs.summary[:400]}
+        # A code-writing action that cannot be verified did not really land
+        # (e.g. git apply reported success but wrote nothing in a gitignored
+        # nested dir). Do not let it pass as ok — downgrade to failed so the
+        # handler counts it as not-done and the loop stops spinning on baseline.
+        status = obs.status
+        if action.type in {"apply_patch", "write"} and not verified and status in {"ok", "ok_metric_recovered"}:
+            status = "failed"
+        note = obs.summary[:400]
+        if status == "failed" and obs.status in {"ok", "ok_metric_recovered"}:
+            note = "unverified change (files not written on disk); " + note
+        return {"item": item, "status": status, "verification": verified, "note": note}
     except Exception as exc:
         return {"item": item, "status": "failed", "verification": False, "note": str(exc)}
 
@@ -131,7 +140,7 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
         action_type="note",
         rationale=f"execute todo: {item}",
         content=item,
-        allowed_tools=("apply_patch", "write", "note", "read"),
+        allowed_tools=("write", "apply_patch", "note", "read"),
     )
     fallback = AutoResearchAction(type="note", rationale="execute_no_safe_change", content=item)
     parent_context = _execute_parent_context(ctx.root, ctx.project_text, item)
@@ -148,7 +157,12 @@ def _execute_parent_context(root: str | Path, project_text: str, item: str, max_
         "V2 execute phase: implement exactly one safe project-confined change for this todo.",
         f"Todo: {item}",
         "Forbidden: do not edit eval harness/read-only evaluation files.",
-        "Prefer a full-file write for train-side scripts when exact patch context is uncertain.",
+        "STRONGLY PREFER a full-file 'write' action (path + complete new file content) over "
+        "'apply_patch'. A unified diff is fragile: wrong hunk counts or a new-file diff inside a "
+        "gitignored/nested directory can be reported as applied yet write nothing to disk, and it is "
+        "much slower to generate. Only use apply_patch for a tiny edit to a file whose exact current "
+        "contents you already know. For any new file or substantial change, emit 'write' with the "
+        "entire file content.",
         "",
         "# project.md",
         project_text or "",
@@ -178,16 +192,35 @@ def _verify_action_effect(loop, obs, action=None) -> bool:
 
 
 def _verify_changed_python(loop, obs) -> bool:
-    """Cheap verification: py_compile any changed .py files."""
+    """Verify an apply_patch actually took effect on disk, then smoke-compile.
+
+    git apply can report success (returncode 0, changed_files listed) yet leave
+    nothing on disk — e.g. a new-file diff applied inside a gitignored/nested
+    directory. Trusting the return code let a no-op "succeed" and the loop spun
+    on the baseline forever. So we require every claimed changed file to exist
+    and be non-empty before believing the patch, then py_compile any .py files.
+    """
     try:
         raw = Path(obs.artifact_path).read_text(encoding="utf-8") if obs.artifact_path else "{}"
         data = json.loads(raw)
         changed = data.get("changed_files") or []
     except Exception:
         changed = []
+    if not changed:
+        # Nothing was reported as changed: an apply_patch that changed nothing is
+        # not a real edit, regardless of exit code.
+        return False
+    root = Path(loop.settings.root())
+    for rel in changed:
+        target = root / str(rel)
+        try:
+            if not target.exists() or target.stat().st_size == 0:
+                return False
+        except Exception:
+            return False
     py_files = [str(f) for f in changed if str(f).endswith(".py")]
     if not py_files:
-        return obs.status == "ok"
+        return obs.status in {"ok", "ok_metric_recovered"}
     result = loop.runner.run("python3 -m py_compile " + " ".join(shlex.quote(f) for f in py_files))
     return result.get("returncode") == 0
 
