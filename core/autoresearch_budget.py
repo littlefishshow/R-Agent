@@ -137,6 +137,9 @@ class BudgetLedger:
         self.limits = limits or BudgetLimits.from_env()
         self._lock = threading.Lock()
         self._data = self._load()
+        # Persist immediately so a run always has an on-disk ledger, even before
+        # the first metered LLM call (deterministic phases make no calls).
+        self._save()
 
     def _load(self) -> dict:
         if self.path.exists():

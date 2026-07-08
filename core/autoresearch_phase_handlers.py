@@ -190,10 +190,13 @@ def default_handlers() -> dict:
     to a deterministic no-op when no LLM client is available on the loop.
     """
     from core.autoresearch_personas import make_plan_handler
+    from core.autoresearch_execution import make_execute_handler, make_run_handler
 
     return {
         "init": make_init_handler(),
         "plan": make_plan_handler(),
+        "execute": make_execute_handler(),
+        "run": make_run_handler(),
         "evaluate": make_evaluate_handler(),
         "compress": make_compress_handler(),
     }

@@ -282,4 +282,30 @@ __all__ = [
     "PhaseResult",
     "PhaseController",
     "PhaseHandler",
+    "run_phase_loop",
 ]
+
+
+def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = None, loop=None) -> dict:
+    """Build a loop + controller with the default handlers and run the machine.
+
+    This is the v2 entrypoint: it reuses ``AutoResearchLoop`` purely for its
+    budget ledger, model tiers, confined runner, and artifact store, while the
+    ``PhaseController`` drives the 6-phase state machine over project.md.
+    """
+    from core.autoresearch_loop import AutoResearchLoop
+    from core.autoresearch_phase_handlers import default_handlers
+
+    loop = loop or AutoResearchLoop(settings)
+    controller = PhaseController(settings, handlers=handlers or default_handlers(), loop=loop)
+    reports = controller.run(max_steps=max_steps)
+    budget = getattr(loop, "budget", None)
+    return {
+        "project_id": settings.project_id,
+        "steps": reports,
+        "final_phase": (reports[-1]["next_phase"] if reports else "init"),
+        "project_path": str(settings.project_state_file()),
+        "program_path": str(settings.program_file()),
+        "budget_path": str(settings.budget_file()),
+        "budget": (budget.snapshot() if budget is not None else {}),
+    }

@@ -220,6 +220,56 @@ def auto_research_status_tool(run_id: str = "", project_dir: str = ".") -> str:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
+def auto_research_run_v2_tool(
+    project_dir: str,
+    project_id: str = "autoresearch",
+    max_steps: int = 24,
+    program_path: str = "program.md",
+    project_state_path: str = "project.md",
+    use_llm_step_agents: bool = False,
+    llm_model: str = "",
+    max_usd: float = 0.0,
+    max_tokens: int = 0,
+    model_tier_plan: str = "",
+    model_tier_exec: str = "",
+    model_tier_util: str = "",
+    max_experiments: int = 4,
+    max_pareto_items: int = 8,
+    max_useful_failures: int = 3,
+    use_git_versioning: bool = True,
+    versioning_policy: str = "artifact_only",
+    plateau_patience: int = 3,
+) -> str:
+    """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress)."""
+    try:
+        from core.autoresearch_phases import run_phase_loop
+
+        settings = AutoResearchSettings(
+            project_dir=project_dir,
+            project_id=project_id,
+            program_path=program_path,
+            project_state_path=project_state_path,
+            max_rounds=0,
+            use_llm_step_agents=use_llm_step_agents,
+            llm_model=llm_model or None,
+            max_usd=max_usd,
+            max_tokens=max_tokens,
+            model_tier_plan=model_tier_plan,
+            model_tier_exec=model_tier_exec,
+            model_tier_util=model_tier_util,
+            max_experiments=max_experiments,
+            max_pareto_items=max_pareto_items,
+            max_useful_failures=max_useful_failures,
+            use_git_versioning=use_git_versioning,
+            versioning_policy=versioning_policy,
+            plateau_patience=plateau_patience,
+        )
+        result = run_phase_loop(settings, max_steps=max_steps)
+        return json.dumps({"success": True, **result}, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
 def _common_properties():
     return {
         "project_dir": {"type": "string", "description": "要运行 autoresearch 的项目目录，必须在当前工作区内。"},
@@ -267,4 +317,38 @@ registry.register(
         },
     },
     handler=auto_research_status_tool,
+)
+
+
+def _v2_properties():
+    return {
+        "project_dir": {"type": "string", "description": "要运行 autoresearch v2 的项目目录，必须在当前工作区内。"},
+        "project_id": {"type": "string", "description": "项目 ID。", "default": "autoresearch"},
+        "max_steps": {"type": "integer", "description": "相位机最多推进多少个相位（init/plan/execute/run/evaluate/compress 循环）。", "default": 24},
+        "program_path": {"type": "string", "description": "program.md 路径；含 CONSTITUTION(L0,只读)/BELIEF(L1,可演化) 标记。", "default": "program.md"},
+        "project_state_path": {"type": "string", "description": "project.md 路径（L2 项目态，父进程单写，含 phase 标记）。", "default": "project.md"},
+        "use_llm_step_agents": {"type": "boolean", "description": "是否启用 LLM（多性格 Plan 等）；关闭则走 deterministic handlers。", "default": False},
+        "llm_model": {"type": "string", "description": "基础模型；为空用默认。", "default": ""},
+        "max_usd": {"type": "number", "description": "预算硬上限(USD)，0=无限。触顶暂停并通知用户。", "default": 0.0},
+        "max_tokens": {"type": "integer", "description": "预算硬上限(tokens)，0=无限。", "default": 0},
+        "model_tier_plan": {"type": "string", "description": "Plan 相位(辩论/结论)使用的强模型；为空回落基础模型。", "default": ""},
+        "model_tier_exec": {"type": "string", "description": "Execute/Run 相位使用的模型。", "default": ""},
+        "model_tier_util": {"type": "string", "description": "Init/监控/压缩等使用的便宜模型。", "default": ""},
+        "max_experiments": {"type": "integer", "description": "最多记录多少个 trial。", "default": 4},
+        "max_pareto_items": {"type": "integer", "description": "Pareto 候选上限。", "default": 8},
+        "max_useful_failures": {"type": "integer", "description": "保留的失败摘要数。", "default": 3},
+        "use_git_versioning": {"type": "boolean", "description": "已有 git 仓库中记录版本；非 git 安全降级。", "default": True},
+        "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
+        "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
+    }
+
+
+registry.register(
+    name="auto_research_run_v2",
+    description=(
+        "运行 autoresearch v2 相位状态机：init→plan(多性格辩论)→execute(Todo+验证)→run(事件驱动+有界autofix)"
+        "→evaluate(Pareto+经验账本)→compress，成本可控(预算账本+模型分级)且可无限运行(状态全在 program.md/project.md/.auto/git)。"
+    ),
+    parameters={"type": "object", "properties": _v2_properties(), "required": ["project_dir"]},
+    handler=auto_research_run_v2_tool,
 )
