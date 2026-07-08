@@ -481,6 +481,12 @@ def apply_patch_with_git(project_dir: str | Path, patch_text: str, readonly_glob
 
     ``readonly_globs`` protects evaluation files (e.g. prepare.py): a patch that
     touches any matching path is rejected before it can bias the benchmark.
+
+    LLM-authored diffs frequently carry wrong hunk line counts (``@@ -a,b +c,d @@``)
+    or slightly stale context, which makes a strict ``git apply`` reject them with
+    "corrupt patch". We therefore try a small ladder of increasingly tolerant
+    flag sets (recount + context fuzz) before giving up, so a semantically correct
+    edit is not lost to a cosmetic header mistake.
     """
     if not patch_text or not patch_text.strip():
         raise AutoResearchSafetyError("empty patch")
@@ -494,27 +500,37 @@ def apply_patch_with_git(project_dir: str | Path, patch_text: str, readonly_glob
                 f"patch modifies read-only evaluation file: {rel} (requires user approval)"
             )
     workdir = boundary.ensure_inside(boundary.project_dir)
-    check = subprocess.run(
-        ["git", "apply", "--check", "--whitespace=nowarn", "-"],
-        input=patch_text,
-        cwd=str(workdir),
-        capture_output=True,
-        text=True,
-        timeout=60,
+
+    # Ladder of flag sets: strict first, then recount (fixes wrong @@ counts),
+    # then recount + context fuzz (tolerates slightly stale surrounding lines).
+    flag_ladder = (
+        ["--whitespace=nowarn"],
+        ["--whitespace=nowarn", "--recount"],
+        ["--whitespace=nowarn", "--recount", "-C1"],
     )
-    if check.returncode != 0:
-        raise AutoResearchSafetyError("git apply --check failed: " + (check.stderr or check.stdout).strip())
-    applied = subprocess.run(
-        ["git", "apply", "--whitespace=nowarn", "-"],
-        input=patch_text,
-        cwd=str(workdir),
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    if applied.returncode != 0:
-        raise AutoResearchSafetyError("git apply failed: " + (applied.stderr or applied.stdout).strip())
-    return {"changed_files": changed_files, "apply_engine": "git apply"}
+    last_err = ""
+    for flags in flag_ladder:
+        check = subprocess.run(
+            ["git", "apply", "--check", *flags, "-"],
+            input=patch_text, cwd=str(workdir), capture_output=True, text=True, timeout=60,
+        )
+        if check.returncode != 0:
+            last_err = (check.stderr or check.stdout).strip()
+            continue
+        applied = subprocess.run(
+            ["git", "apply", *flags, "-"],
+            input=patch_text, cwd=str(workdir), capture_output=True, text=True, timeout=60,
+        )
+        if applied.returncode != 0:
+            last_err = (applied.stderr or applied.stdout).strip()
+            continue
+        return {
+            "changed_files": changed_files,
+            "apply_engine": "git apply",
+            "apply_flags": flags,
+            "recovered": flags != list(flag_ladder[0]),
+        }
+    raise AutoResearchSafetyError("git apply failed (tried strict/recount/fuzz): " + last_err)
 
 
 class ProjectBoundary:
@@ -1055,22 +1071,25 @@ class AutoResearchStepAgent:
         attempts = max(1, 1 + int(self.settings.llm_retry_attempts))
         timeout = float(self.settings.llm_request_timeout or 60)
         last_exc: Exception | None = None
+
+        # Some OpenAI-compatible providers only accept the model default
+        # temperature and reject explicit temperature=0. Avoid sending the
+        # parameter for the default deterministic setting; callers that really
+        # need sampling can still set a non-zero temperature.
+        completion_kwargs = {"model": model, "messages": messages}
+        if self.settings.llm_temperature not in (None, 0, 0.0):
+            completion_kwargs["temperature"] = self.settings.llm_temperature
+
         for attempt in range(attempts):
             try:
                 try:
                     return client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=self.settings.llm_temperature,
+                        **completion_kwargs,
                         timeout=timeout,
                     )
                 except TypeError:
                     # Older client shims may not accept timeout=
-                    return client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        temperature=self.settings.llm_temperature,
-                    )
+                    return client.chat.completions.create(**completion_kwargs)
             except Exception as exc:
                 last_exc = exc
         raise last_exc if last_exc else RuntimeError("LLM completion failed with no exception")

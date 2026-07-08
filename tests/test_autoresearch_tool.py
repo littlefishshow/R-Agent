@@ -274,6 +274,35 @@ index 0000000..3e75765
     assert "new_file.txt" in raw["changed_files"]
 
 
+def test_apply_patch_recovers_from_wrong_hunk_count(tmp_path):
+    """LLM diffs often carry wrong @@ counts; recount recovery must apply them."""
+    import subprocess
+    from core.autoresearch_loop import AutoResearchAction
+
+    (tmp_path / "target.py").write_text('x = 0.0\ny = 0.0\nz = 1\n', encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path)
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path)
+    subprocess.run(["git", "-c", "user.email=a@b.c", "-c", "user.name=t", "commit", "-qm", "init"], cwd=tmp_path)
+
+    # Header claims 3 lines but body only lists 2 context + change => corrupt for strict apply.
+    bad_patch = (
+        "--- a/target.py\n"
+        "+++ b/target.py\n"
+        "@@ -1,3 +1,3 @@\n"
+        "-x = 0.0\n"
+        "+x = 100.0\n"
+        " y = 0.0\n"
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="apply_patch", rationale="wrong_count", patch=bad_patch))
+
+    assert obs.status == "ok"
+    assert (tmp_path / "target.py").read_text(encoding="utf-8").startswith("x = 100.0")
+    raw = json.loads(Path(obs.artifact_path).read_text(encoding="utf-8"))
+    assert raw["recovered"] is True
+
+
 def test_git_apply_rejects_escape_and_failed_check_without_modifying(tmp_path):
     from core.autoresearch_loop import AutoResearchAction
 

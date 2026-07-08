@@ -238,11 +238,14 @@ def _loop_chat_fn(loop) -> Optional[ChatFn]:
         tiers = getattr(loop, "model_tiers", None)
         if tiers is not None:
             model = tiers.resolve("plan")
-        resp = client.chat.completions.create(
-            model=model or "gpt-4o",
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=getattr(loop.settings, "llm_temperature", 0.0),
-        )
+        kwargs = {
+            "model": model or "gpt-4o",
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        }
+        temperature = getattr(loop.settings, "llm_temperature", 0.0)
+        if temperature not in (None, 0, 0.0):
+            kwargs["temperature"] = temperature
+        resp = client.chat.completions.create(**kwargs)
         return getattr(resp.choices[0].message, "content", "") or ""
 
     return chat

@@ -57,3 +57,4 @@ models/
 app_gui_frontend/node_modules/
 app_gui_frontend/dist/
 app_gui/package-lock.json
+autoresearch_test/
