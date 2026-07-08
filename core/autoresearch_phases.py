@@ -284,6 +284,13 @@ class PhaseController:
         error = ""
         try:
             for _ in range(max(0, int(max_steps))):
+                # Cooperative interrupt: STOP sentinel ends the machine cleanly at
+                # a phase boundary (state already persisted to project.md each step).
+                stop_file = self.root / ".autoresearch" / "STOP"
+                if stop_file.exists():
+                    if self.monitor is not None:
+                        self.monitor.finish(status="paused", error="stopped_by_request")
+                    break
                 report = self.step(extra_signals)
                 reports.append(report)
                 if report["next_phase"] == "pause":

@@ -36,7 +36,7 @@ def test_auto_research_run_tool_registered_and_runs(tmp_path):
     registry.reload_all()
     assert "auto_research_run" in registry._tools
 
-    payload = json.loads(auto_research_run_tool(str(tmp_path), project_id="tool", rounds=2))
+    payload = json.loads(auto_research_run_tool(str(tmp_path), project_id="tool", rounds=2, use_llm_step_agents=False, planner="fixed"))
 
     assert payload["success"] is True
     assert payload["project_id"] == "tool"
@@ -177,7 +177,7 @@ def test_auto_research_background_run_and_status(tmp_path):
     from tools.autoresearch_tool import auto_research_status_tool
 
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
-    payload = json.loads(auto_research_run_tool(str(tmp_path), project_id="bg", rounds=2, background=True))
+    payload = json.loads(auto_research_run_tool(str(tmp_path), project_id="bg", rounds=2, background=True, use_llm_step_agents=False, planner="fixed"))
     assert payload["success"] is True
     assert payload["background"] is True
     assert payload["run_id"].startswith("ar-")

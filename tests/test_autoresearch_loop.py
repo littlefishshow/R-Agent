@@ -362,18 +362,46 @@ def test_versioning_policy_non_git_safely_degrades_to_manifest_without_git_init(
 
 
 def test_default_rounds_reaches_record_decision(tmp_path):
-    """The default rounds must be large enough to reach the record_decision step."""
+    """With the fixed planner, rounds must be large enough to reach record_decision.
+
+    Pinned to the deterministic fixed planner (LLM off) so this stays fast and
+    hermetic; the aggressive tool defaults (evolutionary + LLM on) are exercised
+    elsewhere. This guards the off-by-one that previously skipped record_decision.
+    """
     from core.autoresearch_loop import FixedAutoResearchPlanner
     from tools.autoresearch_tool import auto_research_run_tool
 
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
-    payload = json.loads(auto_research_run_tool(str(tmp_path), project_id="rounds-default"))
+    payload = json.loads(auto_research_run_tool(
+        str(tmp_path), project_id="rounds-default",
+        rounds=len(FixedAutoResearchPlanner.DEFAULT_STEPS),
+        planner="fixed", use_llm_step_agents=False,
+    ))
 
     assert payload["success"] is True
     assert payload["rounds_completed"] == len(FixedAutoResearchPlanner.DEFAULT_STEPS)
     state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
     rationales = [obs.get("summary", "") for obs in state["observations"]]
     assert any("conclusion_record_decision" in r for r in rationales)
+
+
+def test_tool_defaults_are_aggressive():
+    """The user-facing tool defaults must be the aggressive config (main agent can't set them)."""
+    import inspect
+    from tools.autoresearch_tool import auto_research_run_tool, auto_research_run_v2_tool
+
+    d1 = {p.name: p.default for p in inspect.signature(auto_research_run_tool).parameters.values()}
+    assert d1["rounds"] == 100
+    assert d1["use_llm_step_agents"] is True
+    assert d1["planner"] == "evolutionary"
+    assert d1["max_experiments"] == 40
+    assert d1["trace_rounds"] is True
+
+    d2 = {p.name: p.default for p in inspect.signature(auto_research_run_v2_tool).parameters.values()}
+    assert d2["max_steps"] == 100
+    assert d2["use_llm_step_agents"] is True
+    assert d2["max_experiments"] == 40
+    assert d2["trace_rounds"] is True
 
 
 def test_action_role_drives_experiment_recording(tmp_path):
@@ -774,4 +802,49 @@ def test_step_guidance_mentions_python3_and_cross_round_improvement():
     assert "python3" in g["run_experiment_if_available"]
     assert "IMPROVE ACROSS ROUNDS" in g["propose_experiment"]
     assert "submission.json" in g["propose_experiment"]
+
+
+def test_stop_sentinel_ends_loop_early(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    # Pre-create the STOP sentinel so the loop stops before round 0 runs.
+    (tmp_path / ".autoresearch").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".autoresearch" / "STOP").write_text("stop\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="stop", max_rounds=50)
+    result = AutoResearchLoop(settings).run()
+    assert result["stopped_early"] is True
+    assert result["rounds_completed"] == 0
+
+
+def test_stop_sentinel_mid_run_is_respected(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="stopmid", max_rounds=50)
+    loop = AutoResearchLoop(settings)
+    # Plant the sentinel after the 2nd round via a planner side effect.
+    calls = {"n": 0}
+    orig = loop.planner
+
+    def planner(parent_context, round_index):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            loop.settings.stop_file().parent.mkdir(parents=True, exist_ok=True)
+            loop.settings.stop_file().write_text("stop\n", encoding="utf-8")
+        return orig(parent_context, round_index)
+
+    loop.planner = planner
+    result = loop.run()
+    assert result["stopped_early"] is True
+    # ran a couple rounds, then stopped well before 50
+    assert 0 < result["rounds_completed"] < 50
+
+
+def test_auto_research_stop_tool_creates_and_clears_sentinel(tmp_path):
+    from tools.autoresearch_tool import auto_research_stop_tool
+
+    stop = json.loads(auto_research_stop_tool(str(tmp_path)))
+    assert stop["success"] is True and stop["action"] == "stop"
+    assert (tmp_path / ".autoresearch" / "STOP").exists()
+
+    resume = json.loads(auto_research_stop_tool(str(tmp_path), resume=True))
+    assert resume["success"] is True and resume["removed"] is True
+    assert not (tmp_path / ".autoresearch" / "STOP").exists()
 

@@ -214,8 +214,15 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
 
 
 def _loop_chat_fn(loop) -> Optional[ChatFn]:
-    """Build a (system, user)->text callable backed by the loop's step agent client."""
+    """Build a (system, user)->text callable backed by the loop's step agent client.
+
+    Returns None (deterministic, no LLM) unless the loop was explicitly configured
+    with use_llm_step_agents=True. This prevents the plan phase from silently
+    reaching for a live client when the caller asked for the deterministic path.
+    """
     if loop is None:
+        return None
+    if not bool(getattr(getattr(loop, "settings", None), "use_llm_step_agents", False)):
         return None
     step_agent = getattr(loop, "step_agent", None)
     if step_agent is None:

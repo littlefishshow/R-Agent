@@ -12,7 +12,7 @@ from tools.registry import registry
 def _make_settings(
     project_dir: str,
     project_id: str = "autoresearch",
-    rounds: int = 10,
+    rounds: int = 100,
     program_path: str = "program.md",
     context_char_budget: int = 24000,
     program_char_budget: int = 12000,
@@ -20,16 +20,16 @@ def _make_settings(
     bucket_item_char_budget: int = 900,
     bucket_max_items: int = 3,
     command_timeout_seconds: int = 300,
-    use_llm_step_agents: bool = False,
+    use_llm_step_agents: bool = True,
     llm_model: str = "",
-    max_experiments: int = 4,
+    max_experiments: int = 40,
     max_active_context_chars: int = 8000,
     max_pareto_items: int = 8,
     max_useful_failures: int = 3,
     use_git_versioning: bool = True,
     versioning_policy: str = "artifact_only",
-    planner: str = "fixed",
-    trace_rounds: bool = False,
+    planner: str = "evolutionary",
+    trace_rounds: bool = True,
 ) -> AutoResearchSettings:
     return AutoResearchSettings(
         project_dir=project_dir,
@@ -126,7 +126,7 @@ status_path.write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", 
 def auto_research_run_tool(
     project_dir: str,
     project_id: str = "autoresearch",
-    rounds: int = 10,
+    rounds: int = 100,
     program_path: str = "program.md",
     context_char_budget: int = 24000,
     program_char_budget: int = 12000,
@@ -134,17 +134,17 @@ def auto_research_run_tool(
     bucket_item_char_budget: int = 900,
     bucket_max_items: int = 3,
     command_timeout_seconds: int = 300,
-    use_llm_step_agents: bool = False,
+    use_llm_step_agents: bool = True,
     llm_model: str = "",
-    max_experiments: int = 4,
+    max_experiments: int = 40,
     max_active_context_chars: int = 8000,
     max_pareto_items: int = 8,
     max_useful_failures: int = 3,
     use_git_versioning: bool = True,
     versioning_policy: str = "artifact_only",
-    planner: str = "fixed",
+    planner: str = "evolutionary",
     background: bool = False,
-    trace_rounds: bool = False,
+    trace_rounds: bool = True,
 ) -> str:
     """Run the dedicated autoresearch loop for a project."""
     try:
@@ -281,24 +281,24 @@ def _v2_settings_kwargs(
 def auto_research_run_v2_tool(
     project_dir: str,
     project_id: str = "autoresearch",
-    max_steps: int = 24,
+    max_steps: int = 100,
     program_path: str = "program.md",
     project_state_path: str = "project.md",
-    use_llm_step_agents: bool = False,
+    use_llm_step_agents: bool = True,
     llm_model: str = "",
     max_usd: float = 0.0,
     max_tokens: int = 0,
     model_tier_plan: str = "",
     model_tier_exec: str = "",
     model_tier_util: str = "",
-    max_experiments: int = 4,
+    max_experiments: int = 40,
     max_pareto_items: int = 8,
     max_useful_failures: int = 3,
     use_git_versioning: bool = True,
     versioning_policy: str = "artifact_only",
     plateau_patience: int = 3,
     background: bool = False,
-    trace_rounds: bool = False,
+    trace_rounds: bool = True,
 ) -> str:
     """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress).
 
@@ -368,11 +368,35 @@ def auto_research_v2_status_tool(project_dir: str = ".", monitor_path: str = "")
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
+def auto_research_stop_tool(project_dir: str = ".", resume: bool = False) -> str:
+    """Request a graceful stop (or clear it) for an autoresearch run.
+
+    Drops a STOP sentinel at <project_dir>/.autoresearch/STOP. Both the legacy
+    loop and the v2 phase machine check it at each round/phase boundary and exit
+    cleanly (all prior rounds are already persisted). Pass resume=true to remove
+    the sentinel before starting a new run. Pure file IO, no LLM.
+    """
+    try:
+        root = Path(project_dir).expanduser().resolve()
+        stop_path = root / ".autoresearch" / "STOP"
+        if resume:
+            existed = stop_path.exists()
+            if existed:
+                stop_path.unlink()
+            return json.dumps({"success": True, "action": "resume", "removed": existed, "stop_path": str(stop_path)}, ensure_ascii=False)
+        stop_path.parent.mkdir(parents=True, exist_ok=True)
+        stop_path.write_text(f"stop requested at {time.time()}\n", encoding="utf-8")
+        return json.dumps({"success": True, "action": "stop", "stop_path": str(stop_path),
+                           "note": "loop will exit cleanly at the next round/phase boundary"}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
 def _common_properties():
     return {
         "project_dir": {"type": "string", "description": "要运行 autoresearch 的项目目录，必须在当前工作区内。"},
         "project_id": {"type": "string", "description": "项目 ID，会写入 artifact 文件名。", "default": "autoresearch"},
-        "rounds": {"type": "integer", "description": "最多执行多少个 workflow step；fixed 默认 10 步跑完，evolutionary 会在完成一遍后循环 propose/apply/run/decide 直至 max_experiments 或 rounds 用尽。", "default": 10},
+        "rounds": {"type": "integer", "description": "最多执行多少个 workflow step；默认 100（激进，配合 evolutionary 多轮改进）。evolutionary 会在完成一遍固定 workflow 后循环 propose/apply/run/decide 直至 max_experiments 或 rounds 用尽；可随时用 auto_research_stop 或 esc 中断。", "default": 100},
         "program_path": {"type": "string", "description": "相对 project_dir 的 program.md 路径。", "default": "program.md"},
         "context_char_budget": {"type": "integer", "description": "父上下文总字符预算。", "default": 24000},
         "program_char_budget": {"type": "integer", "description": "program.md 注入字符预算。", "default": 12000},
@@ -380,16 +404,16 @@ def _common_properties():
         "bucket_item_char_budget": {"type": "integer", "description": "每个模块化上下文条目的字符预算。", "default": 900},
         "bucket_max_items": {"type": "integer", "description": "每个模块化上下文 bucket 最多保留条目数。", "default": 3},
         "command_timeout_seconds": {"type": "integer", "description": "单个项目内命令超时时间。", "default": 300},
-        "use_llm_step_agents": {"type": "boolean", "description": "是否启用每个固定 workflow step 的 LLM 子 Agent；失败会降级 deterministic fallback。", "default": False},
+        "use_llm_step_agents": {"type": "boolean", "description": "是否启用每个 workflow step 的 LLM 子 Agent（默认 True，真正思考/写搜索脚本）；失败会降级 deterministic fallback。", "default": True},
         "llm_model": {"type": "string", "description": "LLM step agent 使用的模型；为空则使用默认模型。", "default": ""},
-        "max_experiments": {"type": "integer", "description": "最多记录/执行多少个实际 trial/run_experiment 轮次。", "default": 4},
+        "max_experiments": {"type": "integer", "description": "最多记录/执行多少个实际 trial/run_experiment 轮次；默认 40（激进）。", "default": 40},
         "max_active_context_chars": {"type": "integer", "description": "active_context.md 压缩上下文字符预算。", "default": 8000},
         "max_pareto_items": {"type": "integer", "description": "pareto_front.json 最多保留候选数。", "default": 8},
         "max_useful_failures": {"type": "integer", "description": "active context/state 中保留的失败/无用轮次摘要数。", "default": 3},
         "use_git_versioning": {"type": "boolean", "description": "在已有 git 仓库中记录 base commit/status/diff；非 git 安全降级且不会 git init。", "default": True},
         "versioning_policy": {"type": "string", "description": "中间版本生命周期策略：artifact_only(默认，仅保存 patch/manifest)、commit_pareto、commit_all_trials、branch_per_trial。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
-        "planner": {"type": "string", "description": "workflow planner：fixed(默认，跑一遍固定 10 步)；evolutionary(跑完固定 workflow 后按 propose/apply/run/decide 循环，直到 max_experiments 或 rounds 用尽)。", "enum": ["fixed", "evolutionary"], "default": "fixed"},
-        "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认关闭(内容较大)。", "default": False},
+        "planner": {"type": "string", "description": "workflow planner：evolutionary(默认，跑完固定 workflow 后按 propose/apply/run/decide 循环并跨轮改进搜索脚本，直到 max_experiments 或 rounds 用尽)；fixed(只跑一遍固定 10 步)。", "enum": ["fixed", "evolutionary"], "default": "evolutionary"},
+        "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认开启。", "default": True},
         "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 时立即返回 run_id 和 progress_path。", "default": False},
     }
 
@@ -423,23 +447,23 @@ def _v2_properties():
     return {
         "project_dir": {"type": "string", "description": "要运行 autoresearch v2 的项目目录，必须在当前工作区内。"},
         "project_id": {"type": "string", "description": "项目 ID。", "default": "autoresearch"},
-        "max_steps": {"type": "integer", "description": "相位机最多推进多少个相位（init/plan/execute/run/evaluate/compress 循环）。", "default": 24},
+        "max_steps": {"type": "integer", "description": "相位机最多推进多少个相位（init/plan/execute/run/evaluate/compress 循环）；默认 100（激进）。可随时用 auto_research_stop 或 esc 中断。", "default": 100},
         "program_path": {"type": "string", "description": "program.md 路径；含 CONSTITUTION(L0,只读)/BELIEF(L1,可演化) 标记。", "default": "program.md"},
         "project_state_path": {"type": "string", "description": "project.md 路径（L2 项目态，父进程单写，含 phase 标记）。", "default": "project.md"},
-        "use_llm_step_agents": {"type": "boolean", "description": "是否启用 LLM（多性格 Plan 等）；关闭则走 deterministic handlers。", "default": False},
+        "use_llm_step_agents": {"type": "boolean", "description": "是否启用 LLM（多性格 Plan 等），默认 True；关闭则走 deterministic handlers。", "default": True},
         "llm_model": {"type": "string", "description": "基础模型；为空用默认。", "default": ""},
         "max_usd": {"type": "number", "description": "预算硬上限(USD)，0=无限。触顶暂停并通知用户。", "default": 0.0},
         "max_tokens": {"type": "integer", "description": "预算硬上限(tokens)，0=无限。", "default": 0},
         "model_tier_plan": {"type": "string", "description": "Plan 相位(辩论/结论)使用的强模型；为空回落基础模型。", "default": ""},
         "model_tier_exec": {"type": "string", "description": "Execute/Run 相位使用的模型。", "default": ""},
         "model_tier_util": {"type": "string", "description": "Init/监控/压缩等使用的便宜模型。", "default": ""},
-        "max_experiments": {"type": "integer", "description": "最多记录多少个 trial。", "default": 4},
+        "max_experiments": {"type": "integer", "description": "最多记录多少个 trial；默认 40（激进）。", "default": 40},
         "max_pareto_items": {"type": "integer", "description": "Pareto 候选上限。", "default": 8},
         "max_useful_failures": {"type": "integer", "description": "保留的失败摘要数。", "default": 3},
         "use_git_versioning": {"type": "boolean", "description": "已有 git 仓库中记录版本；非 git 安全降级。", "default": True},
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
-        "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认关闭(内容较大)。", "default": False},
+        "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认开启。", "default": True},
         "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 立即返回 run_id 和 monitor_path，用 auto_research_v2_status 轮询进度/花费(纯文件读，无 LLM)。", "default": False},
     }
 
@@ -470,4 +494,22 @@ registry.register(
         },
     },
     handler=auto_research_v2_status_tool,
+)
+
+registry.register(
+    name="auto_research_stop",
+    description=(
+        "优雅中断正在运行的 autoresearch（legacy 或 v2）：在 <project_dir>/.autoresearch/STOP 放置停止标记，"
+        "loop 会在下一个 round/phase 边界干净退出（此前每轮状态均已持久化）。resume=true 则清除标记以便重新开始。"
+        "纯文件操作，不调用 LLM。等价于 esc 主动退出。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "project_dir": {"type": "string", "description": "运行 autoresearch 的项目目录。", "default": "."},
+            "resume": {"type": "boolean", "description": "true=移除 STOP 标记（准备重新运行）；false=请求停止。", "default": False},
+        },
+        "required": ["project_dir"],
+    },
+    handler=auto_research_stop_tool,
 )

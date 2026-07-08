@@ -144,3 +144,13 @@ def test_compress_handler_trims_oversized_belief(tmp_path):
     result = handler(ctx)
     assert result.program_text is not None
     assert len(split_program(result.program_text).belief) <= 1000
+
+
+def test_v2_controller_stop_sentinel_halts_run(tmp_path):
+    (tmp_path / "program.md").write_text("Goal: x\n", encoding="utf-8")
+    (tmp_path / ".autoresearch").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".autoresearch" / "STOP").write_text("stop\n", encoding="utf-8")
+    ctrl = _make_controller(tmp_path)
+    reports = ctrl.run(max_steps=50)
+    # STOP present from the start => no phase steps executed
+    assert reports == []

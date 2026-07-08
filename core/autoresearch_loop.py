@@ -96,6 +96,10 @@ class AutoResearchSettings:
         p = Path(self.trace_dir)
         return p if p.is_absolute() else self.root() / p
 
+    def stop_file(self) -> Path:
+        # Sentinel a watcher / esc handler can create to stop the loop cleanly.
+        return self.root() / ".autoresearch" / "STOP"
+
     def state_file(self) -> Path:
         p = Path(self.state_path)
         return p if p.is_absolute() else self.root() / p
@@ -1579,7 +1583,16 @@ class AutoResearchLoop:
     def run(self, rounds: Optional[int] = None) -> dict:
         max_rounds = max(0, int(rounds if rounds is not None else self.settings.max_rounds))
         self._write_progress("running", "starting", 0, max_rounds)
+        stopped_early = False
         for round_index in range(max_rounds):
+            # Cooperative interrupt: a watcher (or the user's esc handler) can
+            # drop a STOP sentinel in .autoresearch/ to end the loop cleanly at a
+            # round boundary. All prior rounds are already persisted, so this
+            # loses at most the not-yet-started round.
+            if self._stop_requested():
+                self._write_progress("stopped", "stopped_by_request", round_index, max_rounds)
+                stopped_early = True
+                break
             step = getattr(self.planner, "step_for_round", lambda _i: None)(round_index)
             step_name = getattr(step, "name", f"round_{round_index}")
             self._write_progress("running", step_name, round_index, max_rounds)
@@ -1611,10 +1624,12 @@ class AutoResearchLoop:
             if action.type == "stop":
                 break
         self._write_evolution_artifacts(self.context.load_state())
-        self._write_progress("completed", "done", max_rounds, max_rounds)
+        final_status = "stopped" if stopped_early else "completed"
+        self._write_progress(final_status, "stopped_by_request" if stopped_early else "done", len(self._observations) if stopped_early else max_rounds, max_rounds)
         return {
             "project_id": self.settings.project_id,
             "rounds_completed": len(self._observations),
+            "stopped_early": stopped_early,
             "observations": [obs.compact(max_chars=1200) for obs in self._observations],
             "state_path": str(self.settings.state_file()),
             "artifact_dir": str(self.settings.artifacts_root()),
@@ -1626,6 +1641,13 @@ class AutoResearchLoop:
             "use_git_versioning": bool(self.settings.use_git_versioning),
             "step_agent_errors": list(self._step_agent_errors),
         }
+
+    def _stop_requested(self) -> bool:
+        """True if a STOP sentinel exists (cooperative interrupt / esc)."""
+        try:
+            return self.settings.stop_file().exists()
+        except Exception:
+            return False
 
     def _write_progress(self, status: str, current_step: str, round_index: int, total_rounds: int) -> None:
         try:
