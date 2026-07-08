@@ -155,6 +155,53 @@ def test_execute_prefers_write_action_surface(tmp_path):
     assert "PREFER a full-file 'write'" in captured["ctx"]
 
 
+def test_execute_context_lists_existing_files_and_tiers(tmp_path):
+    """Execute context must surface existing train-side files + the 3-tier rule
+    so the LLM edits what exists instead of spawning parallel helpers."""
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text("echo hi\n", encoding="utf-8")
+    (tmp_path / "train" / "search.py").write_text("x = 1\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    captured = {}
+
+    class Agent:
+        def plan_step(self, *, step, fallback_action, parent_context, round_index):
+            captured["ctx"] = parent_context
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="write", rationale="w", path="train/search.py", content="x = 2\n")
+            )
+
+    loop.step_agent = Agent()
+    write_auto_note(tmp_path, "plan", "1. improve search\n")
+    make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    ctx = captured["ctx"]
+    # existing files listed for Tier-1 in-place editing
+    assert "train/train.sh" in ctx
+    assert "train/search.py" in ctx
+    # the escalation rule is present
+    assert "TIER 1" in ctx and "TIER 2" in ctx and "TIER 3" in ctx
+    assert "cap 3" in ctx or "hard cap 3" in ctx
+
+
+def test_train_side_inventory_skips_noise(tmp_path):
+    from core.autoresearch_execution import _train_side_inventory
+
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text("x\n", encoding="utf-8")
+    (tmp_path / "train" / "outputs").mkdir()
+    (tmp_path / "train" / "outputs" / "junk.json").write_text("{}", encoding="utf-8")
+    (tmp_path / "train" / "__pycache__").mkdir()
+    (tmp_path / "train" / "__pycache__" / "c.py").write_text("x\n", encoding="utf-8")
+    inv = _train_side_inventory(tmp_path)
+    joined = "\n".join(inv)
+    assert "train/train.sh" in joined
+    assert "outputs" not in joined
+    assert "__pycache__" not in joined
+
+
 # --------------------------------------------------------------------------- #
 # P4 Run — bounded autofix
 # --------------------------------------------------------------------------- #

@@ -151,18 +151,66 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
     return result.action
 
 
+_TRAIN_SIDE_DIRS = ("train", "src", "scripts")
+_INVENTORY_SUFFIXES = (".py", ".sh", ".json", ".yaml", ".yml", ".toml", ".cfg")
+_INVENTORY_SKIP_DIRS = {".git", ".autoresearch", ".auto", "__pycache__", "outputs", "logs", ".venv", "venv", "node_modules"}
+
+
+def _train_side_inventory(root: str | Path, max_files: int = 40) -> list[str]:
+    """List existing editable train-side files (relative paths) so the executor
+    edits what already exists instead of spawning parallel helpers each round."""
+    root = Path(root)
+    found: list[str] = []
+    for d in _TRAIN_SIDE_DIRS:
+        base = root / d
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file():
+                continue
+            if any(part in _INVENTORY_SKIP_DIRS for part in path.parts):
+                continue
+            if path.suffix.lower() not in _INVENTORY_SUFFIXES:
+                continue
+            try:
+                rel = str(path.relative_to(root))
+            except ValueError:
+                continue
+            size = path.stat().st_size
+            found.append(f"{rel} ({size}B)")
+            if len(found) >= max_files:
+                return found
+    return found
+
+
 def _execute_parent_context(root: str | Path, project_text: str, item: str, max_chars: int = 12000) -> str:
     notes = read_auto_notes(root, max_files=8)
+    inventory = _train_side_inventory(root)
+    inv_block = "\n".join(f"- {f}" for f in inventory) if inventory else "(no train-side files yet)"
     parts = [
         "V2 execute phase: implement exactly one safe project-confined change for this todo.",
         f"Todo: {item}",
         "Forbidden: do not edit eval harness/read-only evaluation files.",
-        "STRONGLY PREFER a full-file 'write' action (path + complete new file content) over "
-        "'apply_patch'. A unified diff is fragile: wrong hunk counts or a new-file diff inside a "
-        "gitignored/nested directory can be reported as applied yet write nothing to disk, and it is "
-        "much slower to generate. Only use apply_patch for a tiny edit to a file whose exact current "
-        "contents you already know. For any new file or substantial change, emit 'write' with the "
-        "entire file content.",
+        "",
+        "## Keep the change surface MINIMAL — follow this 3-tier escalation:",
+        "TIER 1 (default): edit the MOST RELEVANT EXISTING file listed below in-place. Do not create a "
+        "new file if an existing one can hold the change.",
+        "TIER 2 (only if Tier 1 truly cannot fit): create at most a FEW NEW files (hard cap 3 total across "
+        "the whole run) and keep all work inside those 3 plus the existing files. Do not spawn a new helper "
+        "every round — reuse and rewrite the same files.",
+        "TIER 3 (only if Tier 2 is insufficient): create a single subdirectory under train/ and put new files "
+        "there. If you add or grow files in that subdirectory, first re-read the whole subdirectory, then "
+        "consolidate: merge overlapping logic and DELETE now-unused files so it stays minimal.",
+        "Never leave dead/parallel scripts behind. Prefer rewriting one driver over adding another.",
+        "",
+        "## Existing editable train-side files (prefer editing these — Tier 1):",
+        inv_block,
+        "",
+        "## Action choice:",
+        "STRONGLY PREFER a full-file 'write' action (path + complete new file content) over 'apply_patch'. "
+        "A unified diff is fragile (wrong hunk counts / stale context can no-op) and slower to generate. "
+        "Use apply_patch only for a tiny edit to a file whose exact current contents you already know; "
+        "for any new file or substantial change, emit 'write' with the entire file content.",
         "",
         "# project.md",
         project_text or "",
