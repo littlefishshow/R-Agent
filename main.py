@@ -934,6 +934,10 @@ def get_completions():
         "/help": None,
         "/bbb": None,
         "/project_list": None,
+        "/autoresearch": {
+            "run": None,
+            "show": None,
+        },
         "/skill": skills_dict,
         "/tool": tools_dict,
         "/mem": {
@@ -951,6 +955,81 @@ def get_completions():
     
     return NestedCompleter.from_nested_dict(completer_dict)
 
+_AUTORESEARCH_LAST_DIR = Path.home() / ".r_agent_autoresearch_last.json"
+
+
+def _remember_autoresearch_dir(project_dir: str) -> None:
+    """Persist the last project autoresearch was launched on, so `show` can find it."""
+    try:
+        _AUTORESEARCH_LAST_DIR.write_text(
+            json.dumps({"project_dir": str(Path(project_dir).expanduser().resolve()), "ts": time.time()}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _recall_autoresearch_dir() -> str | None:
+    try:
+        data = json.loads(_AUTORESEARCH_LAST_DIR.read_text(encoding="utf-8"))
+        return data.get("project_dir")
+    except Exception:
+        return None
+
+
+def _handle_autoresearch_command(args: list[str], console) -> None:
+    """`/autoresearch run <dir>` launches a fire-and-forget v2 loop;
+    `/autoresearch show [dir]` prints progress from monitor.json (no LLM)."""
+    from tools.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
+
+    sub = (args[0].lower() if args else "")
+
+    if sub == "run":
+        if len(args) < 2:
+            console.print("[bold red]用法: /autoresearch run <项目文件夹>[/bold red]")
+            return
+        project_dir = args[1]
+        root = Path(project_dir).expanduser()
+        if not root.is_dir():
+            console.print(f"[bold red]目录不存在: {project_dir}[/bold red]")
+            return
+        # Fire-and-forget: detach immediately, do not block the terminal.
+        payload = json.loads(auto_research_run_v2_tool(str(root), background=True, detach=True))
+        if not payload.get("success"):
+            console.print(f"[bold red]启动失败: {payload.get('error')}[/bold red]")
+            return
+        _remember_autoresearch_dir(str(root))
+        text = (
+            f"✅ 已在后台启动 autoresearch (v2)，主进程不阻塞。\n\n"
+            f"- 项目目录: `{payload.get('project_dir')}`\n"
+            f"- run_id: `{payload.get('run_id')}`\n"
+            f"- monitor: `{payload.get('monitor_path')}`\n\n"
+            f"> 用 `/autoresearch show` 查看进度（读取 monitor.json，不调用 LLM）。"
+        )
+        console.print(Panel(Markdown(text), title="🔬 AutoResearch 已启动", border_style="cyan", expand=False))
+        return
+
+    if sub == "show":
+        project_dir = args[1] if len(args) > 1 else _recall_autoresearch_dir()
+        if not project_dir:
+            console.print("[bold red]没有可查看的运行；用 /autoresearch show <项目文件夹> 指定目录。[/bold red]")
+            return
+        status = json.loads(auto_research_v2_status_tool(project_dir=str(Path(project_dir).expanduser())))
+        if not status.get("success"):
+            console.print(f"[bold red]读取进度失败: {status.get('error')}[/bold red]")
+            return
+        monitor_text = status.get("monitor_text") or "(暂无进度：monitor.json 尚未生成或不可读)"
+        console.print(Panel(monitor_text, title=f"🔬 AutoResearch 进度: {project_dir}", border_style="cyan", expand=False))
+        return
+
+    console.print(
+        "[bold red]未知子命令。[/bold red]\n"
+        "用法:\n"
+        "  /autoresearch run <项目文件夹>   # 后台启动，主进程不阻塞\n"
+        "  /autoresearch show [项目文件夹]  # 查看进度（缺省用最近一次）"
+    )
+
+
 def handle_slash_command(command_str: str, console) -> bool:
     """处理本地斜杠命令，返回 True 表示已拦截处理，False 表示继续传递给 Agent"""
     parts = command_str.strip().split()
@@ -966,6 +1045,7 @@ def handle_slash_command(command_str: str, console) -> bool:
             "- `/help`: 显示此帮助信息\n"
             "- `/bbb`: 开始语音输入；按 Enter 停止并识别，按 Esc 取消\n"
             "- `/project_list`: 列出项目进度，并手动选择载入当前上下文\n"
+            "- `/autoresearch [run <目录>|show [目录]]`: 后台启动 autoresearch(不阻塞)或查看进度\n"
             "- `/skill [list|name]`: 列出或查看技能\n"
             "- `/tool [list|name]`: 列出或查看基础工具\n"
             "- `/mem [list|USER|MEMORY]`: 查看环境记忆与用户偏好\n"
@@ -1065,7 +1145,11 @@ def handle_slash_command(command_str: str, console) -> bool:
             update_env_var("OPENAI_API_KEY", arg)
             console.print("✅ API Key 已更新 (已保存至 .env)")
         return True
-        
+
+    if cmd == "/autoresearch":
+        _handle_autoresearch_command(parts[1:], console)
+        return True
+
     console.print(f"[bold red]未知的命令: {cmd}[/bold red]")
     return True
 

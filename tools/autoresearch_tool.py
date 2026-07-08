@@ -278,6 +278,44 @@ def _v2_settings_kwargs(
     )
 
 
+def _v2_state_snapshot(settings) -> dict:
+    """Read experiments/best/pareto from state.json (pure file read)."""
+    snap = {"experiments_recorded": 0, "best_experiment": None, "pareto_size": 0}
+    try:
+        state_path = settings.root() / ".autoresearch" / "state.json"
+        if state_path.exists():
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            snap["experiments_recorded"] = len(state.get("experiments") or [])
+            snap["best_experiment"] = state.get("best_experiment")
+            snap["pareto_size"] = len(state.get("pareto_front") or [])
+    except Exception:
+        pass
+    return snap
+
+
+_TERMINAL_STATUSES = {"completed", "paused", "failed"}
+
+
+def _wait_for_v2_completion(settings, run_id: str, wait_seconds: float, poll_interval: float = 2.0) -> dict:
+    """Poll the monitor heartbeat until terminal or the bounded wait elapses.
+
+    Returns the last monitor snapshot read. Never blocks longer than
+    wait_seconds so the foreground tool call cannot be killed by the harness
+    wall-clock timeout; the child subprocess keeps running regardless.
+    """
+    from core.autoresearch_monitor import read_monitor
+
+    monitor_path = settings.monitor_file()
+    deadline = time.time() + max(0.0, float(wait_seconds))
+    data = read_monitor(monitor_path)
+    while time.time() < deadline:
+        data = read_monitor(monitor_path)
+        if data.get("run_id") == run_id and data.get("status") in _TERMINAL_STATUSES:
+            break
+        time.sleep(max(0.2, float(poll_interval)))
+    return data
+
+
 def auto_research_run_v2_tool(
     project_dir: str,
     project_id: str = "autoresearch",
@@ -299,14 +337,27 @@ def auto_research_run_v2_tool(
     plateau_patience: int = 3,
     background: bool = True,
     trace_rounds: bool = True,
+    wait_seconds: float = 180.0,
+    detach: bool = False,
 ) -> str:
     """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress).
 
-    Defaults to background=true so the loop runs as its own detached process and
-    the call returns immediately with a run_id + monitor_path. This is required
-    because a full loop of slow LLM phases easily exceeds a foreground tool's
-    wall-clock timeout; watch progress via auto_research_v2_status (pure file
-    read, no LLM). Pass background=false only for short deterministic runs.
+    Runs the loop in a detached subprocess (survives long LLM phases) but, by
+    default, the CALL BLOCKS and polls the heartbeat for up to ``wait_seconds``
+    before returning, so the caller does not mistake a just-started run for a
+    finished one:
+
+    - if the loop reaches a terminal state (completed/paused/failed) within
+      ``wait_seconds``, the tool returns ``completed=true`` with the real final
+      results (experiments_recorded, best_experiment, budget);
+    - if it is still running when ``wait_seconds`` elapses, the tool returns
+      ``completed=false`` with ``status="running"`` and an explicit instruction
+      to keep polling ``auto_research_v2_status`` — it MUST NOT be treated as done.
+
+    ``wait_seconds`` is kept safely under a typical tool wall-clock timeout.
+    Pass ``detach=true`` to return immediately after launch (fire-and-forget;
+    still returns ``completed=false``). Pass ``background=false`` to run fully
+    synchronously in-process (short deterministic runs/tests only).
     """
     try:
         from core.autoresearch_phases import run_phase_loop
@@ -320,7 +371,7 @@ def auto_research_run_v2_tool(
         settings = AutoResearchSettings(**kwargs)
 
         if background:
-            from core.autoresearch_monitor import RunMonitor
+            from core.autoresearch_monitor import RunMonitor, read_monitor, render_monitor_text
 
             run_id = f"arv2-{uuid.uuid4().hex[:10]}"
             # Seed a queued monitor file synchronously so a watcher can find it
@@ -336,7 +387,8 @@ def auto_research_run_v2_tool(
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
             )
-            return json.dumps({
+
+            base = {
                 "success": True,
                 "background": True,
                 "run_id": run_id,
@@ -346,10 +398,57 @@ def auto_research_run_v2_tool(
                 "budget_path": str(settings.budget_file()),
                 "project_path": str(settings.project_state_file()),
                 "created_at": time.time(),
-            }, ensure_ascii=False, indent=2)
+            }
+
+            # Fire-and-forget: return immediately, but still mark completed=false
+            # so the caller knows the loop only just started.
+            if detach:
+                base.update({
+                    "completed": False,
+                    "status": "queued",
+                    "note": ("autoresearch v2 launched in background (detach=true). It has NOT finished. "
+                             "Do NOT treat this as an optimization result. Poll auto_research_v2_status "
+                             f"(project_dir={project_dir!r}) until status is completed/paused/failed."),
+                })
+                return json.dumps(base, ensure_ascii=False, indent=2)
+
+            # Bounded wait: block up to wait_seconds, polling the heartbeat, so a
+            # just-started run is never mistaken for a finished one.
+            data = _wait_for_v2_completion(settings, run_id, wait_seconds)
+            status = data.get("status", "unknown")
+            terminal = status in _TERMINAL_STATUSES
+            snap = _v2_state_snapshot(settings)
+            base.update({
+                "completed": bool(terminal),
+                "status": status,
+                "step_index": data.get("step_index", 0),
+                "max_steps": max_steps,
+                "current_phase": data.get("current_phase", ""),
+                "budget": data.get("budget", {}),
+                "monitor_text": render_monitor_text(data) if status != "unknown" else "",
+                "experiments_recorded": snap["experiments_recorded"],
+                "best_experiment": snap["best_experiment"],
+                "pareto_size": snap["pareto_size"],
+                "waited_seconds": wait_seconds,
+            })
+            if not terminal:
+                base["note"] = (
+                    f"autoresearch v2 is STILL RUNNING after waiting {wait_seconds:.0f}s "
+                    f"(status={status}, step {data.get('step_index',0)}/{max_steps}). "
+                    "It has NOT finished — do NOT treat this as a final optimization result and do NOT "
+                    "proceed as if the task is solved. The loop keeps running in its own process; poll "
+                    f"auto_research_v2_status (project_dir={project_dir!r}) until status is "
+                    "completed/paused/failed, or auto_research_stop to end it."
+                )
+            else:
+                base["note"] = (
+                    f"autoresearch v2 finished with status={status}, "
+                    f"{snap['experiments_recorded']} experiment(s) recorded."
+                )
+            return json.dumps(base, ensure_ascii=False, indent=2)
 
         result = run_phase_loop(settings, max_steps=max_steps)
-        return json.dumps({"success": True, "background": False, **result}, ensure_ascii=False, indent=2)
+        return json.dumps({"success": True, "background": False, "completed": True, **result}, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -466,7 +565,9 @@ def _v2_properties():
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
         "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认开启。", "default": True},
-        "background": {"type": "boolean", "description": "是否后台非阻塞运行；默认 True。立即返回 run_id 和 monitor_path，用 auto_research_v2_status 轮询进度/花费(纯文件读，无 LLM)。前台运行整轮慢 LLM 相位极易超时被杀，故默认后台。", "default": True},
+        "background": {"type": "boolean", "description": "是否在独立子进程运行(存活于慢 LLM 相位)；默认 True。注意：调用默认仍会阻塞并轮询心跳最多 wait_seconds 秒后才返回，返回体带 completed 布尔标志——completed=false 表示仍在运行，禁止当作优化完成，必须继续用 auto_research_v2_status 轮询。", "default": True},
+        "wait_seconds": {"type": "number", "description": "background=true 时，调用阻塞轮询心跳的最长秒数(默认 180，安全低于工具超时)。期间跑完则返回真实最终结果(experiments/best/budget)且 completed=true；超时未完成则返回 completed=false 且 status=running，需继续轮询。", "default": 180.0},
+        "detach": {"type": "boolean", "description": "是否发射后不管：true 时启动子进程后立即返回(completed=false, status=queued)，不阻塞等待。默认 False(即有界等待)。", "default": False},
     }
 
 
