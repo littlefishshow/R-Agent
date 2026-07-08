@@ -45,6 +45,53 @@ def test_budget_ledger_accumulates_and_persists(tmp_path):
     assert reloaded.snapshot()["total_tokens"] == 1800
 
 
+def test_budget_ledger_tracks_thinking_time_per_call_and_phase(tmp_path):
+    ledger = BudgetLedger(tmp_path / "budget.json")
+    r1 = ledger.record(prompt_tokens=100, completion_tokens=50, model="gpt-4o", phase="plan", duration_seconds=2.0)
+    r2 = ledger.record(prompt_tokens=100, completion_tokens=50, model="gpt-4o", phase="plan", duration_seconds=4.0)
+    ledger.record(prompt_tokens=10, completion_tokens=5, model="gpt-4o", phase="exec", duration_seconds=1.0)
+
+    assert r1["duration_seconds"] == 2.0
+    snap = ledger.snapshot()
+    assert snap["duration_seconds_total"] == 7.0
+    assert snap["duration_seconds_last"] == 1.0
+    assert snap["duration_seconds_max"] == 4.0
+    assert snap["by_phase"]["plan"]["duration_seconds"] == 6.0
+    assert snap["by_phase"]["exec"]["duration_seconds"] == 1.0
+    assert snap["by_model"]["gpt-4o"]["duration_seconds"] == 7.0
+    # avg reported back from record()
+    assert r2["duration_seconds_avg"] == 3.0
+    # survives reload
+    assert BudgetLedger(tmp_path / "budget.json").snapshot()["duration_seconds_total"] == 7.0
+
+
+def test_metered_client_measures_wall_time(tmp_path):
+    import time as _t
+
+    class _SlowInner:
+        class _Chat:
+            class _Comp:
+                def create(self, **kwargs):
+                    _t.sleep(0.05)
+                    class _U:
+                        prompt_tokens = 10
+                        completion_tokens = 5
+                    class _R:
+                        usage = _U()
+                    return _R()
+            def __init__(self):
+                self.completions = _SlowInner._Chat._Comp()
+        def __init__(self):
+            self.chat = _SlowInner._Chat()
+
+    ledger = BudgetLedger(tmp_path / "b.json")
+    client = MeteredLLMClient(_SlowInner(), ledger, get_phase=lambda: "plan", get_model=lambda: "gpt-4o")
+    client.chat.completions.create(model="gpt-4o", messages=[])
+    snap = ledger.snapshot()
+    assert snap["duration_seconds_total"] >= 0.05
+    assert snap["by_phase"]["plan"]["duration_seconds"] >= 0.05
+
+
 def test_budget_unlimited_never_exhausts(tmp_path):
     ledger = BudgetLedger(tmp_path / "b.json", BudgetLimits(max_usd=0, max_tokens=0))
     ledger.record(prompt_tokens=10_000_000, completion_tokens=10_000_000, model="gpt-4o", phase="plan")

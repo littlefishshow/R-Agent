@@ -151,6 +151,9 @@ class BudgetLedger:
                     data.setdefault("total_tokens", 0)
                     data.setdefault("estimated_usd", 0.0)
                     data.setdefault("calls", 0)
+                    data.setdefault("duration_seconds_total", 0.0)
+                    data.setdefault("duration_seconds_last", 0.0)
+                    data.setdefault("duration_seconds_max", 0.0)
                     data.setdefault("by_phase", {})
                     data.setdefault("by_model", {})
                     return data
@@ -162,6 +165,9 @@ class BudgetLedger:
             "total_tokens": 0,
             "estimated_usd": 0.0,
             "calls": 0,
+            "duration_seconds_total": 0.0,
+            "duration_seconds_last": 0.0,
+            "duration_seconds_max": 0.0,
             "by_phase": {},
             "by_model": {},
             "created_at": time.time(),
@@ -181,27 +187,41 @@ class BudgetLedger:
         tmp.write_text(payload, encoding="utf-8")
         os.replace(tmp, self.path)
 
-    def record(self, *, prompt_tokens: int, completion_tokens: int, model: str, phase: str = "") -> dict:
+    def record(self, *, prompt_tokens: int, completion_tokens: int, model: str, phase: str = "", duration_seconds: float = 0.0) -> dict:
         with self._lock:
             usd = estimate_usd(model, prompt_tokens, completion_tokens)
             total = max(0, int(prompt_tokens)) + max(0, int(completion_tokens))
+            dur = max(0.0, float(duration_seconds or 0.0))
             self._data["prompt_tokens"] += max(0, int(prompt_tokens))
             self._data["completion_tokens"] += max(0, int(completion_tokens))
             self._data["total_tokens"] += total
             self._data["estimated_usd"] = round(self._data["estimated_usd"] + usd, 6)
             self._data["calls"] += 1
+            self._data["duration_seconds_total"] = round(self._data.get("duration_seconds_total", 0.0) + dur, 3)
+            self._data["duration_seconds_last"] = round(dur, 3)
+            self._data["duration_seconds_max"] = round(max(self._data.get("duration_seconds_max", 0.0), dur), 3)
             phase_key = phase or "unknown"
-            phase_row = self._data["by_phase"].setdefault(phase_key, {"tokens": 0, "usd": 0.0, "calls": 0})
+            phase_row = self._data["by_phase"].setdefault(phase_key, {"tokens": 0, "usd": 0.0, "calls": 0, "duration_seconds": 0.0})
             phase_row["tokens"] += total
             phase_row["usd"] = round(phase_row["usd"] + usd, 6)
             phase_row["calls"] += 1
+            phase_row["duration_seconds"] = round(phase_row.get("duration_seconds", 0.0) + dur, 3)
             model_key = model or "unknown"
-            model_row = self._data["by_model"].setdefault(model_key, {"tokens": 0, "usd": 0.0, "calls": 0})
+            model_row = self._data["by_model"].setdefault(model_key, {"tokens": 0, "usd": 0.0, "calls": 0, "duration_seconds": 0.0})
             model_row["tokens"] += total
             model_row["usd"] = round(model_row["usd"] + usd, 6)
             model_row["calls"] += 1
+            model_row["duration_seconds"] = round(model_row.get("duration_seconds", 0.0) + dur, 3)
             self._save()
-            return {"usd": usd, "tokens": total, "estimated_usd_total": self._data["estimated_usd"]}
+            avg = round(self._data["duration_seconds_total"] / max(1, self._data["calls"]), 3)
+            return {
+                "usd": usd,
+                "tokens": total,
+                "duration_seconds": round(dur, 3),
+                "estimated_usd_total": self._data["estimated_usd"],
+                "duration_seconds_total": self._data["duration_seconds_total"],
+                "duration_seconds_avg": avg,
+            }
 
     # ---- read-side ----
 
@@ -255,14 +275,16 @@ class _MeteredCompletions:
         self._get_model = get_model
 
     def create(self, *args, **kwargs):
+        started = time.perf_counter()
         response = self._inner.create(*args, **kwargs)
+        elapsed = time.perf_counter() - started
         try:
             usage = getattr(response, "usage", None)
             model = kwargs.get("model") or (self._get_model() if callable(self._get_model) else "") or ""
             prompt = _usage_field(usage, "prompt_tokens")
             completion = _usage_field(usage, "completion_tokens")
             phase = self._get_phase() if callable(self._get_phase) else (self._get_phase or "")
-            self._ledger.record(prompt_tokens=prompt, completion_tokens=completion, model=model, phase=phase)
+            self._ledger.record(prompt_tokens=prompt, completion_tokens=completion, model=model, phase=phase, duration_seconds=elapsed)
         except Exception:
             # Metering must never break the actual completion path.
             pass

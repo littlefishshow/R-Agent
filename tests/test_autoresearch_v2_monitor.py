@@ -35,11 +35,19 @@ def test_render_monitor_text_has_rounds_and_tokens(tmp_path):
     mon.start()
     mon.update_step(step_index=3, current_phase="run", next_phase="evaluate", summary="ran",
                     budget_snapshot={"total_tokens": 500, "estimated_usd": 0.5, "calls": 4, "status": "ok",
+                                     "duration_seconds_total": 12.0, "duration_seconds_last": 3.0,
+                                     "duration_seconds_max": 5.0,
                                      "limits": {"max_tokens": 1000, "max_usd": 5.0}})
-    text = render_monitor_text(read_monitor(tmp_path / "m.json"))
+    data = read_monitor(tmp_path / "m.json")
+    text = render_monitor_text(data)
     assert "rounds: 3/10" in text
     assert "tokens: 500/1000" in text
     assert "usd: 0.5/5.0" in text
+    # thinking-time line surfaces total/avg/last/max
+    assert "think time: total=12.0s" in text
+    assert "avg=3.0s" in text  # 12.0 / 4 calls
+    assert "last=3.0s" in text
+    assert data["budget"]["duration_seconds_avg"] == 3.0
 
 
 def test_controller_updates_monitor_each_step(tmp_path):

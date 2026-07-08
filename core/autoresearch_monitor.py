@@ -91,12 +91,18 @@ def _compact_budget(snapshot: dict) -> dict:
     """Keep only the numbers a watcher cares about (tokens/usd/status)."""
     if not isinstance(snapshot, dict):
         return {}
+    calls = snapshot.get("calls", 0) or 0
+    dur_total = snapshot.get("duration_seconds_total", 0.0) or 0.0
     return {
         "total_tokens": snapshot.get("total_tokens", 0),
         "prompt_tokens": snapshot.get("prompt_tokens", 0),
         "completion_tokens": snapshot.get("completion_tokens", 0),
         "estimated_usd": snapshot.get("estimated_usd", 0.0),
-        "calls": snapshot.get("calls", 0),
+        "calls": calls,
+        "duration_seconds_total": round(dur_total, 3),
+        "duration_seconds_last": snapshot.get("duration_seconds_last", 0.0),
+        "duration_seconds_max": snapshot.get("duration_seconds_max", 0.0),
+        "duration_seconds_avg": round(dur_total / calls, 3) if calls else 0.0,
         "status": snapshot.get("status", "ok"),
         "limits": snapshot.get("limits", {}),
     }
@@ -137,6 +143,10 @@ def render_monitor_text(data: dict, bar_width: int = 20) -> str:
         + f"  usd: {budget.get('estimated_usd',0.0)}"
         + (f"/{limits.get('max_usd')}" if limits.get('max_usd') else "")
         + f"  calls: {budget.get('calls',0)}  budget:{budget.get('status','ok')}",
+        f"think time: total={budget.get('duration_seconds_total',0.0)}s"
+        + f" avg={budget.get('duration_seconds_avg',0.0)}s"
+        + f" last={budget.get('duration_seconds_last',0.0)}s"
+        + f" max={budget.get('duration_seconds_max',0.0)}s",
         f"last: {data.get('last_summary','')}",
     ]
     if data.get("stale"):
