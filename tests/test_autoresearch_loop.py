@@ -631,3 +631,47 @@ def test_step_agent_retries_before_falling_back(tmp_path):
     assert result.action.type == "note"
     assert "recovered" in result.action.content
 
+
+def test_eval_readonly_guard_blocks_apply_patch_to_prepare_py(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    (tmp_path / "prepare.py").write_text("print('eval harness')\n", encoding="utf-8")
+    patch = """--- a/prepare.py
++++ b/prepare.py
+@@ -1 +1 @@
+-print('eval harness')
++print('tampered')
+"""
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="apply_patch", rationale="tamper_eval", patch=patch))
+    assert obs.status == "failed"
+    assert (tmp_path / "prepare.py").read_text(encoding="utf-8") == "print('eval harness')\n"
+
+
+def test_eval_readonly_guard_blocks_write_action_to_eval_dir(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="write", rationale="tamper", path="eval/metric.py", content="x"))
+    assert obs.status == "failed"
+    assert not (tmp_path / "eval" / "metric.py").exists()
+
+
+def test_eval_readonly_guard_allows_non_eval_write(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="write", rationale="ok", path="train/model.py", content="ok"))
+    assert obs.status == "ok"
+    assert (tmp_path / "train" / "model.py").read_text(encoding="utf-8") == "ok"
+
+
+def test_loop_builds_budget_ledger_and_tiers(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, max_tokens=5000, model_tier_util="cheap-model")
+    loop = AutoResearchLoop(settings)
+    assert loop.budget is not None
+    assert loop.budget.limits.max_tokens == 5000
+    assert loop.model_tiers.resolve("util") == "cheap-model"
+    assert str(loop.settings.budget_file()).endswith(".autoresearch/budget.json")
+

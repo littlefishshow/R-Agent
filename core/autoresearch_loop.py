@@ -52,6 +52,17 @@ class AutoResearchSettings:
     planner_kind: str = "fixed"
     llm_request_timeout: float = 60.0
     llm_retry_attempts: int = 1
+    # --- v2: cost control + layered memory ---
+    project_state_path: str | Path = "project.md"
+    budget_path: str | Path = ".autoresearch/budget.json"
+    max_usd: float = 0.0            # 0 => unlimited
+    max_tokens: int = 0             # 0 => unlimited
+    budget_degrade_ratio: float = 0.8
+    model_tier_plan: str = ""
+    model_tier_exec: str = ""
+    model_tier_util: str = ""
+    readonly_eval_globs: tuple[str, ...] = ("prepare.py", "eval.sh", "eval/**", "evaluation/**")
+    plateau_patience: int = 3
 
     def __post_init__(self) -> None:
         # Normalize early so tools, background payloads, state, progress, and
@@ -64,6 +75,14 @@ class AutoResearchSettings:
 
     def program_file(self) -> Path:
         p = Path(self.program_path)
+        return p if p.is_absolute() else self.root() / p
+
+    def project_state_file(self) -> Path:
+        p = Path(self.project_state_path)
+        return p if p.is_absolute() else self.root() / p
+
+    def budget_file(self) -> Path:
+        p = Path(self.budget_path)
         return p if p.is_absolute() else self.root() / p
 
     def state_file(self) -> Path:
@@ -442,14 +461,38 @@ def _scan_patch_paths_for_safety(patch_text: str) -> list[str]:
     return sorted(set(paths))
 
 
-def apply_patch_with_git(project_dir: str | Path, patch_text: str) -> dict:
-    """Apply a full git-compatible patch inside project_dir using git apply."""
+def _matches_readonly(rel_path: str, readonly_globs) -> bool:
+    """True if a project-relative path matches any read-only (eval) glob."""
+    import fnmatch
+
+    rel = str(rel_path or "").lstrip("./")
+    for pattern in readonly_globs or ():
+        pat = str(pattern).lstrip("./")
+        if fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, pat.rstrip("/") + "/*"):
+            return True
+        # Support "dir/**" style directory guards.
+        if pat.endswith("/**") and (rel == pat[:-3] or rel.startswith(pat[:-2])):
+            return True
+    return False
+
+
+def apply_patch_with_git(project_dir: str | Path, patch_text: str, readonly_globs=()) -> dict:
+    """Apply a full git-compatible patch inside project_dir using git apply.
+
+    ``readonly_globs`` protects evaluation files (e.g. prepare.py): a patch that
+    touches any matching path is rejected before it can bias the benchmark.
+    """
     if not patch_text or not patch_text.strip():
         raise AutoResearchSafetyError("empty patch")
     if "GIT binary patch" in patch_text:
         raise AutoResearchSafetyError("binary git patches are not allowed")
     boundary = ProjectBoundary(project_dir)
     changed_files = _scan_patch_paths_for_safety(patch_text)
+    for rel in changed_files:
+        if _matches_readonly(rel, readonly_globs):
+            raise AutoResearchSafetyError(
+                f"patch modifies read-only evaluation file: {rel} (requires user approval)"
+            )
     workdir = boundary.ensure_inside(boundary.project_dir)
     check = subprocess.run(
         ["git", "apply", "--check", "--whitespace=nowarn", "-"],
@@ -889,17 +932,39 @@ class AutoResearchStepAgent:
     JSON.  The parent loop still validates and executes the selected action.
     """
 
-    def __init__(self, settings: AutoResearchSettings, client=None, model: str | None = None):
+    def __init__(self, settings: AutoResearchSettings, client=None, model: str | None = None, loop: "AutoResearchLoop | None" = None):
         self.settings = settings
         self.client = client
         self.model = model or settings.llm_model
+        self.loop = loop
+        self._tier = "plan"
 
     def _client(self):
         if self.client is None:
             from core import config
 
-            self.client = config.create_llm_client()
+            inner = config.create_llm_client()
+            ledger = getattr(self.loop, "budget", None)
+            if ledger is not None:
+                from core.autoresearch_budget import MeteredLLMClient
+
+                self.client = MeteredLLMClient(
+                    inner,
+                    ledger,
+                    get_phase=lambda: getattr(self.loop, "_current_phase", "") or "",
+                    get_model=lambda: self._resolved_model(),
+                )
+            else:
+                self.client = inner
         return self.client
+
+    def _resolved_model(self) -> str:
+        if self.model:
+            return self.model
+        tiers = getattr(self.loop, "model_tiers", None)
+        if tiers is not None:
+            return tiers.resolve(self._tier)
+        return __import__("core.config", fromlist=["get_model"]).get_model()
 
     def plan_step(
         self,
@@ -982,7 +1047,7 @@ class AutoResearchStepAgent:
 
     def _chat_completion_with_retry(self, system: str, user: dict):
         client = self._client()
-        model = self.model or __import__("core.config", fromlist=["get_model"]).get_model()
+        model = self._resolved_model()
         messages = [
             {"role": "system", "content": system},
             {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
@@ -1394,9 +1459,12 @@ class AutoResearchLoop:
         self.context = AutoResearchContextManager(settings)
         self.artifacts = AutoResearchArtifactStore(settings)
         self.runner = ProjectConfinedCommandRunner(settings.project_dir, settings.command_timeout_seconds)
+        self.budget = self._build_budget_ledger()
+        self.model_tiers = self._build_model_tiers()
+        self._current_phase = ""
         self.planner = planner or self._build_default_planner()
         self.summarizer = summarizer or self.default_summarizer
-        self.step_agent = step_agent or (AutoResearchStepAgent(settings) if settings.use_llm_step_agents else None)
+        self.step_agent = step_agent or (AutoResearchStepAgent(settings, loop=self) if settings.use_llm_step_agents else None)
         self._observations: list[AutoResearchObservation] = []
         self._step_agent_errors: list[str] = []
         self.progress = AutoResearchProgressView(settings)
@@ -1404,6 +1472,30 @@ class AutoResearchLoop:
         bind_loop = getattr(self.planner, "bind_loop", None)
         if callable(bind_loop):
             bind_loop(self)
+
+    def _build_budget_ledger(self):
+        from core.autoresearch_budget import BudgetLedger, BudgetLimits
+
+        limits = BudgetLimits(
+            max_usd=float(self.settings.max_usd or 0.0),
+            max_tokens=int(self.settings.max_tokens or 0),
+            degrade_ratio=float(self.settings.budget_degrade_ratio or 0.8),
+        )
+        return BudgetLedger(self.settings.budget_file(), limits)
+
+    def _build_model_tiers(self):
+        from core.autoresearch_budget import ModelTiers
+
+        base = self.settings.llm_model or ""
+        tiers = ModelTiers.from_env(base=base)
+        # Explicit settings override env.
+        if self.settings.model_tier_plan:
+            tiers.plan = self.settings.model_tier_plan
+        if self.settings.model_tier_exec:
+            tiers.exec = self.settings.model_tier_exec
+        if self.settings.model_tier_util:
+            tiers.util = self.settings.model_tier_util
+        return tiers
 
     def _build_default_planner(self) -> "Planner":
         if normalize_planner_kind(self.settings.planner_kind) == "evolutionary":
@@ -1636,6 +1728,7 @@ class AutoResearchLoop:
             if action.type == "write":
                 path = self.boundary.resolve(action.path)
                 self._ensure_write_allowed(path)
+                self._ensure_not_readonly_eval(path)
                 old = path.read_text(encoding="utf-8") if path.exists() else ""
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(action.content, encoding="utf-8")
@@ -1643,7 +1736,7 @@ class AutoResearchLoop:
                 artifact = self.artifacts.save(kind="write", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("write", self.summarizer(action, raw), artifact, "ok")
             if action.type == "apply_patch":
-                result = apply_patch_with_git(self.settings.root(), action.patch or action.content)
+                result = apply_patch_with_git(self.settings.root(), action.patch or action.content, readonly_globs=self.settings.readonly_eval_globs)
                 raw = json.dumps(result, ensure_ascii=False, indent=2)
                 artifact = self.artifacts.save(kind="apply_patch", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("apply_patch", self.summarizer(action, raw), artifact, "ok")
@@ -1708,6 +1801,16 @@ class AutoResearchLoop:
             except ValueError:
                 continue
         raise AutoResearchSafetyError(f"Write path is outside allowed roots: {path}")
+
+    def _ensure_not_readonly_eval(self, path: Path) -> None:
+        try:
+            rel = str(Path(path).resolve().relative_to(self.settings.root()))
+        except ValueError:
+            return
+        if _matches_readonly(rel, self.settings.readonly_eval_globs):
+            raise AutoResearchSafetyError(
+                f"write target is a read-only evaluation file: {rel} (requires user approval)"
+            )
 
     def _persist_observation(self, obs: AutoResearchObservation) -> None:
         state = self.context.load_state()
