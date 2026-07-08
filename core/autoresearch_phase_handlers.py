@@ -184,9 +184,16 @@ def make_compress_handler(max_belief_chars: int = 4000):
 
 
 def default_handlers() -> dict:
-    """Deterministic handler map covering the phases that have real no-LLM work."""
+    """Deterministic handler map covering the phases that have real no-LLM work.
+
+    The ``plan`` phase uses the persona debate handler, which itself falls back
+    to a deterministic no-op when no LLM client is available on the loop.
+    """
+    from core.autoresearch_personas import make_plan_handler
+
     return {
         "init": make_init_handler(),
+        "plan": make_plan_handler(),
         "evaluate": make_evaluate_handler(),
         "compress": make_compress_handler(),
     }

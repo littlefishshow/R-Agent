@@ -1,0 +1,143 @@
+import json
+from pathlib import Path
+
+from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
+from core.autoresearch_personas import (
+    PlanDebate,
+    DebateConfig,
+    make_plan_handler,
+    DEFAULT_PERSONAS,
+)
+from core.autoresearch_phases import PhaseContext, PhaseSignals
+from core.autoresearch_memory import (
+    ensure_program_scaffold,
+    split_program,
+    read_phase,
+    write_phase,
+)
+
+
+def _fake_chat_factory():
+    """Return a chat(system,user)->json that answers as persona or leader."""
+    calls = []
+
+    def chat(system, user):
+        calls.append((system, user))
+        if system.startswith("You are the LEADER"):
+            return json.dumps({
+                "belief": "prefer smaller LR with warmup",
+                "plan": "add LR warmup and re-eval",
+                "detailed_plan": "1. edit train config\n2. run\n3. eval",
+                "rationale": "pragmatic said feasible; divergent liked warmup",
+            })
+        if system.startswith("You are the DIVERGENT"):
+            return json.dumps({"opinion": "try cosine warmup", "ideas": ["warmup"], "risks": ["slower"]})
+        return json.dumps({"opinion": "warmup is feasible", "feasible": ["warmup"], "reject": []})
+
+    return chat, calls
+
+
+def test_debate_persona_count_respects_budget_degrade():
+    chat, _ = _fake_chat_factory()
+    debate = PlanDebate(chat, config=DebateConfig(max_personas=2, degrade_personas=1))
+    normal = debate.run(program_text="", project_text="", degrade=False)
+    degraded = debate.run(program_text="", project_text="", degrade=True)
+    # normal uses 2 personas + leader; degrade uses 1 + leader
+    assert len(normal["personas_used"]) == 3
+    assert len(degraded["personas_used"]) == 2
+    assert normal["personas_used"][-1] == "leader"
+
+
+def test_debate_leader_forces_a_decision():
+    chat, _ = _fake_chat_factory()
+    debate = PlanDebate(chat)
+    result = debate.run(program_text="", project_text="")
+    assert result["belief"] == "prefer smaller LR with warmup"
+    assert result["plan"] == "add LR warmup and re-eval"
+    assert result["detailed_plan"].startswith("1.")
+
+
+def test_debate_survives_persona_failure():
+    def flaky_chat(system, user):
+        if system.startswith("You are the DIVERGENT"):
+            raise RuntimeError("boom")
+        if system.startswith("You are the LEADER"):
+            return json.dumps({"belief": "b", "plan": "p", "detailed_plan": "d"})
+        return json.dumps({"opinion": "ok"})
+
+    debate = PlanDebate(flaky_chat)
+    result = debate.run(program_text="", project_text="")
+    # leader still decided despite divergent failing
+    assert result["plan"] == "p"
+
+
+def _make_loop(tmp_path):
+    (tmp_path / "program.md").write_text("Goal: maximize accuracy\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    return AutoResearchLoop(settings)
+
+
+def test_plan_handler_writes_belief_plan_auto_and_transcript(tmp_path):
+    chat, _ = _fake_chat_factory()
+    loop = _make_loop(tmp_path)
+    program_text = ensure_program_scaffold((tmp_path / "program.md").read_text(encoding="utf-8"))
+    project_text = "# Project State\n\n## 当前计划\n(no plan yet)\n"
+    ctx = PhaseContext(
+        phase="plan",
+        root=tmp_path,
+        program_text=program_text,
+        project_text=project_text,
+        signals=PhaseSignals(phase="plan"),
+        loop=loop,
+    )
+    handler = make_plan_handler(chat)
+    result = handler(ctx)
+
+    # belief updated in L1
+    assert result.program_text is not None
+    assert "warmup" in split_program(result.program_text).belief
+    # coarse plan in project.md
+    assert "add LR warmup" in result.project_text
+    # detailed plan in .auto/plan.md
+    assert (tmp_path / ".auto" / "plan.md").exists()
+    assert "edit train config" in (tmp_path / ".auto" / "plan.md").read_text(encoding="utf-8")
+    # transcript archived to L4, not project.md
+    artifacts = list((tmp_path / ".autoresearch" / "artifacts").glob("*plan_debate*"))
+    assert artifacts
+    assert "cosine warmup" not in result.project_text  # persona detail stays out of L2
+
+
+def test_plan_handler_no_llm_is_deterministic_noop(tmp_path):
+    program_text = ensure_program_scaffold("Goal: maximize accuracy\n")
+    # loop=None and chat=None => no client can be built => deterministic note
+    ctx = PhaseContext(
+        phase="plan",
+        root=tmp_path,
+        program_text=program_text,
+        project_text="# Project State\n",
+        signals=PhaseSignals(phase="plan"),
+        loop=None,
+    )
+    handler = make_plan_handler(None)
+    result = handler(ctx)
+    assert "plan" in result.summary
+    assert (tmp_path / ".auto" / "plan.md").exists()
+
+
+def test_plan_handler_readonly_program_skips_belief(tmp_path):
+    chat, _ = _fake_chat_factory()
+    loop = _make_loop(tmp_path)
+    # program without markers = read-only constitution
+    ctx = PhaseContext(
+        phase="plan",
+        root=tmp_path,
+        program_text="Goal only, no markers",
+        project_text="# Project State\n\n## 当前计划\nold\n",
+        signals=PhaseSignals(phase="plan"),
+        loop=loop,
+    )
+    handler = make_plan_handler(chat)
+    result = handler(ctx)
+    # belief update skipped (program_text None) but plan still updated
+    assert result.program_text is None
+    assert "add LR warmup" in result.project_text
