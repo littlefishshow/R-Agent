@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -64,27 +65,95 @@ def _default_execute_fn(item: str, ctx: PhaseContext) -> dict:
     loop = ctx.loop
     root = Path(ctx.root)
     spec_path = root / ".autoresearch" / "proposed_change.json"
-    if loop is None or not spec_path.exists():
+    if loop is None:
         return {"item": item, "status": "planned", "verification": False,
-                "note": "no queued change spec; recorded as plan-only"}
+                "note": "no loop available; recorded as plan-only"}
     try:
-        action = loop._maybe_hydrate_apply_change("apply_change",
-                                                  _note_action(item))
-        if action.type != "apply_patch":
-            return {"item": item, "status": "planned", "verification": False,
-                    "note": "spec did not synthesize a patch"}
+        if spec_path.exists():
+            action = loop._maybe_hydrate_apply_change("apply_change",
+                                                      _note_action(item))
+            if action.type != "apply_patch":
+                return {"item": item, "status": "planned", "verification": False,
+                        "note": "spec did not synthesize a patch"}
+        else:
+            action = _llm_execute_action(item, ctx)
+            if action is None:
+                return {"item": item, "status": "planned", "verification": False,
+                        "note": "no queued change spec and no execute step agent available"}
+            if action.type not in {"apply_patch", "write"}:
+                return {"item": item, "status": "tried", "verification": False,
+                        "note": f"execute step agent chose non-mutating action {action.type}; no change applied"}
         obs = loop.execute_action(action)
-        verified = _verify_changed_python(loop, obs)
+        verified = _verify_action_effect(loop, obs, action)
         return {"item": item, "status": obs.status, "verification": verified,
                 "note": obs.summary[:400]}
     except Exception as exc:
         return {"item": item, "status": "failed", "verification": False, "note": str(exc)}
 
 
+
+def _llm_execute_action(item: str, ctx: PhaseContext):
+    """Ask the v2 step agent to materialize a plan item when no queued spec exists.
+
+    This bridges the v2 persona plan (natural-language todo items) to the legacy
+    safe action surface.  The parent loop still validates and executes the action
+    inside the project boundary, including read-only eval protections.
+    """
+    loop = ctx.loop
+    agent = getattr(loop, "step_agent", None) if loop is not None else None
+    if agent is None:
+        return None
+    from core.autoresearch_loop import AutoResearchAction, AutoResearchWorkflowStep
+
+    step = AutoResearchWorkflowStep(
+        name="apply_change",
+        action_type="note",
+        rationale=f"execute todo: {item}",
+        content=item,
+        allowed_tools=("apply_patch", "write", "note", "read"),
+    )
+    fallback = AutoResearchAction(type="note", rationale="execute_no_safe_change", content=item)
+    parent_context = _execute_parent_context(ctx.root, ctx.project_text, item)
+    result = agent.plan_step(step=step, fallback_action=fallback, parent_context=parent_context, round_index=0)
+    apply_updates = getattr(loop, "_apply_bucket_updates", None)
+    if callable(apply_updates):
+        apply_updates(getattr(result, "bucket_updates", {}) or {})
+    return result.action
+
+
+def _execute_parent_context(root: str | Path, project_text: str, item: str, max_chars: int = 12000) -> str:
+    notes = read_auto_notes(root, max_files=8)
+    parts = [
+        "V2 execute phase: implement exactly one safe project-confined change for this todo.",
+        f"Todo: {item}",
+        "Forbidden: do not edit eval harness/read-only evaluation files.",
+        "Prefer a full-file write for train-side scripts when exact patch context is uncertain.",
+        "",
+        "# project.md",
+        project_text or "",
+    ]
+    for name, text in notes.items():
+        parts.extend(["", f"# .auto/{name}", text])
+    data = "\n".join(parts)
+    return data[-max_chars:]
+
 def _note_action(item: str):
     from core.autoresearch_loop import AutoResearchAction
 
     return AutoResearchAction(type="note", rationale="execute_apply_change", content=item)
+
+
+def _verify_action_effect(loop, obs, action=None) -> bool:
+    """Cheap verification for mutating actions."""
+    if getattr(obs, "status", "") not in {"ok", "ok_metric_recovered"}:
+        return False
+    if action is not None and getattr(action, "type", "") == "write":
+        path = str(getattr(action, "path", "") or "")
+        if path.endswith(".py"):
+            result = loop.runner.run("python3 -m py_compile " + shlex.quote(path))
+            return result.get("returncode") == 0
+        return bool(path)
+    return _verify_changed_python(loop, obs)
 
 
 def _verify_changed_python(loop, obs) -> bool:
@@ -95,10 +164,10 @@ def _verify_changed_python(loop, obs) -> bool:
         changed = data.get("changed_files") or []
     except Exception:
         changed = []
-    py_files = [f for f in changed if str(f).endswith(".py")]
+    py_files = [str(f) for f in changed if str(f).endswith(".py")]
     if not py_files:
         return obs.status == "ok"
-    result = loop.runner.run("python -m py_compile " + " ".join(py_files))
+    result = loop.runner.run("python3 -m py_compile " + " ".join(shlex.quote(f) for f in py_files))
     return result.get("returncode") == 0
 
 
@@ -165,15 +234,23 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     if loop is None:
         return {"status": "skipped", "returncode": None, "stdout": "no loop"}
     command = (
+        "set -e; "
         "if [ -f train/train.sh ]; then bash train/train.sh; "
         "elif [ -f run.sh ]; then bash run.sh; "
-        "elif [ -f eval.sh ]; then bash eval.sh; "
-        "else echo 'no runnable script found'; fi"
+        "else echo 'no train/run script found'; fi; "
+        "if [ -f eval.sh ]; then bash eval.sh; fi"
     )
-    result = loop.runner.run(command)
-    status = "ok" if result.get("returncode") == 0 else "failed"
-    return {"status": status, "returncode": result.get("returncode"),
-            "stdout": result.get("stdout", ""), "stderr": result.get("stderr", "")}
+    from core.autoresearch_loop import AutoResearchAction, git_snapshot
+
+    action = AutoResearchAction(type="run", rationale="v2 run experiment", command=command, role="trial")
+    base_git = git_snapshot(loop.settings.root(), enabled=loop.settings.use_git_versioning)
+    obs = loop.execute_action(action)
+    recorder = getattr(loop, "_maybe_record_experiment", None)
+    if callable(recorder):
+        recorder(action, obs, base_git, "run_experiment")
+    status = "ok" if obs.status in {"ok", "ok_metric_recovered"} else "failed"
+    return {"status": status, "returncode": 0 if status == "ok" else 1,
+            "stdout": obs.summary, "stderr": "", "artifact_path": obs.artifact_path}
 
 
 def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[AutofixFn] = None, *, max_autofix: int = 2):

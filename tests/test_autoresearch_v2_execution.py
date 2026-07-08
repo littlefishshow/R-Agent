@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
+from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop, AutoResearchAction, AutoResearchStepResult
 from core.autoresearch_execution import (
     parse_todo_from_plan,
     make_execute_handler,
@@ -158,3 +158,33 @@ def test_run_stops_autofix_when_fix_not_attempted(tmp_path):
     assert result.signals_update.get("major_error") is True
     # run once, one autofix attempt that returns False -> no re-run
     assert calls["n"] == 1
+
+
+def test_execute_without_proposed_change_uses_step_agent_write(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="write", rationale="create train helper", path="train/helper.py", content="x = 1\n")
+            )
+
+    loop.step_agent = Agent()
+    write_auto_note(tmp_path, "plan", "1. create helper\n")
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert (tmp_path / "train" / "helper.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert "1/1 verified" in result.summary
+
+
+def test_default_run_records_metric_bearing_experiment(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "eval.sh").write_text("#!/usr/bin/env bash\necho 'primary_metric_name: score'\necho 'primary_metric: 0.5'\necho 'higher_is_better: true'\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert state["experiments"][0]["metrics"]["score"] == 0.5
+    assert state["experiments"][0]["primary_metric_name"] == "score"

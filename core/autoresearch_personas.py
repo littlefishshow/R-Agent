@@ -178,7 +178,7 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
     """
 
     def handler(ctx: PhaseContext) -> PhaseResult:
-        chat_fn = chat or _loop_chat_fn(ctx.loop)
+        chat_fn = chat or build_loop_chat_fn(ctx.loop, tier="plan")
         degrade = bool(getattr(ctx.signals, "budget_degrade", False))
 
         if chat_fn is None:
@@ -213,12 +213,13 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
     return handler
 
 
-def _loop_chat_fn(loop) -> Optional[ChatFn]:
+def build_loop_chat_fn(loop, *, tier: str = "plan") -> Optional[ChatFn]:
     """Build a (system, user)->text callable backed by the loop's step agent client.
 
     Returns None (deterministic, no LLM) unless the loop was explicitly configured
-    with use_llm_step_agents=True. This prevents the plan phase from silently
-    reaching for a live client when the caller asked for the deterministic path.
+    with use_llm_step_agents=True. This prevents phases from silently reaching for a
+    live client when the caller asked for the deterministic path. ``tier`` picks the
+    model cost tier (plan for debate, exec for code execution).
     """
     if loop is None:
         return None
@@ -226,7 +227,7 @@ def _loop_chat_fn(loop) -> Optional[ChatFn]:
         return None
     step_agent = getattr(loop, "step_agent", None)
     if step_agent is None:
-        # Build a transient plan-tier agent if the loop supports it.
+        # Build a transient step agent if the loop supports it.
         try:
             from core.autoresearch_loop import AutoResearchStepAgent
 
@@ -244,7 +245,7 @@ def _loop_chat_fn(loop) -> Optional[ChatFn]:
         model = ""
         tiers = getattr(loop, "model_tiers", None)
         if tiers is not None:
-            model = tiers.resolve("plan")
+            model = tiers.resolve(tier)
         kwargs = {
             "model": model or "gpt-4o",
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -256,6 +257,11 @@ def _loop_chat_fn(loop) -> Optional[ChatFn]:
         return getattr(resp.choices[0].message, "content", "") or ""
 
     return chat
+
+
+# Backwards-compatible alias used by the plan handler.
+def _loop_chat_fn(loop) -> Optional[ChatFn]:
+    return build_loop_chat_fn(loop, tier="plan")
 
 
 def _update_plan_section(project_text: str, plan: str) -> str:
@@ -300,4 +306,5 @@ __all__ = [
     "DebateConfig",
     "PlanDebate",
     "make_plan_handler",
+    "build_loop_chat_fn",
 ]
