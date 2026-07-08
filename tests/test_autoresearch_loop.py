@@ -675,3 +675,40 @@ def test_loop_builds_budget_ledger_and_tiers(tmp_path):
     assert loop.model_tiers.resolve("util") == "cheap-model"
     assert str(loop.settings.budget_file()).endswith(".autoresearch/budget.json")
 
+
+def test_round_trace_disabled_by_default(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="notrace", max_rounds=2)
+    AutoResearchLoop(settings).run()
+    assert not (tmp_path / ".autoresearch" / "round_traces").exists()
+
+
+def test_round_trace_dumps_full_context_when_enabled(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmax accuracy\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path, project_id="trace", max_rounds=3, trace_rounds=True
+    )
+    AutoResearchLoop(settings).run()
+
+    trace_dir = tmp_path / ".autoresearch" / "round_traces"
+    assert trace_dir.exists()
+    files = sorted(trace_dir.glob("round_*.json"))
+    assert len(files) == 3
+    trace = json.loads(files[0].read_text(encoding="utf-8"))
+    for key in ("round_index", "step_name", "parent_context", "llm", "chosen_action", "observation"):
+        assert key in trace
+    assert "system_prompt" in trace["llm"]
+    assert "raw_response" in trace["llm"]
+    assert trace["chosen_action"]["type"]
+    # deterministic path (no step agent) => used_fallback True
+    assert trace["used_fallback"] is True
+
+
+def test_apply_change_allows_write_scope():
+    """apply_change must permit a full-file write (option b), not only apply_patch."""
+    from core.autoresearch_loop import FixedAutoResearchPlanner
+
+    planner = FixedAutoResearchPlanner()
+    apply_round = [s.name for s in planner.steps].index("apply_change")
+    assert "write" in planner.allowed_tools_for_round(apply_round)
+

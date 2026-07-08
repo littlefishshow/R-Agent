@@ -56,6 +56,8 @@ class AutoResearchSettings:
     project_state_path: str | Path = "project.md"
     budget_path: str | Path = ".autoresearch/budget.json"
     monitor_path: str | Path = ".autoresearch/monitor.json"
+    trace_rounds: bool = False
+    trace_dir: str | Path = ".autoresearch/round_traces"
     max_usd: float = 0.0            # 0 => unlimited
     max_tokens: int = 0             # 0 => unlimited
     budget_degrade_ratio: float = 0.8
@@ -88,6 +90,10 @@ class AutoResearchSettings:
 
     def monitor_file(self) -> Path:
         p = Path(self.monitor_path)
+        return p if p.is_absolute() else self.root() / p
+
+    def trace_root(self) -> Path:
+        p = Path(self.trace_dir)
         return p if p.is_absolute() else self.root() / p
 
     def state_file(self) -> Path:
@@ -208,6 +214,9 @@ class AutoResearchStepResult:
     raw_response: str = ""
     used_fallback: bool = False
     error: str = ""
+    # Full LLM I/O for post-hoc debugging (only populated when round tracing is on).
+    system_prompt: str = ""
+    user_payload: str = ""
 
 
 class AutoResearchSafetyError(RuntimeError):
@@ -824,7 +833,7 @@ class FixedAutoResearchPlanner:
             action_type="note",
             rationale="current_change_apply_patch_or_skip",
             content="No safe patch has been produced by the step agent; record that apply-change was skipped.",
-            allowed_tools=("apply_patch", "note", "read"),
+            allowed_tools=("apply_patch", "write", "note", "read"),
         ),
         AutoResearchWorkflowStep(
             name="run_experiment_if_available",
@@ -936,11 +945,28 @@ class AutoResearchStepAgent:
     STEP_GUIDANCE = {
         "inspect_project": "Build concise project understanding: structure, likely entrypoints, existing eval/train files, and risks.",
         "read_program": "Extract research goal, success metric, allowed edits, fixed eval harness, budget, and stop conditions from program.md.",
-        "plan_change": "Propose one reversible experiment hypothesis only; specify target files, expected metric direction, risk, rollback.",
+        "plan_change": (
+            "Propose one reversible experiment hypothesis. Prefer a plan that lets ONE edit do MANY evaluations: "
+            "if the protocol allows editing files under train/, you MAY write a self-iterating search script "
+            "(e.g. train/train.py runs a loop that itself calls the eval harness many times, reads the returned "
+            "metric, and keeps the best candidate) instead of hand-editing a single constant per round. "
+            "This is your choice; pick it when the task is a search/optimization loop, so you do not need to think "
+            "once per evaluation. Specify target files, expected metric direction, risk, rollback."
+        ),
         "baseline_eval": "Run or prepare baseline evaluation; focus on machine-parseable metrics and failure diagnosis.",
         "summarize_baseline": "Summarize baseline evidence and whether metrics are sufficient for comparison.",
-        "propose_experiment": "Produce a single minimal modification plan; do not combine unrelated ideas.",
-        "apply_change": "If and only if there is a safe minimal patch, emit apply_patch with a unified diff. Otherwise emit note explaining why no patch is safe yet.",
+        "propose_experiment": (
+            "Produce a single minimal modification plan; do not combine unrelated ideas. For search/optimization "
+            "tasks, a strong single plan is to (re)write an allowed train-side script that internally loops over "
+            "many candidates and calls the eval harness each time, returning the best. That amortizes one LLM "
+            "decision over many cheap evaluations instead of one candidate per round."
+        ),
+        "apply_change": (
+            "Make the planned train-side change. Two safe options: (a) emit apply_patch with a unified diff when you "
+            "know the exact current file contents; (b) if you do NOT have the exact contents, prefer a full-file "
+            "'write' action (path + complete new content) rather than skipping — a self-contained search script is a "
+            "good fit for 'write'. Only skip if no safe change can be expressed. Never touch forbidden eval files."
+        ),
         "run_experiment_if_available": "Run the configured experiment/eval command; prefer bounded commands and preserve logs.",
         "parse_metric_and_decide": "Parse metrics, compare against baseline if present, and decide keep/discard/needs_metrics.",
         "record_decision": "Record final decision, completed parts, artifacts, next steps, and what would be committed.",
@@ -1064,7 +1090,13 @@ class AutoResearchStepAgent:
                 values = [values]
             if isinstance(values, list):
                 normalized.setdefault(key, []).extend(str(v) for v in values if str(v).strip())
-        return AutoResearchStepResult(action=action, bucket_updates=normalized, raw_response=raw)
+        return AutoResearchStepResult(
+            action=action,
+            bucket_updates=normalized,
+            raw_response=raw,
+            system_prompt=system,
+            user_payload=json.dumps(user, ensure_ascii=False),
+        )
 
     def _chat_completion_with_retry(self, system: str, user: dict):
         client = self._client()
@@ -1556,6 +1588,7 @@ class AutoResearchLoop:
             self._observations.append(observation)
             self._persist_observation(observation)
             self._maybe_record_experiment(action, observation, base_git, step_name)
+            self._write_round_trace(round_index, step_name, parent_context, step_result, observation)
             self._write_progress("running", step_name, round_index + 1, max_rounds)
             if action.type == "stop":
                 break
@@ -1617,6 +1650,56 @@ class AutoResearchLoop:
                 used_fallback=True,
                 error=str(exc),
             )
+
+    def _write_round_trace(self, round_index, step_name, parent_context, step_result, observation) -> None:
+        """Dump the full per-round LLM I/O + outcome for post-hoc debugging.
+
+        Gated by settings.trace_rounds (default off) because it writes the entire
+        parent context and prompt/response each round, which is verbose. When on,
+        every round produces .autoresearch/round_traces/round_<NNN>_<step>.json so
+        it is possible to see exactly what the LLM saw and replied, and why an
+        action was chosen or fell back.
+        """
+        if not getattr(self.settings, "trace_rounds", False):
+            return
+        try:
+            root = self.settings.trace_root()
+            root.mkdir(parents=True, exist_ok=True)
+            action = step_result.action
+            trace = {
+                "round_index": round_index,
+                "step_name": step_name,
+                "timestamp": time.strftime("%F %T"),
+                "used_fallback": bool(step_result.used_fallback),
+                "step_agent_error": step_result.error or "",
+                "llm": {
+                    "system_prompt": step_result.system_prompt or "",
+                    "user_payload": step_result.user_payload or "",
+                    "raw_response": step_result.raw_response or "",
+                },
+                "parent_context": parent_context,
+                "chosen_action": {
+                    "type": action.type,
+                    "role": getattr(action, "role", ""),
+                    "rationale": action.rationale,
+                    "command": action.command,
+                    "path": action.path,
+                    "patch": action.patch,
+                    "content_preview": (action.content or "")[:2000],
+                },
+                "bucket_updates": step_result.bucket_updates,
+                "observation": {
+                    "kind": observation.kind,
+                    "status": observation.status,
+                    "summary": observation.summary[:2000],
+                    "artifact_path": observation.artifact_path,
+                },
+            }
+            fname = f"round_{round_index:03d}_{_safe_slug(step_name)}.json"
+            (root / fname).write_text(json.dumps(trace, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        except Exception:
+            # Tracing must never break the loop.
+            pass
 
     def _apply_bucket_updates(self, bucket_updates: dict[str, list[str]]) -> None:
         if not bucket_updates:

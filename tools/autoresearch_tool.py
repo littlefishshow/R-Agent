@@ -29,6 +29,7 @@ def _make_settings(
     use_git_versioning: bool = True,
     versioning_policy: str = "artifact_only",
     planner: str = "fixed",
+    trace_rounds: bool = False,
 ) -> AutoResearchSettings:
     return AutoResearchSettings(
         project_dir=project_dir,
@@ -50,6 +51,7 @@ def _make_settings(
         use_git_versioning=use_git_versioning,
         versioning_policy=versioning_policy,
         planner_kind=planner,
+        trace_rounds=trace_rounds,
     )
 
 
@@ -83,6 +85,7 @@ def _settings_payload(settings: AutoResearchSettings, progress_path: str) -> dic
         "use_git_versioning": settings.use_git_versioning,
         "versioning_policy": normalize_versioning_policy(settings.versioning_policy),
         "planner_kind": settings.planner_kind,
+        "trace_rounds": settings.trace_rounds,
     }
 
 
@@ -141,6 +144,7 @@ def auto_research_run_tool(
     versioning_policy: str = "artifact_only",
     planner: str = "fixed",
     background: bool = False,
+    trace_rounds: bool = False,
 ) -> str:
     """Run the dedicated autoresearch loop for a project."""
     try:
@@ -164,6 +168,7 @@ def auto_research_run_tool(
             use_git_versioning=use_git_versioning,
             versioning_policy=versioning_policy,
             planner=planner,
+            trace_rounds=trace_rounds,
         )
         if background:
             run_id = f"ar-{uuid.uuid4().hex[:10]}"
@@ -248,7 +253,7 @@ def _v2_settings_kwargs(
     project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
     llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
     max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
-    versioning_policy, plateau_patience,
+    versioning_policy, plateau_patience, trace_rounds=False,
 ) -> dict:
     return dict(
         project_dir=project_dir,
@@ -269,6 +274,7 @@ def _v2_settings_kwargs(
         use_git_versioning=use_git_versioning,
         versioning_policy=versioning_policy,
         plateau_patience=plateau_patience,
+        trace_rounds=trace_rounds,
     )
 
 
@@ -292,6 +298,7 @@ def auto_research_run_v2_tool(
     versioning_policy: str = "artifact_only",
     plateau_patience: int = 3,
     background: bool = False,
+    trace_rounds: bool = False,
 ) -> str:
     """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress).
 
@@ -306,7 +313,7 @@ def auto_research_run_v2_tool(
             project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
             llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
             max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
-            versioning_policy, plateau_patience,
+            versioning_policy, plateau_patience, trace_rounds,
         )
         settings = AutoResearchSettings(**kwargs)
 
@@ -382,6 +389,7 @@ def _common_properties():
         "use_git_versioning": {"type": "boolean", "description": "在已有 git 仓库中记录 base commit/status/diff；非 git 安全降级且不会 git init。", "default": True},
         "versioning_policy": {"type": "string", "description": "中间版本生命周期策略：artifact_only(默认，仅保存 patch/manifest)、commit_pareto、commit_all_trials、branch_per_trial。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "planner": {"type": "string", "description": "workflow planner：fixed(默认，跑一遍固定 10 步)；evolutionary(跑完固定 workflow 后按 propose/apply/run/decide 循环，直到 max_experiments 或 rounds 用尽)。", "enum": ["fixed", "evolutionary"], "default": "fixed"},
+        "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认关闭(内容较大)。", "default": False},
         "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 时立即返回 run_id 和 progress_path。", "default": False},
     }
 
@@ -431,6 +439,7 @@ def _v2_properties():
         "use_git_versioning": {"type": "boolean", "description": "已有 git 仓库中记录版本；非 git 安全降级。", "default": True},
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
+        "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认关闭(内容较大)。", "default": False},
         "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 立即返回 run_id 和 monitor_path，用 auto_research_v2_status 轮询进度/花费(纯文件读，无 LLM)。", "default": False},
     }
 
