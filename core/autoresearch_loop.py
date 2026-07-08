@@ -55,6 +55,7 @@ class AutoResearchSettings:
     # --- v2: cost control + layered memory ---
     project_state_path: str | Path = "project.md"
     budget_path: str | Path = ".autoresearch/budget.json"
+    monitor_path: str | Path = ".autoresearch/monitor.json"
     max_usd: float = 0.0            # 0 => unlimited
     max_tokens: int = 0             # 0 => unlimited
     budget_degrade_ratio: float = 0.8
@@ -83,6 +84,10 @@ class AutoResearchSettings:
 
     def budget_file(self) -> Path:
         p = Path(self.budget_path)
+        return p if p.is_absolute() else self.root() / p
+
+    def monitor_file(self) -> Path:
+        p = Path(self.monitor_path)
         return p if p.is_absolute() else self.root() / p
 
     def state_file(self) -> Path:

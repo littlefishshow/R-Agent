@@ -149,11 +149,14 @@ class PhaseController:
         *,
         handlers: Optional[dict] = None,
         loop=None,
+        monitor=None,
     ):
         self.settings = settings
         self.loop = loop
         self.root = Path(settings.root())
         self.handlers = dict(handlers or {})
+        self.monitor = monitor
+        self._step_index = 0
 
     # ---- file helpers ----
 
@@ -250,26 +253,57 @@ class PhaseController:
         project_text = write_phase(project_text, nxt, reason)
         self._atomic_write(self._project_path(), project_text)
 
+        self._step_index += 1
+        budget = getattr(self.loop, "budget", None)
+        budget_snapshot = budget.snapshot() if budget is not None else None
+        if self.monitor is not None:
+            self.monitor.update_step(
+                step_index=self._step_index,
+                current_phase=phase,
+                next_phase=nxt,
+                summary=result.summary,
+                budget_snapshot=budget_snapshot,
+            )
+
         return {
             "ran_phase": phase,
             "next_phase": nxt,
             "reason": reason,
             "summary": result.summary,
-            "budget_status": (getattr(self.loop, "budget", None).status() if getattr(self.loop, "budget", None) else "ok"),
+            "step_index": self._step_index,
+            "budget_status": (budget.status() if budget is not None else "ok"),
             "timestamp": time.strftime("%F %T"),
         }
 
     def run(self, max_steps: int = 24, extra_signals: Optional[dict] = None) -> list[dict]:
         """Advance the machine up to ``max_steps`` phases or until pause."""
+        if self.monitor is not None:
+            self.monitor.set_max_steps(max_steps)
+            self.monitor.start()
         reports = []
-        for _ in range(max(0, int(max_steps))):
-            report = self.step(extra_signals)
-            reports.append(report)
-            if report["next_phase"] == "pause":
-                # Run the pause phase's handler once, then stop.
-                break
-            if getattr(self.loop, "budget", None) and self.loop.budget.is_exhausted():
-                break
+        error = ""
+        try:
+            for _ in range(max(0, int(max_steps))):
+                report = self.step(extra_signals)
+                reports.append(report)
+                if report["next_phase"] == "pause":
+                    # Run the pause phase's handler once, then stop.
+                    break
+                if getattr(self.loop, "budget", None) and self.loop.budget.is_exhausted():
+                    break
+        except Exception as exc:
+            error = str(exc)
+            raise
+        finally:
+            if self.monitor is not None:
+                budget = getattr(self.loop, "budget", None)
+                paused = bool(reports) and reports[-1]["next_phase"] == "pause"
+                status = "failed" if error else ("paused" if paused else "completed")
+                self.monitor.finish(
+                    status=status,
+                    error=error,
+                    budget_snapshot=(budget.snapshot() if budget is not None else None),
+                )
         return reports
 
 
@@ -286,26 +320,35 @@ __all__ = [
 ]
 
 
-def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = None, loop=None) -> dict:
+def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = None, loop=None,
+                   run_id: str = "", monitor=None) -> dict:
     """Build a loop + controller with the default handlers and run the machine.
 
     This is the v2 entrypoint: it reuses ``AutoResearchLoop`` purely for its
     budget ledger, model tiers, confined runner, and artifact store, while the
     ``PhaseController`` drives the 6-phase state machine over project.md.
+
+    A ``RunMonitor`` heartbeat (``.autoresearch/monitor.json``) is written every
+    phase step so the run can be watched without invoking any LLM.
     """
     from core.autoresearch_loop import AutoResearchLoop
     from core.autoresearch_phase_handlers import default_handlers
+    from core.autoresearch_monitor import RunMonitor
 
     loop = loop or AutoResearchLoop(settings)
-    controller = PhaseController(settings, handlers=handlers or default_handlers(), loop=loop)
+    if monitor is None:
+        monitor = RunMonitor(settings.monitor_file(), run_id=run_id, project_id=settings.project_id)
+    controller = PhaseController(settings, handlers=handlers or default_handlers(), loop=loop, monitor=monitor)
     reports = controller.run(max_steps=max_steps)
     budget = getattr(loop, "budget", None)
     return {
         "project_id": settings.project_id,
+        "run_id": run_id,
         "steps": reports,
         "final_phase": (reports[-1]["next_phase"] if reports else "init"),
         "project_path": str(settings.project_state_file()),
         "program_path": str(settings.program_file()),
         "budget_path": str(settings.budget_file()),
+        "monitor_path": str(settings.monitor_file()),
         "budget": (budget.snapshot() if budget is not None else {}),
     }

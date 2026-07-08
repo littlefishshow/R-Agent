@@ -220,6 +220,58 @@ def auto_research_status_tool(run_id: str = "", project_dir: str = ".") -> str:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
 
+_V2_CHILD_CODE = r'''
+import json
+import sys
+import time
+from pathlib import Path
+from core.autoresearch_loop import AutoResearchSettings
+from core.autoresearch_phases import run_phase_loop
+
+payload = json.loads(sys.argv[1])
+run_id = sys.argv[2]
+max_steps = int(sys.argv[3])
+settings = AutoResearchSettings(**payload)
+try:
+    run_phase_loop(settings, max_steps=max_steps, run_id=run_id)
+except Exception as exc:
+    # run_phase_loop's monitor finally-block already records failure; make sure
+    # a monitor file exists even if construction failed before the loop started.
+    mon = Path(settings.monitor_file())
+    if not mon.exists():
+        mon.parent.mkdir(parents=True, exist_ok=True)
+        mon.write_text(json.dumps({"run_id": run_id, "status": "failed", "error": str(exc)}) + "\n", encoding="utf-8")
+'''
+
+
+def _v2_settings_kwargs(
+    project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
+    llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
+    max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
+    versioning_policy, plateau_patience,
+) -> dict:
+    return dict(
+        project_dir=project_dir,
+        project_id=project_id,
+        program_path=program_path,
+        project_state_path=project_state_path,
+        max_rounds=0,
+        use_llm_step_agents=use_llm_step_agents,
+        llm_model=llm_model or None,
+        max_usd=max_usd,
+        max_tokens=max_tokens,
+        model_tier_plan=model_tier_plan,
+        model_tier_exec=model_tier_exec,
+        model_tier_util=model_tier_util,
+        max_experiments=max_experiments,
+        max_pareto_items=max_pareto_items,
+        max_useful_failures=max_useful_failures,
+        use_git_versioning=use_git_versioning,
+        versioning_policy=versioning_policy,
+        plateau_patience=plateau_patience,
+    )
+
+
 def auto_research_run_v2_tool(
     project_dir: str,
     project_id: str = "autoresearch",
@@ -239,33 +291,72 @@ def auto_research_run_v2_tool(
     use_git_versioning: bool = True,
     versioning_policy: str = "artifact_only",
     plateau_patience: int = 3,
+    background: bool = False,
 ) -> str:
-    """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress)."""
+    """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress).
+
+    background=true detaches the loop into its own process and returns immediately
+    with a run_id + monitor_path; watch progress via auto_research_v2_status
+    (pure file read, no LLM).
+    """
     try:
         from core.autoresearch_phases import run_phase_loop
 
-        settings = AutoResearchSettings(
-            project_dir=project_dir,
-            project_id=project_id,
-            program_path=program_path,
-            project_state_path=project_state_path,
-            max_rounds=0,
-            use_llm_step_agents=use_llm_step_agents,
-            llm_model=llm_model or None,
-            max_usd=max_usd,
-            max_tokens=max_tokens,
-            model_tier_plan=model_tier_plan,
-            model_tier_exec=model_tier_exec,
-            model_tier_util=model_tier_util,
-            max_experiments=max_experiments,
-            max_pareto_items=max_pareto_items,
-            max_useful_failures=max_useful_failures,
-            use_git_versioning=use_git_versioning,
-            versioning_policy=versioning_policy,
-            plateau_patience=plateau_patience,
+        kwargs = _v2_settings_kwargs(
+            project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
+            llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
+            max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
+            versioning_policy, plateau_patience,
         )
+        settings = AutoResearchSettings(**kwargs)
+
+        if background:
+            from core.autoresearch_monitor import RunMonitor
+
+            run_id = f"arv2-{uuid.uuid4().hex[:10]}"
+            # Seed a queued monitor file synchronously so a watcher can find it
+            # immediately, before the child process has started running.
+            RunMonitor(settings.monitor_file(), run_id=run_id, project_id=project_id)
+            # Serialize settings without the derived normalization fields the
+            # dataclass sets in __post_init__ (they are accepted kwargs too).
+            child_payload = json.dumps(kwargs, ensure_ascii=False)
+            subprocess.Popen(
+                [sys.executable, "-c", _V2_CHILD_CODE, child_payload, run_id, str(max_steps)],
+                cwd=str(Path.cwd()),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return json.dumps({
+                "success": True,
+                "background": True,
+                "run_id": run_id,
+                "project_dir": str(settings.root()),
+                "project_id": project_id,
+                "monitor_path": str(settings.monitor_file()),
+                "budget_path": str(settings.budget_file()),
+                "project_path": str(settings.project_state_file()),
+                "created_at": time.time(),
+            }, ensure_ascii=False, indent=2)
+
         result = run_phase_loop(settings, max_steps=max_steps)
-        return json.dumps({"success": True, **result}, ensure_ascii=False, indent=2)
+        return json.dumps({"success": True, "background": False, **result}, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
+
+
+def auto_research_v2_status_tool(project_dir: str = ".", monitor_path: str = "") -> str:
+    """Read the v2 run monitor heartbeat (rounds + token/usd + phase). Pure file read, no LLM."""
+    try:
+        from core.autoresearch_monitor import read_monitor, render_monitor_text
+
+        if monitor_path:
+            path = Path(monitor_path).expanduser()
+        else:
+            path = Path(project_dir).expanduser().resolve() / ".autoresearch" / "monitor.json"
+        data = read_monitor(path)
+        data["monitor_text"] = render_monitor_text(data) if data.get("status") not in {"unknown"} else ""
+        return json.dumps({"success": True, "monitor_path": str(path), **data}, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -340,6 +431,7 @@ def _v2_properties():
         "use_git_versioning": {"type": "boolean", "description": "已有 git 仓库中记录版本；非 git 安全降级。", "default": True},
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
+        "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 立即返回 run_id 和 monitor_path，用 auto_research_v2_status 轮询进度/花费(纯文件读，无 LLM)。", "default": False},
     }
 
 
@@ -348,7 +440,25 @@ registry.register(
     description=(
         "运行 autoresearch v2 相位状态机：init→plan(多性格辩论)→execute(Todo+验证)→run(事件驱动+有界autofix)"
         "→evaluate(Pareto+经验账本)→compress，成本可控(预算账本+模型分级)且可无限运行(状态全在 program.md/project.md/.auto/git)。"
+        "background=true 可脱离主 agent 独立子进程运行，不阻塞主进程。"
     ),
     parameters={"type": "object", "properties": _v2_properties(), "required": ["project_dir"]},
     handler=auto_research_run_v2_tool,
+)
+
+
+registry.register(
+    name="auto_research_v2_status",
+    description=(
+        "查询 v2 后台运行的进度与花费：迭代轮数(step_index)、当前/下一相位、token 与 USD 消耗、状态与心跳。"
+        "纯读取 .autoresearch/monitor.json，不调用任何 LLM。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "project_dir": {"type": "string", "description": "项目目录；从中读取 .autoresearch/monitor.json。", "default": "."},
+            "monitor_path": {"type": "string", "description": "直接指定 monitor.json 路径（可选，优先于 project_dir）。", "default": ""},
+        },
+    },
+    handler=auto_research_v2_status_tool,
 )
