@@ -221,6 +221,13 @@ class PhaseController:
         """
         self.ensure_scaffold()
         phase, _reason = self.current_phase()
+        # Tag the loop so the metered LLM client attributes token/time spend to
+        # the running phase instead of the "unknown" bucket.
+        if self.loop is not None:
+            try:
+                self.loop._current_phase = phase
+            except Exception:
+                pass
         signals = self.build_signals(phase, extra_signals)
         ctx = PhaseContext(
             phase=phase,

@@ -297,14 +297,16 @@ def auto_research_run_v2_tool(
     use_git_versioning: bool = True,
     versioning_policy: str = "artifact_only",
     plateau_patience: int = 3,
-    background: bool = False,
+    background: bool = True,
     trace_rounds: bool = True,
 ) -> str:
     """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress).
 
-    background=true detaches the loop into its own process and returns immediately
-    with a run_id + monitor_path; watch progress via auto_research_v2_status
-    (pure file read, no LLM).
+    Defaults to background=true so the loop runs as its own detached process and
+    the call returns immediately with a run_id + monitor_path. This is required
+    because a full loop of slow LLM phases easily exceeds a foreground tool's
+    wall-clock timeout; watch progress via auto_research_v2_status (pure file
+    read, no LLM). Pass background=false only for short deterministic runs.
     """
     try:
         from core.autoresearch_phases import run_phase_loop
@@ -464,7 +466,7 @@ def _v2_properties():
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
         "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认开启。", "default": True},
-        "background": {"type": "boolean", "description": "是否后台非阻塞运行；true 立即返回 run_id 和 monitor_path，用 auto_research_v2_status 轮询进度/花费(纯文件读，无 LLM)。", "default": False},
+        "background": {"type": "boolean", "description": "是否后台非阻塞运行；默认 True。立即返回 run_id 和 monitor_path，用 auto_research_v2_status 轮询进度/花费(纯文件读，无 LLM)。前台运行整轮慢 LLM 相位极易超时被杀，故默认后台。", "default": True},
     }
 
 

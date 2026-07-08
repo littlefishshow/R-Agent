@@ -402,6 +402,10 @@ def test_tool_defaults_are_aggressive():
     assert d2["use_llm_step_agents"] is True
     assert d2["max_experiments"] == 40
     assert d2["trace_rounds"] is True
+    # v2 must default to background: a full loop of slow LLM phases exceeds a
+    # foreground tool timeout, so the main agent (which cannot set params) needs
+    # the non-blocking path by default.
+    assert d2["background"] is True
 
 
 def test_action_role_drives_experiment_recording(tmp_path):

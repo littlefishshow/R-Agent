@@ -16,6 +16,7 @@ def test_auto_research_run_v2_end_to_end_deterministic(tmp_path):
         max_steps=8,
         use_llm_step_agents=False,   # deterministic handlers
         use_git_versioning=False,
+        background=False,            # test the synchronous path directly
     ))
 
     assert payload["success"] is True
@@ -43,6 +44,7 @@ def test_auto_research_run_v2_pauses_on_budget(tmp_path):
         max_tokens=1,          # effectively force degrade/exhaust paths quickly
         use_llm_step_agents=False,
         use_git_versioning=False,
+        background=False,      # test the synchronous path directly
     ))
     assert payload["success"] is True
     assert "budget" in payload

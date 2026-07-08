@@ -188,3 +188,86 @@ def test_default_run_records_metric_bearing_experiment(tmp_path):
     state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
     assert state["experiments"][0]["metrics"]["score"] == 0.5
     assert state["experiments"][0]["primary_metric_name"] == "score"
+
+
+# --------------------------------------------------------------------------- #
+# C: hardened todo parsing
+# --------------------------------------------------------------------------- #
+
+def test_parse_todo_handles_step_and_dash_forms(tmp_path):
+    write_auto_note(tmp_path, "plan", "# Plan\nStep 1: do a\nStep 2. do b\n3 - do c\n• do d\n")
+    items = parse_todo_from_plan(tmp_path)
+    assert items == ["do a", "do b", "do c", "do d"]
+
+
+def test_parse_todo_fallback_to_body_when_no_list(tmp_path):
+    write_auto_note(tmp_path, "plan", "# Plan\nJust run a broad search then refine around the best point.\n")
+    items = parse_todo_from_plan(tmp_path)
+    assert len(items) == 1
+    assert "broad search" in items[0]
+
+
+# --------------------------------------------------------------------------- #
+# B: Execute phase bounds actions per visit with a plan-keyed cursor
+# --------------------------------------------------------------------------- #
+
+def test_execute_caps_actions_per_step_and_advances_cursor(tmp_path):
+    write_auto_note(tmp_path, "plan", "1. a\n2. b\n3. c\n4. d\n5. e\n")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_actions_per_step=2)
+    loop = AutoResearchLoop(settings)
+
+    seen = []
+
+    def fake_execute(item, ctx):
+        seen.append(item)
+        return {"item": item, "status": "ok", "verification": True}
+
+    handler = make_execute_handler(fake_execute)
+    r1 = handler(_ctx(tmp_path, "execute", loop=loop))
+    assert seen == ["a", "b"]
+    assert "+3 pending" in r1.summary
+    # second visit picks up where the cursor left off
+    r2 = handler(_ctx(tmp_path, "execute", loop=loop))
+    assert seen == ["a", "b", "c", "d"]
+    assert "+1 pending" in r2.summary
+    r3 = handler(_ctx(tmp_path, "execute", loop=loop))
+    assert seen[-1] == "e"
+    assert "pending" not in r3.summary
+
+
+def test_execute_no_major_error_while_items_pending(tmp_path):
+    write_auto_note(tmp_path, "plan", "1. a\n2. b\n3. c\n")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_actions_per_step=1)
+    loop = AutoResearchLoop(settings)
+
+    def fake_execute(item, ctx):
+        return {"item": item, "status": "failed", "verification": False}
+
+    handler = make_execute_handler(fake_execute)
+    r1 = handler(_ctx(tmp_path, "execute", loop=loop))
+    # still items pending -> don't flag major error yet
+    assert r1.signals_update == {}
+
+
+# --------------------------------------------------------------------------- #
+# C: Run executes a self-iterating search driver when present
+# --------------------------------------------------------------------------- #
+
+def test_run_prefers_search_driver(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    # driver writes a metric line itself (stands in for many internal evals)
+    (tmp_path / "train" / "search.py").write_text(
+        "print('primary_metric_name: z'); print('primary_metric: 0.0'); print('higher_is_better: false')\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "train/search.py" in report
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert state["experiments"][0]["metrics"]["z"] == 0.0

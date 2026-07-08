@@ -66,6 +66,15 @@ class AutoResearchSettings:
     model_tier_util: str = ""
     readonly_eval_globs: tuple[str, ...] = ("prepare.py", "eval.sh", "eval/**", "evaluation/**")
     plateau_patience: int = 3
+    # --- v2 execute/run tuning ---
+    # Cap LLM-backed actions per Execute phase visit so one step cannot burn the
+    # whole time/token budget on a long todo list; remaining items advance on the
+    # next Execute visit via a cursor.
+    execute_max_actions_per_step: int = 3
+    # When Execute wrote a self-iterating search driver, let Run execute it so it
+    # performs many internal evaluations from a single LLM decision.
+    run_search_driver: bool = True
+    search_driver_globs: tuple[str, ...] = ("train/search.py", "search.py", "train/search.sh", "search.sh")
 
     def __post_init__(self) -> None:
         # Normalize early so tools, background payloads, state, progress, and

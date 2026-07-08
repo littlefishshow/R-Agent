@@ -33,19 +33,40 @@ from core.autoresearch_phases import PhaseContext, PhaseResult
 # Todo parsing
 # --------------------------------------------------------------------------- #
 
-_TODO_LINE = re.compile(r"^\s*(?:\d+[.)]|[-*])\s+(.*\S)\s*$")
+# Numbered ("1." / "1)" / "1 -"), bulleted ("-" / "*" / "•"), or "Step N:" items.
+_TODO_LINE = re.compile(
+    r"^\s*(?:"
+    r"\d+\s*[.)\-:]"          # 1.  1)  1-  1:
+    r"|[-*•]"                  # -  *  •
+    r"|[Ss]tep\s+\d+\s*[:.)-]"  # Step 1:  step 2.
+    r")\s+(.*\S)\s*$"
+)
 
 
 def parse_todo_from_plan(root: str | Path) -> list[str]:
-    """Extract Todo items from .auto/plan.md (numbered or bulleted lines)."""
+    """Extract Todo items from .auto/plan.md (numbered, bulleted, or 'Step N:').
+
+    Falls back to the whole non-header body as a single item when no structured
+    list is found, so a differently formatted plan still gives Execute something
+    concrete to act on instead of a vague "execute current plan".
+    """
     notes = read_auto_notes(root, max_files=5)
     plan = notes.get("plan.md", "")
     items: list[str] = []
     for line in plan.splitlines():
         m = _TODO_LINE.match(line)
         if m:
-            items.append(m.group(1).strip())
-    return items
+            text = m.group(1).strip()
+            if text:
+                items.append(text)
+    if items:
+        return items
+    # Fallback: treat the plan body (minus markdown headers/blank lines) as one
+    # actionable block rather than losing the plan entirely.
+    body = [ln.strip() for ln in plan.splitlines() if ln.strip() and not ln.lstrip().startswith("#")]
+    if body:
+        return [" ".join(body)]
+    return []
 
 
 # --------------------------------------------------------------------------- #
@@ -171,6 +192,39 @@ def _verify_changed_python(loop, obs) -> bool:
     return result.get("returncode") == 0
 
 
+def _execute_cursor_path(root: str | Path) -> Path:
+    return Path(root) / ".autoresearch" / "execute_cursor.json"
+
+
+def _load_execute_cursor(root: str | Path, plan_key: str) -> int:
+    """Return the next todo index to run, resetting when the plan changed."""
+    path = _execute_cursor_path(root)
+    if not path.exists():
+        return 0
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0
+    if str(data.get("plan_key")) != plan_key:
+        return 0
+    try:
+        return max(0, int(data.get("index", 0)))
+    except Exception:
+        return 0
+
+
+def _save_execute_cursor(root: str | Path, plan_key: str, index: int) -> None:
+    path = _execute_cursor_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"plan_key": plan_key, "index": int(index)}, ensure_ascii=False), encoding="utf-8")
+
+
+def _plan_key(items: list[str]) -> str:
+    import hashlib
+
+    return hashlib.sha1("\n".join(items).encode("utf-8")).hexdigest()[:16]
+
+
 def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
     fn = execute_fn or _default_execute_fn
 
@@ -178,30 +232,50 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         items = parse_todo_from_plan(ctx.root)
         if not items:
             items = ["(no explicit todo; execute current plan)"]
+
+        # Bound the number of (possibly slow, LLM-backed) actions per Execute visit
+        # so one step cannot exhaust the whole time/token budget on a long todo
+        # list. A plan-keyed cursor carries remaining items to the next visit.
+        cap = int(getattr(getattr(ctx.loop, "settings", None), "execute_max_actions_per_step", 0) or 0)
+        plan_key = _plan_key(items)
+        start = _load_execute_cursor(ctx.root, plan_key) if cap > 0 else 0
+        if start >= len(items):
+            start = 0  # plan fully executed before; re-run from the top on re-entry
+        window = items[start:start + cap] if cap > 0 else items
+        end = start + len(window)
+        more_pending = cap > 0 and end < len(items)
+
         results = []
         done = 0
         any_verified = False
-        for item in items:
+        for item in window:
             res = fn(item, ctx) or {}
             results.append(res)
             # verification hard-constraint: only verified items count as done.
             if res.get("status") in {"ok", "done"} and res.get("verification"):
                 done += 1
                 any_verified = True
+
+        if cap > 0:
+            _save_execute_cursor(ctx.root, plan_key, 0 if more_pending is False else end)
+
         # children write .auto/, parent is the single writer of project.md.
         write_auto_note(ctx.root, "execute_report", "# Execute Report\n\n" +
+                        f"window items {start + 1}-{end} of {len(items)}\n\n" +
                         "\n".join(f"- {r.get('item')}: status={r.get('status')} verified={r.get('verification')} — {r.get('note','')}" for r in results))
-        project_text = _append_change_record(ctx.project_text, f"executed {done}/{len(items)} todo items (verified)")
+        project_text = _append_change_record(ctx.project_text, f"executed {done}/{len(window)} todo items (verified); window {start + 1}-{end}/{len(items)}")
 
         # If nothing verified and something was attempted, treat as an execute-side
-        # major error so the machine routes to Evaluate rather than Run.
+        # major error so the machine routes to Evaluate rather than Run — but only
+        # when there is nothing left to try (otherwise let the next visit continue).
         attempted = any(r.get("status") in {"ok", "done", "failed"} for r in results)
-        major = attempted and not any_verified
+        major = attempted and not any_verified and not more_pending
         signals_update = {"major_error": True} if major else {}
         if major:
             append_lesson(ctx.root, kind="operational_error",
                           summary="execute produced no verified change", detail=json.dumps(results, ensure_ascii=False)[:2000])
-        summary = f"execute: {done}/{len(items)} verified" + (" (major_error)" if major else "")
+        pending_note = f" (+{len(items) - end} pending)" if more_pending else ""
+        summary = f"execute: {done}/{len(window)} verified{pending_note}" + (" (major_error)" if major else "")
         return PhaseResult(project_text=project_text, signals_update=signals_update, summary=summary)
 
     return handler
@@ -228,21 +302,61 @@ RunFn = Callable[[PhaseContext], dict]     # (ctx) -> {status, returncode, stdou
 AutofixFn = Callable[[PhaseContext, dict], bool]  # (ctx, last_result) -> attempted_fix?
 
 
+def _find_search_driver(ctx: PhaseContext) -> Optional[str]:
+    """Return a relative path to a self-iterating search driver, if enabled/present.
+
+    Execute may write a driver (e.g. train/search.py) that internally loops over
+    many candidates and calls the eval harness each time. Running it amortizes one
+    LLM decision over many cheap evaluations, which is the whole point of the
+    search-script pattern.
+    """
+    settings = getattr(ctx.loop, "settings", None)
+    if settings is None or not bool(getattr(settings, "run_search_driver", False)):
+        return None
+    root = Path(ctx.root)
+    for rel in getattr(settings, "search_driver_globs", ()) or ():
+        if (root / rel).exists():
+            return rel
+    return None
+
+
+def _search_driver_command(rel: str) -> str:
+    if rel.endswith(".sh"):
+        return f"set -e; bash {rel}"
+    # Python driver: run it, then materialize + evaluate the best candidate it found.
+    return (
+        "set -e; "
+        f"python3 {rel}; "
+        "if [ -f train/train.sh ]; then bash train/train.sh; fi; "
+        "if [ -f eval.sh ]; then bash eval.sh; fi"
+    )
+
+
 def _default_run_fn(ctx: PhaseContext) -> dict:
-    """Run the project/experiment via the loop's confined runner."""
+    """Run the project/experiment via the loop's confined runner.
+
+    Prefers a self-iterating search driver (many internal evals) when Execute
+    produced one; otherwise falls back to a single train+eval pass.
+    """
     loop = ctx.loop
     if loop is None:
         return {"status": "skipped", "returncode": None, "stdout": "no loop"}
-    command = (
-        "set -e; "
-        "if [ -f train/train.sh ]; then bash train/train.sh; "
-        "elif [ -f run.sh ]; then bash run.sh; "
-        "else echo 'no train/run script found'; fi; "
-        "if [ -f eval.sh ]; then bash eval.sh; fi"
-    )
+    driver = _find_search_driver(ctx)
+    if driver:
+        command = _search_driver_command(driver)
+        rationale = f"v2 run search driver ({driver})"
+    else:
+        command = (
+            "set -e; "
+            "if [ -f train/train.sh ]; then bash train/train.sh; "
+            "elif [ -f run.sh ]; then bash run.sh; "
+            "else echo 'no train/run script found'; fi; "
+            "if [ -f eval.sh ]; then bash eval.sh; fi"
+        )
+        rationale = "v2 run experiment"
     from core.autoresearch_loop import AutoResearchAction, git_snapshot
 
-    action = AutoResearchAction(type="run", rationale="v2 run experiment", command=command, role="trial")
+    action = AutoResearchAction(type="run", rationale=rationale, command=command, role="trial")
     base_git = git_snapshot(loop.settings.root(), enabled=loop.settings.use_git_versioning)
     obs = loop.execute_action(action)
     recorder = getattr(loop, "_maybe_record_experiment", None)
@@ -250,7 +364,8 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         recorder(action, obs, base_git, "run_experiment")
     status = "ok" if obs.status in {"ok", "ok_metric_recovered"} else "failed"
     return {"status": status, "returncode": 0 if status == "ok" else 1,
-            "stdout": obs.summary, "stderr": "", "artifact_path": obs.artifact_path}
+            "stdout": obs.summary, "stderr": "", "artifact_path": obs.artifact_path,
+            "search_driver": driver or ""}
 
 
 def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[AutofixFn] = None, *, max_autofix: int = 2):
@@ -266,8 +381,9 @@ def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[Autofi
                 break
             result = run(ctx)
         major = result.get("status") == "failed"
+        driver = result.get("search_driver") or "(single train+eval)"
         write_auto_note(ctx.root, "run_report",
-                        f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} autofix_attempts={attempts}\n")
+                        f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} autofix_attempts={attempts} driver={driver}\n")
         if major:
             append_lesson(ctx.root, kind="operational_error",
                           summary=f"run failed after {attempts} autofix attempts",
