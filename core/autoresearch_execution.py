@@ -28,7 +28,14 @@ from typing import Callable, Optional
 
 from core.autoresearch_memory import write_auto_note, read_auto_notes, append_lesson
 from core.autoresearch_phases import PhaseContext, PhaseResult
-from core.autoresearch_todo_state import load_todo_state, ready_tasks, save_todo_state
+from core.autoresearch_todo_state import (
+    has_open_tasks,
+    load_todo_state,
+    ready_execute_tasks,
+    ready_tasks,
+    save_todo_state,
+    task_phase,
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -162,10 +169,11 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
         action_type="note",
         rationale=f"execute todo: {item}",
         content=item,
-        allowed_tools=("write", "apply_patch", "note", "read"),
+        allowed_tools=("write", "apply_patch"),
     )
     fallback = AutoResearchAction(type="note", rationale="execute_no_safe_change", content=item)
-    parent_context = _execute_parent_context(ctx.root, ctx.project_text, item)
+    max_chars = int(getattr(getattr(ctx.loop, "settings", None), "execute_context_chars", 12000) or 12000)
+    parent_context = _execute_parent_context(ctx.root, ctx.project_text, item, max_chars=max_chars)
     result = agent.plan_step(step=step, fallback_action=fallback, parent_context=parent_context, round_index=0)
     apply_updates = getattr(loop, "_apply_bucket_updates", None)
     if callable(apply_updates):
@@ -205,14 +213,47 @@ def _train_side_inventory(root: str | Path, max_files: int = 40) -> list[str]:
     return found
 
 
+def _train_side_snippets(root: str | Path, max_files: int = 4, max_chars_per_file: int = 2200) -> list[str]:
+    root = Path(root)
+    preferred = [
+        root / "train" / "train.py",
+        root / "train" / "train.sh",
+        root / "train.py",
+        root / "run.sh",
+    ]
+    paths: list[Path] = []
+    for path in preferred:
+        if path.exists() and path.is_file() and path not in paths:
+            paths.append(path)
+    train_dir = root / "train"
+    if train_dir.is_dir():
+        for path in sorted(train_dir.glob("*")):
+            if path.is_file() and path.suffix.lower() in _INVENTORY_SUFFIXES and path not in paths:
+                paths.append(path)
+            if len(paths) >= max_files:
+                break
+    snippets: list[str] = []
+    for path in paths[:max_files]:
+        try:
+            rel = str(path.relative_to(root))
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippets.append(f"## {rel}\n{text[:max_chars_per_file]}")
+    return snippets
+
+
 def _execute_parent_context(root: str | Path, project_text: str, item: str, max_chars: int = 12000) -> str:
-    notes = read_auto_notes(root, max_files=8)
+    notes = read_auto_notes(root, max_files=3)
     inventory = _train_side_inventory(root)
     inv_block = "\n".join(f"- {f}" for f in inventory) if inventory else "(no train-side files yet)"
+    snippet_block = "\n\n".join(_train_side_snippets(root)) or "(no readable train-side snippets)"
     parts = [
         "V2 execute phase: implement exactly one safe project-confined change for this todo.",
         f"Todo: {item}",
         "Forbidden: do not edit eval harness/read-only evaluation files.",
+        "You MUST return a mutating action: prefer type='write' with a complete file body. "
+        "Do not return note/read for implementation tasks.",
         "",
         "## Keep the change surface MINIMAL — follow this 3-tier escalation:",
         "TIER 1 (default): edit the MOST RELEVANT EXISTING file listed below in-place. Do not create a "
@@ -228,6 +269,9 @@ def _execute_parent_context(root: str | Path, project_text: str, item: str, max_
         "## Existing editable train-side files (prefer editing these — Tier 1):",
         inv_block,
         "",
+        "## Current train-side file snippets:",
+        snippet_block,
+        "",
         "## Action choice:",
         "STRONGLY PREFER a full-file 'write' action (path + complete new file content) over 'apply_patch'. "
         "A unified diff is fragile (wrong hunk counts / stale context can no-op) and slower to generate. "
@@ -238,7 +282,7 @@ def _execute_parent_context(root: str | Path, project_text: str, item: str, max_
         project_text or "",
     ]
     for name, text in notes.items():
-        parts.extend(["", f"# .auto/{name}", text])
+        parts.extend(["", f"# .auto/{name} (truncated)", (text or "")[:1200]])
     data = "\n".join(parts)
     return data[-max_chars:]
 
@@ -333,10 +377,23 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
 
     def handler(ctx: PhaseContext) -> PhaseResult:
         todo_state = load_todo_state(ctx.root)
-        ready = ready_tasks(todo_state)
-        using_todo_state = bool(ready)
+        structured_tasks = bool(todo_state.get("tasks"))
+        ready = ready_execute_tasks(todo_state)
+        using_todo_state = structured_tasks
         items = [task["goal"] for task in ready] if using_todo_state else parse_todo_from_plan(ctx.root)
         if not items:
+            if using_todo_state:
+                execute_open = has_open_tasks(todo_state, phase="execute")
+                run_open = has_open_tasks(todo_state, phase="run")
+                run_ready = bool(ready_tasks(todo_state, phase="run", statuses={"pending", "in_progress"}))
+                signals_update = {"execute_has_open_tasks": execute_open and not run_ready}
+                if (execute_open and not ready and not run_ready) or (run_open and not run_ready and not execute_open):
+                    signals_update["plan_still_valid"] = False
+                summary = "execute: no ready execute tasks"
+                if run_open:
+                    summary += "; run tasks are ready or waiting"
+                write_auto_note(ctx.root, "execute_report", "# Execute Report\n\n" + summary + "\n")
+                return PhaseResult(signals_update=signals_update, summary=summary)
             items = ["(no explicit todo; execute current plan)"]
 
         # Bound the number of (possibly slow, LLM-backed) actions per Execute visit
@@ -363,7 +420,7 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                 done += 1
                 any_verified = True
                 continue
-            if not _is_implementation_todo(item):
+            if not using_todo_state and not _is_implementation_todo(item):
                 res = {
                     "item": item,
                     "status": "skipped",
@@ -375,7 +432,16 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                 done += 1
                 any_verified = True
                 continue
-            res = fn(item, ctx) or {}
+            exec_item = _execution_attempt_item(task, item)
+            res = fn(exec_item, ctx) or {}
+            if task and exec_item != item:
+                res.setdefault("full_item", item)
+                res.setdefault("subgoal", exec_item)
+            if task:
+                res.setdefault(
+                    "max_attempts",
+                    int(getattr(getattr(ctx.loop, "settings", None), "execute_max_task_attempts", 2) or 2),
+                )
             results.append(res)
             _update_task_from_execute_result(todo_state, task, res)
             # verification hard-constraint: only verified items count as done.
@@ -398,9 +464,12 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         # If nothing verified and something was attempted, treat as an execute-side
         # major error so the machine routes to Evaluate rather than Run — but only
         # when there is nothing left to try (otherwise let the next visit continue).
-        attempted = any(r.get("status") in {"ok", "done", "failed"} for r in results)
+        attempted = any(r.get("status") in {"ok", "done", "failed", "tried"} for r in results)
         major = attempted and not any_verified and not more_pending
-        signals_update = {"major_error": True} if major else {}
+        execute_open = bool(ready_execute_tasks(todo_state)) if using_todo_state else bool(more_pending)
+        signals_update = {"execute_has_open_tasks": execute_open}
+        if major:
+            signals_update["major_error"] = True
         if major:
             append_lesson(ctx.root, kind="operational_error",
                           summary="execute produced no verified change", detail=json.dumps(results, ensure_ascii=False)[:2000])
@@ -409,6 +478,43 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         return PhaseResult(project_text=project_text, signals_update=signals_update, summary=summary)
 
     return handler
+
+
+def _execution_attempt_item(task: Optional[dict], item: str) -> str:
+    """Select a small current subgoal from an oversized implementation task."""
+    if not task:
+        return item
+    text = str(item or "").strip()
+    if len(text) <= 700:
+        return text
+    last = task.get("last_result") if isinstance(task, dict) else {}
+    attempts = 0
+    if isinstance(last, dict):
+        try:
+            attempts = int(last.get("attempts") or 0)
+        except Exception:
+            attempts = 0
+    pieces = _split_implementation_goal(text)
+    if not pieces:
+        return text[:700]
+    selected = pieces[min(attempts, len(pieces) - 1)]
+    return (
+        "Implement this focused part of the larger task: "
+        + selected[:650]
+        + "\nKeep existing behavior working and prefer editing the most relevant existing train-side file."
+    )
+
+
+def _split_implementation_goal(text: str) -> list[str]:
+    raw = str(text or "").strip()
+    if "covering:" in raw:
+        raw = raw.split("covering:", 1)[1]
+    parts = []
+    for chunk in raw.replace("\n", "; ").split(";"):
+        cleaned = chunk.strip(" -.\t")
+        if cleaned:
+            parts.append(cleaned)
+    return parts
 
 
 def _execute_analysis_task(ctx: PhaseContext, task: dict) -> dict:
@@ -462,11 +568,22 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         return
     status = str(result.get("status") or "")
     verified = bool(result.get("verification"))
+    last_result = dict(target.get("last_result") or {})
+    attempts = int(last_result.get("attempts") or 0)
+    if not verified and status not in {"skipped"}:
+        attempts += 1
+    max_attempts = 2
+    try:
+        max_attempts = max(1, int(result.get("max_attempts") or 2))
+    except Exception:
+        max_attempts = 2
     if status == "skipped":
         target["status"] = "skipped"
     elif status in {"ok", "done"} and verified:
         target["status"] = "verified"
     elif status == "failed":
+        target["status"] = "failed"
+    elif attempts >= max_attempts:
         target["status"] = "failed"
     else:
         target["status"] = "in_progress"
@@ -474,6 +591,8 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         "status": status,
         "verification": verified,
         "note": str(result.get("note") or "")[:1000],
+        "attempts": attempts,
+        "max_attempts": max_attempts,
         "updated_at": time.time(),
     }
 
@@ -522,7 +641,7 @@ def _find_search_driver(ctx: PhaseContext) -> Optional[str]:
         for path in sorted(train_dir.glob("*.py")):
             if path.name.startswith("_") or path.name == "__init__.py":
                 continue
-            if path.name in {"train.py", "search.py"} or "search" in path.stem or "driver" in path.stem or "exploration" in path.stem:
+            if path.name == "search.py" or "search" in path.stem or "driver" in path.stem or "exploration" in path.stem:
                 candidates.append(path)
     if candidates:
         preferred = sorted(candidates, key=lambda p: (
@@ -564,20 +683,21 @@ def _fallback_eval_loop_command() -> str:
 
 def _select_run_task(root: str | Path) -> Optional[dict]:
     state = load_todo_state(root)
-    candidates = []
-    for task in state.get("tasks", []):
-        if task.get("status") not in {"pending", "verified", "in_progress"}:
-            continue
-        if task.get("type") not in {"validation", "experiment", "maintenance"}:
-            continue
-        if not task.get("run_spec"):
-            continue
-        candidates.append(task)
+    candidates = [task for task in ready_tasks(state, phase="run", statuses={"pending", "in_progress"}) if task.get("run_spec")]
     candidates.sort(key=lambda t: (int(t.get("priority") or 0), t.get("task_id", "")))
     return candidates[0] if candidates else None
 
 
-def _command_from_run_spec(run_spec: dict, *, fallback_command: str) -> tuple[str, int, float, str]:
+def _has_structured_run_work(root: str | Path) -> bool:
+    state = load_todo_state(root)
+    return any(
+        task.get("run_spec")
+        for task in state.get("tasks", [])
+        if task.get("status") in {"pending", "in_progress"} and task_phase(task) == "run"
+    )
+
+
+def _command_from_run_spec(run_spec: dict, *, fallback_command: str) -> tuple[str, int, float, str, str, float]:
     run_spec = dict(run_spec or {})
     commands = run_spec.get("commands") or []
     if isinstance(commands, str):
@@ -585,9 +705,17 @@ def _command_from_run_spec(run_spec: dict, *, fallback_command: str) -> tuple[st
     commands = [str(c).strip() for c in commands if str(c).strip()]
     command = " && ".join(commands) if commands else fallback_command
     mode = str(run_spec.get("mode") or "single").strip().lower()
-    max_iters = int(run_spec.get("max_iters") or (1 if mode == "single" else 100))
+    if mode not in {"single", "loop", "long_job"}:
+        mode = "single"
+    max_iters = int(run_spec.get("max_iters") or (100 if mode == "loop" else 1))
     max_seconds = float(run_spec.get("max_seconds") or 0.0)
-    return command, max(1, max_iters), max(0.0, max_seconds), mode
+    monitor_commands = run_spec.get("monitor_commands") or []
+    if isinstance(monitor_commands, str):
+        monitor_commands = [monitor_commands]
+    monitor_commands = [str(c).strip() for c in monitor_commands if str(c).strip()]
+    monitor_command = " && ".join(monitor_commands)
+    poll_interval = float(run_spec.get("poll_interval_seconds") or 0.0)
+    return command, max(1, max_iters), max(0.0, max_seconds), mode, monitor_command, max(0.0, poll_interval)
 
 
 def _ensure_search_log_helper(root: str | Path) -> None:
@@ -684,20 +812,33 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         return {"status": "skipped", "returncode": None, "stdout": "no loop"}
     _ensure_search_log_helper(ctx.root)
     run_task = _select_run_task(ctx.root)
+    if run_task is None and _has_structured_run_work(ctx.root):
+        return {
+            "status": "failed",
+            "returncode": 1,
+            "stdout": "",
+            "stderr": "structured run tasks exist, but none are ready; dependencies are not satisfied",
+            "search_driver": "",
+            "inner_evals": 0,
+        }
     driver = _find_search_driver(ctx)
     if driver:
         fallback_command = _search_driver_command(driver)
         rationale = f"v2 run search driver ({driver})"
+        mode = "loop"
     else:
         fallback_command = _fallback_eval_loop_command()
         rationale = "v2 run experiment"
+        mode = "single"
     if run_task:
-        command, spec_max_evals, spec_max_seconds, mode = _command_from_run_spec(run_task.get("run_spec"), fallback_command=fallback_command)
+        command, spec_max_evals, spec_max_seconds, mode, monitor_command, poll_interval = _command_from_run_spec(run_task.get("run_spec"), fallback_command=fallback_command)
         max_evals_override = spec_max_evals
         max_seconds_override = spec_max_seconds
         rationale = f"v2 run task {run_task.get('task_id')} ({mode})"
     else:
         command = fallback_command
+        monitor_command = ""
+        poll_interval = 0.0
         max_evals_override = None
         max_seconds_override = None
     from core.autoresearch_loop import AutoResearchAction, git_snapshot
@@ -710,20 +851,26 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     max_seconds = max(0.0, float(max_seconds_override if max_seconds_override is not None else getattr(loop.settings, "run_max_inner_seconds", 20.0) or 0.0))
     max_evals = max(1, int(max_evals_override if max_evals_override is not None else getattr(loop.settings, "run_max_inner_evals", 100) or 1))
     cheap_threshold = max(0.0, float(getattr(loop.settings, "run_cheap_eval_threshold_seconds", 2.0) or 0.0))
-    previous_candidate = _current_submission_key(ctx.root)
     obs = None
     for index in range(max_evals):
         obs = loop.execute_action(action)
         observations.append(obs)
-        current_candidate = _current_submission_key(ctx.root)
         last_duration = _artifact_duration(obs)
         if obs.status not in {"ok", "ok_metric_recovered"}:
             break
-        if index == 0 and (last_duration is None or last_duration > cheap_threshold):
+        if mode == "single":
             break
-        if current_candidate is not None and current_candidate == previous_candidate:
+        if mode == "long_job":
+            if monitor_command:
+                monitor_action = AutoResearchAction(type="run", rationale=f"{rationale} monitor", command=monitor_command, role="trial")
+                if poll_interval:
+                    time.sleep(min(poll_interval, max(0.0, max_seconds - (time.time() - started))) if max_seconds else poll_interval)
+                monitor_obs = loop.execute_action(monitor_action)
+                observations.append(monitor_obs)
+                obs = monitor_obs
             break
-        previous_candidate = current_candidate
+        if index == 0 and run_task is None and driver and (last_duration is None or last_duration > cheap_threshold):
+            break
         if max_seconds and time.time() - started >= max_seconds:
             break
     obs = obs or observations[-1]

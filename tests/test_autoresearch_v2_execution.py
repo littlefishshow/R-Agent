@@ -7,6 +7,7 @@ from core.autoresearch_execution import (
     make_execute_handler,
     make_run_handler,
     _find_search_driver,
+    _execution_attempt_item,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
@@ -99,11 +100,11 @@ def test_execute_prefers_todo_state_and_updates_task_status(tmp_path):
 
     result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
     assert seen == ["edit config"]
-    assert "2/2 verified" in result.summary
+    assert "1/1 verified" in result.summary
     state = load_todo_state(tmp_path)
     assert state["tasks"][0]["status"] == "verified"
     assert state["tasks"][0]["last_result"]["note"] == "done"
-    assert state["tasks"][1]["status"] == "skipped"
+    assert state["tasks"][1]["status"] == "pending"
 
 
 def test_execute_analysis_task_writes_analysis_note(tmp_path):
@@ -401,7 +402,7 @@ def test_execute_no_major_error_while_items_pending(tmp_path):
     handler = make_execute_handler(fake_execute)
     r1 = handler(_ctx(tmp_path, "execute", loop=loop))
     # still items pending -> don't flag major error yet
-    assert r1.signals_update == {}
+    assert r1.signals_update == {"execute_has_open_tasks": True}
 
 
 def test_execute_skips_non_implementation_todos(tmp_path):
@@ -417,6 +418,111 @@ def test_execute_skips_non_implementation_todos(tmp_path):
     assert "2/2 verified" in result.summary
     report = (tmp_path / ".auto" / "execute_report.md").read_text(encoding="utf-8")
     assert "non-implementation todo" in report
+
+
+def test_execute_does_not_verify_structured_run_tasks(tmp_path):
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "edit config", "type": "implementation", "status": "verified", "priority": 1},
+            {"task_id": "val", "goal": "run eval", "type": "validation", "status": "pending", "priority": 2,
+             "depends_on": ["impl"], "run_spec": {"commands": ["bash eval.sh"]}},
+        ]
+    })
+    seen = []
+
+    def fake_execute(item, ctx):
+        seen.append(item)
+        return {"item": item, "status": "ok", "verification": True}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
+    assert seen == []
+    assert "no ready execute tasks" in result.summary
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][1]["status"] == "pending"
+
+
+def test_execute_yields_to_ready_run_checkpoint_before_later_implementation(tmp_path):
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "a", "goal": "inspect", "type": "analysis", "status": "verified", "priority": 1},
+            {"task_id": "baseline", "goal": "run baseline", "type": "validation", "status": "pending", "priority": 2,
+             "run_spec": {"commands": ["bash eval.sh"]}},
+            {"task_id": "impl", "goal": "edit train", "type": "implementation", "status": "pending", "priority": 3},
+        ]
+    })
+    seen = []
+
+    def fake_execute(item, ctx):
+        seen.append(item)
+        return {"item": item, "status": "ok", "verification": True}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
+    assert seen == []
+    assert "no ready execute tasks" in result.summary
+    assert result.signals_update["execute_has_open_tasks"] is False
+    assert "plan_still_valid" not in result.signals_update
+
+
+def test_execute_stays_in_execute_when_structured_execute_tasks_remain(tmp_path):
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "a", "goal": "edit a", "type": "implementation", "status": "pending", "priority": 1},
+            {"task_id": "b", "goal": "edit b", "type": "implementation", "status": "pending", "priority": 2},
+            {"task_id": "v", "goal": "run eval", "type": "validation", "status": "pending", "priority": 3,
+             "depends_on": ["a", "b"], "run_spec": {"commands": ["bash eval.sh"]}},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_actions_per_step=1)
+    loop = AutoResearchLoop(settings)
+
+    def fake_execute(item, ctx):
+        return {"item": item, "status": "ok", "verification": True}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute", loop=loop))
+    assert result.signals_update["execute_has_open_tasks"] is True
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["status"] == "verified"
+    assert state["tasks"][1]["status"] == "pending"
+
+
+def test_execute_failed_attempts_eventually_fail_task(tmp_path):
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "edit train", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_task_attempts=2)
+    loop = AutoResearchLoop(settings)
+
+    def fake_execute(item, ctx):
+        return {"item": item, "status": "tried", "verification": False, "note": "no edit"}
+
+    handler = make_execute_handler(fake_execute)
+    first = handler(_ctx(tmp_path, "execute", loop=loop))
+    assert first.signals_update["execute_has_open_tasks"] is True
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["status"] == "in_progress"
+    assert state["tasks"][0]["last_result"]["attempts"] == 1
+
+    second = handler(_ctx(tmp_path, "execute", loop=loop))
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["status"] == "failed"
+    assert state["tasks"][0]["last_result"]["attempts"] == 2
+    assert second.signals_update.get("major_error") is True
+
+
+def test_execution_attempt_item_focuses_long_implementation_task():
+    item = "Implement consolidated change covering: " + "; ".join([
+        "Add optimizer " + ("x" * 300),
+        "Add logging " + ("y" * 300),
+        "Add restarts " + ("z" * 300),
+    ])
+    task = {"task_id": "t", "type": "implementation", "last_result": {"attempts": 1}}
+    focused = _execution_attempt_item(task, item)
+    assert "Add logging" in focused
+    assert "Add optimizer" not in focused
 
 
 # --------------------------------------------------------------------------- #
@@ -506,6 +612,33 @@ def test_run_uses_todo_state_run_spec_and_updates_task(tmp_path):
     assert "inner_evals=1" in report
 
 
+def test_run_does_not_fallback_when_structured_run_task_is_blocked(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nmkdir -p outputs\nprintf '{\"x\":0,\"y\":0}\\n' > outputs/submission.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nprintf '{\"primary_metric\":999,\"z\":999,\"higher_is_better\":false}\\n' > metrics.json\n",
+        encoding="utf-8",
+    )
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "edit train", "type": "implementation", "status": "pending"},
+            {"task_id": "val", "goal": "run eval", "type": "validation", "status": "pending",
+             "depends_on": ["impl"], "run_spec": {"commands": ["bash train/train.sh", "bash eval.sh"]}},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler(max_autofix=0)(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update.get("major_error") is True
+    assert not (tmp_path / "metrics.json").exists()
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][1]["status"] == "pending"
+
+
 def test_run_task_verification_metric_threshold_can_fail(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     save_todo_state(tmp_path, {
@@ -535,13 +668,14 @@ def test_run_task_verification_metric_threshold_can_fail(tmp_path):
     assert task["last_result"]["metric"] == 7
 
 
-def test_run_adaptive_loop_continues_only_when_cheap_and_changing(tmp_path):
+def test_run_spec_loop_repeats_until_budget(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "train").mkdir()
     (tmp_path / "train" / "train.sh").write_text(
         "#!/usr/bin/env bash\nmkdir -p outputs\n"
-        "n=$(wc -l < outputs/search_log.jsonl 2>/dev/null || echo 0)\n"
-        "printf '{\"x\":%s,\"y\":0}\\n' \"$n\" > outputs/submission.json\n",
+        "n=$(cat outputs/counter.txt 2>/dev/null || echo 0)\n"
+        "printf '{\"x\":%s,\"y\":0}\\n' \"$n\" > outputs/submission.json\n"
+        "printf '%s' \"$((n+1))\" > outputs/counter.txt\n",
         encoding="utf-8",
     )
     (tmp_path / "eval.sh").write_text(
@@ -555,16 +689,30 @@ def test_run_adaptive_loop_continues_only_when_cheap_and_changing(tmp_path):
         "PY\n",
         encoding="utf-8",
     )
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "loop",
+                "goal": "loop eval",
+                "type": "experiment",
+                "status": "pending",
+                "run_spec": {
+                    "mode": "loop",
+                    "commands": ["bash train/train.sh", "bash eval.sh"],
+                    "max_iters": 5,
+                    "max_seconds": 5.0,
+                },
+            }
+        ]
+    })
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
-                                    run_search_driver=False, run_max_inner_evals=5,
-                                    run_max_inner_seconds=5.0, run_cheap_eval_threshold_seconds=2.0)
+                                    run_search_driver=False)
     loop = AutoResearchLoop(settings)
     result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
     assert result.signals_update == {}
     report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
     assert "inner_evals=5" in report
-    rows = (tmp_path / "outputs" / "search_log.jsonl").read_text(encoding="utf-8").splitlines()
-    assert len(rows) == 5
+    assert (tmp_path / "outputs" / "counter.txt").read_text(encoding="utf-8") == "5"
 
 
 def test_run_does_not_mark_solved_without_explicit_threshold(tmp_path):
@@ -607,7 +755,7 @@ def test_run_marks_solved_with_explicit_threshold(tmp_path):
     assert "solved=True" in report
 
 
-def test_run_adaptive_loop_stops_after_expensive_first_eval(tmp_path):
+def test_default_run_is_single_even_when_eval_is_cheap(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "train").mkdir()
     (tmp_path / "train" / "train.sh").write_text(
@@ -615,14 +763,50 @@ def test_run_adaptive_loop_stops_after_expensive_first_eval(tmp_path):
         encoding="utf-8",
     )
     (tmp_path / "eval.sh").write_text(
-        "#!/usr/bin/env bash\nsleep 1\nprintf '{\"primary_metric\":3,\"z\":3,\"higher_is_better\":false}\\n' > metrics.json\n",
+        "#!/usr/bin/env bash\nprintf '{\"primary_metric\":3,\"z\":3,\"higher_is_better\":false}\\n' > metrics.json\n",
         encoding="utf-8",
     )
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
                                     run_search_driver=False, run_max_inner_evals=5,
-                                    run_max_inner_seconds=10.0, run_cheap_eval_threshold_seconds=0.1)
+                                    run_max_inner_seconds=10.0)
     loop = AutoResearchLoop(settings)
     result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
     assert result.signals_update == {}
     report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
     assert "inner_evals=1" in report
+
+
+def test_run_spec_long_job_runs_submit_and_one_monitor(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "job",
+                "goal": "submit training job",
+                "type": "experiment",
+                "status": "pending",
+                "run_spec": {
+                    "mode": "long_job",
+                    "commands": [
+                        "mkdir -p outputs",
+                        "printf submitted > outputs/job_status.txt",
+                        "printf '{\"primary_metric\":5,\"z\":5,\"higher_is_better\":false}\\n' > metrics.json",
+                    ],
+                    "monitor_commands": [
+                        "printf monitored >> outputs/job_status.txt",
+                        "printf '{\"primary_metric\":4,\"z\":4,\"higher_is_better\":false}\\n' > metrics.json",
+                    ],
+                    "max_iters": 10,
+                },
+            }
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False)
+    loop = AutoResearchLoop(settings)
+    make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "inner_evals=2" in report
+    assert (tmp_path / "outputs" / "job_status.txt").read_text(encoding="utf-8") == "submittedmonitored"
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "verified"

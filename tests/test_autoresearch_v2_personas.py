@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
@@ -7,6 +8,10 @@ from core.autoresearch_personas import (
     DebateConfig,
     make_plan_handler,
     DEFAULT_PERSONAS,
+    _classify_plan_item,
+    _coalesce_plan_items,
+    _ensure_baseline_checkpoint,
+    _plan_to_todo_state,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import (
@@ -72,6 +77,66 @@ def test_debate_survives_persona_failure():
     assert result["plan"] == "p"
 
 
+def test_plan_item_classification_prefers_implementation_verbs():
+    assert _classify_plan_item("Create or update train/train.sh so it reliably runs a Python optimizer") == "implementation"
+    assert _classify_plan_item("Add a persistent history file containing every evaluated x,y,z") == "implementation"
+    assert _classify_plan_item("Run bash train/train.sh, then bash eval.sh and compare metrics") == "validation"
+    assert _classify_plan_item("Inspect existing train structure") == "analysis"
+
+
+def test_plan_items_coalesce_many_implementation_bullets():
+    items = [
+        "Inspect train files",
+        "Implement optimizer",
+        "Add history logging",
+        "Create oracle wrapper",
+        "Add restart logic",
+        "Write best candidate",
+        "Run bash train/train.sh and bash eval.sh",
+    ]
+    coalesced = _coalesce_plan_items(items, max_implementation_tasks=2)
+    assert coalesced[0] == "Inspect train files"
+    assert len([item for item in coalesced if _classify_plan_item(item) == "implementation"]) == 2
+    assert coalesced[-1].startswith("Run bash")
+
+
+def test_plan_to_todo_state_validation_depends_only_on_prior_execute_tasks():
+    state = _plan_to_todo_state(
+        "1. Implement optimizer\n"
+        "2. Run bash train/train.sh and bash eval.sh\n"
+        "3. Add restart logic\n"
+        "4. Run final validation\n"
+    )
+    tasks = state["tasks"]
+    assert tasks[1]["depends_on"] == ["t1"]
+    assert tasks[3]["depends_on"] == ["t1", "t3"]
+
+
+def test_baseline_checkpoint_inserted_before_first_implementation():
+    state = _plan_to_todo_state(
+        "1. Inspect train files\n"
+        "2. Implement optimizer\n"
+        "3. Run bash train/train.sh and bash eval.sh\n"
+    )
+    state = _ensure_baseline_checkpoint(state)
+    tasks = state["tasks"]
+    assert [t["task_id"] for t in tasks[:3]] == ["t1", "baseline", "t2"]
+    assert tasks[1]["type"] == "validation"
+    assert tasks[1]["depends_on"] == ["t1"]
+    assert tasks[1]["run_spec"]["commands"] == ["bash train/train.sh", "bash eval.sh"]
+
+
+def test_baseline_checkpoint_not_duplicated_when_run_precedes_implementation():
+    state = _plan_to_todo_state(
+        "1. Inspect train files\n"
+        "2. Run bash train/train.sh and bash eval.sh\n"
+        "3. Implement optimizer\n"
+    )
+    updated = _ensure_baseline_checkpoint(state)
+    assert [task["task_id"] for task in updated["tasks"]].count("baseline") == 0
+    assert [task["type"] for task in updated["tasks"]] == ["analysis", "validation", "implementation"]
+
+
 def _make_loop(tmp_path):
     (tmp_path / "program.md").write_text("Goal: maximize accuracy\n", encoding="utf-8")
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
@@ -104,10 +169,13 @@ def test_plan_handler_writes_belief_plan_auto_and_transcript(tmp_path):
     assert "edit train config" in (tmp_path / ".auto" / "plan.md").read_text(encoding="utf-8")
     # structured task state is now the machine-readable handoff
     todo_state = load_todo_state(tmp_path)
-    assert [t["task_id"] for t in todo_state["tasks"]] == ["t1", "t2", "t3"]
-    assert todo_state["tasks"][0]["goal"] == "edit train config"
-    assert todo_state["tasks"][1]["type"] == "validation"
-    assert todo_state["tasks"][1]["run_spec"]["commands"] == ["bash train/train.sh", "bash eval.sh"]
+    assert [t["task_id"] for t in todo_state["tasks"]] == ["baseline", "t1", "t2", "t3"]
+    assert todo_state["tasks"][0]["type"] == "validation"
+    assert todo_state["tasks"][1]["goal"] == "edit train config"
+    assert todo_state["tasks"][2]["type"] == "validation"
+    assert todo_state["tasks"][2]["run_spec"]["commands"] == ["bash train/train.sh", "bash eval.sh"]
+    assert todo_state["tasks"][2]["depends_on"] == ["t1"]
+    assert todo_state["tasks"][3]["depends_on"] == ["t1"]
     # transcript archived to L4, not project.md
     artifacts = list((tmp_path / ".autoresearch" / "artifacts").glob("*plan_debate*"))
     assert artifacts
@@ -129,6 +197,32 @@ def test_plan_handler_no_llm_is_deterministic_noop(tmp_path):
     result = handler(ctx)
     assert "plan" in result.summary
     assert (tmp_path / ".auto" / "plan.md").exists()
+
+
+def test_plan_handler_framework_deadline_records_fallback_plan(tmp_path):
+    loop = _make_loop(tmp_path)
+    loop.settings.llm_request_timeout = 0.05
+    loop.settings.plan_max_personas = 1
+    program_text = ensure_program_scaffold((tmp_path / "program.md").read_text(encoding="utf-8"))
+
+    def slow_chat(system, user):  # noqa: ARG001
+        time.sleep(1.0)
+        return "{}"
+
+    ctx = PhaseContext(
+        phase="plan",
+        root=tmp_path,
+        program_text=program_text,
+        project_text="# Project State\n\n## 当前计划\nold\n",
+        signals=PhaseSignals(phase="plan"),
+        loop=loop,
+    )
+    started = time.time()
+    result = make_plan_handler(slow_chat)(ctx)
+    assert time.time() - started < 0.5
+    assert "plan_set" in result.summary
+    state = load_todo_state(tmp_path)
+    assert state["tasks"]
 
 
 def test_plan_handler_readonly_program_skips_belief(tmp_path):
@@ -169,6 +263,6 @@ def test_plan_handler_preserves_existing_todo_progress(tmp_path):
     )
     make_plan_handler(chat)(ctx)
     state = load_todo_state(tmp_path)
-    assert state["tasks"][0]["goal"] == "edit train config"
-    assert state["tasks"][0]["status"] == "verified"
-    assert state["tasks"][0]["last_result"] == {"ok": True}
+    edited = next(task for task in state["tasks"] if task["goal"] == "edit train config")
+    assert edited["status"] == "verified"
+    assert edited["last_result"] == {"ok": True}

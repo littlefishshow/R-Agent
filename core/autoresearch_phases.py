@@ -30,6 +30,7 @@ from core.autoresearch_memory import (
 )
 from core.autoresearch_debug import debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
 from core.autoresearch_gate_state import load_gate_state
+from core.autoresearch_todo_state import has_failed_tasks, has_open_tasks, load_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -47,6 +48,8 @@ class PhaseSignals:
     major_error: bool = False          # Run/Execute hit an unrecoverable error
     solved: bool = False               # objective is good enough; stop cleanly
     plan_still_valid: bool = True      # is the current L2 plan still actionable?
+    plan_has_open_tasks: bool = False  # current structured plan still has work
+    execute_has_open_tasks: bool = False  # execute phase still has unlocked work
     budget_exhausted: bool = False
     budget_degrade: bool = False
     started: bool = True               # first Gate visit after Init?
@@ -56,12 +59,14 @@ def phase_gate(sig: PhaseSignals) -> tuple[str, str]:
     """Gate after Init/Compress: decide whether to re-Plan or go straight to Execute."""
     if sig.started:
         return "plan", "project start: initial planning"
+    if not sig.plan_still_valid:
+        return "plan", "current plan exhausted/invalid"
+    if sig.plan_has_open_tasks:
+        return "execute", "current plan still has open tasks"
     if sig.pareto_changed:
         return "plan", "pareto front changed since last evaluate"
     if sig.plateau_counter >= max(1, sig.plateau_patience):
         return "plan", f"plateau>={sig.plateau_patience}: replan (widen exploration)"
-    if not sig.plan_still_valid:
-        return "plan", "current plan exhausted/invalid"
     return "execute", "current plan still valid: continue executing"
 
 
@@ -91,6 +96,10 @@ def next_phase(sig: PhaseSignals) -> tuple[str, str]:
     if phase == "execute":
         if sig.major_error:
             return "evaluate", "major error during execute: jump to evaluate"
+        if sig.execute_has_open_tasks:
+            return "execute", "execute still has open plan tasks"
+        if not sig.plan_still_valid:
+            return "evaluate", "current plan exhausted before run"
         return "run", "changes applied: run project"
     if phase == "run":
         if sig.solved:
@@ -209,12 +218,15 @@ class PhaseController:
     def build_signals(self, phase: str, extra: Optional[dict] = None) -> PhaseSignals:
         budget = getattr(self.loop, "budget", None)
         gate = load_gate_state(self.root)
+        todo_state = load_todo_state(self.root)
+        todo_has_failed = has_failed_tasks(todo_state)
         sig = PhaseSignals(
             phase=phase,
             plateau_patience=int(getattr(self.settings, "plateau_patience", 3)),
             pareto_changed=bool(gate.get("pareto_changed")),
             plateau_counter=int(gate.get("plateau_counter") or 0),
-            plan_still_valid=bool(gate.get("plan_still_valid", True)),
+            plan_still_valid=bool(gate.get("plan_still_valid", True)) and not todo_has_failed,
+            plan_has_open_tasks=has_open_tasks(todo_state),
             budget_exhausted=bool(budget.is_exhausted()) if budget is not None else False,
             budget_degrade=bool(budget.should_degrade()) if budget is not None else False,
         )

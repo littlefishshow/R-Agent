@@ -13,6 +13,7 @@ from core.autoresearch_phases import (
 from core.autoresearch_phase_handlers import default_handlers, survey_project
 from core.autoresearch_memory import read_phase, split_program
 from core.autoresearch_gate_state import save_gate_state
+from core.autoresearch_todo_state import save_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -21,6 +22,7 @@ from core.autoresearch_gate_state import save_gate_state
 
 def test_phase_gate_branches():
     assert phase_gate(PhaseSignals(phase="gate", started=True))[0] == "plan"
+    assert phase_gate(PhaseSignals(phase="gate", started=False, pareto_changed=True, plan_has_open_tasks=True))[0] == "execute"
     assert phase_gate(PhaseSignals(phase="gate", started=False, pareto_changed=True))[0] == "plan"
     assert phase_gate(PhaseSignals(phase="gate", started=False, plateau_counter=3, plateau_patience=3))[0] == "plan"
     assert phase_gate(PhaseSignals(phase="gate", started=False, plan_still_valid=False))[0] == "plan"
@@ -36,6 +38,7 @@ def test_budget_gate_pauses_on_exhaustion_and_plateau():
 def test_next_phase_linear_edges():
     assert next_phase(PhaseSignals(phase="plan"))[0] == "execute"
     assert next_phase(PhaseSignals(phase="execute"))[0] == "run"
+    assert next_phase(PhaseSignals(phase="execute", execute_has_open_tasks=True))[0] == "execute"
     assert next_phase(PhaseSignals(phase="run"))[0] == "evaluate"
     assert next_phase(PhaseSignals(phase="evaluate"))[0] == "compress"
 
@@ -129,6 +132,18 @@ def test_controller_build_signals_reads_gate_state(tmp_path):
     assert sig.pareto_changed is True
     assert sig.plateau_counter == 2
     assert sig.plan_still_valid is False
+
+
+def test_controller_build_signals_invalidates_plan_on_failed_task(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "t1", "goal": "edit", "type": "implementation", "status": "failed"},
+        ]
+    })
+    sig = ctrl.build_signals("gate")
+    assert sig.plan_still_valid is False
+    assert phase_gate(sig)[0] == "plan"
 
 
 def test_evaluate_handler_writes_lesson_on_major_error(tmp_path):

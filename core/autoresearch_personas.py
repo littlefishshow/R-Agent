@@ -21,8 +21,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from core.autoresearch_debug import inflight_finish, inflight_start
 from core.autoresearch_memory import update_belief, split_program, write_auto_note
 from core.autoresearch_phases import PhaseContext, PhaseResult
+from core.autoresearch_timeout import call_with_deadline
 from core.autoresearch_todo_state import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
 
 
@@ -90,11 +92,12 @@ class DebateConfig:
 class PlanDebate:
     """Run a bounded persona debate and let the leader produce the plan."""
 
-    def __init__(self, chat: ChatFn, *, personas=DEFAULT_PERSONAS, leader: Persona = LEADER, config: Optional[DebateConfig] = None):
+    def __init__(self, chat: ChatFn, *, personas=DEFAULT_PERSONAS, leader: Persona = LEADER, config: Optional[DebateConfig] = None, chat_timeout_seconds: float = 0.0):
         self.chat = chat
         self.personas = tuple(personas)
         self.leader = leader
         self.config = config or DebateConfig()
+        self.chat_timeout_seconds = float(chat_timeout_seconds or 0.0)
 
     def _persona_count(self, degrade: bool) -> int:
         cap = self.config.degrade_personas if degrade else self.config.max_personas
@@ -122,7 +125,7 @@ class PlanDebate:
         for persona in self.personas[:n]:
             user = json.dumps({"task": "give your opinion on how to improve the project next",
                                "stable_context": context}, ensure_ascii=False)
-            raw = _safe_chat(self.chat, persona.system, user)
+            raw = _safe_chat(self.chat, persona.system, user, timeout_seconds=self.chat_timeout_seconds, label=f"plan persona {persona.name}")
             transcript.append({"persona": persona.name, "raw": raw})
             opinions.append(f"[{persona.name}] {_extract_opinion(raw)}")
 
@@ -131,7 +134,7 @@ class PlanDebate:
             "stable_context": context,
             "persona_opinions": opinions,
         }, ensure_ascii=False)
-        leader_raw = _safe_chat(self.chat, self.leader.system, leader_user)
+        leader_raw = _safe_chat(self.chat, self.leader.system, leader_user, timeout_seconds=self.chat_timeout_seconds, label="plan leader")
         transcript.append({"persona": self.leader.name, "raw": leader_raw})
         decision = _extract_json(leader_raw)
 
@@ -145,9 +148,9 @@ class PlanDebate:
         }
 
 
-def _safe_chat(chat: ChatFn, system: str, user: str) -> str:
+def _safe_chat(chat: ChatFn, system: str, user: str, *, timeout_seconds: float = 0.0, label: str = "plan chat") -> str:
     try:
-        return chat(system, user) or ""
+        return call_with_deadline(lambda: chat(system, user) or "", timeout_seconds=timeout_seconds, label=label)
     except Exception as exc:
         return json.dumps({"opinion": f"(persona failed: {exc})", "error": str(exc)})
 
@@ -179,7 +182,7 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
     """
 
     def handler(ctx: PhaseContext) -> PhaseResult:
-        chat_fn = chat or build_loop_chat_fn(ctx.loop, tier="plan")
+        chat_fn = chat or build_loop_chat_fn(ctx.loop, tier="plan", root=ctx.root, phase=ctx.phase)
         degrade = bool(getattr(ctx.signals, "budget_degrade", False))
 
         if chat_fn is None:
@@ -188,7 +191,12 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
             write_auto_note(ctx.root, "plan", "# Plan\n(no LLM available; retained previous plan)\n")
             return PhaseResult(summary=note)
 
-        debate = PlanDebate(chat_fn, config=config)
+        debate_config = config or _debate_config_from_settings(getattr(ctx.loop, "settings", None))
+        debate = PlanDebate(
+            chat_fn,
+            config=debate_config,
+            chat_timeout_seconds=float(getattr(getattr(ctx.loop, "settings", None), "llm_request_timeout", 60.0) or 60.0),
+        )
         result = debate.run(program_text=ctx.program_text, project_text=ctx.project_text, degrade=degrade)
 
         # 1) belief -> L1 (program.md), only if we got one and program is writable
@@ -199,11 +207,19 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
             except ValueError:
                 program_text = None  # read-only program: skip belief update
 
+        plan_text = result["plan"] or _fallback_plan_text(ctx.program_text, ctx.project_text)
+        detailed_plan = result["detailed_plan"] or plan_text
+
         # 2) coarse plan -> project.md "## 当前计划"
-        project_text = _update_plan_section(ctx.project_text, result["plan"] or "(leader produced no plan)")
+        project_text = _update_plan_section(ctx.project_text, plan_text or "(leader produced no plan)")
 
         # 3) detailed plan -> .auto/plan.md (L3)
-        planned_todo_state = _plan_to_todo_state(result["detailed_plan"] or result["plan"] or "")
+        planned_todo_state = _plan_to_todo_state(
+            detailed_plan,
+            max_implementation_tasks=int(getattr(getattr(ctx.loop, "settings", None), "plan_max_implementation_tasks", 3) or 3),
+        )
+        if not _has_metric_experiment(ctx.root):
+            planned_todo_state = _ensure_baseline_checkpoint(planned_todo_state)
         todo_state = merge_todo_state(load_todo_state(ctx.root), planned_todo_state)
         save_todo_state(ctx.root, todo_state)
         write_auto_note(ctx.root, "plan", render_todo_markdown(todo_state))
@@ -211,13 +227,72 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         # 4) transcript -> L4 artifact (never into project.md)
         _archive_transcript(ctx, result)
 
-        summary = f"plan: personas={result['personas_used']} plan_set={bool(result['plan'])}"
+        summary = f"plan: personas={result['personas_used']} plan_set={bool(plan_text)}"
         return PhaseResult(program_text=program_text, project_text=project_text, summary=summary)
 
     return handler
 
 
-def _plan_to_todo_state(plan_text: str) -> dict:
+def _fallback_plan_text(program_text: str, project_text: str) -> str:
+    return (
+        "1. Inspect the allowed project files and current train-side behavior.\n"
+        "2. Run bash train/train.sh and bash eval.sh to establish a metric-bearing baseline.\n"
+        "3. Implement the smallest train-side change that can improve the objective while respecting program.md.\n"
+        "4. Run bash train/train.sh and bash eval.sh again, then record the metric and next action."
+    )
+
+
+def _has_metric_experiment(root: str | Path) -> bool:
+    path = Path(root) / ".autoresearch" / "state.json"
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return bool(data.get("experiments"))
+
+
+def _ensure_baseline_checkpoint(state: dict) -> dict:
+    tasks = list(state.get("tasks") or [])
+    if any((task or {}).get("task_id") == "baseline" for task in tasks):
+        return state
+    first_run_index = next((i for i, task in enumerate(tasks) if _task_runs_in_phase(task) == "run"), None)
+    first_impl_index = next((i for i, task in enumerate(tasks) if (task or {}).get("type") == "implementation"), None)
+    if first_run_index is not None and (first_impl_index is None or first_run_index < first_impl_index):
+        return state
+    insert_at = first_impl_index if first_impl_index is not None else (first_run_index if first_run_index is not None else len(tasks))
+    prior_execute_ids = [
+        str(task.get("task_id"))
+        for task in tasks[:insert_at]
+        if _task_runs_in_phase(task) == "execute" and str(task.get("task_id") or "").strip()
+    ]
+    baseline = {
+        "task_id": "baseline",
+        "goal": "Run the existing train/eval pipeline once to establish a metric-bearing baseline before modifications.",
+        "type": "validation",
+        "status": "pending",
+        "priority": insert_at + 1,
+        "depends_on": prior_execute_ids,
+        "plan_summary": "Run existing train/eval baseline before modifications.",
+        "run_spec": {"mode": "single", "commands": ["bash train/train.sh", "bash eval.sh"]},
+    }
+    updated = tasks[:insert_at] + [baseline] + tasks[insert_at:]
+    for index, task in enumerate(updated, start=1):
+        task["priority"] = index
+    return {"version": 1, "tasks": updated}
+
+
+def _debate_config_from_settings(settings) -> DebateConfig:
+    if settings is None:
+        return DebateConfig()
+    return DebateConfig(
+        max_personas=max(1, int(getattr(settings, "plan_max_personas", 2) or 2)),
+        degrade_personas=max(1, int(getattr(settings, "plan_degrade_personas", 1) or 1)),
+    )
+
+
+def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 3) -> dict:
     """Best-effort bridge from current leader prose to structured task state.
 
     This is an interim compatibility layer: the next iteration should ask the
@@ -233,15 +308,10 @@ def _plan_to_todo_state(plan_text: str) -> dict:
             items.append(m.group(1).strip())
     if not items and (plan_text or "").strip():
         items = [(plan_text or "").strip()]
+    items = _coalesce_plan_items(items, max_implementation_tasks=max_implementation_tasks)
     tasks = []
     for index, item in enumerate(items, start=1):
-        lowered = item.lower()
-        if any(token in lowered for token in ("run", "eval", "verify", "validate", "test", "运行", "评估", "验证", "测试")):
-            task_type = "validation"
-        elif any(token in lowered for token in ("analyze", "inspect", "compare", "检查", "分析", "对比")):
-            task_type = "analysis"
-        else:
-            task_type = "implementation"
+        task_type = _classify_plan_item(item)
         tasks.append({
             "task_id": f"t{index}",
             "goal": item,
@@ -252,7 +322,85 @@ def _plan_to_todo_state(plan_text: str) -> dict:
             "allowed_paths": ["train/**"] if task_type == "implementation" else [],
             "run_spec": _default_run_spec_for_task(task_type, item),
         })
+    prior_execute_task_ids: list[str] = []
+    for task in tasks:
+        if _task_runs_in_phase(task) == "run":
+            if prior_execute_task_ids:
+                task["depends_on"] = list(prior_execute_task_ids)
+        else:
+            prior_execute_task_ids.append(task["task_id"])
     return {"version": 1, "tasks": tasks}
+
+
+def _coalesce_plan_items(items: list[str], *, max_implementation_tasks: int = 3) -> list[str]:
+    """Keep the structured task list coarse enough for phase-level execution.
+
+    Persona plans often contain many tactical bullets. Sending each bullet to a
+    separate Execute LLM call is slow and encourages half-finished edits. Merge
+    adjacent implementation bullets into a few coherent work packets, keep early
+    analysis explicit, and keep validation checkpoints as Run-owned tasks.
+    """
+    implementation: list[str] = []
+    output: list[str] = []
+    for item in items:
+        task_type = _classify_plan_item(item)
+        if task_type == "implementation":
+            implementation.append(item)
+            continue
+        if implementation:
+            output.extend(_chunk_implementation_items(implementation, max_tasks=max_implementation_tasks))
+            implementation = []
+        output.append(item)
+    if implementation:
+        output.extend(_chunk_implementation_items(implementation, max_tasks=max_implementation_tasks))
+    return output
+
+
+def _chunk_implementation_items(items: list[str], *, max_tasks: int) -> list[str]:
+    if len(items) <= max(1, max_tasks):
+        return items
+    chunks: list[list[str]] = [[] for _ in range(max(1, max_tasks))]
+    for index, item in enumerate(items):
+        chunks[index % len(chunks)].append(item)
+    merged = []
+    for chunk in chunks:
+        if len(chunk) == 1:
+            merged.append(chunk[0])
+        else:
+            merged.append("Implement a consolidated train-side change covering: " + "; ".join(chunk))
+    return merged
+
+
+_IMPLEMENTATION_PLAN_RE = r"\b(implement|update|modify|rewrite|replace|create|add|edit|refactor|fix|write|build|integrate|ensure)\b"
+_ANALYSIS_PLAN_RE = r"^\s*(analyze|inspect|compare|检查|分析|对比)\b"
+_VALIDATION_PLAN_RE = r"^\s*(run|evaluate|eval|verify|validate|test|运行|评估|验证|测试)\b"
+
+
+def _classify_plan_item(item: str) -> str:
+    """Classify prose plan items without treating every "run/eval" substring as validation.
+
+    The bridge still consumes natural-language leader plans, so classification
+    must be conservative. A sentence like "update train.sh so it runs ..." is an
+    implementation task, not a validation task. Likewise "evaluated points" is
+    just a noun phrase. Validation is reserved for explicit run/eval/verify/test
+    actions or concrete eval commands when no implementation verb is present.
+    """
+    import re
+
+    text = str(item or "").strip().lower()
+    if not text:
+        return "implementation"
+    has_impl = bool(re.search(_IMPLEMENTATION_PLAN_RE, text)) or any(
+        token in text for token in ("保存", "修改", "新增", "创建", "实现", "重写")
+    )
+    if has_impl:
+        return "implementation"
+    if re.search(_ANALYSIS_PLAN_RE, text):
+        return "analysis"
+    explicit_eval_command = any(token in text for token in ("bash eval.sh", "bash train/train.sh", "pytest", "python -m pytest"))
+    if explicit_eval_command or re.search(_VALIDATION_PLAN_RE, text):
+        return "validation"
+    return "implementation"
 
 
 def _default_run_spec_for_task(task_type: str, item: str) -> dict:
@@ -261,7 +409,15 @@ def _default_run_spec_for_task(task_type: str, item: str) -> dict:
     return {}
 
 
-def build_loop_chat_fn(loop, *, tier: str = "plan") -> Optional[ChatFn]:
+def _task_runs_in_phase(task: dict) -> str:
+    if task.get("type") in {"validation", "experiment"}:
+        return "run"
+    if task.get("type") == "maintenance" and task.get("run_spec"):
+        return "run"
+    return "execute"
+
+
+def build_loop_chat_fn(loop, *, tier: str = "plan", root: str | Path | None = None, phase: str = "") -> Optional[ChatFn]:
     """Build a (system, user)->text callable backed by the loop's step agent client.
 
     Returns None (deterministic, no LLM) unless the loop was explicitly configured
@@ -302,13 +458,55 @@ def build_loop_chat_fn(loop, *, tier: str = "plan") -> Optional[ChatFn]:
         if temperature not in (None, 0, 0.0):
             kwargs["temperature"] = temperature
         timeout = float(getattr(loop.settings, "llm_request_timeout", 60.0) or 60.0)
+        debug_root = Path(root) if root is not None else loop.settings.root()
+        label = _plan_chat_label(system)
+        inflight_start(
+            debug_root,
+            "llm",
+            phase=phase or getattr(loop, "_current_phase", ""),
+            detail=label,
+            model=model or "gpt-4o",
+            timeout_seconds=timeout,
+            prompt_chars=len(system) + len(user),
+        )
         try:
-            resp = client.chat.completions.create(**kwargs, timeout=timeout)
-        except TypeError:
-            resp = client.chat.completions.create(**kwargs)
+            def _call():
+                try:
+                    return client.chat.completions.create(**kwargs, timeout=timeout)
+                except TypeError:
+                    return client.chat.completions.create(**kwargs)
+
+            resp = call_with_deadline(_call, timeout_seconds=timeout, label=label)
+        except Exception as exc:
+            inflight_finish(
+                debug_root,
+                "llm",
+                phase=phase or getattr(loop, "_current_phase", ""),
+                detail=label,
+                model=model or "gpt-4o",
+                error=str(exc)[:500],
+            )
+            raise
+        inflight_finish(
+            debug_root,
+            "llm",
+            phase=phase or getattr(loop, "_current_phase", ""),
+            detail=label,
+            model=model or "gpt-4o",
+        )
         return getattr(resp.choices[0].message, "content", "") or ""
 
     return chat
+
+
+def _plan_chat_label(system: str) -> str:
+    if "DIVERGENT" in system:
+        return "plan persona divergent"
+    if "PRAGMATIC" in system:
+        return "plan persona pragmatic"
+    if "LEADER" in system:
+        return "plan leader"
+    return "plan chat"
 
 
 # Backwards-compatible alias used by the plan handler.

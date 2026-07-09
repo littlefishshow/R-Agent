@@ -11,6 +11,7 @@ from typing import Callable, Iterable, Literal, Optional
 
 from tools.web_tools import web_extract_tool, web_search_tool
 from core.autoresearch_debug import inflight_finish, inflight_start
+from core.autoresearch_timeout import call_with_deadline
 
 Decision = Literal["run", "read", "write", "apply_patch", "web_search", "web_extract", "note", "stop"]
 
@@ -68,6 +69,12 @@ class AutoResearchSettings:
     readonly_eval_globs: tuple[str, ...] = ("prepare.py", "eval.sh", "eval/**", "evaluation/**")
     plateau_patience: int = 3
     debug_mode: bool = False
+    # --- v2 plan tuning ---
+    plan_max_personas: int = 2
+    plan_degrade_personas: int = 1
+    plan_max_implementation_tasks: int = 3
+    execute_context_chars: int = 6_000
+    execute_max_task_attempts: int = 2
     # --- v2 execute/run tuning ---
     # Cap LLM-backed actions per Execute phase visit so one step cannot burn the
     # whole time/token budget on a long todo list; remaining items advance on the
@@ -1091,6 +1098,12 @@ class AutoResearchStepAgent:
             "short bucket_updates for modular context. Do not claim experimental "
             "improvements without metrics in context/artifacts."
         )
+        if step.name == "apply_change" and "write" in allowed:
+            system += (
+                " For apply_change implementation tasks, return a mutating action. "
+                "Prefer action.type='write' with path and complete content. "
+                "Do not return action.type='note' unless no safe mutation is possible."
+            )
         user = {
             "round_index": round_index,
             "step": {
@@ -1115,14 +1128,25 @@ class AutoResearchStepAgent:
                 "bucket_updates": {name: ["short item"] for name in DEFAULT_CONTEXT_BUCKETS},
             },
         }
-        response = self._chat_completion_with_retry(system, user)
-        message = response.choices[0].message
-        raw = getattr(message, "content", None) or ""
-        data = extract_json_object(raw)
-        action_data = data.get("action") or {}
-        action_type = action_data.get("type") or fallback_action.type
-        if action_type not in allowed:
-            raise AutoResearchSafetyError(f"LLM step action {action_type!r} not in allowed_tools={allowed}")
+        try:
+            response = self._chat_completion_with_retry(system, user)
+            message = response.choices[0].message
+            raw = getattr(message, "content", None) or ""
+            data = extract_json_object(raw)
+            action_data = data.get("action") or {}
+            action_type = action_data.get("type") or fallback_action.type
+            if action_type not in allowed:
+                raise AutoResearchSafetyError(f"LLM step action {action_type!r} not in allowed_tools={allowed}")
+        except Exception as exc:
+            return AutoResearchStepResult(
+                action=fallback_action,
+                bucket_updates={"useful_failures": [f"{step.name} LLM fallback: {exc}"]},
+                raw_response="",
+                used_fallback=True,
+                error=str(exc),
+                system_prompt=system,
+                user_payload=json.dumps(user, ensure_ascii=False),
+            )
         action = AutoResearchAction(
             type=action_type,
             rationale=str(action_data.get("rationale") or fallback_action.rationale),
@@ -1193,14 +1217,21 @@ class AutoResearchStepAgent:
                 prompt_chars=sum(len(str(m.get("content", ""))) for m in messages),
             )
             try:
-                try:
-                    response = client.chat.completions.create(
-                        **completion_kwargs,
-                        timeout=timeout,
-                    )
-                except TypeError:
-                    # Older client shims may not accept timeout=
-                    response = client.chat.completions.create(**completion_kwargs)
+                def _call():
+                    try:
+                        return client.chat.completions.create(
+                            **completion_kwargs,
+                            timeout=timeout,
+                        )
+                    except TypeError:
+                        # Older client shims may not accept timeout=
+                        return client.chat.completions.create(**completion_kwargs)
+
+                response = call_with_deadline(
+                    _call,
+                    timeout_seconds=timeout,
+                    label=f"{step or 'chat'} attempt {attempt + 1}/{attempts}",
+                )
                 inflight_finish(root, "llm", phase=phase, detail=f"{step or 'chat'} attempt {attempt + 1}/{attempts}", model=model)
                 return response
             except Exception as exc:

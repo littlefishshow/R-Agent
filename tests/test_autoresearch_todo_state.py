@@ -1,14 +1,20 @@
 import json
 
 from core.autoresearch_todo_state import (
+    dependencies_satisfied,
     empty_todo_state,
+    has_open_tasks,
+    has_failed_tasks,
     load_todo_state,
     merge_todo_state,
     normalize_task,
     normalize_todo_state,
+    open_tasks,
+    ready_execute_tasks,
     ready_tasks,
     render_todo_markdown,
     save_todo_state,
+    task_phase,
     todo_state_path,
     upsert_task,
 )
@@ -34,6 +40,7 @@ def test_normalize_task_sanitizes_defaults():
     assert task["status"] == "pending"
     assert task["type"] == "implementation"
     assert task["goal"] == "G"
+    assert task["depends_on"] == []
     assert task["run_spec"] == {}
 
 
@@ -52,6 +59,51 @@ def test_ready_tasks_sorted_by_priority():
     })
     assert [t["task_id"] for t in ready_tasks(state)] == ["a", "b"]
     assert [t["task_id"] for t in ready_tasks(state, limit=1)] == ["a"]
+
+
+def test_ready_tasks_respects_dependencies_and_phase():
+    state = normalize_todo_state({
+        "tasks": [
+            {"task_id": "impl", "type": "implementation", "status": "pending", "priority": 1},
+            {"task_id": "val", "type": "validation", "status": "pending", "priority": 2, "depends_on": ["impl"], "run_spec": {"commands": "bash eval.sh"}},
+        ]
+    })
+    assert task_phase(state["tasks"][0]) == "execute"
+    assert task_phase(state["tasks"][1]) == "run"
+    assert dependencies_satisfied(state, state["tasks"][1]) is False
+    assert [t["task_id"] for t in ready_tasks(state, phase="execute")] == ["impl"]
+    assert ready_tasks(state, phase="run") == []
+    assert has_open_tasks(state, phase="run") is True
+
+    state["tasks"][0]["status"] = "verified"
+    assert dependencies_satisfied(state, state["tasks"][1]) is True
+    assert [t["task_id"] for t in ready_tasks(state, phase="run")] == ["val"]
+    assert [t["task_id"] for t in open_tasks(state, phase="run")] == ["val"]
+
+
+def test_has_failed_tasks_can_filter_by_phase():
+    state = normalize_todo_state({
+        "tasks": [
+            {"task_id": "impl", "type": "implementation", "status": "failed"},
+            {"task_id": "val", "type": "validation", "status": "pending"},
+        ]
+    })
+    assert has_failed_tasks(state) is True
+    assert has_failed_tasks(state, phase="execute") is True
+    assert has_failed_tasks(state, phase="run") is False
+
+
+def test_ready_execute_tasks_stops_before_ready_run_checkpoint():
+    state = normalize_todo_state({
+        "tasks": [
+            {"task_id": "a", "type": "analysis", "status": "verified", "priority": 1},
+            {"task_id": "baseline", "type": "validation", "status": "pending", "priority": 2, "run_spec": {"commands": "bash eval.sh"}},
+            {"task_id": "impl", "type": "implementation", "status": "pending", "priority": 3},
+        ]
+    })
+    assert ready_execute_tasks(state) == []
+    state["tasks"][1]["status"] = "verified"
+    assert [t["task_id"] for t in ready_execute_tasks(state)] == ["impl"]
 
 
 def test_upsert_task_updates_existing(tmp_path):
@@ -81,6 +133,21 @@ def test_merge_todo_state_preserves_progress_by_goal():
     assert merged["tasks"][0]["run_spec"] == {"mode": "single"}
 
 
+def test_merge_todo_state_preserves_existing_depends_when_plan_omits_it():
+    existing = normalize_todo_state({
+        "tasks": [
+            {"task_id": "v", "goal": "validate", "type": "validation", "depends_on": ["i"]},
+        ]
+    })
+    planned = normalize_todo_state({
+        "tasks": [
+            {"task_id": "v", "goal": "validate", "type": "validation"},
+        ]
+    })
+    merged = merge_todo_state(existing, planned)
+    assert merged["tasks"][0]["depends_on"] == ["i"]
+
+
 def test_render_markdown_includes_run_spec():
     state = normalize_todo_state({
         "tasks": [
@@ -97,6 +164,17 @@ def test_render_markdown_includes_run_spec():
     assert "[pending] t1 (validation): run eval" in text
     assert "run_spec" in text
     assert "bash eval.sh" in text
+
+
+def test_render_markdown_includes_depends_on():
+    state = normalize_todo_state({
+        "tasks": [
+            {"task_id": "v1", "goal": "run eval", "type": "validation", "depends_on": ["i1"]},
+        ]
+    })
+    text = render_todo_markdown(state)
+    assert "depends_on" in text
+    assert "i1" in text
 
 
 def test_load_corrupt_state_returns_empty(tmp_path):

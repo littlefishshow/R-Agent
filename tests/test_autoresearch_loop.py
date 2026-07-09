@@ -1,4 +1,5 @@
 import json
+import time
 from pathlib import Path
 
 from core.autoresearch_loop import (
@@ -664,6 +665,40 @@ def test_step_agent_retries_before_falling_back(tmp_path):
     assert "recovered" in result.action.content
 
 
+def test_step_agent_framework_deadline_falls_back_quickly(tmp_path):
+    from core.autoresearch_loop import AutoResearchStepAgent, AutoResearchWorkflowStep
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="timeout",
+        max_rounds=1,
+        use_llm_step_agents=True,
+        llm_request_timeout=0.05,
+        llm_retry_attempts=0,
+    )
+
+    class _SlowCompletions:
+        def create(self, **kwargs):  # noqa: ARG002
+            import time
+
+            time.sleep(1.0)
+
+    class _SlowChat:
+        completions = _SlowCompletions()
+
+    class _SlowClient:
+        chat = _SlowChat()
+
+    agent = AutoResearchStepAgent(settings, client=_SlowClient(), model="test-model")
+    step = AutoResearchWorkflowStep(name="apply_change", action_type="note", rationale="fb", content="fallback", allowed_tools=("note",))
+    started = time.time()
+    result = agent.plan_step(step=step, fallback_action=step.to_action(), parent_context="{}", round_index=0)
+    assert time.time() - started < 0.5
+    assert result.used_fallback is True
+    assert result.action.content == "fallback"
+
+
 def test_eval_readonly_guard_blocks_apply_patch_to_prepare_py(tmp_path):
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
     (tmp_path / "prepare.py").write_text("print('eval harness')\n", encoding="utf-8")
@@ -851,4 +886,3 @@ def test_auto_research_stop_tool_creates_and_clears_sentinel(tmp_path):
     resume = json.loads(auto_research_stop_tool(str(tmp_path), resume=True))
     assert resume["success"] is True and resume["removed"] is True
     assert not (tmp_path / ".autoresearch" / "STOP").exists()
-

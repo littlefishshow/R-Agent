@@ -64,6 +64,7 @@ Planned schema:
       "priority": 0,
       "allowed_paths": ["train/**"],
       "context_paths": ["train/train.py", "program.md"],
+      "depends_on": ["t0"],
       "plan_summary": "",
       "run_spec": {},
       "verification": {},
@@ -80,6 +81,7 @@ Deliverables:
 - Parser/writer helpers in `core/autoresearch_memory.py` or a new `core/autoresearch_todo_state.py`.
 - Plan handler writes structured tasks.
 - Execute handler reads ready tasks from `todo_state.json`.
+- Ready-task selection honors `depends_on` and phase ownership (`execute` vs `run`).
 - Existing `.auto/plan.md` becomes human-readable mirror only.
 
 ### Phase 2: Bounded Execute Inner Loop
@@ -95,7 +97,10 @@ Deliverables:
 - Execute loop budget: max actions, max wall time, max changed files.
 - Each task records verification commands/results.
 - Execute updates task status atomically.
-- Non-implementation tasks are not sent to edit LLM.
+- Run-owned tasks are not sent to the edit LLM and are not marked verified by Execute.
+- The phase machine stays in Execute while unlocked execute-owned tasks remain.
+- Execute tasks track failed/unverified attempts and stop retrying after a bounded threshold.
+- Ready Run checkpoints can interrupt later Execute tasks, so plans can run a baseline before modifications.
 
 ### Phase 3: Per-Task Run Spec
 
@@ -105,11 +110,11 @@ Example:
 
 ```json
 {
-  "mode": "single|loop|long_job|custom_sequence",
+  "mode": "single|loop|long_job",
   "commands": ["bash train/train.sh", "bash eval.sh"],
+  "monitor_commands": ["bash scripts/check_job.sh"],
   "max_iters": 1,
   "max_seconds": 600,
-  "cheap_threshold_seconds": 2.0,
   "stop_condition": {
     "type": "plateau|metric_threshold|command_success|manual",
     "patience": 3,
@@ -124,6 +129,7 @@ Deliverables:
 - Generic run-spec interpreter.
 - `single`, `loop`, and `long_job` built-in modes.
 - No benchmark-specific numeric probing in the default path.
+- Default project fallback is `single`; repeated runs require `mode: loop` or an explicit project-provided search driver.
 - Task run results stored back into `todo_state.json`.
 
 ### Phase 4: Strong Evaluate Signals
@@ -195,15 +201,20 @@ Deliverables:
 - [x] Hard-coded numeric black-box probe removed from the generic run loop.
 - [x] Phase 1a: pure `todo_state.json` helpers and tests.
 - [x] Phase 1b: Plan writes structured tasks into `todo_state.json` and mirrors them into `.auto/plan.md`.
+- [x] Phase 1c: task dependencies and phase-aware ready-task selection.
 - [x] Phase 2a: Execute reads ready tasks from `todo_state.json` and updates task status.
+- [x] Phase 2a.1: Execute stays in Execute while unlocked execute-owned tasks remain.
+- [x] Phase 2a.2: Execute attempt budgets prevent retry dead loops and failed tasks invalidate the current plan.
 - [ ] Phase 2b: Bounded Execute inner loop with per-task read/edit/verify cycles.
 - [x] Phase 3a: Run reads per-task `run_spec.commands` and updates task result.
-- [ ] Phase 3b: richer run spec modes (`single`, `loop`, `long_job`) with monitoring semantics.
+- [x] Phase 3b: richer run spec modes (`single`, `loop`, `long_job`) with monitoring semantics.
 - [x] Phase 4a: Evaluate writes `gate_signals.json`; PhaseController reads it into `PhaseSignals`.
 - [ ] Phase 4b: Evaluate updates per-task status and richer replan reasons.
 - [x] Phase 5a: git preflight reports non-repo, nested repo, missing HEAD, and dirty worktree warnings.
 - [ ] Phase 5b: optional strict preflight mode for versioning-sensitive runs.
 - [x] Phase 6a: `/autoresearch debug show` uses a diagnostic summary (monitor, inflight, budget, best, gate, todo, recent events).
+- [x] Phase 6b: framework-side LLM deadlines protect Plan/Execute even when SDK/provider timeouts are delayed.
+- [x] Phase 6c: Plan injects an early metric-bearing baseline checkpoint when no experiment exists.
 - [ ] Large-project docs.
 
 ## Open Questions
@@ -215,4 +226,4 @@ Deliverables:
 
 ## Next Step
 
-Implement Phase 1: `todo_state.json` helpers and make Plan produce structured tasks while keeping `.auto/plan.md` as a readable mirror.
+Finish Phase 2b by replacing the current one-action Execute visit with a bounded per-task read/edit/verify loop while keeping the same dependency and phase-ownership rules.

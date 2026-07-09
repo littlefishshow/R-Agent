@@ -10,6 +10,8 @@ from typing import Any
 
 VALID_STATUSES = {"pending", "in_progress", "verified", "failed", "blocked", "skipped"}
 VALID_TYPES = {"implementation", "experiment", "validation", "analysis", "maintenance"}
+DEPENDENCY_DONE_STATUSES = {"verified"}
+OPEN_STATUSES = {"pending", "in_progress"}
 
 
 def todo_state_path(root: str | Path) -> Path:
@@ -42,6 +44,7 @@ def normalize_task(task: dict, *, fallback_index: int = 1) -> dict:
         "priority": int(task.get("priority") or fallback_index),
         "allowed_paths": _string_list(task.get("allowed_paths")),
         "context_paths": _string_list(task.get("context_paths")),
+        "depends_on": _string_list(task.get("depends_on")),
         "plan_summary": str(task.get("plan_summary") or "").strip(),
         "run_spec": _dict(task.get("run_spec")),
         "verification": _dict(task.get("verification")),
@@ -112,6 +115,7 @@ def merge_todo_state(existing: dict, planned: dict) -> dict:
             task = {
                 **task,
                 "status": prior.get("status", task["status"]),
+                "depends_on": task.get("depends_on") or prior.get("depends_on", []),
                 "artifacts": prior.get("artifacts", task["artifacts"]),
                 "last_result": prior.get("last_result", task["last_result"]),
                 "lessons": prior.get("lessons", task["lessons"]),
@@ -133,8 +137,80 @@ def upsert_task(root: str | Path, task: dict) -> dict:
     return normalized
 
 
-def ready_tasks(state: dict, *, limit: int | None = None) -> list[dict]:
-    tasks = [t for t in normalize_todo_state(state)["tasks"] if t.get("status") == "pending"]
+def task_phase(task: dict) -> str:
+    """Return the lifecycle phase that should own this task.
+
+    Tasks that run commands or produce metrics belong to Run. Analysis and code
+    changes belong to Execute. Maintenance follows its run_spec: command-backed
+    maintenance is a Run task; otherwise it is an Execute task.
+    """
+    task = normalize_task(task)
+    task_type = task.get("type")
+    if task_type in {"validation", "experiment"}:
+        return "run"
+    if task_type == "maintenance" and task.get("run_spec"):
+        return "run"
+    return "execute"
+
+
+def dependencies_satisfied(state: dict, task: dict) -> bool:
+    normalized = normalize_todo_state(state)
+    by_id = {t["task_id"]: t for t in normalized["tasks"]}
+    for dep in _string_list(task.get("depends_on")):
+        if by_id.get(dep, {}).get("status") not in DEPENDENCY_DONE_STATUSES:
+            return False
+    return True
+
+
+def open_tasks(state: dict, *, phase: str | None = None) -> list[dict]:
+    tasks = [t for t in normalize_todo_state(state)["tasks"] if t.get("status") in OPEN_STATUSES]
+    if phase:
+        tasks = [t for t in tasks if task_phase(t) == phase]
+    tasks.sort(key=lambda t: (int(t.get("priority") or 0), t.get("task_id", "")))
+    return tasks
+
+
+def has_open_tasks(state: dict, *, phase: str | None = None) -> bool:
+    return bool(open_tasks(state, phase=phase))
+
+
+def has_failed_tasks(state: dict, *, phase: str | None = None) -> bool:
+    tasks = [t for t in normalize_todo_state(state)["tasks"] if t.get("status") in {"failed", "blocked"}]
+    if phase:
+        tasks = [t for t in tasks if task_phase(t) == phase]
+    return bool(tasks)
+
+
+def ready_execute_tasks(state: dict, *, limit: int | None = None) -> list[dict]:
+    """Return ready Execute tasks before the next ready Run checkpoint."""
+    normalized = normalize_todo_state(state)
+    ready_run = ready_tasks(normalized, phase="run", statuses=OPEN_STATUSES)
+    cutoff_priority = None
+    if ready_run:
+        cutoff_priority = min(int(t.get("priority") or 0) for t in ready_run)
+    tasks = ready_tasks(normalized, phase="execute", statuses=OPEN_STATUSES)
+    if cutoff_priority is not None:
+        tasks = [t for t in tasks if int(t.get("priority") or 0) < cutoff_priority]
+    return tasks[:limit] if limit is not None else tasks
+
+
+def has_ready_execute_tasks(state: dict) -> bool:
+    return bool(ready_execute_tasks(state))
+
+
+def ready_tasks(
+    state: dict,
+    *,
+    limit: int | None = None,
+    phase: str | None = None,
+    statuses: set[str] | tuple[str, ...] | list[str] | None = None,
+) -> list[dict]:
+    normalized = normalize_todo_state(state)
+    allowed_statuses = set(statuses or {"pending"})
+    tasks = [t for t in normalized["tasks"] if t.get("status") in allowed_statuses]
+    if phase:
+        tasks = [t for t in tasks if task_phase(t) == phase]
+    tasks = [t for t in tasks if dependencies_satisfied(normalized, t)]
     tasks.sort(key=lambda t: (int(t.get("priority") or 0), t.get("task_id", "")))
     return tasks[:limit] if limit is not None else tasks
 
@@ -149,6 +225,8 @@ def render_todo_markdown(state: dict) -> str:
         lines.append(f"- [{task['status']}] {task['task_id']} ({task['type']}): {task['goal']}")
         if task.get("plan_summary"):
             lines.append(f"  - plan: {task['plan_summary']}")
+        if task.get("depends_on"):
+            lines.append(f"  - depends_on: `{json.dumps(task['depends_on'], ensure_ascii=False)}`")
         if task.get("run_spec"):
             lines.append(f"  - run_spec: `{json.dumps(task['run_spec'], ensure_ascii=False, sort_keys=True)}`")
     return "\n".join(lines) + "\n"
@@ -171,15 +249,22 @@ def _dict(value: Any) -> dict:
 __all__ = [
     "VALID_STATUSES",
     "VALID_TYPES",
+    "dependencies_satisfied",
     "empty_todo_state",
+    "has_open_tasks",
+    "has_failed_tasks",
+    "has_ready_execute_tasks",
     "load_todo_state",
     "merge_todo_state",
     "normalize_task",
     "normalize_task_id",
     "normalize_todo_state",
+    "open_tasks",
+    "ready_execute_tasks",
     "ready_tasks",
     "render_todo_markdown",
     "save_todo_state",
+    "task_phase",
     "todo_state_path",
     "upsert_task",
 ]
