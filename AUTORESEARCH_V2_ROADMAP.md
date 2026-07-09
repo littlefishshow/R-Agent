@@ -197,7 +197,8 @@ Deliverables:
 - [x] Phase 1b: Plan writes structured tasks into `todo_state.json` and mirrors them into `.auto/plan.md`.
 - [x] Phase 2a: Execute reads ready tasks from `todo_state.json` and updates task status.
 - [ ] Phase 2b: Bounded Execute inner loop with per-task read/edit/verify cycles.
-- [ ] Per-task run specs.
+- [x] Phase 3a: Run reads per-task `run_spec.commands` and updates task result.
+- [ ] Phase 3b: richer run spec modes (`single`, `loop`, `long_job`) with monitoring semantics.
 - [ ] Evaluate writes real gate signals.
 - [ ] Git preflight validation.
 - [ ] Debug diagnostic summary.

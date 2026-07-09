@@ -449,6 +449,40 @@ def test_run_fallback_loop_records_search_log(tmp_path):
     assert row["x"] == 1 and row["y"] == 2 and row["z"] == 3
 
 
+def test_run_uses_todo_state_run_spec_and_updates_task(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "v1",
+                "goal": "custom validation",
+                "type": "validation",
+                "status": "pending",
+                "priority": 1,
+                "run_spec": {
+                    "mode": "single",
+                    "commands": [
+                        "mkdir -p outputs",
+                        "printf '{\"x\":3,\"y\":4}\\n' > outputs/submission.json",
+                        "printf '{\"primary_metric\":7,\"z\":7,\"higher_is_better\":false}\\n' > metrics.json",
+                    ],
+                },
+            }
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    assert json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))["z"] == 7
+    state = load_todo_state(tmp_path)
+    task = state["tasks"][0]
+    assert task["status"] == "verified"
+    assert task["last_result"]["inner_evals"] == 1
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "inner_evals=1" in report
+
+
 def test_run_adaptive_loop_continues_only_when_cheap_and_changing(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "train").mkdir()

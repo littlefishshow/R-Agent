@@ -516,6 +516,34 @@ def _fallback_eval_loop_command() -> str:
     )
 
 
+def _select_run_task(root: str | Path) -> Optional[dict]:
+    state = load_todo_state(root)
+    candidates = []
+    for task in state.get("tasks", []):
+        if task.get("status") not in {"pending", "verified", "in_progress"}:
+            continue
+        if task.get("type") not in {"validation", "experiment", "maintenance"}:
+            continue
+        if not task.get("run_spec"):
+            continue
+        candidates.append(task)
+    candidates.sort(key=lambda t: (int(t.get("priority") or 0), t.get("task_id", "")))
+    return candidates[0] if candidates else None
+
+
+def _command_from_run_spec(run_spec: dict, *, fallback_command: str) -> tuple[str, int, float, str]:
+    run_spec = dict(run_spec or {})
+    commands = run_spec.get("commands") or []
+    if isinstance(commands, str):
+        commands = [commands]
+    commands = [str(c).strip() for c in commands if str(c).strip()]
+    command = " && ".join(commands) if commands else fallback_command
+    mode = str(run_spec.get("mode") or "single").strip().lower()
+    max_iters = int(run_spec.get("max_iters") or (1 if mode == "single" else 100))
+    max_seconds = float(run_spec.get("max_seconds") or 0.0)
+    return command, max(1, max_iters), max(0.0, max_seconds), mode
+
+
 def _ensure_search_log_helper(root: str | Path) -> None:
     helper = Path(root) / ".autoresearch" / "append_search_log.py"
     helper.parent.mkdir(parents=True, exist_ok=True)
@@ -609,13 +637,23 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     if loop is None:
         return {"status": "skipped", "returncode": None, "stdout": "no loop"}
     _ensure_search_log_helper(ctx.root)
+    run_task = _select_run_task(ctx.root)
     driver = _find_search_driver(ctx)
     if driver:
-        command = _search_driver_command(driver)
+        fallback_command = _search_driver_command(driver)
         rationale = f"v2 run search driver ({driver})"
     else:
-        command = _fallback_eval_loop_command()
+        fallback_command = _fallback_eval_loop_command()
         rationale = "v2 run experiment"
+    if run_task:
+        command, spec_max_evals, spec_max_seconds, mode = _command_from_run_spec(run_task.get("run_spec"), fallback_command=fallback_command)
+        max_evals_override = spec_max_evals
+        max_seconds_override = spec_max_seconds
+        rationale = f"v2 run task {run_task.get('task_id')} ({mode})"
+    else:
+        command = fallback_command
+        max_evals_override = None
+        max_seconds_override = None
     from core.autoresearch_loop import AutoResearchAction, git_snapshot
 
     action = AutoResearchAction(type="run", rationale=rationale, command=command, role="trial")
@@ -623,8 +661,8 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     observations = []
     started = time.time()
     start_rows = len(_search_log_rows(ctx.root))
-    max_seconds = max(0.0, float(getattr(loop.settings, "run_max_inner_seconds", 20.0) or 0.0))
-    max_evals = max(1, int(getattr(loop.settings, "run_max_inner_evals", 100) or 1))
+    max_seconds = max(0.0, float(max_seconds_override if max_seconds_override is not None else getattr(loop.settings, "run_max_inner_seconds", 20.0) or 0.0))
+    max_evals = max(1, int(max_evals_override if max_evals_override is not None else getattr(loop.settings, "run_max_inner_evals", 100) or 1))
     cheap_threshold = max(0.0, float(getattr(loop.settings, "run_cheap_eval_threshold_seconds", 2.0) or 0.0))
     previous_candidate = _current_submission_key(ctx.root)
     obs = None
@@ -646,14 +684,34 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     recorder = getattr(loop, "_maybe_record_experiment", None)
     if callable(recorder):
         recorder(action, obs, base_git, "run_experiment")
+    inner_evals = max(len(observations), len(_search_log_rows(ctx.root)) - start_rows)
+    if run_task:
+        _update_run_task_result(ctx.root, run_task, obs, inner_evals=inner_evals)
     status = "ok" if obs.status in {"ok", "ok_metric_recovered"} else "failed"
     stdout = obs.summary
-    inner_evals = max(len(observations), len(_search_log_rows(ctx.root)) - start_rows)
     if len(observations) > 1:
         stdout = f"{stdout}\ninner_evals={inner_evals} elapsed_seconds={round(time.time() - started, 3)}"
     return {"status": status, "returncode": 0 if status == "ok" else 1,
             "stdout": stdout, "stderr": "", "artifact_path": obs.artifact_path,
             "search_driver": driver or "", "inner_evals": inner_evals}
+
+
+def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: int) -> None:
+    state = load_todo_state(root)
+    for existing in state.get("tasks", []):
+        if existing.get("task_id") != task.get("task_id"):
+            continue
+        ok = getattr(obs, "status", "") in {"ok", "ok_metric_recovered"}
+        existing["status"] = "verified" if ok else "failed"
+        existing["last_result"] = {
+            "status": getattr(obs, "status", ""),
+            "artifact_path": getattr(obs, "artifact_path", ""),
+            "summary": getattr(obs, "summary", "")[:1000],
+            "inner_evals": inner_evals,
+            "updated_at": time.time(),
+        }
+        break
+    save_todo_state(root, state)
 
 
 def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[AutofixFn] = None, *, max_autofix: int = 2):
