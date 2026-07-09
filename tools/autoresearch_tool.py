@@ -595,7 +595,7 @@ def _v2_properties():
     return {
         "project_dir": {"type": "string", "description": "要运行 autoresearch v2 的项目目录，必须在当前工作区内。"},
         "project_id": {"type": "string", "description": "项目 ID。", "default": "autoresearch"},
-        "max_steps": {"type": "integer", "description": "相位机最多推进多少个相位（init/plan/execute/run/evaluate/compress 循环）；默认 100（激进）。可随时用 auto_research_stop 或 esc 中断。", "default": 100},
+        "max_steps": {"type": "integer", "description": "V3 三步循环最多推进多少个 step（plan/attempt/conclude）；默认 100（激进）。可随时用 auto_research_stop 或 esc 中断。", "default": 100},
         "program_path": {"type": "string", "description": "program.md 路径；含 CONSTITUTION(L0,只读)/BELIEF(L1,可演化) 标记。", "default": "program.md"},
         "project_state_path": {"type": "string", "description": "project.md 路径（L2 项目态，父进程单写，含 phase 标记）。", "default": "project.md"},
         "use_llm_step_agents": {"type": "boolean", "description": "是否启用 LLM（多性格 Plan 等），默认 True；关闭则走 deterministic handlers。", "default": True},

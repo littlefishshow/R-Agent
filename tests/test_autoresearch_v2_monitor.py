@@ -4,8 +4,8 @@ from pathlib import Path
 
 from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
 from core.autoresearch_monitor import RunMonitor, read_monitor, render_monitor_text
-from core.autoresearch_phases import PhaseController, run_phase_loop
-from core.autoresearch_phase_handlers import default_handlers
+from core.autoresearch_phases import run_phase_loop
+from core.autoresearch_three_step import ThreeStepController
 from tools.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
 
 
@@ -110,12 +110,26 @@ def test_monitor_preserves_step_index_on_resume(tmp_path):
     assert data["current_phase"] == "execute"
 
 
+def test_read_monitor_marks_missing_running_pid_stale(tmp_path):
+    p = tmp_path / "monitor.json"
+    p.write_text(json.dumps({
+        "run_id": "r", "project_id": "p", "pid": 99999999, "status": "running",
+        "current_phase": "execute", "next_phase": "(running)",
+        "step_index": 3, "max_steps": 10, "updated_at": time.time(),
+    }), encoding="utf-8")
+    data = read_monitor(p)
+    assert data["status"] == "running"
+    assert data["stale"] is True
+    assert data["stale_reason"] == "pid_not_found"
+    assert "pid_not_found" in render_monitor_text(data)
+
+
 def test_controller_updates_monitor_each_step(tmp_path):
     (tmp_path / "program.md").write_text("Goal: x\n", encoding="utf-8")
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
     loop = AutoResearchLoop(settings)
     mon = RunMonitor(settings.monitor_file(), run_id="rc", project_id="p")
-    ctrl = PhaseController(settings, handlers=default_handlers(), loop=loop, monitor=mon)
+    ctrl = ThreeStepController(settings, loop=loop, monitor=mon)
     ctrl.run(max_steps=4)
     data = read_monitor(settings.monitor_file())
     assert data["step_index"] >= 1

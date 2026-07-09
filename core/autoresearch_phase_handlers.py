@@ -19,6 +19,7 @@ from core.autoresearch_memory import (
     write_auto_note,
     gc_auto_dir,
     append_lesson,
+    read_phase,
 )
 from core.autoresearch_gate_state import update_gate_state_from_experiment_state
 from core.autoresearch_phases import PhaseContext, PhaseResult
@@ -123,7 +124,12 @@ def make_evaluate_handler():
             except Exception:
                 pass
 
-        major = bool(ctx.signals.major_error)
+        _phase, phase_reason = read_phase(ctx.project_text)
+        prior_unrecoverable = any(
+            token in str(phase_reason or "").lower()
+            for token in ("major error", "plan exhausted", "replan required")
+        )
+        major = bool(ctx.signals.major_error or prior_unrecoverable)
         gate = update_gate_state_from_experiment_state(root, state if isinstance(state, dict) else {}, major_error=major)
         pareto_changed = bool(gate.get("pareto_changed"))
 
@@ -186,29 +192,9 @@ def make_compress_handler(max_belief_chars: int = 4000):
     return handler
 
 
-def default_handlers() -> dict:
-    """Deterministic handler map covering the phases that have real no-LLM work.
-
-    The ``plan`` phase uses the persona debate handler, which itself falls back
-    to a deterministic no-op when no LLM client is available on the loop.
-    """
-    from core.autoresearch_personas import make_plan_handler
-    from core.autoresearch_execution import make_execute_handler, make_run_handler
-
-    return {
-        "init": make_init_handler(),
-        "plan": make_plan_handler(),
-        "execute": make_execute_handler(),
-        "run": make_run_handler(),
-        "evaluate": make_evaluate_handler(),
-        "compress": make_compress_handler(),
-    }
-
-
 __all__ = [
     "survey_project",
     "make_init_handler",
     "make_evaluate_handler",
     "make_compress_handler",
-    "default_handlers",
 ]
