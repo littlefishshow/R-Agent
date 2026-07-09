@@ -44,6 +44,10 @@ def test_next_phase_major_error_jumps_to_evaluate():
     assert next_phase(PhaseSignals(phase="run", major_error=True))[0] == "evaluate"
 
 
+def test_next_phase_solved_run_pauses():
+    assert next_phase(PhaseSignals(phase="run", solved=True)) == ("pause", "objective solved: pause")
+
+
 # --------------------------------------------------------------------------- #
 # Controller: scaffolding + one full cycle
 # --------------------------------------------------------------------------- #

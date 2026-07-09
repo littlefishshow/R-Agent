@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from core.autoresearch_debug import read_inflight
+
 
 class RunMonitor:
     """Heartbeat writer for a single autoresearch run (atomic JSON writes)."""
@@ -28,15 +30,21 @@ class RunMonitor:
         self.path = Path(path)
         self.run_id = run_id
         self.project_id = project_id
+        existing = {}
+        if self.path.exists():
+            try:
+                existing = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                existing = {}
         self._data = {
             "run_id": run_id,
             "project_id": project_id,
             "pid": os.getpid(),
             "status": "queued",
-            "current_phase": "init",
+            "current_phase": existing.get("next_phase") if existing.get("next_phase") not in {"", "(running)", None} else existing.get("current_phase", "init"),
             "next_phase": "",
-            "step_index": 0,          # == rounds completed
-            "max_steps": 0,
+            "step_index": int(existing.get("step_index") or 0),
+            "max_steps": int(existing.get("max_steps") or 0),
             "last_summary": "",
             "budget": {},
             "started_at": time.time(),
@@ -59,7 +67,7 @@ class RunMonitor:
 
     def start(self) -> None:
         self._data["status"] = "running"
-        self._data["started_at"] = time.time()
+        self._data.setdefault("started_at", time.time())
         self._write()
 
     def update_step(self, *, step_index: int, current_phase: str, next_phase: str,
@@ -72,6 +80,17 @@ class RunMonitor:
             self._data["budget"] = _compact_budget(budget_snapshot)
         if next_phase == "pause":
             self._data["status"] = "paused"
+        self._write()
+
+    def update_phase_start(self, *, step_index: int, current_phase: str,
+                           summary: str = "", budget_snapshot: Optional[dict] = None) -> None:
+        self._data["step_index"] = int(step_index)
+        self._data["current_phase"] = current_phase
+        self._data["next_phase"] = "(running)"
+        self._data["last_summary"] = str(summary or f"starting {current_phase}")[:500]
+        self._data["status"] = "running"
+        if budget_snapshot is not None:
+            self._data["budget"] = _compact_budget(budget_snapshot)
         self._write()
 
     def finish(self, *, status: str = "completed", error: str = "", budget_snapshot: Optional[dict] = None) -> None:
@@ -122,6 +141,13 @@ def read_monitor(path: str | Path) -> dict:
         age = time.time() - float(data.get("updated_at") or 0)
         data["heartbeat_age_seconds"] = round(age, 1)
         data["stale"] = age > 300  # 5 min without an update => suspicious
+    try:
+        root = p.parent.parent
+        inflight = read_inflight(root)
+        if inflight:
+            data["inflight"] = inflight
+    except Exception:
+        pass
     return data
 
 
@@ -138,7 +164,7 @@ def render_monitor_text(data: dict, bar_width: int = 20) -> str:
         f"run_id: {data.get('run_id','')}  status: {data.get('status','?')}",
         f"phase: {data.get('current_phase','?')} -> {data.get('next_phase','?')}",
         f"rounds: {step}/{total or '?'}  [{bar}] {pct}%",
-        f"tokens: {budget.get('total_tokens',0)}"
+        f"completed tokens: {budget.get('total_tokens',0)}"
         + (f"/{limits.get('max_tokens')}" if limits.get('max_tokens') else "")
         + f"  usd: {budget.get('estimated_usd',0.0)}"
         + (f"/{limits.get('max_usd')}" if limits.get('max_usd') else "")
@@ -149,6 +175,13 @@ def render_monitor_text(data: dict, bar_width: int = 20) -> str:
         + f" max={budget.get('duration_seconds_max',0.0)}s",
         f"last: {data.get('last_summary','')}",
     ]
+    inflight = data.get("inflight") or {}
+    if inflight:
+        lines.append(
+            f"inflight: {inflight.get('kind','?')} age={inflight.get('age_seconds','?')}s"
+            + (f" phase={inflight.get('phase')}" if inflight.get("phase") else "")
+            + (f" detail={inflight.get('detail')}" if inflight.get("detail") else "")
+        )
     if data.get("stale"):
         lines.append(f"⚠️ heartbeat stale ({data.get('heartbeat_age_seconds')}s, pid {data.get('pid')})")
     if data.get("error"):

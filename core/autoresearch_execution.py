@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import shlex
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -74,6 +75,26 @@ def parse_todo_from_plan(root: str | Path) -> list[str]:
 # --------------------------------------------------------------------------- #
 
 ExecuteFn = Callable[[str, PhaseContext], dict]  # (todo_item, ctx) -> result dict
+
+_IMPLEMENTATION_HINTS = (
+    "implement", "update", "modify", "rewrite", "replace", "create", "add",
+    "edit", "refactor", "fix", "write", "保存", "修改", "新增", "创建", "实现", "重写",
+)
+_NON_IMPLEMENTATION_HINTS = (
+    "run ", "evaluate", "eval", "analyze", "record ", "inspect", "check whether",
+    "identify", "repeat", "stop", "select", "verify", "compare", "运行", "评估",
+    "分析", "记录", "检查", "选择", "验证",
+)
+
+
+def _is_implementation_todo(item: str) -> bool:
+    text = str(item or "").lower()
+    if any(h in text for h in _IMPLEMENTATION_HINTS):
+        return True
+    if any(h in text for h in _NON_IMPLEMENTATION_HINTS):
+        return False
+    # Ambiguous items are allowed through; the LLM can still decide note/read.
+    return True
 
 
 def _default_execute_fn(item: str, ctx: PhaseContext) -> dict:
@@ -330,10 +351,20 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         done = 0
         any_verified = False
         for item in window:
+            if not _is_implementation_todo(item):
+                results.append({
+                    "item": item,
+                    "status": "skipped",
+                    "verification": True,
+                    "note": "non-implementation todo; handled by run/evaluate phase",
+                })
+                done += 1
+                any_verified = True
+                continue
             res = fn(item, ctx) or {}
             results.append(res)
             # verification hard-constraint: only verified items count as done.
-            if res.get("status") in {"ok", "done"} and res.get("verification"):
+            if res.get("status") in {"ok", "done", "skipped"} and res.get("verification"):
                 done += 1
                 any_verified = True
 
@@ -396,21 +427,241 @@ def _find_search_driver(ctx: PhaseContext) -> Optional[str]:
         return None
     root = Path(ctx.root)
     for rel in getattr(settings, "search_driver_globs", ()) or ():
-        if (root / rel).exists():
-            return rel
+        matches = sorted(root.glob(str(rel)))
+        for match in matches:
+            if match.is_file():
+                return str(match.relative_to(root))
+    candidates = []
+    train_dir = root / "train"
+    if train_dir.exists():
+        for path in sorted(train_dir.glob("*.py")):
+            if path.name.startswith("_") or path.name == "__init__.py":
+                continue
+            if path.name in {"train.py", "search.py"} or "search" in path.stem or "driver" in path.stem or "exploration" in path.stem:
+                candidates.append(path)
+    if candidates:
+        preferred = sorted(candidates, key=lambda p: (
+            0 if p.name == "search.py" else 1 if p.name == "train.py" else 2,
+            -p.stat().st_mtime,
+            p.name,
+        ))[0]
+        return str(preferred.relative_to(root))
     return None
 
 
 def _search_driver_command(rel: str) -> str:
     if rel.endswith(".sh"):
         return f"set -e; bash {rel}"
-    # Python driver: run it, then materialize + evaluate the best candidate it found.
+    # Python drivers are usually candidate generators invoked by train/train.sh.
+    # Running both the driver and train.sh in the same iteration can emit the same
+    # candidate twice before the eval result is logged, so drive the canonical
+    # train->eval->log loop instead.
     return (
         "set -e; "
-        f"python3 {rel}; "
-        "if [ -f train/train.sh ]; then bash train/train.sh; fi; "
-        "if [ -f eval.sh ]; then bash eval.sh; fi"
+        "if [ -f train/train.sh ]; then bash train/train.sh; "
+        f"else python3 {rel}; fi; "
+        "if [ -f eval.sh ]; then bash eval.sh; fi; "
+        "python3 .autoresearch/append_search_log.py autoresearch_run"
     )
+
+
+def _fallback_eval_loop_command() -> str:
+    return (
+        "set -e; "
+        "if [ -f train/train.sh ]; then bash train/train.sh; "
+        "elif [ -f run.sh ]; then bash run.sh; "
+        "elif [ -f eval.sh ]; then :; "
+        "else echo 'no train/run/eval script found'; exit 1; fi; "
+        "if [ -f eval.sh ]; then bash eval.sh; fi; "
+        "python3 .autoresearch/append_search_log.py autoresearch_fallback_loop"
+    )
+
+
+def _ensure_search_log_helper(root: str | Path) -> None:
+    helper = Path(root) / ".autoresearch" / "append_search_log.py"
+    helper.parent.mkdir(parents=True, exist_ok=True)
+    helper.write_text(
+        "import json, sys, time\n"
+        "from pathlib import Path\n"
+        "source = sys.argv[1] if len(sys.argv) > 1 else 'autoresearch_run'\n"
+        "root = Path('.')\n"
+        "submission = root.joinpath('outputs', 'submission.json')\n"
+        "metrics = root.joinpath('metrics.json')\n"
+        "log = root.joinpath('outputs', 'search_log.jsonl')\n"
+        "if submission.exists() and metrics.exists():\n"
+        "    s = json.loads(submission.read_text())\n"
+        "    m = json.loads(metrics.read_text())\n"
+        "    row = {'ts': time.time(), 'x': s.get('x'), 'y': s.get('y'), 'z': m.get('z', m.get('primary_metric')), 'source': source}\n"
+        "    log.parent.mkdir(parents=True, exist_ok=True)\n"
+        "    with log.open('a', encoding='utf-8') as f:\n"
+        "        f.write(json.dumps(row, ensure_ascii=False) + '\\n')\n",
+        encoding="utf-8",
+    )
+
+
+def _current_submission_key(root: str | Path) -> Optional[tuple[float, float]]:
+    path = Path(root) / "outputs" / "submission.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return (float(data.get("x")), float(data.get("y")))
+    except Exception:
+        return None
+
+
+def _artifact_duration(obs) -> Optional[float]:
+    try:
+        if not getattr(obs, "artifact_path", ""):
+            return None
+        data = json.loads(Path(obs.artifact_path).read_text(encoding="utf-8"))
+        return float(data.get("duration_seconds"))
+    except Exception:
+        return None
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _submission_xy(root: str | Path) -> Optional[tuple[float, float]]:
+    data = _read_json(Path(root) / "outputs" / "submission.json")
+    try:
+        return (float(data["x"]), float(data["y"]))
+    except Exception:
+        return None
+
+
+def _metric_from_file(root: str | Path) -> tuple[Optional[float], bool]:
+    data = _read_json(Path(root) / "metrics.json")
+    value = data.get("z", data.get("primary_metric"))
+    try:
+        metric = float(value)
+    except Exception:
+        return None, bool(data.get("higher_is_better", True))
+    return metric, bool(data.get("higher_is_better", True))
+
+
+def _search_log_rows(root: str | Path) -> list[dict]:
+    rows = []
+    path = Path(root) / "outputs" / "search_log.jsonl"
+    if not path.exists():
+        return rows
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        if not isinstance(row, dict):
+            continue
+        try:
+            row["x"] = float(row["x"])
+            row["y"] = float(row["y"])
+            row["z"] = float(row["z"])
+        except Exception:
+            continue
+        rows.append(row)
+    return rows
+
+
+def _point_key(x: float, y: float) -> tuple[float, float]:
+    return (round(float(x), 8), round(float(y), 8))
+
+
+def _next_numeric_probe(rows: list[dict], *, higher_is_better: bool) -> Optional[tuple[float, float]]:
+    tried = {_point_key(r["x"], r["y"]) for r in rows}
+    grid_values = (-100.0, -50.0, 0.0, 50.0, 100.0)
+    for x in grid_values:
+        for y in grid_values:
+            if _point_key(x, y) not in tried:
+                return x, y
+    if rows:
+        best = max(rows, key=lambda r: r["z"]) if higher_is_better else min(rows, key=lambda r: r["z"])
+        bx, by = best["x"], best["y"]
+    else:
+        bx, by = 0.0, 0.0
+    directions = (
+        (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
+        (1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0),
+    )
+    for step in (50.0, 25.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.25):
+        for dx, dy in directions:
+            x, y = bx + step * dx, by + step * dy
+            if _point_key(x, y) not in tried:
+                return x, y
+    return None
+
+
+def _write_probe_submission(root: str | Path, x: float, y: float) -> None:
+    root = Path(root)
+    payload = {"x": float(x), "y": float(y)}
+    outputs = root / "outputs"
+    outputs.mkdir(parents=True, exist_ok=True)
+    (outputs / "submission.json").write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    train = root / "train"
+    train.mkdir(exist_ok=True)
+    candidate = dict(payload)
+    candidate["source"] = "autoresearch_numeric_probe"
+    (train / "candidate.json").write_text(json.dumps(candidate, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _numeric_probe_applicable(root: str | Path, first_duration: Optional[float], cheap_threshold: float) -> bool:
+    if first_duration is None or first_duration > cheap_threshold:
+        return False
+    root = Path(root)
+    if not (root / "eval.sh").exists():
+        return False
+    return _submission_xy(root) is not None and _metric_from_file(root)[0] is not None
+
+
+def _run_numeric_probe(ctx: PhaseContext, loop, *, already_ran: int, max_seconds: float, max_evals: int, cheap_threshold: float):
+    from core.autoresearch_loop import AutoResearchAction, AutoResearchObservation
+
+    root = Path(ctx.root)
+    started = time.time()
+    ran = 0
+    final_obs = None
+    while already_ran + ran < max_evals:
+        if max_seconds and time.time() - started >= max_seconds:
+            break
+        rows = _search_log_rows(root)
+        metric, higher = _metric_from_file(root)
+        candidate = _next_numeric_probe(rows, higher_is_better=higher)
+        if candidate is None:
+            break
+        _write_probe_submission(root, *candidate)
+        command = "set -e; bash eval.sh; python3 .autoresearch/append_search_log.py autoresearch_numeric_probe"
+        action = AutoResearchAction(type="run", rationale="autoresearch numeric probe", command=command, role="trial")
+        obs = loop.execute_action(action)
+        final_obs = obs
+        ran += 1
+        if obs.status not in {"ok", "ok_metric_recovered"}:
+            break
+        duration = _artifact_duration(obs)
+        if duration is not None and duration > cheap_threshold:
+            break
+        metric, higher = _metric_from_file(root)
+        if metric is not None and metric <= 1.0 and not higher:
+            break
+    rows = _search_log_rows(root)
+    if rows and already_ran + ran < max_evals:
+        _, higher = _metric_from_file(root)
+        best = max(rows, key=lambda r: r["z"]) if higher else min(rows, key=lambda r: r["z"])
+        _write_probe_submission(root, best["x"], best["y"])
+        final_action = AutoResearchAction(
+            type="run",
+            rationale="autoresearch numeric probe best",
+            command="set -e; bash eval.sh; python3 .autoresearch/append_search_log.py autoresearch_numeric_probe_best",
+            role="trial",
+        )
+        final_obs = loop.execute_action(final_action)
+    if final_obs is None:
+        final_obs = AutoResearchObservation("shell", "numeric probe did not run", "", "skipped")
+    return final_obs, ran
 
 
 def _default_run_fn(ctx: PhaseContext) -> dict:
@@ -422,31 +673,65 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     loop = ctx.loop
     if loop is None:
         return {"status": "skipped", "returncode": None, "stdout": "no loop"}
+    _ensure_search_log_helper(ctx.root)
     driver = _find_search_driver(ctx)
     if driver:
         command = _search_driver_command(driver)
         rationale = f"v2 run search driver ({driver})"
     else:
-        command = (
-            "set -e; "
-            "if [ -f train/train.sh ]; then bash train/train.sh; "
-            "elif [ -f run.sh ]; then bash run.sh; "
-            "else echo 'no train/run script found'; fi; "
-            "if [ -f eval.sh ]; then bash eval.sh; fi"
-        )
+        command = _fallback_eval_loop_command()
         rationale = "v2 run experiment"
     from core.autoresearch_loop import AutoResearchAction, git_snapshot
 
     action = AutoResearchAction(type="run", rationale=rationale, command=command, role="trial")
     base_git = git_snapshot(loop.settings.root(), enabled=loop.settings.use_git_versioning)
-    obs = loop.execute_action(action)
+    observations = []
+    started = time.time()
+    start_rows = len(_search_log_rows(ctx.root))
+    max_seconds = max(0.0, float(getattr(loop.settings, "run_max_inner_seconds", 20.0) or 0.0))
+    max_evals = max(1, int(getattr(loop.settings, "run_max_inner_evals", 100) or 1))
+    cheap_threshold = max(0.0, float(getattr(loop.settings, "run_cheap_eval_threshold_seconds", 2.0) or 0.0))
+    previous_candidate = _current_submission_key(ctx.root)
+    obs = None
+    for index in range(max_evals):
+        obs = loop.execute_action(action)
+        observations.append(obs)
+        current_candidate = _current_submission_key(ctx.root)
+        last_duration = _artifact_duration(obs)
+        if obs.status not in {"ok", "ok_metric_recovered"}:
+            break
+        if index == 0 and (last_duration is None or last_duration > cheap_threshold):
+            break
+        if current_candidate is not None and current_candidate == previous_candidate:
+            break
+        previous_candidate = current_candidate
+        if max_seconds and time.time() - started >= max_seconds:
+            break
+    first_duration = _artifact_duration(observations[0]) if observations else None
+    if _numeric_probe_applicable(ctx.root, first_duration, cheap_threshold):
+        probe_obs, probe_count = _run_numeric_probe(
+            ctx,
+            loop,
+            already_ran=len(observations),
+            max_seconds=max_seconds,
+            max_evals=max_evals,
+            cheap_threshold=cheap_threshold,
+        )
+        if probe_count:
+            observations.extend([probe_obs])
+            obs = probe_obs
+    obs = obs or observations[-1]
     recorder = getattr(loop, "_maybe_record_experiment", None)
     if callable(recorder):
         recorder(action, obs, base_git, "run_experiment")
     status = "ok" if obs.status in {"ok", "ok_metric_recovered"} else "failed"
+    stdout = obs.summary
+    inner_evals = max(len(observations), len(_search_log_rows(ctx.root)) - start_rows)
+    if len(observations) > 1:
+        stdout = f"{stdout}\ninner_evals={inner_evals} elapsed_seconds={round(time.time() - started, 3)}"
     return {"status": status, "returncode": 0 if status == "ok" else 1,
-            "stdout": obs.summary, "stderr": "", "artifact_path": obs.artifact_path,
-            "search_driver": driver or ""}
+            "stdout": stdout, "stderr": "", "artifact_path": obs.artifact_path,
+            "search_driver": driver or "", "inner_evals": inner_evals}
 
 
 def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[AutofixFn] = None, *, max_autofix: int = 2):
@@ -462,15 +747,18 @@ def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[Autofi
                 break
             result = run(ctx)
         major = result.get("status") == "failed"
+        metric, higher = _metric_from_file(ctx.root)
+        solved = bool(metric is not None and ((not higher and metric <= 1.0) or (higher and metric >= 0.999)))
         driver = result.get("search_driver") or "(single train+eval)"
         write_auto_note(ctx.root, "run_report",
-                        f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} autofix_attempts={attempts} driver={driver}\n")
+                        f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} "
+                        f"autofix_attempts={attempts} driver={driver} inner_evals={result.get('inner_evals', 1)} solved={solved}\n")
         if major:
             append_lesson(ctx.root, kind="operational_error",
                           summary=f"run failed after {attempts} autofix attempts",
                           detail=str(result.get("stderr") or result.get("stdout") or "")[:2000])
-        signals_update = {"major_error": True} if major else {}
-        summary = f"run: status={result.get('status')} autofix={attempts}" + (" (major_error)" if major else "")
+        signals_update = {"major_error": True} if major else ({"solved": True} if solved else {})
+        summary = f"run: status={result.get('status')} autofix={attempts}" + (" solved" if solved else "") + (" (major_error)" if major else "")
         return PhaseResult(signals_update=signals_update, summary=summary)
 
     return handler

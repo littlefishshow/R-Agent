@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Literal, Optional
 
 from tools.web_tools import web_extract_tool, web_search_tool
+from core.autoresearch_debug import inflight_finish, inflight_start
 
 Decision = Literal["run", "read", "write", "apply_patch", "web_search", "web_extract", "note", "stop"]
 
@@ -51,7 +52,7 @@ class AutoResearchSettings:
     versioning_policy: str = "artifact_only"
     planner_kind: str = "fixed"
     llm_request_timeout: float = 60.0
-    llm_retry_attempts: int = 1
+    llm_retry_attempts: int = 0
     # --- v2: cost control + layered memory ---
     project_state_path: str | Path = "project.md"
     budget_path: str | Path = ".autoresearch/budget.json"
@@ -66,15 +67,23 @@ class AutoResearchSettings:
     model_tier_util: str = ""
     readonly_eval_globs: tuple[str, ...] = ("prepare.py", "eval.sh", "eval/**", "evaluation/**")
     plateau_patience: int = 3
+    debug_mode: bool = False
     # --- v2 execute/run tuning ---
     # Cap LLM-backed actions per Execute phase visit so one step cannot burn the
     # whole time/token budget on a long todo list; remaining items advance on the
     # next Execute visit via a cursor.
-    execute_max_actions_per_step: int = 3
+    execute_max_actions_per_step: int = 1
     # When Execute wrote a self-iterating search driver, let Run execute it so it
     # performs many internal evaluations from a single LLM decision.
     run_search_driver: bool = True
-    search_driver_globs: tuple[str, ...] = ("train/search.py", "search.py", "train/search.sh", "search.sh")
+    run_max_inner_seconds: float = 20.0
+    run_max_inner_evals: int = 100
+    run_cheap_eval_threshold_seconds: float = 2.0
+    search_driver_globs: tuple[str, ...] = (
+        "train/search.py", "train/search_driver.py", "train/*search*.py",
+        "train/*driver*.py", "train/*exploration*.py", "search.py",
+        "train/search.sh", "search.sh",
+    )
 
     def __post_init__(self) -> None:
         # Normalize early so tools, background payloads, state, progress, and
@@ -108,6 +117,9 @@ class AutoResearchSettings:
     def stop_file(self) -> Path:
         # Sentinel a watcher / esc handler can create to stop the loop cleanly.
         return self.root() / ".autoresearch" / "STOP"
+
+    def debug_file(self) -> Path:
+        return self.root() / ".autoresearch" / "DEBUG"
 
     def state_file(self) -> Path:
         p = Path(self.state_path)
@@ -644,6 +656,7 @@ class ProjectConfinedCommandRunner:
         workdir = self.boundary.resolve(cwd)
         self.boundary.validate_command_surface(command)
         started = time.time()
+        inflight_start(self.boundary.project_dir, "shell", detail=command[:300], cwd=str(workdir))
         try:
             completed = subprocess.run(
                 command,
@@ -653,7 +666,7 @@ class ProjectConfinedCommandRunner:
                 text=True,
                 timeout=self.timeout_seconds,
             )
-            return {
+            result = {
                 "command": command,
                 "cwd": str(workdir),
                 "returncode": completed.returncode,
@@ -661,8 +674,16 @@ class ProjectConfinedCommandRunner:
                 "stderr": completed.stderr,
                 "duration_seconds": round(time.time() - started, 3),
             }
+            inflight_finish(
+                self.boundary.project_dir,
+                "shell",
+                detail=command[:300],
+                returncode=completed.returncode,
+                duration_seconds=result["duration_seconds"],
+            )
+            return result
         except subprocess.TimeoutExpired as exc:
-            return {
+            result = {
                 "command": command,
                 "cwd": str(workdir),
                 "returncode": None,
@@ -671,6 +692,15 @@ class ProjectConfinedCommandRunner:
                 "duration_seconds": round(time.time() - started, 3),
                 "timeout": True,
             }
+            inflight_finish(
+                self.boundary.project_dir,
+                "shell",
+                detail=command[:300],
+                returncode=None,
+                timeout=True,
+                duration_seconds=result["duration_seconds"],
+            )
+            return result
 
 
 class AutoResearchContextManager:
@@ -1149,16 +1179,31 @@ class AutoResearchStepAgent:
             completion_kwargs["temperature"] = self.settings.llm_temperature
 
         for attempt in range(attempts):
+            root = self.settings.root()
+            phase = getattr(self.loop, "_current_phase", "") if self.loop is not None else ""
+            step = (user.get("step") or {}).get("name") if isinstance(user, dict) else ""
+            inflight_start(
+                root,
+                "llm",
+                phase=phase,
+                detail=f"{step or 'chat'} attempt {attempt + 1}/{attempts}",
+                model=model,
+                timeout_seconds=timeout,
+                prompt_chars=sum(len(str(m.get("content", ""))) for m in messages),
+            )
             try:
                 try:
-                    return client.chat.completions.create(
+                    response = client.chat.completions.create(
                         **completion_kwargs,
                         timeout=timeout,
                     )
                 except TypeError:
                     # Older client shims may not accept timeout=
-                    return client.chat.completions.create(**completion_kwargs)
+                    response = client.chat.completions.create(**completion_kwargs)
+                inflight_finish(root, "llm", phase=phase, detail=f"{step or 'chat'} attempt {attempt + 1}/{attempts}", model=model)
+                return response
             except Exception as exc:
+                inflight_finish(root, "llm", phase=phase, detail=f"{step or 'chat'} attempt {attempt + 1}/{attempts}", model=model, error=str(exc)[:500])
                 last_exc = exc
         raise last_exc if last_exc else RuntimeError("LLM completion failed with no exception")
 

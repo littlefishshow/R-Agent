@@ -240,12 +240,19 @@ settings = AutoResearchSettings(**payload)
 try:
     run_phase_loop(settings, max_steps=max_steps, run_id=run_id)
 except Exception as exc:
-    # run_phase_loop's monitor finally-block already records failure; make sure
-    # a monitor file exists even if construction failed before the loop started.
+    # run_phase_loop's monitor finally-block usually records failure; overwrite
+    # the monitor too, because the queued seed file may already exist when
+    # construction/import fails before the loop starts.
     mon = Path(settings.monitor_file())
-    if not mon.exists():
-        mon.parent.mkdir(parents=True, exist_ok=True)
-        mon.write_text(json.dumps({"run_id": run_id, "status": "failed", "error": str(exc)}) + "\n", encoding="utf-8")
+    mon.parent.mkdir(parents=True, exist_ok=True)
+    data = {}
+    if mon.exists():
+        try:
+            data = json.loads(mon.read_text(encoding="utf-8"))
+        except Exception:
+            data = {}
+    data.update({"run_id": run_id, "status": "failed", "error": str(exc), "finished_at": time.time()})
+    mon.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 '''
 
 
@@ -253,7 +260,7 @@ def _v2_settings_kwargs(
     project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
     llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
     max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
-    versioning_policy, plateau_patience, trace_rounds=False,
+    versioning_policy, plateau_patience, trace_rounds=False, debug_mode=False,
 ) -> dict:
     return dict(
         project_dir=project_dir,
@@ -275,6 +282,7 @@ def _v2_settings_kwargs(
         versioning_policy=versioning_policy,
         plateau_patience=plateau_patience,
         trace_rounds=trace_rounds,
+        debug_mode=debug_mode,
     )
 
 
@@ -337,6 +345,7 @@ def auto_research_run_v2_tool(
     plateau_patience: int = 3,
     background: bool = True,
     trace_rounds: bool = True,
+    debug_mode: bool = False,
     wait_seconds: float = 180.0,
     detach: bool = False,
 ) -> str:
@@ -366,9 +375,18 @@ def auto_research_run_v2_tool(
             project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
             llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
             max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
-            versioning_policy, plateau_patience, trace_rounds,
+            versioning_policy, plateau_patience, trace_rounds, debug_mode,
         )
         settings = AutoResearchSettings(**kwargs)
+        if debug_mode:
+            from core.autoresearch_debug import set_debug
+
+            set_debug(settings.root(), True)
+        else:
+            # A stale STOP from the previous interrupted run should not make the
+            # next launch immediately pause. The user's explicit stop/kill still
+            # wins for the currently running process.
+            settings.stop_file().unlink(missing_ok=True)
 
         if background:
             from core.autoresearch_monitor import RunMonitor, read_monitor, render_monitor_text
@@ -382,7 +400,7 @@ def auto_research_run_v2_tool(
             child_payload = json.dumps(kwargs, ensure_ascii=False)
             subprocess.Popen(
                 [sys.executable, "-c", _V2_CHILD_CODE, child_payload, run_id, str(max_steps)],
-                cwd=str(Path.cwd()),
+                cwd=str(Path(__file__).resolve().parents[1]),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True,
@@ -565,6 +583,7 @@ def _v2_properties():
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
         "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
         "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认开启。", "default": True},
+        "debug_mode": {"type": "boolean", "description": "是否开启 debug 模式：写 .autoresearch/debug/debug.jsonl 和 inflight.json，显示当前卡在 LLM/shell/phase 的哪一步。可删除 .autoresearch/DEBUG 或用 /autoresearch debug off 关闭。", "default": False},
         "background": {"type": "boolean", "description": "是否在独立子进程运行(存活于慢 LLM 相位)；默认 True。注意：调用默认仍会阻塞并轮询心跳最多 wait_seconds 秒后才返回，返回体带 completed 布尔标志——completed=false 表示仍在运行，禁止当作优化完成，必须继续用 auto_research_v2_status 轮询。", "default": True},
         "wait_seconds": {"type": "number", "description": "background=true 时，调用阻塞轮询心跳的最长秒数(默认 180，安全低于工具超时)。期间跑完则返回真实最终结果(experiments/best/budget)且 completed=true；超时未完成则返回 completed=false 且 status=running，需继续轮询。", "default": 180.0},
         "detach": {"type": "boolean", "description": "是否发射后不管：true 时启动子进程后立即返回(completed=false, status=queued)，不阻塞等待。默认 False(即有界等待)。", "default": False},

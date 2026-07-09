@@ -41,13 +41,41 @@ def test_render_monitor_text_has_rounds_and_tokens(tmp_path):
     data = read_monitor(tmp_path / "m.json")
     text = render_monitor_text(data)
     assert "rounds: 3/10" in text
-    assert "tokens: 500/1000" in text
+    assert "completed tokens: 500/1000" in text
     assert "usd: 0.5/5.0" in text
     # thinking-time line surfaces total/avg/last/max
     assert "think time: total=12.0s" in text
     assert "avg=3.0s" in text  # 12.0 / 4 calls
     assert "last=3.0s" in text
     assert data["budget"]["duration_seconds_avg"] == 3.0
+
+
+def test_monitor_renders_inflight(tmp_path):
+    from core.autoresearch_debug import inflight_start, set_debug
+
+    set_debug(tmp_path, True)
+    inflight_start(tmp_path, "llm", phase="execute", detail="apply_change attempt 1/1")
+    mon = RunMonitor(tmp_path / ".autoresearch" / "monitor.json", run_id="rI")
+    mon.set_max_steps(10)
+    mon.start()
+    data = read_monitor(mon.path)
+    text = render_monitor_text(data)
+    assert data["inflight"]["kind"] == "llm"
+    assert "inflight: llm" in text
+    assert "phase=execute" in text
+
+
+def test_monitor_preserves_step_index_on_resume(tmp_path):
+    p = tmp_path / "monitor.json"
+    p.write_text(json.dumps({
+        "run_id": "old", "project_id": "p", "pid": 1, "status": "failed",
+        "current_phase": "compress", "next_phase": "execute",
+        "step_index": 7, "max_steps": 100,
+    }), encoding="utf-8")
+    mon = RunMonitor(p, run_id="new", project_id="p")
+    data = read_monitor(p)
+    assert data["step_index"] == 7
+    assert data["current_phase"] == "execute"
 
 
 def test_controller_updates_monitor_each_step(tmp_path):

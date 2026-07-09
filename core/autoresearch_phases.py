@@ -28,6 +28,7 @@ from core.autoresearch_memory import (
     write_phase,
     normalize_phase,
 )
+from core.autoresearch_debug import debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
 
 
 # --------------------------------------------------------------------------- #
@@ -43,6 +44,7 @@ class PhaseSignals:
     plateau_counter: int = 0           # consecutive rounds with no Pareto improvement
     plateau_patience: int = 3          # K
     major_error: bool = False          # Run/Execute hit an unrecoverable error
+    solved: bool = False               # objective is good enough; stop cleanly
     plan_still_valid: bool = True      # is the current L2 plan still actionable?
     budget_exhausted: bool = False
     budget_degrade: bool = False
@@ -90,6 +92,8 @@ def next_phase(sig: PhaseSignals) -> tuple[str, str]:
             return "evaluate", "major error during execute: jump to evaluate"
         return "run", "changes applied: run project"
     if phase == "run":
+        if sig.solved:
+            return "pause", "objective solved: pause"
         if sig.major_error:
             return "evaluate", "major error during run: jump to evaluate"
         return "evaluate", "run finished"
@@ -229,6 +233,17 @@ class PhaseController:
             except Exception:
                 pass
         signals = self.build_signals(phase, extra_signals)
+        budget = getattr(self.loop, "budget", None)
+        budget_snapshot = budget.snapshot() if budget is not None else None
+        if self.monitor is not None:
+            self.monitor.update_phase_start(
+                step_index=self._step_index,
+                current_phase=phase,
+                summary=f"starting {phase}",
+                budget_snapshot=budget_snapshot,
+            )
+        debug_event(self.root, "phase_start", step_index=self._step_index, phase=phase)
+        inflight_start(self.root, "phase", phase=phase, detail=f"{phase} handler")
         ctx = PhaseContext(
             phase=phase,
             root=self.root,
@@ -238,7 +253,10 @@ class PhaseController:
             loop=self.loop,
         )
         handler = self._handler_for(phase)
-        result = handler(ctx) or PhaseResult()
+        try:
+            result = handler(ctx) or PhaseResult()
+        finally:
+            inflight_finish(self.root, "phase", phase=phase)
 
         # Persist handler outputs (belief-only for program.md).
         if result.program_text is not None:
@@ -261,7 +279,6 @@ class PhaseController:
         self._atomic_write(self._project_path(), project_text)
 
         self._step_index += 1
-        budget = getattr(self.loop, "budget", None)
         budget_snapshot = budget.snapshot() if budget is not None else None
         if self.monitor is not None:
             self.monitor.update_step(
@@ -271,6 +288,8 @@ class PhaseController:
                 summary=result.summary,
                 budget_snapshot=budget_snapshot,
             )
+        debug_event(self.root, "phase_finish", step_index=self._step_index, phase=phase,
+                    next_phase=nxt, reason=reason, summary=result.summary)
 
         return {
             "ran_phase": phase,
@@ -349,6 +368,7 @@ def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = 
     from core.autoresearch_phase_handlers import default_handlers
     from core.autoresearch_monitor import RunMonitor
 
+    ensure_debug_from_settings(settings)
     loop = loop or AutoResearchLoop(settings)
     if monitor is None:
         monitor = RunMonitor(settings.monitor_file(), run_id=run_id, project_id=settings.project_id)

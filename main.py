@@ -937,6 +937,11 @@ def get_completions():
         "/autoresearch": {
             "run": None,
             "show": None,
+            "debug": {
+                "on": None,
+                "off": None,
+                "show": None,
+            },
             "kill": None,
         },
         "/skill": skills_dict,
@@ -1059,6 +1064,7 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
     """`/autoresearch run <dir>` launches a fire-and-forget v2 loop;
     `/autoresearch show [dir]` prints progress from monitor.json (no LLM)."""
     from tools.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
+    from core.autoresearch_debug import read_inflight, set_debug
 
     sub = (args[0].lower() if args else "")
 
@@ -1072,7 +1078,7 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
             console.print(f"[bold red]目录不存在: {project_dir}[/bold red]")
             return
         # Fire-and-forget: detach immediately, do not block the terminal.
-        payload = json.loads(auto_research_run_v2_tool(str(root), background=True, detach=True))
+        payload = json.loads(auto_research_run_v2_tool(str(root), background=True, detach=True, debug_mode=True))
         if not payload.get("success"):
             console.print(f"[bold red]启动失败: {payload.get('error')}[/bold red]")
             return
@@ -1082,7 +1088,7 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
             f"- 项目目录: `{payload.get('project_dir')}`\n"
             f"- run_id: `{payload.get('run_id')}`\n"
             f"- monitor: `{payload.get('monitor_path')}`\n\n"
-            f"> 用 `/autoresearch show` 查看进度（读取 monitor.json，不调用 LLM）。"
+            f"> 用 `/autoresearch show` 查看进度（读取 monitor.json，不调用 LLM）。debug 默认开启，可 `/autoresearch debug off` 关闭。"
         )
         console.print(Panel(Markdown(text), title="🔬 AutoResearch 已启动", border_style="cyan", expand=False))
         return
@@ -1098,6 +1104,40 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
             return
         monitor_text = status.get("monitor_text") or "(暂无进度：monitor.json 尚未生成或不可读)"
         console.print(Panel(monitor_text, title=f"🔬 AutoResearch 进度: {project_dir}", border_style="cyan", expand=False))
+        return
+
+    if sub == "debug":
+        mode = args[1].lower() if len(args) > 1 else "show"
+        project_dir = args[2] if len(args) > 2 else _recall_autoresearch_dir()
+        if not project_dir:
+            console.print("[bold red]没有可操作的目录；用 /autoresearch debug <on|off|show> <项目文件夹> 指定目录。[/bold red]")
+            return
+        root = Path(project_dir).expanduser()
+        if mode == "on":
+            flag = set_debug(root, True)
+            console.print(f"debug 已开启: {flag}")
+            return
+        if mode == "off":
+            flag = set_debug(root, False)
+            console.print(f"debug 已关闭: {flag}")
+            return
+        if mode == "show":
+            inflight = read_inflight(root)
+            debug_log = root / ".autoresearch" / "debug" / "debug.jsonl"
+            lines = []
+            if inflight:
+                lines.append("inflight:")
+                lines.append(json.dumps(inflight, ensure_ascii=False, indent=2))
+            else:
+                lines.append("inflight: (none)")
+            if debug_log.exists():
+                tail = "\n".join(debug_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
+                lines.extend(["", "debug tail:", tail])
+            else:
+                lines.extend(["", "debug tail: (no debug.jsonl)"])
+            console.print(Panel("\n".join(lines), title=f"🔬 AutoResearch Debug: {project_dir}", border_style="cyan", expand=False))
+            return
+        console.print("[bold red]用法: /autoresearch debug [on|off|show] [项目文件夹][/bold red]")
         return
 
     if sub == "kill":
@@ -1126,6 +1166,7 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
         "用法:\n"
         "  /autoresearch run <项目文件夹>   # 后台启动，主进程不阻塞\n"
         "  /autoresearch show [项目文件夹]  # 查看进度（缺省用最近一次）\n"
+        "  /autoresearch debug [on|off|show] [项目文件夹]\n"
         "  /autoresearch kill              # 列出并终止所有正在运行的 autoresearch 进程"
     )
 

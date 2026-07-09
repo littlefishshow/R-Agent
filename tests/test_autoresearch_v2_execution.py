@@ -6,6 +6,7 @@ from core.autoresearch_execution import (
     parse_todo_from_plan,
     make_execute_handler,
     make_run_handler,
+    _find_search_driver,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
@@ -356,6 +357,21 @@ def test_execute_no_major_error_while_items_pending(tmp_path):
     assert r1.signals_update == {}
 
 
+def test_execute_skips_non_implementation_todos(tmp_path):
+    write_auto_note(tmp_path, "plan", "1. run bash train/train.sh then bash eval.sh\n2. analyze logged observations\n")
+    called = []
+
+    def fake_execute(item, ctx):
+        called.append(item)
+        return {"item": item, "status": "ok", "verification": True}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
+    assert called == []
+    assert "2/2 verified" in result.summary
+    report = (tmp_path / ".auto" / "execute_report.md").read_text(encoding="utf-8")
+    assert "non-implementation todo" in report
+
+
 # --------------------------------------------------------------------------- #
 # C: Run executes a self-iterating search driver when present
 # --------------------------------------------------------------------------- #
@@ -376,3 +392,87 @@ def test_run_prefers_search_driver(tmp_path):
     assert "train/search.py" in report
     state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
     assert state["experiments"][0]["metrics"]["z"] == 0.0
+
+
+def test_find_search_driver_supports_driver_globs(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "search_driver.py").write_text("print('x')\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    assert _find_search_driver(_ctx(tmp_path, "run", loop=loop)) == "train/search_driver.py"
+
+
+def test_run_fallback_loop_records_search_log(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nmkdir -p outputs\nprintf '{\"x\":1,\"y\":2}\\n' > outputs/submission.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nprintf '{\"primary_metric\":3,\"z\":3,\"higher_is_better\":false}\\n' > metrics.json\necho primary_metric=3\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    lines = (tmp_path / "outputs" / "search_log.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) >= 1
+    row = json.loads(lines[-1])
+    assert row["x"] == 1 and row["y"] == 2 and row["z"] == 3
+
+
+def test_run_adaptive_loop_continues_only_when_cheap_and_changing(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nmkdir -p outputs\n"
+        "n=$(wc -l < outputs/search_log.jsonl 2>/dev/null || echo 0)\n"
+        "printf '{\"x\":%s,\"y\":0}\\n' \"$n\" > outputs/submission.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "python3 - <<'PY'\n"
+        "import json\n"
+        "s=json.load(open('outputs/submission.json'))\n"
+        "z=10-int(s['x'])\n"
+        "json.dump({'primary_metric':z,'z':z,'higher_is_better':False}, open('metrics.json','w'))\n"
+        "print('primary_metric=%s' % z)\n"
+        "PY\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False, run_max_inner_evals=5,
+                                    run_max_inner_seconds=5.0, run_cheap_eval_threshold_seconds=2.0)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "inner_evals=5" in report
+    rows = (tmp_path / "outputs" / "search_log.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 5
+
+
+def test_run_adaptive_loop_stops_after_expensive_first_eval(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nmkdir -p outputs\nprintf '{\"x\":1,\"y\":2}\\n' > outputs/submission.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nsleep 1\nprintf '{\"primary_metric\":3,\"z\":3,\"higher_is_better\":false}\\n' > metrics.json\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False, run_max_inner_evals=5,
+                                    run_max_inner_seconds=10.0, run_cheap_eval_threshold_seconds=0.1)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "inner_evals=1" in report
