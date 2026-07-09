@@ -1064,7 +1064,7 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
     """`/autoresearch run <dir>` launches a fire-and-forget v2 loop;
     `/autoresearch show [dir]` prints progress from monitor.json (no LLM)."""
     from tools.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
-    from core.autoresearch_debug import read_inflight, set_debug
+    from core.autoresearch_debug import build_debug_summary, set_debug
 
     sub = (args[0].lower() if args else "")
 
@@ -1122,20 +1122,7 @@ def _handle_autoresearch_command(args: list[str], console) -> None:
             console.print(f"debug 已关闭: {flag}")
             return
         if mode == "show":
-            inflight = read_inflight(root)
-            debug_log = root / ".autoresearch" / "debug" / "debug.jsonl"
-            lines = []
-            if inflight:
-                lines.append("inflight:")
-                lines.append(json.dumps(inflight, ensure_ascii=False, indent=2))
-            else:
-                lines.append("inflight: (none)")
-            if debug_log.exists():
-                tail = "\n".join(debug_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:])
-                lines.extend(["", "debug tail:", tail])
-            else:
-                lines.extend(["", "debug tail: (no debug.jsonl)"])
-            console.print(Panel("\n".join(lines), title=f"🔬 AutoResearch Debug: {project_dir}", border_style="cyan", expand=False))
+            console.print(Panel(build_debug_summary(root), title=f"🔬 AutoResearch Debug: {project_dir}", border_style="cyan", expand=False))
             return
         console.print("[bold red]用法: /autoresearch debug [on|off|show] [项目文件夹][/bold red]")
         return

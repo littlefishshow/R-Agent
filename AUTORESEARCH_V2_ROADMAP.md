@@ -203,7 +203,7 @@ Deliverables:
 - [ ] Phase 4b: Evaluate updates per-task status and richer replan reasons.
 - [x] Phase 5a: git preflight reports non-repo, nested repo, missing HEAD, and dirty worktree warnings.
 - [ ] Phase 5b: optional strict preflight mode for versioning-sensitive runs.
-- [ ] Debug diagnostic summary.
+- [x] Phase 6a: `/autoresearch debug show` uses a diagnostic summary (monitor, inflight, budget, best, gate, todo, recent events).
 - [ ] Large-project docs.
 
 ## Open Questions

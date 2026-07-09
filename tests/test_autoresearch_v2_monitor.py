@@ -65,6 +65,38 @@ def test_monitor_renders_inflight(tmp_path):
     assert "phase=execute" in text
 
 
+def test_debug_summary_includes_monitor_budget_events_and_tasks(tmp_path):
+    from core.autoresearch_debug import build_debug_summary, debug_event, inflight_start, set_debug
+    from core.autoresearch_gate_state import save_gate_state
+    from core.autoresearch_todo_state import save_todo_state
+
+    set_debug(tmp_path, True)
+    mon = RunMonitor(tmp_path / ".autoresearch" / "monitor.json", run_id="rD", project_id="p")
+    mon.set_max_steps(5)
+    mon.start()
+    mon.update_step(step_index=2, current_phase="run", next_phase="evaluate", summary="ran",
+                    budget_snapshot={"total_tokens": 12, "estimated_usd": 0.1, "calls": 2,
+                                     "duration_seconds_total": 3.0, "duration_seconds_max": 2.0,
+                                     "status": "ok"})
+    (tmp_path / ".autoresearch" / "state.json").write_text(json.dumps({
+        "best_experiment": {"experiment_id": "e1", "decision": "improved", "metrics": {"z": 1}},
+    }), encoding="utf-8")
+    save_gate_state(tmp_path, {"pareto_changed": True, "plateau_counter": 0, "plan_still_valid": True})
+    save_todo_state(tmp_path, {"tasks": [{"task_id": "t1", "goal": "do it", "status": "pending"}]})
+    inflight_start(tmp_path, "shell", detail="bash eval.sh")
+    debug_event(tmp_path, "phase_finish", time="now", phase="run", next_phase="evaluate", summary="done")
+    debug_event(tmp_path, "shell_finish", returncode=0, elapsed_seconds=0.2, detail="bash eval.sh")
+
+    text = build_debug_summary(tmp_path)
+    assert "AutoResearch Debug Summary" in text
+    assert "status=running" in text
+    assert "inflight: kind=shell" in text
+    assert "tokens=12" in text
+    assert "best: id=e1" in text
+    assert "todo: total=1" in text
+    assert "recent shell" in text
+
+
 def test_monitor_preserves_step_index_on_resume(tmp_path):
     p = tmp_path / "monitor.json"
     p.write_text(json.dumps({
