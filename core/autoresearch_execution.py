@@ -28,6 +28,8 @@ from typing import Callable, Optional
 
 from core.autoresearch_memory import write_auto_note, read_auto_notes, append_lesson
 from core.autoresearch_phases import PhaseContext, PhaseResult
+from core.autoresearch_debug import inflight_finish, inflight_start
+from core.autoresearch_timeout import call_with_deadline
 from core.autoresearch_todo_state import (
     has_open_tasks,
     load_todo_state,
@@ -169,6 +171,13 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
         pass
     from core.autoresearch_loop import AutoResearchAction, AutoResearchWorkflowStep
 
+    direct = _direct_write_action(item, ctx)
+    if direct is not None:
+        return direct
+    direct_failed = getattr(ctx, "_autoresearch_direct_write_failed", "")
+    if direct_failed:
+        return AutoResearchAction(type="note", rationale="execute_direct_write_failed", content=direct_failed)
+
     step = AutoResearchWorkflowStep(
         name="apply_change",
         action_type="note",
@@ -190,6 +199,119 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
     if callable(apply_updates):
         apply_updates(getattr(result, "bucket_updates", {}) or {})
     return result.action
+
+
+def _direct_write_action(item: str, ctx: PhaseContext):
+    """Ask the model for a minimal {path, content} write before full StepAgent."""
+    loop = ctx.loop
+    agent = getattr(loop, "step_agent", None) if loop is not None else None
+    if agent is None:
+        return None
+    try:
+        client = agent._client()
+    except Exception:
+        return None
+    try:
+        from core.autoresearch_loop import AutoResearchAction, extract_json_object
+    except Exception:
+        return None
+    model = ""
+    try:
+        old_tier = getattr(agent, "_tier", "plan")
+        agent._tier = "exec"
+        model = agent._resolved_model()
+        agent._tier = old_tier
+    except Exception:
+        model = getattr(agent, "model", "") or ""
+    root = Path(ctx.root)
+    target = _preferred_write_target(root)
+    current = ""
+    if target:
+        try:
+            current = (root / target).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            current = ""
+    system = (
+        "Return ONLY JSON with keys path and content. "
+        "Rewrite exactly one train-side file. Do not edit eval.py, eval.sh, or blackbox_oracle.py. "
+        "No markdown, no explanation."
+    )
+    user = json.dumps({
+        "todo": item,
+        "preferred_path": target,
+        "current_file": current[:6000],
+        "schema": {"path": "relative train-side path", "content": "complete new file content"},
+    }, ensure_ascii=False)
+    timeout = float(getattr(getattr(loop, "settings", None), "llm_request_timeout", 60.0) or 60.0)
+    try:
+        inflight_start(
+            root,
+            "llm",
+            phase=getattr(loop, "_current_phase", "execute") if loop is not None else "execute",
+            detail="execute direct write",
+            model=model or "gpt-4o",
+            timeout_seconds=timeout,
+            prompt_chars=len(system) + len(user),
+        )
+        def _call():
+            try:
+                return client.chat.completions.create(
+                    model=model or "gpt-4o",
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                    timeout=timeout,
+                )
+            except TypeError:
+                return client.chat.completions.create(
+                    model=model or "gpt-4o",
+                    messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+                )
+
+        resp = call_with_deadline(_call, timeout_seconds=timeout, label="execute direct write")
+        inflight_finish(
+            root,
+            "llm",
+            phase=getattr(loop, "_current_phase", "execute") if loop is not None else "execute",
+            detail="execute direct write",
+            model=model or "gpt-4o",
+        )
+        raw = getattr(resp.choices[0].message, "content", "") or ""
+        data = extract_json_object(raw)
+        path = str(data.get("path") or "").strip()
+        content = str(data.get("content") or "")
+        if not path or not content:
+            return None
+        if not _is_train_side_write_path(path):
+            setattr(ctx, "_autoresearch_direct_write_failed", f"direct write returned unsafe path: {path}")
+            return None
+        return AutoResearchAction(type="write", rationale=f"direct write for execute todo: {item[:120]}", path=path, content=content)
+    except Exception as exc:
+        inflight_finish(
+            root,
+            "llm",
+            phase=getattr(loop, "_current_phase", "execute") if loop is not None else "execute",
+            detail="execute direct write",
+            model=model or "gpt-4o",
+            error=str(exc)[:500],
+        )
+        setattr(ctx, "_autoresearch_direct_write_failed", f"direct write failed: {exc}")
+        return None
+
+
+def _preferred_write_target(root: Path) -> str:
+    for rel in ("train/train.py", "train/train.sh", "train/search.py", "train/optimizer.py"):
+        if (root / rel).exists():
+            return rel
+    return "train/train.py"
+
+
+def _is_train_side_write_path(path: str) -> bool:
+    parts = Path(path).parts
+    if not parts or ".." in parts:
+        return False
+    if parts[0] not in {"train", "src", "scripts"}:
+        return False
+    name = Path(path).name
+    return name not in {"eval.py", "eval.sh", "blackbox_oracle.py"}
 
 
 _TRAIN_SIDE_DIRS = ("train", "src", "scripts")

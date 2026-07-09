@@ -9,6 +9,7 @@ from core.autoresearch_execution import (
     _find_search_driver,
     _execution_attempt_item,
     _execute_parent_context,
+    _is_train_side_write_path,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
@@ -534,6 +535,14 @@ def test_execute_parent_context_truncation_keeps_todo_and_action_guidance(tmp_pa
     assert "MUST return a mutating action" in text
     assert "train/train.py" in text
     assert "execute context truncated" in text
+
+
+def test_direct_write_path_guard():
+    assert _is_train_side_write_path("train/train.py") is True
+    assert _is_train_side_write_path("src/model.py") is True
+    assert _is_train_side_write_path("eval.py") is False
+    assert _is_train_side_write_path("train/../eval.py") is False
+    assert _is_train_side_write_path("blackbox_oracle.py") is False
 
 
 # --------------------------------------------------------------------------- #
