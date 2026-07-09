@@ -370,14 +370,11 @@ __all__ = [
 
 def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = None, loop=None,
                    run_id: str = "", monitor=None) -> dict:
-    """Build a loop + controller with the default handlers and run the machine.
+    """Run the default v2 loop.
 
-    This is the v2 entrypoint: it reuses ``AutoResearchLoop`` purely for its
-    budget ledger, model tiers, confined runner, and artifact store, while the
-    ``PhaseController`` drives the 6-phase state machine over project.md.
-
-    A ``RunMonitor`` heartbeat (``.autoresearch/monitor.json``) is written every
-    phase step so the run can be watched without invoking any LLM.
+    The public v2 entrypoint now uses the simplified three-step controller
+    (plan -> attempt -> conclude). The legacy 6-phase ``PhaseController`` is
+    still available for tests and compatibility when custom handlers are passed.
     """
     from core.autoresearch_loop import AutoResearchLoop
     from core.autoresearch_phase_handlers import default_handlers
@@ -387,6 +384,10 @@ def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = 
     loop = loop or AutoResearchLoop(settings)
     if monitor is None:
         monitor = RunMonitor(settings.monitor_file(), run_id=run_id, project_id=settings.project_id)
+    if handlers is None:
+        from core.autoresearch_three_step import run_three_step_loop
+
+        return run_three_step_loop(settings, max_steps=max_steps, loop=loop, run_id=run_id, monitor=monitor)
     controller = PhaseController(settings, handlers=handlers or default_handlers(), loop=loop, monitor=monitor)
     reports = controller.run(max_steps=max_steps)
     budget = getattr(loop, "budget", None)

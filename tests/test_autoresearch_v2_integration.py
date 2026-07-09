@@ -27,13 +27,13 @@ def test_auto_research_run_v2_end_to_end_deterministic(tmp_path):
     # project.md created with a valid phase marker
     project = (tmp_path / "project.md").read_text(encoding="utf-8")
     phase, _ = read_phase(project)
-    assert phase in {"plan", "execute", "run", "evaluate", "compress", "gate", "init", "pause"}
+    assert phase in {"plan", "attempt", "conclude", "pause"}
     # survey ran
     assert (tmp_path / ".auto" / "survey.md").exists()
     # budget ledger exists
     assert (tmp_path / ".autoresearch" / "budget.json").exists()
-    # steps were recorded, first is init
-    assert payload["steps"][0]["ran_phase"] == "init"
+    # steps were recorded; init survey is run before the first public 3-step phase.
+    assert payload["steps"][0]["ran_phase"] == "plan"
 
 
 def test_auto_research_run_v2_pauses_on_budget(tmp_path):

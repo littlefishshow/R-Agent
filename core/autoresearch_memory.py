@@ -103,7 +103,7 @@ def ensure_program_scaffold(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-PHASES = ("init", "plan", "execute", "run", "evaluate", "compress", "pause")
+PHASES = ("init", "plan", "attempt", "conclude", "execute", "run", "evaluate", "compress", "pause")
 DEFAULT_PROJECT_TEMPLATE = """# Project State
 
 ## 梗概

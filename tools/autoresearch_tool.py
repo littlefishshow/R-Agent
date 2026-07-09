@@ -373,7 +373,7 @@ def auto_research_run_v2_tool(
     wait_seconds: float = 180.0,
     detach: bool = False,
 ) -> str:
-    """Run the v2 phase-machine autoresearch loop (init/plan/execute/run/evaluate/compress).
+    """Run the v2 autoresearch loop (plan -> attempt -> conclude).
 
     Runs the loop in a detached subprocess (survives long LLM phases) but, by
     default, the CALL BLOCKS and polls the heartbeat for up to ``wait_seconds``
@@ -631,8 +631,8 @@ def _v2_properties():
 registry.register(
     name="auto_research_run_v2",
     description=(
-        "运行 autoresearch v2 相位状态机：init→plan(多性格辩论)→execute(Todo+验证)→run(事件驱动+有界autofix)"
-        "→evaluate(Pareto+经验账本)→compress，成本可控(预算账本+模型分级)且可无限运行(状态全在 program.md/project.md/.auto/git)。"
+        "运行 autoresearch v2 三步循环：plan(DAG规划)→attempt(读写代码+运行验证闭环)"
+        "→conclude(评估、经验账本、压缩与状态保存)，成本可控(预算账本+模型分级)且可无限运行(状态全在 program.md/project.md/.auto/git)。"
         "background=true 可脱离主 agent 独立子进程运行，不阻塞主进程。"
     ),
     parameters={"type": "object", "properties": _v2_properties(), "required": ["project_dir"]},
