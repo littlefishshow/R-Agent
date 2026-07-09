@@ -266,22 +266,13 @@ def _execute_parent_context(root: str | Path, project_text: str, item: str, max_
         "You MUST return a mutating action: prefer type='write' with a complete file body. "
         "Do not return note/read for implementation tasks.",
         "",
-        "## Keep the change surface MINIMAL — follow this 3-tier escalation:",
-        "TIER 1 (default): edit the MOST RELEVANT EXISTING file listed below in-place. Do not create a "
-        "new file if an existing one can hold the change.",
-        "TIER 2 (only if Tier 1 truly cannot fit): create at most a FEW NEW files (hard cap 3 total across "
-        "the whole run) and keep all work inside those 3 plus the existing files. Do not spawn a new helper "
-        "every round — reuse and rewrite the same files.",
-        "TIER 3 (only if Tier 2 is insufficient): create a single subdirectory under train/ and put new files "
-        "there. If you add or grow files in that subdirectory, first re-read the whole subdirectory, then "
-        "consolidate: merge overlapping logic and DELETE now-unused files so it stays minimal.",
-        "Never leave dead/parallel scripts behind. Prefer rewriting one driver over adding another.",
-        "",
-        "## Existing editable train-side files (prefer editing these — Tier 1):",
-        inv_block,
+        "Keep the change surface minimal: prefer editing one existing train-side file; create new files only when necessary.",
         "",
         "## Current train-side file snippets:",
         snippet_block,
+        "",
+        "## Existing editable train-side files:",
+        inv_block,
         "",
         "## Action choice:",
         "STRONGLY PREFER a full-file 'write' action (path + complete new file content) over 'apply_patch'. "
@@ -295,7 +286,12 @@ def _execute_parent_context(root: str | Path, project_text: str, item: str, max_
     for name, text in notes.items():
         parts.extend(["", f"# .auto/{name} (truncated)", (text or "")[:1200]])
     data = "\n".join(parts)
-    return data[-max_chars:]
+    if len(data) <= max_chars:
+        return data
+    # Keep the front: it contains the todo, safety boundaries, editable-file
+    # snippets, and action schema guidance. Tail truncation hid the actual task
+    # and made Execute more likely to time out or return a non-mutating note.
+    return data[: max(0, max_chars - 80)].rstrip() + "\n\n[execute context truncated]\n"
 
 def _note_action(item: str):
     from core.autoresearch_loop import AutoResearchAction

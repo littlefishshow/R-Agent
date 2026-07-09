@@ -8,6 +8,7 @@ from core.autoresearch_execution import (
     make_run_handler,
     _find_search_driver,
     _execution_attempt_item,
+    _execute_parent_context,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
@@ -230,9 +231,9 @@ def test_execute_context_lists_existing_files_and_tiers(tmp_path):
     # existing files listed for Tier-1 in-place editing
     assert "train/train.sh" in ctx
     assert "train/search.py" in ctx
-    # the escalation rule is present
-    assert "TIER 1" in ctx and "TIER 2" in ctx and "TIER 3" in ctx
-    assert "cap 3" in ctx or "hard cap 3" in ctx
+    # the minimal-change rule is present
+    assert "change surface minimal" in ctx
+    assert "prefer editing one existing train-side file" in ctx
 
 
 def test_train_side_inventory_skips_noise(tmp_path):
@@ -523,6 +524,16 @@ def test_execution_attempt_item_focuses_long_implementation_task():
     focused = _execution_attempt_item(task, item)
     assert "Add logging" in focused
     assert "Add optimizer" not in focused
+
+
+def test_execute_parent_context_truncation_keeps_todo_and_action_guidance(tmp_path):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('train')\n", encoding="utf-8")
+    text = _execute_parent_context(tmp_path, "P" * 10000, "edit train.py", max_chars=1200)
+    assert "Todo: edit train.py" in text
+    assert "MUST return a mutating action" in text
+    assert "train/train.py" in text
+    assert "execute context truncated" in text
 
 
 # --------------------------------------------------------------------------- #
