@@ -15,6 +15,7 @@ action surface all remain owned by ``AutoResearchLoop``.
 from __future__ import annotations
 
 import os
+import json
 import time
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,7 @@ from core.autoresearch_todo_state import (
     has_failed_tasks,
     has_open_tasks,
     load_todo_state,
+    save_todo_state,
     ready_tasks,
 )
 
@@ -156,11 +158,85 @@ class ThreeStepController:
         project_text = self._persist_result(ctx, result)
         return result, project_text, "attempt"
 
+    def _ready_task_digest(self) -> dict:
+        state = load_todo_state(self.root)
+        tasks = state.get("tasks") or []
+        ready_execute = ready_tasks(state, phase="execute", statuses={"pending", "in_progress"})
+        ready_run = ready_tasks(state, phase="run", statuses={"pending", "in_progress"})
+        return {
+            "total": len(tasks),
+            "status_counts": {
+                status: sum(1 for task in tasks if task.get("status") == status)
+                for status in ("pending", "in_progress", "verified", "failed", "blocked", "skipped")
+            },
+            "ready_execute": [
+                {
+                    "task_id": task.get("task_id"),
+                    "goal": task.get("goal"),
+                    "type": task.get("type"),
+                    "depends_on": task.get("depends_on", []),
+                    "last_result": _compact_last_result(task.get("last_result") or {}),
+                }
+                for task in ready_execute[:5]
+            ],
+            "ready_run": [
+                {
+                    "task_id": task.get("task_id"),
+                    "goal": task.get("goal"),
+                    "type": task.get("type"),
+                    "depends_on": task.get("depends_on", []),
+                    "run_spec": task.get("run_spec", {}),
+                    "last_result": _compact_last_result(task.get("last_result") or {}),
+                }
+                for task in ready_run[:5]
+            ],
+        }
+
+    def _save_attempt_context_artifact(self) -> str:
+        """Persist a child-task context artifact for R-Agent-style delegation.
+
+        The V3 parent continues to schedule via todo_state, but it now exposes the
+        exact self-contained context a child process would receive. This mirrors
+        delegate_task's "parent sees digest, child history lives in artifacts"
+        policy and gives us a clean seam for swapping in real child Agents.
+        """
+        state = load_todo_state(self.root)
+        ready_execute = ready_tasks(state, phase="execute", statuses={"pending", "in_progress"})
+        ready_run = ready_tasks(state, phase="run", statuses={"pending", "in_progress"})
+        task = (ready_execute or ready_run or [None])[0]
+        if not task:
+            return ""
+        task_id = str(task.get("task_id") or "task")
+        payload = {
+            "created_at": time.time(),
+            "project_id": self.settings.project_id,
+            "phase": "attempt",
+            "task": task,
+            "todo_digest": self._ready_task_digest(),
+            "program_md": self.read_program()[:12000],
+            "project_md": self.read_project()[:8000],
+            "policy": {
+                "parent_role": "schedule and summarize through todo digest",
+                "child_role": "read needed files, edit allowed project files, run validation, update task state",
+                "context_retention": "full child context is stored as artifact path, not inlined into parent state",
+            },
+        }
+        d = self.root / ".autoresearch" / "delegate_contexts"
+        d.mkdir(parents=True, exist_ok=True)
+        safe = "".join(ch if ch.isalnum() or ch in "_.-" else "_" for ch in task_id)[:80] or "task"
+        path = d / f"{int(time.time() * 1000)}_{safe}_attempt_context.json"
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+        _attach_context_artifact_to_task(self.root, task_id, str(path))
+        return str(path)
+
     def _run_attempt(self, signals: PhaseSignals) -> tuple[PhaseResult, str, str]:
+        context_artifact = self._save_attempt_context_artifact()
         ctx = self._ctx("attempt", signals)
         execute_result = self._execute_handler(ctx) or PhaseResult()
         project_text = self._persist_result(ctx, execute_result)
         combined_summary = execute_result.summary
+        if context_artifact:
+            combined_summary = f"{combined_summary} context={context_artifact}".strip()
         combined_signals = dict(execute_result.signals_update or {})
 
         # If the code/read part completed enough to unlock a metric checkpoint,
@@ -338,3 +414,32 @@ def run_three_step_loop(settings, *, max_steps: int = 24, loop=None, run_id: str
 
 
 __all__ = ["ThreeStepController", "run_three_step_loop"]
+
+
+def _compact_last_result(last: dict) -> dict:
+    if not isinstance(last, dict):
+        return {}
+    return {
+        "status": last.get("status", ""),
+        "verification": last.get("verification"),
+        "note": str(last.get("note", ""))[:600],
+        "metric": (last.get("behavior") or {}).get("metric") if isinstance(last.get("behavior"), dict) else last.get("metric"),
+        "artifacts": list(last.get("artifacts") or [])[:4] if isinstance(last.get("artifacts"), list) else [],
+        "attempts": last.get("attempts"),
+    }
+
+
+def _attach_context_artifact_to_task(root: Path, task_id: str, artifact_path: str) -> None:
+    state = load_todo_state(root)
+    for task in state.get("tasks", []):
+        if task.get("task_id") != task_id:
+            continue
+        artifacts = list(task.get("artifacts") or [])
+        if artifact_path not in artifacts:
+            artifacts.append(artifact_path)
+        task["artifacts"] = artifacts[-12:]
+        last = dict(task.get("last_result") or {})
+        last["context_artifact_path"] = artifact_path
+        task["last_result"] = last
+        save_todo_state(root, state)
+        break

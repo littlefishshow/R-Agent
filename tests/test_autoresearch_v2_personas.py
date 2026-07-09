@@ -12,6 +12,7 @@ from core.autoresearch_personas import (
     _coalesce_plan_items,
     _ensure_baseline_checkpoint,
     _plan_to_todo_state,
+    _planner_project_context,
     _split_inline_plan_items,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
@@ -144,6 +145,21 @@ def test_plan_items_can_preserve_dag_granularity_without_coalescing():
         "Run bash train/train.sh and bash eval.sh",
     ]
     assert _coalesce_plan_items(items, max_implementation_tasks=0) == items
+
+
+def test_planner_project_context_includes_relevant_project_files(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "project.md").write_text("Project state\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('train context marker')\n", encoding="utf-8")
+    (tmp_path / "outputs").mkdir()
+    (tmp_path / "outputs" / "noise.json").write_text('{"large":"runtime"}\n', encoding="utf-8")
+
+    context = _planner_project_context(tmp_path, max_chars=5000)
+
+    assert "train/train.py" in context
+    assert "train context marker" in context
+    assert "outputs/noise.json" not in context
 
 
 def test_plan_to_todo_state_validation_depends_on_recent_execute_slice():

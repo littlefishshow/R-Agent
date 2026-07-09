@@ -97,6 +97,7 @@ class DebateConfig:
     max_personas: int = 2          # excluding the leader
     degrade_personas: int = 1      # persona count when budget says degrade
     max_context_chars: int = 8000  # bound on the stable context per persona
+    project_context_chars: int = 18000
 
 
 class PlanDebate:
@@ -113,22 +114,23 @@ class PlanDebate:
         cap = self.config.degrade_personas if degrade else self.config.max_personas
         return max(1, min(len(self.personas), cap))
 
-    def _stable_context(self, program_text: str, project_text: str) -> str:
+    def _stable_context(self, program_text: str, project_text: str, project_context: str = "") -> str:
         # Personas see L0+L1 (program) and L2 (project) as stable context, bounded.
         sections = split_program(program_text)
         payload = {
             "constitution": sections.constitution,
             "belief": sections.belief,
             "project": project_text,
+            "project_context": project_context,
         }
         blob = json.dumps(payload, ensure_ascii=False)
         if len(blob) > self.config.max_context_chars:
             blob = blob[: self.config.max_context_chars - 3] + "..."
         return blob
 
-    def run(self, *, program_text: str, project_text: str, degrade: bool = False) -> dict:
+    def run(self, *, program_text: str, project_text: str, project_context: str = "", degrade: bool = False) -> dict:
         """Return {belief, plan, detailed_plan, transcript, personas_used}."""
-        context = self._stable_context(program_text, project_text)
+        context = self._stable_context(program_text, project_text, project_context=project_context)
         n = self._persona_count(degrade)
         transcript: list[dict] = []
         opinions: list[str] = []
@@ -225,7 +227,16 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
             config=debate_config,
             chat_timeout_seconds=float(getattr(getattr(ctx.loop, "settings", None), "llm_request_timeout", 60.0) or 60.0),
         )
-        result = debate.run(program_text=ctx.program_text, project_text=ctx.project_text, degrade=degrade)
+        project_context = _planner_project_context(
+            ctx.root,
+            max_chars=int(getattr(debate_config, "project_context_chars", 18000) or 18000),
+        )
+        result = debate.run(
+            program_text=ctx.program_text,
+            project_text=ctx.project_text,
+            project_context=project_context,
+            degrade=degrade,
+        )
 
         # 1) belief -> L1 (program.md), only if we got one and program is writable
         program_text = None
@@ -319,7 +330,63 @@ def _debate_config_from_settings(settings) -> DebateConfig:
     return DebateConfig(
         max_personas=max(1, int(getattr(settings, "plan_max_personas", 2) or 2)),
         degrade_personas=max(1, int(getattr(settings, "plan_degrade_personas", 1) or 1)),
+        project_context_chars=max(1000, int(getattr(settings, "planner_project_context_chars", 18000) or 18000)),
     )
+
+
+_PLANNER_CONTEXT_SKIP_DIRS = {
+    ".git", ".autoresearch", ".auto", "__pycache__", ".venv", "venv", "node_modules", "outputs",
+}
+_PLANNER_CONTEXT_SUFFIXES = (".py", ".sh", ".md", ".json", ".yaml", ".yml", ".toml", ".cfg", ".txt")
+
+
+def _planner_project_context(root: str | Path, *, max_chars: int = 18000) -> str:
+    """Build a rich but bounded context blob for the Planner parent step.
+
+    V3's planner is allowed more context than a tiny phase prompt: it should see
+    program/project state plus the project files that define the task. Runtime
+    outputs and autoresearch artifacts stay out; those are summarized through
+    project.md, lessons, and state.
+    """
+    root = Path(root)
+    sections: list[str] = []
+    candidates: list[Path] = []
+    priority = [
+        "README.md", "program.md", "project.md", "pyproject.toml", "requirements.txt",
+        "train/train.py", "train/train.sh", "eval.py", "eval.sh",
+    ]
+    for rel in priority:
+        p = root / rel
+        if p.exists() and p.is_file():
+            candidates.append(p)
+    for path in sorted(root.rglob("*")):
+        if len(candidates) >= 40:
+            break
+        if not path.is_file():
+            continue
+        if any(part in _PLANNER_CONTEXT_SKIP_DIRS for part in path.relative_to(root).parts):
+            continue
+        if path.suffix.lower() not in _PLANNER_CONTEXT_SUFFIXES:
+            continue
+        if path not in candidates:
+            candidates.append(path)
+    remaining = max(0, int(max_chars))
+    for path in candidates:
+        if remaining <= 0:
+            break
+        try:
+            rel = str(path.relative_to(root))
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippet_budget = min(3000, max(500, remaining - 80))
+        snippet = text[:snippet_budget]
+        block = f"\n## {rel}\n```\n{snippet}\n```\n"
+        if len(block) > remaining:
+            block = block[: max(0, remaining - 40)].rstrip() + "\n...[truncated]\n"
+        sections.append(block)
+        remaining -= len(block)
+    return "\n".join(sections).strip()
 
 
 def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 0) -> dict:

@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 
 from core.autoresearch_loop import AutoResearchLoop, AutoResearchSettings
 from core.autoresearch_memory import read_phase
@@ -44,6 +45,13 @@ def test_three_step_attempt_runs_execute_and_ready_run_checkpoint(tmp_path):
     assert "run: status=ok" in report["summary"]
     state = load_todo_state(tmp_path)
     assert {task["task_id"]: task["status"] for task in state["tasks"]} == {"impl": "verified", "val": "verified"}
+    impl = next(task for task in state["tasks"] if task["task_id"] == "impl")
+    context_path = Path(impl["last_result"]["context_artifact_path"])
+    assert context_path.exists()
+    payload = json.loads(context_path.read_text(encoding="utf-8"))
+    assert payload["task"]["task_id"] == "impl"
+    assert payload["todo_digest"]["ready_execute"][0]["task_id"] == "impl"
+    assert payload["policy"]["parent_role"].startswith("schedule")
     phase, _ = read_phase((tmp_path / "project.md").read_text(encoding="utf-8"))
     assert phase == "conclude"
 

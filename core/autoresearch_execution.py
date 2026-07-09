@@ -1284,6 +1284,8 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         "subgoal": str(result.get("subgoal") or "")[:1000],
         "updated_at": time.time(),
     }
+    if last_result.get("context_artifact_path"):
+        target["last_result"]["context_artifact_path"] = last_result.get("context_artifact_path")
     if isinstance(result.get("artifacts"), list):
         existing_artifacts = list(target.get("artifacts") or [])
         for path in result.get("artifacts") or []:
