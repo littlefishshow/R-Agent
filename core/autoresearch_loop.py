@@ -79,7 +79,7 @@ class AutoResearchSettings:
     run_max_inner_seconds: float = 20.0
     run_max_inner_evals: int = 100
     run_cheap_eval_threshold_seconds: float = 2.0
-    solved_metric_threshold: float | None = None
+    solved_metric_threshold: Optional[float] = None
     search_driver_globs: tuple[str, ...] = (
         "train/search.py", "train/search_driver.py", "train/*search*.py",
         "train/*driver*.py", "train/*exploration*.py", "search.py",

@@ -528,14 +528,6 @@ def _read_json(path: Path) -> dict:
         return {}
 
 
-def _submission_xy(root: str | Path) -> Optional[tuple[float, float]]:
-    data = _read_json(Path(root) / "outputs" / "submission.json")
-    try:
-        return (float(data["x"]), float(data["y"]))
-    except Exception:
-        return None
-
-
 def _metric_from_file(root: str | Path) -> tuple[Optional[float], bool]:
     data = _read_json(Path(root) / "metrics.json")
     value = data.get("z", data.get("primary_metric"))
@@ -566,99 +558,6 @@ def _search_log_rows(root: str | Path) -> list[dict]:
             continue
         rows.append(row)
     return rows
-
-
-def _point_key(x: float, y: float) -> tuple[float, float]:
-    return (round(float(x), 8), round(float(y), 8))
-
-
-def _next_numeric_probe(rows: list[dict], *, higher_is_better: bool) -> Optional[tuple[float, float]]:
-    tried = {_point_key(r["x"], r["y"]) for r in rows}
-    grid_values = (-100.0, -50.0, 0.0, 50.0, 100.0)
-    for x in grid_values:
-        for y in grid_values:
-            if _point_key(x, y) not in tried:
-                return x, y
-    if rows:
-        best = max(rows, key=lambda r: r["z"]) if higher_is_better else min(rows, key=lambda r: r["z"])
-        bx, by = best["x"], best["y"]
-    else:
-        bx, by = 0.0, 0.0
-    directions = (
-        (1.0, 0.0), (-1.0, 0.0), (0.0, 1.0), (0.0, -1.0),
-        (1.0, 1.0), (1.0, -1.0), (-1.0, 1.0), (-1.0, -1.0),
-    )
-    for step in (50.0, 25.0, 10.0, 5.0, 2.0, 1.0, 0.5, 0.25):
-        for dx, dy in directions:
-            x, y = bx + step * dx, by + step * dy
-            if _point_key(x, y) not in tried:
-                return x, y
-    return None
-
-
-def _write_probe_submission(root: str | Path, x: float, y: float) -> None:
-    root = Path(root)
-    payload = {"x": float(x), "y": float(y)}
-    outputs = root / "outputs"
-    outputs.mkdir(parents=True, exist_ok=True)
-    (outputs / "submission.json").write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-    train = root / "train"
-    train.mkdir(exist_ok=True)
-    candidate = dict(payload)
-    candidate["source"] = "autoresearch_numeric_probe"
-    (train / "candidate.json").write_text(json.dumps(candidate, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-
-
-def _numeric_probe_applicable(root: str | Path, first_duration: Optional[float], cheap_threshold: float) -> bool:
-    if first_duration is None or first_duration > cheap_threshold:
-        return False
-    root = Path(root)
-    if not (root / "eval.sh").exists():
-        return False
-    return _submission_xy(root) is not None and _metric_from_file(root)[0] is not None
-
-
-def _run_numeric_probe(ctx: PhaseContext, loop, *, already_ran: int, max_seconds: float, max_evals: int, cheap_threshold: float):
-    from core.autoresearch_loop import AutoResearchAction, AutoResearchObservation
-
-    root = Path(ctx.root)
-    started = time.time()
-    ran = 0
-    final_obs = None
-    while already_ran + ran < max_evals:
-        if max_seconds and time.time() - started >= max_seconds:
-            break
-        rows = _search_log_rows(root)
-        metric, higher = _metric_from_file(root)
-        candidate = _next_numeric_probe(rows, higher_is_better=higher)
-        if candidate is None:
-            break
-        _write_probe_submission(root, *candidate)
-        command = "set -e; bash eval.sh; python3 .autoresearch/append_search_log.py autoresearch_numeric_probe"
-        action = AutoResearchAction(type="run", rationale="autoresearch numeric probe", command=command, role="trial")
-        obs = loop.execute_action(action)
-        final_obs = obs
-        ran += 1
-        if obs.status not in {"ok", "ok_metric_recovered"}:
-            break
-        duration = _artifact_duration(obs)
-        if duration is not None and duration > cheap_threshold:
-            break
-    rows = _search_log_rows(root)
-    if rows and already_ran + ran < max_evals:
-        _, higher = _metric_from_file(root)
-        best = max(rows, key=lambda r: r["z"]) if higher else min(rows, key=lambda r: r["z"])
-        _write_probe_submission(root, best["x"], best["y"])
-        final_action = AutoResearchAction(
-            type="run",
-            rationale="autoresearch numeric probe best",
-            command="set -e; bash eval.sh; python3 .autoresearch/append_search_log.py autoresearch_numeric_probe_best",
-            role="trial",
-        )
-        final_obs = loop.execute_action(final_action)
-    if final_obs is None:
-        final_obs = AutoResearchObservation("shell", "numeric probe did not run", "", "skipped")
-    return final_obs, ran
 
 
 def _default_run_fn(ctx: PhaseContext) -> dict:
@@ -704,19 +603,6 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         previous_candidate = current_candidate
         if max_seconds and time.time() - started >= max_seconds:
             break
-    first_duration = _artifact_duration(observations[0]) if observations else None
-    if _numeric_probe_applicable(ctx.root, first_duration, cheap_threshold):
-        probe_obs, probe_count = _run_numeric_probe(
-            ctx,
-            loop,
-            already_ran=len(observations),
-            max_seconds=max_seconds,
-            max_evals=max_evals,
-            cheap_threshold=cheap_threshold,
-        )
-        if probe_count:
-            observations.extend([probe_obs])
-            obs = probe_obs
     obs = obs or observations[-1]
     recorder = getattr(loop, "_maybe_record_experiment", None)
     if callable(recorder):
