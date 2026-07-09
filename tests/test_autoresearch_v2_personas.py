@@ -12,6 +12,7 @@ from core.autoresearch_personas import (
     _coalesce_plan_items,
     _ensure_baseline_checkpoint,
     _plan_to_todo_state,
+    _split_inline_plan_items,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import (
@@ -81,7 +82,19 @@ def test_plan_item_classification_prefers_implementation_verbs():
     assert _classify_plan_item("Create or update train/train.sh so it reliably runs a Python optimizer") == "implementation"
     assert _classify_plan_item("Add a persistent history file containing every evaluated x,y,z") == "implementation"
     assert _classify_plan_item("Run bash train/train.sh, then bash eval.sh and compare metrics") == "validation"
+    assert _classify_plan_item("Run deterministic global exploration over several boxes") == "implementation"
+    assert _classify_plan_item("Run local refinement from the best few incumbents") == "implementation"
+    assert _classify_plan_item("Evaluate candidates with the oracle and update incumbent") == "implementation"
     assert _classify_plan_item("Inspect existing train structure") == "analysis"
+
+
+def test_split_inline_plan_items_handles_numbered_sentence():
+    text = "Inspect files. 2. Create train optimizer. 3. Run bash train/train.sh and bash eval.sh."
+    assert _split_inline_plan_items(text) == [
+        "Inspect files",
+        "Create train optimizer",
+        "Run bash train/train.sh and bash eval.sh",
+    ]
 
 
 def test_plan_items_coalesce_many_implementation_bullets():

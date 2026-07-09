@@ -16,6 +16,7 @@ resolved at the ``plan`` model tier.
 from __future__ import annotations
 
 import json
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -305,9 +306,9 @@ def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 3) ->
     for line in (plan_text or "").splitlines():
         m = re.match(r"^\s*(?:\d+\s*[.)\-:]|[-*•]|[Ss]tep\s+\d+\s*[:.)-])\s+(.*\S)\s*$", line)
         if m:
-            items.append(m.group(1).strip())
+            items.extend(_split_inline_plan_items(m.group(1).strip()))
     if not items and (plan_text or "").strip():
-        items = [(plan_text or "").strip()]
+        items = _split_inline_plan_items((plan_text or "").strip())
     items = _coalesce_plan_items(items, max_implementation_tasks=max_implementation_tasks)
     tasks = []
     for index, item in enumerate(items, start=1):
@@ -330,6 +331,27 @@ def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 3) ->
         else:
             prior_execute_task_ids.append(task["task_id"])
     return {"version": 1, "tasks": tasks}
+
+
+def _split_inline_plan_items(text: str) -> list[str]:
+    """Split prose that contains multiple inline numbered steps."""
+    raw = str(text or "").strip()
+    if not raw:
+        return []
+    matches = list(re.finditer(r"(?:^|\s)(\d{1,2})\s*[.)]\s+", raw))
+    if not matches:
+        return [raw]
+    items: list[str] = []
+    prefix = raw[:matches[0].start()].strip(" ;.-\t")
+    if prefix:
+        items.append(prefix)
+    for idx, match in enumerate(matches):
+        start = match.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(raw)
+        item = raw[start:end].strip(" ;.-\t")
+        if item:
+            items.append(item)
+    return items or [raw]
 
 
 def _coalesce_plan_items(items: list[str], *, max_implementation_tasks: int = 3) -> list[str]:
@@ -374,6 +396,8 @@ def _chunk_implementation_items(items: list[str], *, max_tasks: int) -> list[str
 _IMPLEMENTATION_PLAN_RE = r"\b(implement|update|modify|rewrite|replace|create|add|edit|refactor|fix|write|build|integrate|ensure)\b"
 _ANALYSIS_PLAN_RE = r"^\s*(analyze|inspect|compare|检查|分析|对比)\b"
 _VALIDATION_PLAN_RE = r"^\s*(run|evaluate|eval|verify|validate|test|运行|评估|验证|测试)\b"
+_RUN_LIKE_IMPLEMENTATION_RE = r"^\s*run\s+(deterministic|global|local|adaptive|coordinate|pattern|random|seeded|low-discrepancy|grid|latin|refinement|exploration|search)\b"
+_EVAL_LIKE_IMPLEMENTATION_RE = r"^\s*(evaluate|verify)\s+(candidates?|points?|proposals?|incumbents?)\s+(with|using|through)\s+(the\s+)?(oracle|train-side|blackbox)"
 
 
 def _classify_plan_item(item: str) -> str:
@@ -398,6 +422,8 @@ def _classify_plan_item(item: str) -> str:
     if re.search(_ANALYSIS_PLAN_RE, text):
         return "analysis"
     explicit_eval_command = any(token in text for token in ("bash eval.sh", "bash train/train.sh", "pytest", "python -m pytest"))
+    if (re.search(_RUN_LIKE_IMPLEMENTATION_RE, text) or re.search(_EVAL_LIKE_IMPLEMENTATION_RE, text)) and not explicit_eval_command:
+        return "implementation"
     if explicit_eval_command or re.search(_VALIDATION_PLAN_RE, text):
         return "validation"
     return "implementation"

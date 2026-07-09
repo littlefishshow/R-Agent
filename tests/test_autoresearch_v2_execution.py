@@ -10,6 +10,7 @@ from core.autoresearch_execution import (
     _execution_attempt_item,
     _execute_parent_context,
     _is_train_side_write_path,
+    _preferred_write_target,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
@@ -521,10 +522,60 @@ def test_execution_attempt_item_focuses_long_implementation_task():
         "Add logging " + ("y" * 300),
         "Add restarts " + ("z" * 300),
     ])
-    task = {"task_id": "t", "type": "implementation", "last_result": {"attempts": 1}}
+    task = {"task_id": "t", "type": "implementation", "last_result": {"next_subgoal_index": 1}}
     focused = _execution_attempt_item(task, item)
     assert "Add logging" in focused
     assert "Add optimizer" not in focused
+
+
+def test_execute_subgoal_success_keeps_long_task_in_progress(tmp_path):
+    long_goal = "Implement consolidated change covering: " + "; ".join([
+        "Add optimizer " + ("x" * 300),
+        "Add logging " + ("y" * 300),
+    ])
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": long_goal, "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+
+    def fake_execute(item, ctx):
+        return {"item": item, "status": "ok", "verification": True, "note": "wrote one file"}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
+    state = load_todo_state(tmp_path)
+    task = state["tasks"][0]
+    assert task["status"] == "in_progress"
+    assert task["last_result"]["next_subgoal_index"] == 1
+    assert "0/1 verified" in result.summary
+
+
+def test_execute_repeats_current_task_until_subgoals_finish(tmp_path):
+    long_goal = "Implement consolidated change covering: " + "; ".join([
+        "Add optimizer " + ("x" * 300),
+        "Add logging " + ("y" * 300),
+    ])
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "a", "goal": long_goal, "type": "implementation", "status": "pending", "priority": 1},
+            {"task_id": "b", "goal": "edit later", "type": "implementation", "status": "pending", "priority": 2},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_actions_per_step=1)
+    loop = AutoResearchLoop(settings)
+    seen = []
+
+    def fake_execute(item, ctx):
+        seen.append(item)
+        return {"item": item, "status": "ok", "verification": True, "note": "wrote"}
+
+    handler = make_execute_handler(fake_execute)
+    handler(_ctx(tmp_path, "execute", loop=loop))
+    handler(_ctx(tmp_path, "execute", loop=loop))
+    assert "Add optimizer" in seen[0]
+    assert "Add logging" in seen[1]
+    assert "edit later" not in "\n".join(seen)
 
 
 def test_execute_parent_context_truncation_keeps_todo_and_action_guidance(tmp_path):
@@ -543,6 +594,14 @@ def test_direct_write_path_guard():
     assert _is_train_side_write_path("eval.py") is False
     assert _is_train_side_write_path("train/../eval.py") is False
     assert _is_train_side_write_path("blackbox_oracle.py") is False
+
+
+def test_preferred_write_target_uses_goal_keywords(tmp_path):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print(1)\n", encoding="utf-8")
+    assert _preferred_write_target(tmp_path, "Implement train optimizer with history") == "train/optimizer.py"
+    assert _preferred_write_target(tmp_path, "Update train.sh entrypoint") == "train/train.sh"
+    assert _preferred_write_target(tmp_path, "Add search driver") == "train/search.py"
 
 
 # --------------------------------------------------------------------------- #

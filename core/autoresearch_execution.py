@@ -224,22 +224,26 @@ def _direct_write_action(item: str, ctx: PhaseContext):
     except Exception:
         model = getattr(agent, "model", "") or ""
     root = Path(ctx.root)
-    target = _preferred_write_target(root)
+    target = _preferred_write_target(root, item)
     current = ""
     if target:
         try:
             current = (root / target).read_text(encoding="utf-8", errors="replace")
         except Exception:
             current = ""
+    support_context = _direct_write_support_context(root, target)
     system = (
         "Return ONLY JSON with keys path and content. "
-        "Rewrite exactly one train-side file. Do not edit eval.py, eval.sh, or blackbox_oracle.py. "
+        "Rewrite exactly one train-side file. The content must be the complete file body. "
+        "If the target is a Python script, include a runnable main entrypoint when appropriate. "
+        "Do not edit eval.py, eval.sh, or blackbox_oracle.py. "
         "No markdown, no explanation."
     )
     user = json.dumps({
         "todo": item,
         "preferred_path": target,
         "current_file": current[:6000],
+        "support_context": support_context,
         "schema": {"path": "relative train-side path", "content": "complete new file content"},
     }, ensure_ascii=False)
     timeout = float(getattr(getattr(loop, "settings", None), "llm_request_timeout", 60.0) or 60.0)
@@ -297,11 +301,41 @@ def _direct_write_action(item: str, ctx: PhaseContext):
         return None
 
 
-def _preferred_write_target(root: Path) -> str:
+def _preferred_write_target(root: Path, item: str = "") -> str:
+    lowered = str(item or "").lower()
+    if "train.sh" in lowered:
+        return "train/train.sh"
+    if "optimizer.py" in lowered or "optimizer" in lowered:
+        return "train/optimizer.py"
+    if "search.py" in lowered or "search" in lowered or "driver" in lowered:
+        return "train/search.py"
     for rel in ("train/train.py", "train/train.sh", "train/search.py", "train/optimizer.py"):
         if (root / rel).exists():
             return rel
     return "train/train.py"
+
+
+def _direct_write_support_context(root: Path, target: str, max_chars: int = 5000) -> dict:
+    """Small, high-signal context for a file-level write request."""
+    candidates = ["program.md", "train/train.py", "train/train.sh"]
+    if target and target not in candidates:
+        candidates.append(target)
+    payload: dict[str, str] = {}
+    remaining = max(0, int(max_chars))
+    for rel in candidates:
+        if remaining <= 0:
+            break
+        path = root / rel
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        snippet = text[: min(remaining, 1800)]
+        payload[rel] = snippet
+        remaining -= len(snippet)
+    return payload
 
 
 def _is_train_side_write_path(path: str) -> bool:
@@ -540,6 +574,7 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         results = []
         done = 0
         any_verified = False
+        repeat_current_window = False
         for offset, item in enumerate(window):
             task = ready[start + offset] if using_todo_state and start + offset < len(ready) else None
             if task and task.get("type") == "analysis":
@@ -561,8 +596,9 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                 done += 1
                 any_verified = True
                 continue
-            exec_item = _execution_attempt_item(task, item)
+            exec_item, subgoal_meta = _execution_attempt(task, item)
             res = fn(exec_item, ctx) or {}
+            res.update(subgoal_meta)
             if task and exec_item != item:
                 res.setdefault("full_item", item)
                 res.setdefault("subgoal", exec_item)
@@ -573,8 +609,11 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                 )
             results.append(res)
             _update_task_from_execute_result(todo_state, task, res)
+            if task and _task_should_continue_subgoals(todo_state, task):
+                repeat_current_window = True
             # verification hard-constraint: only verified items count as done.
-            if res.get("status") in {"ok", "done", "skipped"} and res.get("verification"):
+            subgoal_done = int(res.get("subgoal_index") or 0) + 1 >= int(res.get("subgoal_count") or 1)
+            if res.get("status") in {"ok", "done", "skipped"} and res.get("verification") and subgoal_done:
                 done += 1
                 any_verified = True
 
@@ -582,7 +621,7 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
             save_todo_state(ctx.root, todo_state)
 
         if cap > 0:
-            _save_execute_cursor(ctx.root, plan_key, 0 if more_pending is False else end)
+            _save_execute_cursor(ctx.root, plan_key, start if repeat_current_window else (0 if more_pending is False else end))
 
         # children write .auto/, parent is the single writer of project.md.
         write_auto_note(ctx.root, "execute_report", "# Execute Report\n\n" +
@@ -610,28 +649,49 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
 
 
 def _execution_attempt_item(task: Optional[dict], item: str) -> str:
+    return _execution_attempt(task, item)[0]
+
+
+def _task_should_continue_subgoals(state: dict, task: dict) -> bool:
+    for existing in state.get("tasks", []):
+        if existing.get("task_id") != task.get("task_id"):
+            continue
+        if existing.get("status") != "in_progress":
+            return False
+        last = existing.get("last_result") or {}
+        try:
+            return int(last.get("next_subgoal_index") or 0) > int(last.get("subgoal_index") or 0)
+        except Exception:
+            return False
+    return False
+
+
+def _execution_attempt(task: Optional[dict], item: str) -> tuple[str, dict]:
     """Select a small current subgoal from an oversized implementation task."""
+    empty_meta = {"subgoal_index": 0, "subgoal_count": 1}
     if not task:
-        return item
+        return item, empty_meta
     text = str(item or "").strip()
-    if len(text) <= 700:
-        return text
+    pieces = _split_implementation_goal(text)
+    if len(text) <= 700 and len(pieces) <= 1:
+        return text, empty_meta
     last = task.get("last_result") if isinstance(task, dict) else {}
-    attempts = 0
+    next_index = 0
     if isinstance(last, dict):
         try:
-            attempts = int(last.get("attempts") or 0)
+            next_index = int(last.get("next_subgoal_index") or 0)
         except Exception:
-            attempts = 0
-    pieces = _split_implementation_goal(text)
+            next_index = 0
     if not pieces:
-        return text[:700]
-    selected = pieces[min(attempts, len(pieces) - 1)]
-    return (
+        return text[:700], empty_meta
+    index = min(max(0, next_index), len(pieces) - 1)
+    selected = pieces[index]
+    focused = (
         "Implement this focused part of the larger task: "
         + selected[:650]
         + "\nKeep existing behavior working and prefer editing the most relevant existing train-side file."
     )
+    return focused, {"subgoal_index": index, "subgoal_count": len(pieces)}
 
 
 def _split_implementation_goal(text: str) -> list[str]:
@@ -643,7 +703,33 @@ def _split_implementation_goal(text: str) -> list[str]:
         cleaned = chunk.strip(" -.\t")
         if cleaned:
             parts.append(cleaned)
-    return parts
+    return _coalesce_subgoals(parts)
+
+
+def _coalesce_subgoals(parts: list[str], *, max_subgoals: int = 4) -> list[str]:
+    if len(parts) <= max_subgoals:
+        return parts
+    buckets: list[tuple[str, list[str]]] = [
+        ("Update train/train.sh or the existing train entrypoint so it calls the train-side optimizer and preserves submission JSON validation.", []),
+        ("Implement or update the train-side optimizer/search module with persistent history, oracle verification, deduplication, global exploration, and local refinement.", []),
+        ("Integrate optimizer output with train/train.py or candidate generation so outputs/submission.json always contains the best verified candidate.", []),
+        ("Finalize robustness, rerun behavior, and project notes so repeated train/eval runs use the best verified incumbent.", []),
+    ]
+    for part in parts:
+        low = part.lower()
+        if "train.sh" in low or "entrypoint" in low:
+            buckets[0][1].append(part)
+        elif "optimizer" in low or "search" in low or "oracle" in low or "history" in low or "exploration" in low or "refinement" in low or "candidate" in low:
+            buckets[1][1].append(part)
+        elif "submission" in low or "train.py" in low or "write" in low or "output" in low:
+            buckets[2][1].append(part)
+        else:
+            buckets[3][1].append(part)
+    coalesced = []
+    for summary, grouped in buckets:
+        if grouped:
+            coalesced.append(summary + " Details: " + "; ".join(grouped))
+    return coalesced or parts[:max_subgoals]
 
 
 def _execute_analysis_task(ctx: PhaseContext, task: dict) -> dict:
@@ -706,8 +792,13 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         max_attempts = max(1, int(result.get("max_attempts") or 2))
     except Exception:
         max_attempts = 2
+    subgoal_index = int(result.get("subgoal_index") or 0)
+    subgoal_count = int(result.get("subgoal_count") or 1)
+    subgoal_complete = bool(status in {"ok", "done"} and verified and subgoal_index + 1 < subgoal_count)
     if status == "skipped":
         target["status"] = "skipped"
+    elif subgoal_complete:
+        target["status"] = "in_progress"
     elif status in {"ok", "done"} and verified:
         target["status"] = "verified"
     elif status == "failed":
@@ -722,6 +813,10 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         "note": str(result.get("note") or "")[:1000],
         "attempts": attempts,
         "max_attempts": max_attempts,
+        "subgoal_index": subgoal_index,
+        "subgoal_count": subgoal_count,
+        "next_subgoal_index": subgoal_index + 1 if subgoal_complete else subgoal_index,
+        "subgoal": str(result.get("subgoal") or "")[:1000],
         "updated_at": time.time(),
     }
 

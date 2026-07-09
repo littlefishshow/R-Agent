@@ -100,17 +100,17 @@ def save_todo_state(root: str | Path, state: dict) -> Path:
 def merge_todo_state(existing: dict, planned: dict) -> dict:
     """Merge a new plan into existing task state without discarding progress.
 
-    Matching is by task_id first, then exact goal text. Planning may refresh goal,
+    Matching is by exact goal first, then stable non-generated task_id. Planning may refresh goal,
     type, priority, allowed/context paths, plan summary, run spec, and verification,
     but status/result/artifacts/lessons survive unless the task is genuinely new.
     """
     old = normalize_todo_state(existing)
     new = normalize_todo_state(planned)
-    by_id = {task["task_id"]: task for task in old["tasks"]}
+    by_id = {task["task_id"]: task for task in old["tasks"] if not _is_generated_task_id(task.get("task_id"))}
     by_goal = {task["goal"]: task for task in old["tasks"] if task.get("goal")}
     merged = []
     for task in new["tasks"]:
-        prior = by_id.get(task["task_id"]) or by_goal.get(task.get("goal"))
+        prior = by_goal.get(task.get("goal")) or by_id.get(task["task_id"])
         if prior:
             task = {
                 **task,
@@ -122,6 +122,10 @@ def merge_todo_state(existing: dict, planned: dict) -> dict:
             }
         merged.append(task)
     return normalize_todo_state({"version": 1, "tasks": merged})
+
+
+def _is_generated_task_id(task_id: str | None) -> bool:
+    return bool(re.fullmatch(r"t\d+(?:_\d+)?", str(task_id or "")))
 
 
 def upsert_task(root: str | Path, task: dict) -> dict:

@@ -148,6 +148,22 @@ def test_merge_todo_state_preserves_existing_depends_when_plan_omits_it():
     assert merged["tasks"][0]["depends_on"] == ["i"]
 
 
+def test_merge_todo_state_does_not_match_generated_ids_across_different_goals():
+    existing = normalize_todo_state({
+        "tasks": [
+            {"task_id": "t1", "goal": "old goal", "status": "failed"},
+        ]
+    })
+    planned = normalize_todo_state({
+        "tasks": [
+            {"task_id": "t1", "goal": "new goal", "status": "pending"},
+        ]
+    })
+    merged = merge_todo_state(existing, planned)
+    assert merged["tasks"][0]["goal"] == "new goal"
+    assert merged["tasks"][0]["status"] == "pending"
+
+
 def test_render_markdown_includes_run_spec():
     state = normalize_todo_state({
         "tasks": [
