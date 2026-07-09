@@ -28,6 +28,7 @@ from typing import Callable, Optional
 
 from core.autoresearch_memory import write_auto_note, read_auto_notes, append_lesson
 from core.autoresearch_phases import PhaseContext, PhaseResult
+from core.autoresearch_todo_state import load_todo_state, ready_tasks, save_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -331,7 +332,10 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
     fn = execute_fn or _default_execute_fn
 
     def handler(ctx: PhaseContext) -> PhaseResult:
-        items = parse_todo_from_plan(ctx.root)
+        todo_state = load_todo_state(ctx.root)
+        ready = ready_tasks(todo_state)
+        using_todo_state = bool(ready)
+        items = [task["goal"] for task in ready] if using_todo_state else parse_todo_from_plan(ctx.root)
         if not items:
             items = ["(no explicit todo; execute current plan)"]
 
@@ -350,23 +354,30 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         results = []
         done = 0
         any_verified = False
-        for item in window:
+        for offset, item in enumerate(window):
+            task = ready[start + offset] if using_todo_state and start + offset < len(ready) else None
             if not _is_implementation_todo(item):
-                results.append({
+                res = {
                     "item": item,
                     "status": "skipped",
                     "verification": True,
                     "note": "non-implementation todo; handled by run/evaluate phase",
-                })
+                }
+                results.append(res)
+                _update_task_from_execute_result(todo_state, task, res)
                 done += 1
                 any_verified = True
                 continue
             res = fn(item, ctx) or {}
             results.append(res)
+            _update_task_from_execute_result(todo_state, task, res)
             # verification hard-constraint: only verified items count as done.
             if res.get("status") in {"ok", "done", "skipped"} and res.get("verification"):
                 done += 1
                 any_verified = True
+
+        if using_todo_state:
+            save_todo_state(ctx.root, todo_state)
 
         if cap > 0:
             _save_execute_cursor(ctx.root, plan_key, 0 if more_pending is False else end)
@@ -391,6 +402,34 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         return PhaseResult(project_text=project_text, signals_update=signals_update, summary=summary)
 
     return handler
+
+
+def _update_task_from_execute_result(state: dict, task: Optional[dict], result: dict) -> None:
+    if not task:
+        return
+    target = None
+    for existing in state.get("tasks", []):
+        if existing.get("task_id") == task.get("task_id"):
+            target = existing
+            break
+    if target is None:
+        return
+    status = str(result.get("status") or "")
+    verified = bool(result.get("verification"))
+    if status == "skipped":
+        target["status"] = "skipped"
+    elif status in {"ok", "done"} and verified:
+        target["status"] = "verified"
+    elif status == "failed":
+        target["status"] = "failed"
+    else:
+        target["status"] = "in_progress"
+    target["last_result"] = {
+        "status": status,
+        "verification": verified,
+        "note": str(result.get("note") or "")[:1000],
+        "updated_at": time.time(),
+    }
 
 
 def _append_change_record(project_text: str, line: str) -> str:

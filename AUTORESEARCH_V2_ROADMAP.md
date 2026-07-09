@@ -195,7 +195,8 @@ Deliverables:
 - [x] Hard-coded numeric black-box probe removed from the generic run loop.
 - [x] Phase 1a: pure `todo_state.json` helpers and tests.
 - [x] Phase 1b: Plan writes structured tasks into `todo_state.json` and mirrors them into `.auto/plan.md`.
-- [ ] Bounded Execute inner loop.
+- [x] Phase 2a: Execute reads ready tasks from `todo_state.json` and updates task status.
+- [ ] Phase 2b: Bounded Execute inner loop with per-task read/edit/verify cycles.
 - [ ] Per-task run specs.
 - [ ] Evaluate writes real gate signals.
 - [ ] Git preflight validation.

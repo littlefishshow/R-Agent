@@ -10,6 +10,7 @@ from core.autoresearch_execution import (
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
+from core.autoresearch_todo_state import load_todo_state, save_todo_state
 
 
 def _ctx(tmp_path, phase, loop=None, project_text="# Project State\n"):
@@ -80,6 +81,29 @@ def test_execute_parent_is_single_writer_of_project(tmp_path):
     # parent writes the change record into project.md
     assert "## 改动记录" in result.project_text
     assert "executed 1/1" in result.project_text
+
+
+def test_execute_prefers_todo_state_and_updates_task_status(tmp_path):
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "t1", "goal": "edit config", "type": "implementation", "status": "pending", "priority": 1},
+            {"task_id": "t2", "goal": "run eval", "type": "validation", "status": "pending", "priority": 2},
+        ]
+    })
+    write_auto_note(tmp_path, "plan", "1. stale markdown task\n")
+    seen = []
+
+    def fake_execute(item, ctx):
+        seen.append(item)
+        return {"item": item, "status": "ok", "verification": True, "note": "done"}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
+    assert seen == ["edit config"]
+    assert "2/2 verified" in result.summary
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["status"] == "verified"
+    assert state["tasks"][0]["last_result"]["note"] == "done"
+    assert state["tasks"][1]["status"] == "skipped"
 
 
 def test_execute_default_fn_verifies_via_py_compile(tmp_path):
