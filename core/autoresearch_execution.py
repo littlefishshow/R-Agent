@@ -644,9 +644,6 @@ def _run_numeric_probe(ctx: PhaseContext, loop, *, already_ran: int, max_seconds
         duration = _artifact_duration(obs)
         if duration is not None and duration > cheap_threshold:
             break
-        metric, higher = _metric_from_file(root)
-        if metric is not None and metric <= 1.0 and not higher:
-            break
     rows = _search_log_rows(root)
     if rows and already_ran + ran < max_evals:
         _, higher = _metric_from_file(root)
@@ -748,7 +745,11 @@ def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[Autofi
             result = run(ctx)
         major = result.get("status") == "failed"
         metric, higher = _metric_from_file(ctx.root)
-        solved = bool(metric is not None and ((not higher and metric <= 1.0) or (higher and metric >= 0.999)))
+        threshold = getattr(getattr(ctx.loop, "settings", None), "solved_metric_threshold", None)
+        solved = False
+        if threshold is not None and metric is not None:
+            threshold = float(threshold)
+            solved = bool((not higher and metric <= threshold) or (higher and metric >= threshold))
         driver = result.get("search_driver") or "(single train+eval)"
         write_auto_note(ctx.root, "run_report",
                         f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} "

@@ -457,6 +457,46 @@ def test_run_adaptive_loop_continues_only_when_cheap_and_changing(tmp_path):
     assert len(rows) == 5
 
 
+def test_run_does_not_mark_solved_without_explicit_threshold(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nmkdir -p outputs\nprintf '{\"x\":1,\"y\":2}\\n' > outputs/submission.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nprintf '{\"primary_metric\":0.0,\"z\":0.0,\"higher_is_better\":false}\\n' > metrics.json\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update == {}
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "solved=False" in report
+
+
+def test_run_marks_solved_with_explicit_threshold(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nmkdir -p outputs\nprintf '{\"x\":1,\"y\":2}\\n' > outputs/submission.json\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nprintf '{\"primary_metric\":0.01,\"z\":0.01,\"higher_is_better\":false}\\n' > metrics.json\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False, solved_metric_threshold=0.1)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update.get("solved") is True
+    report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "solved=True" in report
+
+
 def test_run_adaptive_loop_stops_after_expensive_first_eval(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "train").mkdir()
