@@ -94,6 +94,32 @@ def save_todo_state(root: str | Path, state: dict) -> Path:
     return path
 
 
+def merge_todo_state(existing: dict, planned: dict) -> dict:
+    """Merge a new plan into existing task state without discarding progress.
+
+    Matching is by task_id first, then exact goal text. Planning may refresh goal,
+    type, priority, allowed/context paths, plan summary, run spec, and verification,
+    but status/result/artifacts/lessons survive unless the task is genuinely new.
+    """
+    old = normalize_todo_state(existing)
+    new = normalize_todo_state(planned)
+    by_id = {task["task_id"]: task for task in old["tasks"]}
+    by_goal = {task["goal"]: task for task in old["tasks"] if task.get("goal")}
+    merged = []
+    for task in new["tasks"]:
+        prior = by_id.get(task["task_id"]) or by_goal.get(task.get("goal"))
+        if prior:
+            task = {
+                **task,
+                "status": prior.get("status", task["status"]),
+                "artifacts": prior.get("artifacts", task["artifacts"]),
+                "last_result": prior.get("last_result", task["last_result"]),
+                "lessons": prior.get("lessons", task["lessons"]),
+            }
+        merged.append(task)
+    return normalize_todo_state({"version": 1, "tasks": merged})
+
+
 def upsert_task(root: str | Path, task: dict) -> dict:
     state = load_todo_state(root)
     normalized = normalize_task(task, fallback_index=len(state["tasks"]) + 1)
@@ -147,6 +173,7 @@ __all__ = [
     "VALID_TYPES",
     "empty_todo_state",
     "load_todo_state",
+    "merge_todo_state",
     "normalize_task",
     "normalize_task_id",
     "normalize_todo_state",

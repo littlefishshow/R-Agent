@@ -3,6 +3,7 @@ import json
 from core.autoresearch_todo_state import (
     empty_todo_state,
     load_todo_state,
+    merge_todo_state,
     normalize_task,
     normalize_todo_state,
     ready_tasks,
@@ -60,6 +61,24 @@ def test_upsert_task_updates_existing(tmp_path):
     assert len(state["tasks"]) == 1
     assert state["tasks"][0]["goal"] == "new"
     assert state["tasks"][0]["status"] == "blocked"
+
+
+def test_merge_todo_state_preserves_progress_by_goal():
+    existing = normalize_todo_state({
+        "tasks": [
+            {"task_id": "old", "goal": "same goal", "status": "verified", "last_result": {"ok": True}},
+        ]
+    })
+    planned = normalize_todo_state({
+        "tasks": [
+            {"task_id": "t1", "goal": "same goal", "status": "pending", "run_spec": {"mode": "single"}},
+        ]
+    })
+    merged = merge_todo_state(existing, planned)
+    assert merged["tasks"][0]["task_id"] == "t1"
+    assert merged["tasks"][0]["status"] == "verified"
+    assert merged["tasks"][0]["last_result"] == {"ok": True}
+    assert merged["tasks"][0]["run_spec"] == {"mode": "single"}
 
 
 def test_render_markdown_includes_run_spec():

@@ -15,7 +15,7 @@ from core.autoresearch_memory import (
     read_phase,
     write_phase,
 )
-from core.autoresearch_todo_state import load_todo_state
+from core.autoresearch_todo_state import load_todo_state, save_todo_state
 
 
 def _fake_chat_factory():
@@ -148,3 +148,27 @@ def test_plan_handler_readonly_program_skips_belief(tmp_path):
     # belief update skipped (program_text None) but plan still updated
     assert result.program_text is None
     assert "add LR warmup" in result.project_text
+
+
+def test_plan_handler_preserves_existing_todo_progress(tmp_path):
+    chat, _ = _fake_chat_factory()
+    loop = _make_loop(tmp_path)
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "old", "goal": "edit train config", "status": "verified", "last_result": {"ok": True}},
+        ]
+    })
+    program_text = ensure_program_scaffold((tmp_path / "program.md").read_text(encoding="utf-8"))
+    ctx = PhaseContext(
+        phase="plan",
+        root=tmp_path,
+        program_text=program_text,
+        project_text="# Project State\n\n## 当前计划\nold\n",
+        signals=PhaseSignals(phase="plan"),
+        loop=loop,
+    )
+    make_plan_handler(chat)(ctx)
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["goal"] == "edit train config"
+    assert state["tasks"][0]["status"] == "verified"
+    assert state["tasks"][0]["last_result"] == {"ok": True}

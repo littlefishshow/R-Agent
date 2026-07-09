@@ -23,7 +23,7 @@ from typing import Callable, Optional
 
 from core.autoresearch_memory import update_belief, split_program, write_auto_note
 from core.autoresearch_phases import PhaseContext, PhaseResult
-from core.autoresearch_todo_state import render_todo_markdown, save_todo_state
+from core.autoresearch_todo_state import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -203,7 +203,8 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         project_text = _update_plan_section(ctx.project_text, result["plan"] or "(leader produced no plan)")
 
         # 3) detailed plan -> .auto/plan.md (L3)
-        todo_state = _plan_to_todo_state(result["detailed_plan"] or result["plan"] or "")
+        planned_todo_state = _plan_to_todo_state(result["detailed_plan"] or result["plan"] or "")
+        todo_state = merge_todo_state(load_todo_state(ctx.root), planned_todo_state)
         save_todo_state(ctx.root, todo_state)
         write_auto_note(ctx.root, "plan", render_todo_markdown(todo_state))
 

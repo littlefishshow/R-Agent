@@ -29,6 +29,27 @@ def test_update_gate_state_detects_new_best_and_plateau(tmp_path):
     assert second["needs_replan"] is True
 
 
+def test_experiment_count_growth_alone_is_not_pareto_changed(tmp_path):
+    first_state = {
+        "experiments": [{"experiment_id": "e1", "metrics": {"z": 1}}],
+        "pareto_front": [{"experiment_id": "e1"}],
+        "best_experiment": {"experiment_id": "e1"},
+    }
+    second_state = {
+        "experiments": [
+            {"experiment_id": "e1", "metrics": {"z": 1}},
+            {"experiment_id": "e2", "metrics": {"z": 2}},
+        ],
+        "pareto_front": [{"experiment_id": "e1"}],
+        "best_experiment": {"experiment_id": "e1"},
+    }
+    update_gate_state_from_experiment_state(tmp_path, first_state)
+    second = update_gate_state_from_experiment_state(tmp_path, second_state)
+    assert second["experiment_count"] == 2
+    assert second["pareto_changed"] is False
+    assert second["plateau_counter"] == 1
+
+
 def test_update_gate_state_major_error_invalidates_plan(tmp_path):
     state = update_gate_state_from_experiment_state(tmp_path, {}, major_error=True)
     assert state["plan_still_valid"] is False

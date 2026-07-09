@@ -17,6 +17,7 @@ def default_gate_state() -> dict:
         "best_experiment_id": "",
         "experiment_count": 0,
         "pareto_count": 0,
+        "pareto_ids": [],
         "pareto_changed": False,
         "plateau_counter": 0,
         "plan_still_valid": True,
@@ -41,6 +42,7 @@ def normalize_gate_state(data: dict) -> dict:
     state.update({k: v for k, v in dict(data or {}).items() if k in state})
     state["experiment_count"] = int(state.get("experiment_count") or 0)
     state["pareto_count"] = int(state.get("pareto_count") or 0)
+    state["pareto_ids"] = [str(v) for v in state.get("pareto_ids") or []]
     state["plateau_counter"] = int(state.get("plateau_counter") or 0)
     state["pareto_changed"] = bool(state.get("pareto_changed"))
     state["plan_still_valid"] = bool(state.get("plan_still_valid"))
@@ -69,10 +71,10 @@ def update_gate_state_from_experiment_state(root: str | Path, experiment_state: 
     best_id = str(best.get("experiment_id") or "")
     exp_count = len(experiments)
     pareto_count = len(pareto)
+    pareto_ids = [str(item.get("experiment_id") or "") for item in pareto if isinstance(item, dict)]
     pareto_changed = (
         best_id != prev.get("best_experiment_id")
-        or exp_count != int(prev.get("experiment_count") or 0)
-        or pareto_count != int(prev.get("pareto_count") or 0)
+        or pareto_ids != list(prev.get("pareto_ids") or [])
     )
     plateau = 0 if pareto_changed else int(prev.get("plateau_counter") or 0) + (1 if exp_count else 0)
     state = {
@@ -80,6 +82,7 @@ def update_gate_state_from_experiment_state(root: str | Path, experiment_state: 
         "best_experiment_id": best_id,
         "experiment_count": exp_count,
         "pareto_count": pareto_count,
+        "pareto_ids": pareto_ids,
         "pareto_changed": pareto_changed,
         "plateau_counter": plateau,
         "plan_still_valid": not major_error,

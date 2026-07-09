@@ -356,6 +356,13 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         any_verified = False
         for offset, item in enumerate(window):
             task = ready[start + offset] if using_todo_state and start + offset < len(ready) else None
+            if task and task.get("type") == "analysis":
+                res = _execute_analysis_task(ctx, task)
+                results.append(res)
+                _update_task_from_execute_result(todo_state, task, res)
+                done += 1
+                any_verified = True
+                continue
             if not _is_implementation_todo(item):
                 res = {
                     "item": item,
@@ -402,6 +409,45 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
         return PhaseResult(project_text=project_text, signals_update=signals_update, summary=summary)
 
     return handler
+
+
+def _execute_analysis_task(ctx: PhaseContext, task: dict) -> dict:
+    root = Path(ctx.root)
+    context_paths = task.get("context_paths") or []
+    if not context_paths:
+        context_paths = _default_analysis_paths(root)
+    snippets = []
+    for rel in context_paths[:8]:
+        path = root / str(rel)
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(root.resolve())
+        except Exception:
+            continue
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        head = "\n".join(text.splitlines()[:80])
+        snippets.append(f"## {rel}\n{head}")
+    summary = "\n\n".join(snippets)[:6000] if snippets else "no readable context files found"
+    artifact = write_auto_note(ctx.root, f"analysis_{task.get('task_id', 'task')}", "# Analysis\n\n" + summary)
+    return {
+        "item": task.get("goal", ""),
+        "status": "done",
+        "verification": True,
+        "note": f"analysis written to {artifact}",
+    }
+
+
+def _default_analysis_paths(root: Path) -> list[str]:
+    candidates = []
+    for rel in ("program.md", "project.md", "README.md", "train/train.py", "train/train.sh", "metrics.json"):
+        if (root / rel).exists():
+            candidates.append(rel)
+    return candidates
 
 
 def _update_task_from_execute_result(state: dict, task: Optional[dict], result: dict) -> None:
@@ -698,20 +744,39 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
 
 def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: int) -> None:
     state = load_todo_state(root)
+    metric, higher = _metric_from_file(root)
     for existing in state.get("tasks", []):
         if existing.get("task_id") != task.get("task_id"):
             continue
-        ok = getattr(obs, "status", "") in {"ok", "ok_metric_recovered"}
+        command_ok = getattr(obs, "status", "") in {"ok", "ok_metric_recovered"}
+        ok = command_ok and _verification_passed(existing.get("verification") or {}, metric, higher)
         existing["status"] = "verified" if ok else "failed"
         existing["last_result"] = {
             "status": getattr(obs, "status", ""),
             "artifact_path": getattr(obs, "artifact_path", ""),
             "summary": getattr(obs, "summary", "")[:1000],
             "inner_evals": inner_evals,
+            "metric": metric,
+            "higher_is_better": higher,
             "updated_at": time.time(),
         }
         break
     save_todo_state(root, state)
+
+
+def _verification_passed(verification: dict, metric: Optional[float], higher: bool) -> bool:
+    if not verification:
+        return True
+    if verification.get("metric_required") and metric is None:
+        return False
+    threshold = verification.get("metric_threshold")
+    if threshold is not None and metric is not None:
+        threshold = float(threshold)
+        if higher and metric < threshold:
+            return False
+        if not higher and metric > threshold:
+            return False
+    return True
 
 
 def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[AutofixFn] = None, *, max_autofix: int = 2):

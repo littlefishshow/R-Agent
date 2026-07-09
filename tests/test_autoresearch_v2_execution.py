@@ -106,6 +106,29 @@ def test_execute_prefers_todo_state_and_updates_task_status(tmp_path):
     assert state["tasks"][1]["status"] == "skipped"
 
 
+def test_execute_analysis_task_writes_analysis_note(tmp_path):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('train')\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "a1",
+                "goal": "inspect train",
+                "type": "analysis",
+                "status": "pending",
+                "context_paths": ["train/train.py"],
+            }
+        ]
+    })
+    result = make_execute_handler(lambda item, ctx: {"item": item, "status": "failed", "verification": False})(_ctx(tmp_path, "execute"))
+    assert "1/1 verified" in result.summary
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["status"] == "verified"
+    assert "analysis written" in state["tasks"][0]["last_result"]["note"]
+    assert (tmp_path / ".auto" / "analysis_a1.md").exists()
+    assert "print('train')" in (tmp_path / ".auto" / "analysis_a1.md").read_text(encoding="utf-8")
+
+
 def test_execute_default_fn_verifies_via_py_compile(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
@@ -481,6 +504,35 @@ def test_run_uses_todo_state_run_spec_and_updates_task(tmp_path):
     assert task["last_result"]["inner_evals"] == 1
     report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
     assert "inner_evals=1" in report
+
+
+def test_run_task_verification_metric_threshold_can_fail(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "v1",
+                "goal": "metric threshold",
+                "type": "validation",
+                "status": "pending",
+                "run_spec": {
+                    "mode": "single",
+                    "commands": [
+                        "mkdir -p outputs",
+                        "printf '{\"x\":3,\"y\":4}\\n' > outputs/submission.json",
+                        "printf '{\"primary_metric\":7,\"z\":7,\"higher_is_better\":false}\\n' > metrics.json",
+                    ],
+                },
+                "verification": {"metric_required": True, "metric_threshold": 1.0},
+            }
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "failed"
+    assert task["last_result"]["metric"] == 7
 
 
 def test_run_adaptive_loop_continues_only_when_cheap_and_changing(tmp_path):
