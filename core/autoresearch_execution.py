@@ -162,6 +162,11 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
     agent = getattr(loop, "step_agent", None) if loop is not None else None
     if agent is None:
         return None
+    old_tier = getattr(agent, "_tier", "plan")
+    try:
+        agent._tier = "exec"
+    except Exception:
+        pass
     from core.autoresearch_loop import AutoResearchAction, AutoResearchWorkflowStep
 
     step = AutoResearchWorkflowStep(
@@ -174,7 +179,13 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
     fallback = AutoResearchAction(type="note", rationale="execute_no_safe_change", content=item)
     max_chars = int(getattr(getattr(ctx.loop, "settings", None), "execute_context_chars", 12000) or 12000)
     parent_context = _execute_parent_context(ctx.root, ctx.project_text, item, max_chars=max_chars)
-    result = agent.plan_step(step=step, fallback_action=fallback, parent_context=parent_context, round_index=0)
+    try:
+        result = agent.plan_step(step=step, fallback_action=fallback, parent_context=parent_context, round_index=0)
+    finally:
+        try:
+            agent._tier = old_tier
+        except Exception:
+            pass
     apply_updates = getattr(loop, "_apply_bucket_updates", None)
     if callable(apply_updates):
         apply_updates(getattr(result, "bucket_updates", {}) or {})
@@ -461,12 +472,12 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                         "\n".join(f"- {r.get('item')}: status={r.get('status')} verified={r.get('verification')} — {r.get('note','')}" for r in results))
         project_text = _append_change_record(ctx.project_text, f"executed {done}/{len(window)} todo items (verified); window {start + 1}-{end}/{len(items)}")
 
-        # If nothing verified and something was attempted, treat as an execute-side
-        # major error so the machine routes to Evaluate rather than Run — but only
-        # when there is nothing left to try (otherwise let the next visit continue).
         attempted = any(r.get("status") in {"ok", "done", "failed", "tried"} for r in results)
-        major = attempted and not any_verified and not more_pending
         execute_open = bool(ready_execute_tasks(todo_state)) if using_todo_state else bool(more_pending)
+        # If nothing verified and something was attempted, treat it as a major
+        # error only when there are no runnable Execute retries left. Otherwise
+        # stay in Execute and let the bounded attempt counter make progress.
+        major = attempted and not any_verified and not execute_open and not more_pending
         signals_update = {"execute_has_open_tasks": execute_open}
         if major:
             signals_update["major_error"] = True
