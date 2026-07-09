@@ -15,6 +15,7 @@ from core.autoresearch_memory import (
     read_phase,
     write_phase,
 )
+from core.autoresearch_todo_state import load_todo_state
 
 
 def _fake_chat_factory():
@@ -101,6 +102,12 @@ def test_plan_handler_writes_belief_plan_auto_and_transcript(tmp_path):
     # detailed plan in .auto/plan.md
     assert (tmp_path / ".auto" / "plan.md").exists()
     assert "edit train config" in (tmp_path / ".auto" / "plan.md").read_text(encoding="utf-8")
+    # structured task state is now the machine-readable handoff
+    todo_state = load_todo_state(tmp_path)
+    assert [t["task_id"] for t in todo_state["tasks"]] == ["t1", "t2", "t3"]
+    assert todo_state["tasks"][0]["goal"] == "edit train config"
+    assert todo_state["tasks"][1]["type"] == "validation"
+    assert todo_state["tasks"][1]["run_spec"]["commands"] == ["bash train/train.sh", "bash eval.sh"]
     # transcript archived to L4, not project.md
     artifacts = list((tmp_path / ".autoresearch" / "artifacts").glob("*plan_debate*"))
     assert artifacts

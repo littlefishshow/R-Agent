@@ -194,7 +194,7 @@ Deliverables:
 - [x] Hard-coded solved threshold removed; solved now requires explicit `solved_metric_threshold`.
 - [x] Hard-coded numeric black-box probe removed from the generic run loop.
 - [x] Phase 1a: pure `todo_state.json` helpers and tests.
-- [ ] Phase 1b: Plan writes structured tasks into `todo_state.json`.
+- [x] Phase 1b: Plan writes structured tasks into `todo_state.json` and mirrors them into `.auto/plan.md`.
 - [ ] Bounded Execute inner loop.
 - [ ] Per-task run specs.
 - [ ] Evaluate writes real gate signals.

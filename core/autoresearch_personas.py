@@ -23,6 +23,7 @@ from typing import Callable, Optional
 
 from core.autoresearch_memory import update_belief, split_program, write_auto_note
 from core.autoresearch_phases import PhaseContext, PhaseResult
+from core.autoresearch_todo_state import render_todo_markdown, save_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -202,7 +203,9 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         project_text = _update_plan_section(ctx.project_text, result["plan"] or "(leader produced no plan)")
 
         # 3) detailed plan -> .auto/plan.md (L3)
-        write_auto_note(ctx.root, "plan", "# Detailed Plan\n\n" + (result["detailed_plan"] or result["plan"] or "(none)"))
+        todo_state = _plan_to_todo_state(result["detailed_plan"] or result["plan"] or "")
+        save_todo_state(ctx.root, todo_state)
+        write_auto_note(ctx.root, "plan", render_todo_markdown(todo_state))
 
         # 4) transcript -> L4 artifact (never into project.md)
         _archive_transcript(ctx, result)
@@ -211,6 +214,50 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         return PhaseResult(program_text=program_text, project_text=project_text, summary=summary)
 
     return handler
+
+
+def _plan_to_todo_state(plan_text: str) -> dict:
+    """Best-effort bridge from current leader prose to structured task state.
+
+    This is an interim compatibility layer: the next iteration should ask the
+    leader to emit task JSON directly. Until then, keep the structure explicit so
+    Execute/Run/Evaluate no longer depend only on Markdown task text.
+    """
+    import re
+
+    items = []
+    for line in (plan_text or "").splitlines():
+        m = re.match(r"^\s*(?:\d+\s*[.)\-:]|[-*•]|[Ss]tep\s+\d+\s*[:.)-])\s+(.*\S)\s*$", line)
+        if m:
+            items.append(m.group(1).strip())
+    if not items and (plan_text or "").strip():
+        items = [(plan_text or "").strip()]
+    tasks = []
+    for index, item in enumerate(items, start=1):
+        lowered = item.lower()
+        if any(token in lowered for token in ("run", "eval", "verify", "validate", "test", "运行", "评估", "验证", "测试")):
+            task_type = "validation"
+        elif any(token in lowered for token in ("analyze", "inspect", "compare", "检查", "分析", "对比")):
+            task_type = "analysis"
+        else:
+            task_type = "implementation"
+        tasks.append({
+            "task_id": f"t{index}",
+            "goal": item,
+            "type": task_type,
+            "status": "pending",
+            "priority": index,
+            "plan_summary": item,
+            "allowed_paths": ["train/**"] if task_type == "implementation" else [],
+            "run_spec": _default_run_spec_for_task(task_type, item),
+        })
+    return {"version": 1, "tasks": tasks}
+
+
+def _default_run_spec_for_task(task_type: str, item: str) -> dict:
+    if task_type == "validation":
+        return {"mode": "single", "commands": ["bash train/train.sh", "bash eval.sh"]}
+    return {}
 
 
 def build_loop_chat_fn(loop, *, tier: str = "plan") -> Optional[ChatFn]:
