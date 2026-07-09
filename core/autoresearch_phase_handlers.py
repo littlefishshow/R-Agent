@@ -1,11 +1,12 @@
-"""AutoResearch v2 — deterministic phase handlers (no-LLM baseline).
+"""AutoResearch V3 — deterministic helper handlers.
 
 These give the phase machine real behavior without requiring a model, so the
 whole loop is testable and has a safe fallback.  LLM-backed handlers (personas,
 delegate execution) are layered on top in later phases and simply replace the
 entries in the handler map.
 
-Design ref: AUTORESEARCH_DESIGN_v2.md §5.
+These helpers are reused by the V3 conclude/init path. The old six-phase
+controller has been pruned.
 """
 
 from __future__ import annotations
@@ -26,7 +27,7 @@ from core.autoresearch_phases import PhaseContext, PhaseResult
 
 
 # --------------------------------------------------------------------------- #
-# P1 Init — cheap codebase survey (schema/head only, never full dataset)
+# Init helper — cheap codebase survey (schema/head only, never full dataset)
 # --------------------------------------------------------------------------- #
 
 _SURVEY_MAX_FILES = 40
@@ -98,7 +99,7 @@ def make_init_handler():
 
 
 # --------------------------------------------------------------------------- #
-# P5 Evaluate — reuse loop's Pareto/versioning + lessons ledger
+# Conclude helper — reuse loop's Pareto/versioning + lessons ledger
 # --------------------------------------------------------------------------- #
 
 def make_evaluate_handler():
@@ -170,7 +171,7 @@ def make_evaluate_handler():
 
 
 # --------------------------------------------------------------------------- #
-# P6 Compress — semantic-lite compression placeholder (deterministic)
+# Conclude helper — semantic-lite compression placeholder (deterministic)
 # --------------------------------------------------------------------------- #
 
 def make_compress_handler(max_belief_chars: int = 4000):

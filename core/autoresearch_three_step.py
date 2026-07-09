@@ -1,4 +1,4 @@
-"""AutoResearch v2 simplified three-step loop.
+"""AutoResearch V3 simplified three-step loop.
 
 The loop intentionally keeps the outer control structure small:
 

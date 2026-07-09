@@ -1,6 +1,4 @@
-"""AutoResearch v2 — layered memory helpers (L0 constitution / L1 belief / L2 project / L3 .auto).
-
-Implements the file contracts from AUTORESEARCH_DESIGN_v2.md §1:
+"""AutoResearch V3 — layered memory helpers (L0 constitution / L1 belief / L2 project / L3 .auto).
 
 - ``program.md`` is split into an immutable CONSTITUTION (L0, user-only) and a
   mutable BELIEF (L1, loop-editable) section via HTML comment markers. When the

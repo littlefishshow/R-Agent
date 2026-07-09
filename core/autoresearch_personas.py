@@ -1,4 +1,4 @@
-"""AutoResearch v2 — Phase C: multi-persona Plan phase (AUTORESEARCH_DESIGN_v2.md §5).
+"""AutoResearch V3 — multi-persona Planner step.
 
 This is the most expensive phase, so it is bounded on every axis:
 
@@ -204,7 +204,7 @@ def _extract_json(raw: str) -> dict:
 # --------------------------------------------------------------------------- #
 
 def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateConfig] = None):
-    """Build a P2 plan handler.
+    """Build a V3 Planner handler.
 
     If ``chat`` is None, the handler resolves a metered ``plan``-tier client from
     the loop on the context.  A deterministic fallback plan is used when no

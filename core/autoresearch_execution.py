@@ -1,15 +1,13 @@
-"""AutoResearch v2 — Phase D: Execute (P3) and Run (P4) handlers.
-
-Design ref: AUTORESEARCH_DESIGN_v2.md §5.
+"""AutoResearch V3 — attempt-step execution helpers.
 
 Both phases are built around injectable callables so they are testable without
 spinning up real sub-agents or training jobs:
 
-- P3 Execute: derive a Todo list from ``.auto/plan.md``, run an ``execute_fn``
+- Execute: derive a Todo list from ``todo_state.json`` / ``.auto/plan.md``, run an ``execute_fn``
   per item, and enforce the **verification hard-constraint** — an item is only
   "done" if it returns ``verification == True``.  The parent is the single
   writer of project.md (children only touch their own ``.auto/``).
-- P4 Run: run the project/experiment via ``run_fn`` with **bounded autofix** —
+- Run: run the project/experiment via ``run_fn`` with **bounded autofix** —
   at most ``max_autofix`` repair attempts before flagging ``major_error`` and
   letting the state machine jump to Evaluate.
 
@@ -83,7 +81,7 @@ def parse_todo_from_plan(root: str | Path) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# P3 Execute
+# Attempt code/read side
 # --------------------------------------------------------------------------- #
 
 ExecuteFn = Callable[[str, PhaseContext], dict]  # (todo_item, ctx) -> result dict
@@ -1308,7 +1306,7 @@ def _append_change_record(project_text: str, line: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# P4 Run
+# Attempt run/evidence side
 # --------------------------------------------------------------------------- #
 
 RunFn = Callable[[PhaseContext], dict]     # (ctx) -> {status, returncode, stdout, ...}
