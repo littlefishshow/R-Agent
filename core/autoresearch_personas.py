@@ -301,7 +301,11 @@ def build_loop_chat_fn(loop, *, tier: str = "plan") -> Optional[ChatFn]:
         temperature = getattr(loop.settings, "llm_temperature", 0.0)
         if temperature not in (None, 0, 0.0):
             kwargs["temperature"] = temperature
-        resp = client.chat.completions.create(**kwargs)
+        timeout = float(getattr(loop.settings, "llm_request_timeout", 60.0) or 60.0)
+        try:
+            resp = client.chat.completions.create(**kwargs, timeout=timeout)
+        except TypeError:
+            resp = client.chat.completions.create(**kwargs)
         return getattr(resp.choices[0].message, "content", "") or ""
 
     return chat
