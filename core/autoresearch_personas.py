@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -64,10 +65,18 @@ LEADER = Persona(
     name="leader",
     system=(
         "You are the LEADER. You MUST produce a single decision even if opinions conflict. "
-        "Consolidate the personas into one concrete next plan. Return ONLY JSON: "
+        "Consolidate the personas into one concrete next plan. Prefer a DAG-shaped task plan: "
+        "tasks should declare only real dependencies, not every earlier item. A validation/run "
+        "checkpoint should depend on the specific implementation it needs, so feedback can happen "
+        "as soon as a runnable slice exists. Use python3, never bare python, in all run_spec commands. "
+        "Return ONLY JSON: "
         '{"belief": "updated project belief (short, intuition-level)", '
         '"plan": "concrete next plan for project.md (can be coarse)", '
         '"detailed_plan": "step-by-step plan for .auto/plan.md", '
+        '"tasks": [{"task_id": "stable id", "goal": "concrete task", '
+        '"type": "analysis|implementation|validation|experiment|maintenance", '
+        '"depends_on": ["task_id"], "run_spec": {"mode": "single", "commands": ["bash train/train.sh"]}, '
+        '"success_condition": "what proves this task is done"}], '
         '"rationale": "why this over alternatives"}'
     ),
     priority=99,
@@ -123,10 +132,27 @@ class PlanDebate:
         n = self._persona_count(degrade)
         transcript: list[dict] = []
         opinions: list[str] = []
-        for persona in self.personas[:n]:
+        selected_personas = list(self.personas[:n])
+
+        def _ask_persona(persona: Persona) -> tuple[Persona, str]:
             user = json.dumps({"task": "give your opinion on how to improve the project next",
                                "stable_context": context}, ensure_ascii=False)
             raw = _safe_chat(self.chat, persona.system, user, timeout_seconds=self.chat_timeout_seconds, label=f"plan persona {persona.name}")
+            return persona, raw
+
+        by_name: dict[str, str] = {}
+        if len(selected_personas) <= 1:
+            for persona in selected_personas:
+                _, raw = _ask_persona(persona)
+                by_name[persona.name] = raw
+        else:
+            with ThreadPoolExecutor(max_workers=len(selected_personas)) as executor:
+                futures = [executor.submit(_ask_persona, persona) for persona in selected_personas]
+                for future in as_completed(futures):
+                    persona, raw = future.result()
+                    by_name[persona.name] = raw
+        for persona in selected_personas:
+            raw = by_name.get(persona.name, "")
             transcript.append({"persona": persona.name, "raw": raw})
             opinions.append(f"[{persona.name}] {_extract_opinion(raw)}")
 
@@ -143,9 +169,10 @@ class PlanDebate:
             "belief": str(decision.get("belief") or "").strip(),
             "plan": str(decision.get("plan") or "").strip(),
             "detailed_plan": str(decision.get("detailed_plan") or "").strip(),
+            "tasks": decision.get("tasks") if isinstance(decision.get("tasks"), list) else [],
             "rationale": str(decision.get("rationale") or "").strip(),
             "transcript": transcript,
-            "personas_used": [p.name for p in self.personas[:n]] + [self.leader.name],
+            "personas_used": [p.name for p in selected_personas] + [self.leader.name],
         }
 
 
@@ -215,9 +242,11 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         project_text = _update_plan_section(ctx.project_text, plan_text or "(leader produced no plan)")
 
         # 3) detailed plan -> .auto/plan.md (L3)
-        planned_todo_state = _plan_to_todo_state(
-            detailed_plan,
-            max_implementation_tasks=int(getattr(getattr(ctx.loop, "settings", None), "plan_max_implementation_tasks", 3) or 3),
+        max_implementation_tasks = int(getattr(getattr(ctx.loop, "settings", None), "plan_max_implementation_tasks", 0) or 0)
+        planned_todo_state = (
+            _leader_tasks_to_todo_state(result.get("tasks") or [])
+            if result.get("tasks")
+            else _plan_to_todo_state(detailed_plan, max_implementation_tasks=max_implementation_tasks)
         )
         if not _has_metric_experiment(ctx.root):
             planned_todo_state = _ensure_baseline_checkpoint(planned_todo_state)
@@ -293,7 +322,7 @@ def _debate_config_from_settings(settings) -> DebateConfig:
     )
 
 
-def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 3) -> dict:
+def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 0) -> dict:
     """Best-effort bridge from current leader prose to structured task state.
 
     This is an interim compatibility layer: the next iteration should ask the
@@ -323,13 +352,47 @@ def _plan_to_todo_state(plan_text: str, *, max_implementation_tasks: int = 3) ->
             "allowed_paths": ["train/**"] if task_type == "implementation" else [],
             "run_spec": _default_run_spec_for_task(task_type, item),
         })
-    prior_execute_task_ids: list[str] = []
-    for task in tasks:
-        if _task_runs_in_phase(task) == "run":
-            if prior_execute_task_ids:
-                task["depends_on"] = list(prior_execute_task_ids)
+    _assign_default_dag_dependencies(tasks)
+    return {"version": 1, "tasks": tasks}
+
+
+def _leader_tasks_to_todo_state(raw_tasks: list) -> dict:
+    """Convert leader-emitted typed DAG tasks to todo_state.
+
+    This is the preferred path for v2 planning. The fallback prose parser still
+    exists for older leaders, but typed tasks preserve real dependency edges
+    instead of inferring a linear checklist from markdown.
+    """
+    tasks = []
+    for index, raw in enumerate(raw_tasks or [], start=1):
+        if not isinstance(raw, dict):
+            continue
+        goal = str(raw.get("goal") or raw.get("title") or raw.get("description") or "").strip()
+        if not goal:
+            continue
+        task_type = _normalize_task_type(raw.get("type"))
+        task_id = _normalize_task_id(raw.get("task_id") or raw.get("id") or f"t{index}", fallback_index=index)
+        plan_summary = str(raw.get("plan_summary") or raw.get("success_condition") or goal).strip()
+        run_spec = raw.get("run_spec") if isinstance(raw.get("run_spec"), dict) else {}
+        if not run_spec:
+            run_spec = _default_run_spec_for_task(task_type, goal)
         else:
-            prior_execute_task_ids.append(task["task_id"])
+            run_spec = _normalize_run_spec(run_spec)
+        task = {
+            "task_id": task_id,
+            "goal": goal,
+            "type": task_type,
+            "status": "pending",
+            "priority": int(raw.get("priority") or index),
+            "plan_summary": plan_summary,
+            "allowed_paths": _string_list(raw.get("allowed_paths")),
+            "context_paths": _string_list(raw.get("context_paths")),
+            "depends_on": _string_list(raw.get("depends_on") or raw.get("dependencies")),
+            "run_spec": run_spec,
+            "verification": dict(raw.get("verification")) if isinstance(raw.get("verification"), dict) else {},
+        }
+        tasks.append(task)
+    _assign_default_dag_dependencies(tasks)
     return {"version": 1, "tasks": tasks}
 
 
@@ -362,6 +425,8 @@ def _coalesce_plan_items(items: list[str], *, max_implementation_tasks: int = 3)
     adjacent implementation bullets into a few coherent work packets, keep early
     analysis explicit, and keep validation checkpoints as Run-owned tasks.
     """
+    if max_implementation_tasks <= 0:
+        return list(items or [])
     implementation: list[str] = []
     output: list[str] = []
     for item in items:
@@ -379,6 +444,8 @@ def _coalesce_plan_items(items: list[str], *, max_implementation_tasks: int = 3)
 
 
 def _chunk_implementation_items(items: list[str], *, max_tasks: int) -> list[str]:
+    if max_tasks <= 0:
+        return list(items or [])
     if len(items) <= max(1, max_tasks):
         return items
     chunks: list[list[str]] = [[] for _ in range(max(1, max_tasks))]
@@ -396,7 +463,7 @@ def _chunk_implementation_items(items: list[str], *, max_tasks: int) -> list[str
 _IMPLEMENTATION_PLAN_RE = r"\b(implement|update|modify|rewrite|replace|create|add|edit|refactor|fix|write|build|integrate|ensure)\b"
 _ANALYSIS_PLAN_RE = r"^\s*(analyze|inspect|compare|检查|分析|对比)\b"
 _VALIDATION_PLAN_RE = r"^\s*(run|evaluate|eval|verify|validate|test|运行|评估|验证|测试)\b"
-_RUN_LIKE_IMPLEMENTATION_RE = r"^\s*run\s+(deterministic|global|local|adaptive|coordinate|pattern|random|seeded|low-discrepancy|grid|latin|refinement|exploration|search)\b"
+_RUN_LIKE_IMPLEMENTATION_RE = r"^\s*run\s+(?:a\s+|an\s+|the\s+)?(?:(?:broad|bounded|deterministic|global|local|adaptive|coordinate|pattern|random|seeded|low-discrepancy|grid|latin)\s+)*(?:design|refinement|exploration|search)\b"
 _EVAL_LIKE_IMPLEMENTATION_RE = r"^\s*(evaluate|verify)\s+(candidates?|points?|proposals?|incumbents?)\s+(with|using|through)\s+(the\s+)?(oracle|train-side|blackbox)"
 
 
@@ -422,11 +489,98 @@ def _classify_plan_item(item: str) -> str:
     if re.search(_ANALYSIS_PLAN_RE, text):
         return "analysis"
     explicit_eval_command = any(token in text for token in ("bash eval.sh", "bash train/train.sh", "pytest", "python -m pytest"))
-    if (re.search(_RUN_LIKE_IMPLEMENTATION_RE, text) or re.search(_EVAL_LIKE_IMPLEMENTATION_RE, text)) and not explicit_eval_command:
+    natural_language_run_design = bool(re.match(r"^\s*run\b", text) and re.search(r"\b(design|refinement|exploration|search)\b", text))
+    command_like_run = bool(re.search(r"\b(bash|sh|python3?|pytest)\b", text))
+    if (
+        re.search(_RUN_LIKE_IMPLEMENTATION_RE, text)
+        or (natural_language_run_design and not command_like_run)
+        or re.search(_EVAL_LIKE_IMPLEMENTATION_RE, text)
+    ) and not explicit_eval_command:
         return "implementation"
     if explicit_eval_command or re.search(_VALIDATION_PLAN_RE, text):
         return "validation"
     return "implementation"
+
+
+def _normalize_task_type(value) -> str:
+    raw = str(value or "implementation").strip().lower()
+    return raw if raw in {"implementation", "experiment", "validation", "analysis", "maintenance"} else "implementation"
+
+
+def _normalize_task_id(value, *, fallback_index: int) -> str:
+    raw = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "")).strip("._")
+    return raw or f"t{fallback_index}"
+
+
+def _string_list(value) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value.strip() else []
+    if isinstance(value, list):
+        return [str(v) for v in value if str(v).strip()]
+    return []
+
+
+def _assign_default_dag_dependencies(tasks: list[dict]) -> None:
+    """Fill missing dependencies without turning the plan into a linear chain.
+
+    The default DAG policy is feedback-oriented:
+    - an implementation may depend on the immediately previous analysis, because
+      the analysis is its context-gathering step;
+    - a run/validation checkpoint depends only on the most recent execute task
+      since the previous checkpoint, so the loop can run as soon as a runnable
+      slice exists;
+    - existing leader-emitted dependencies are preserved.
+    """
+    current_slice_execute_ids: list[str] = []
+    last_analysis_id = ""
+    for task in tasks:
+        task_id = str(task.get("task_id") or "").strip()
+        if not task_id:
+            continue
+        if task.get("depends_on"):
+            if _task_runs_in_phase(task) == "run":
+                current_slice_execute_ids = []
+            elif _task_runs_in_phase(task) == "execute":
+                current_slice_execute_ids.append(task_id)
+            if task.get("type") == "analysis":
+                last_analysis_id = task_id
+            continue
+        if _task_runs_in_phase(task) == "run":
+            if current_slice_execute_ids:
+                task["depends_on"] = [current_slice_execute_ids[-1]]
+            current_slice_execute_ids = []
+            continue
+        if task.get("type") == "implementation" and last_analysis_id:
+            task["depends_on"] = [last_analysis_id]
+        current_slice_execute_ids.append(task_id)
+        if task.get("type") == "analysis":
+            last_analysis_id = task_id
+
+
+def _normalize_run_spec(run_spec: dict) -> dict:
+    spec = dict(run_spec or {})
+    commands = spec.get("commands")
+    if isinstance(commands, str):
+        commands = [commands]
+    if isinstance(commands, list):
+        spec["commands"] = [_prefer_python3_command(str(command)) for command in commands]
+    monitor_commands = spec.get("monitor_commands")
+    if isinstance(monitor_commands, str):
+        monitor_commands = [monitor_commands]
+    if isinstance(monitor_commands, list):
+        spec["monitor_commands"] = [_prefer_python3_command(str(command)) for command in monitor_commands]
+    return spec
+
+
+def _prefer_python3_command(command: str) -> str:
+    text = str(command or "")
+    # Common leader output uses inline heredocs. Keep command semantics, but
+    # avoid bare python because this environment may map it to Python 2.
+    text = re.sub(r"(^|&&\s*|;\s*)python(\s+-m\b)", r"\1python3\2", text)
+    text = re.sub(r"(^|&&\s*|;\s*)python(\s+-)(?=\s|$)", r"\1python3\2", text)
+    return text
 
 
 def _default_run_spec_for_task(task_type: str, item: str) -> dict:

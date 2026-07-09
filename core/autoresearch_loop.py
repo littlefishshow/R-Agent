@@ -52,7 +52,7 @@ class AutoResearchSettings:
     use_git_versioning: bool = True
     versioning_policy: str = "artifact_only"
     planner_kind: str = "fixed"
-    llm_request_timeout: float = 60.0
+    llm_request_timeout: float = 300.0
     llm_retry_attempts: int = 0
     # --- v2: cost control + layered memory ---
     project_state_path: str | Path = "project.md"
@@ -66,20 +66,25 @@ class AutoResearchSettings:
     model_tier_plan: str = ""
     model_tier_exec: str = ""
     model_tier_util: str = ""
-    readonly_eval_globs: tuple[str, ...] = ("prepare.py", "eval.sh", "eval/**", "evaluation/**")
+    readonly_eval_globs: tuple[str, ...] = (
+        "prepare.py", "eval.py", "eval.sh", "eval/**", "evaluation/**",
+        "blackbox_oracle.py", "blackbox_oracle.*",
+    )
     plateau_patience: int = 3
     debug_mode: bool = False
     # --- v2 plan tuning ---
     plan_max_personas: int = 2
     plan_degrade_personas: int = 1
-    plan_max_implementation_tasks: int = 3
-    execute_context_chars: int = 6_000
-    execute_max_task_attempts: int = 2
+    plan_max_implementation_tasks: int = 0
+    execute_context_chars: int = 24_000
+    execute_max_task_attempts: int = 3
+    execute_behavior_check: bool = True
+    execute_behavior_check_timeout_seconds: int = 300
     # --- v2 execute/run tuning ---
     # Cap LLM-backed actions per Execute phase visit so one step cannot burn the
     # whole time/token budget on a long todo list; remaining items advance on the
     # next Execute visit via a cursor.
-    execute_max_actions_per_step: int = 1
+    execute_max_actions_per_step: int = 0
     # When Execute wrote a self-iterating search driver, let Run execute it so it
     # performs many internal evaluations from a single LLM decision.
     run_search_driver: bool = True
@@ -2002,20 +2007,17 @@ class AutoResearchLoop:
     def _run_has_valid_metric(self, result: dict, action: AutoResearchAction) -> bool:
         """True if a baseline/trial run yielded a parseable primary metric.
 
-        Used to recover a nonzero-exit run whose failure was only in a summary
-        wrapper (e.g. a broken inline python) while train/eval + metrics were
-        fine. Scoped to explicit baseline/trial roles so a generic run that
-        exits nonzero still surfaces as failed even if it happened to print a
-        metric-looking line.
+        Used to recover a nonzero-exit run only when the current command itself
+        printed a parseable metric before a trailing summary/check failed.
+        Deliberately do not recover from metrics.json here: that file may be a
+        stale metric from an earlier run and can make a failed validation look
+        successful.
         """
         role = getattr(action, "role", "")
         if role not in {"baseline", "trial"}:
             return False
         text = (result.get("stdout") or "") + "\n" + (result.get("stderr") or "")
-        if parse_primary_metric(text).get("metric") is not None:
-            return True
-        file_metrics, _ = self._collect_metric_files()
-        return bool(file_metrics)
+        return parse_primary_metric(text).get("metric") is not None
 
     def _record_metric(self, action: AutoResearchAction, raw: str, artifact_path: str, status: str) -> None:
         info = parse_primary_metric(raw)

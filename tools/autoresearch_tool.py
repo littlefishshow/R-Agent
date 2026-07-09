@@ -263,9 +263,10 @@ def _v2_settings_kwargs(
     llm_model, max_usd, max_tokens, model_tier_plan, model_tier_exec, model_tier_util,
     max_experiments, max_pareto_items, max_useful_failures, use_git_versioning,
     versioning_policy, plateau_patience, trace_rounds=False, debug_mode=False,
-    solved_metric_threshold=None, llm_request_timeout=60.0, plan_max_personas=2,
-    plan_degrade_personas=1, plan_max_implementation_tasks=3, execute_context_chars=6000,
-    execute_max_task_attempts=2,
+    solved_metric_threshold=None, llm_request_timeout=300.0, plan_max_personas=2,
+    plan_degrade_personas=1, plan_max_implementation_tasks=0, execute_context_chars=24000,
+    execute_max_task_attempts=3, execute_behavior_check=True,
+    execute_behavior_check_timeout_seconds=300,
 ) -> dict:
     return dict(
         project_dir=project_dir,
@@ -295,6 +296,8 @@ def _v2_settings_kwargs(
         plan_max_implementation_tasks=plan_max_implementation_tasks,
         execute_context_chars=execute_context_chars,
         execute_max_task_attempts=execute_max_task_attempts,
+        execute_behavior_check=execute_behavior_check,
+        execute_behavior_check_timeout_seconds=execute_behavior_check_timeout_seconds,
     )
 
 
@@ -359,12 +362,14 @@ def auto_research_run_v2_tool(
     trace_rounds: bool = True,
     debug_mode: bool = False,
     solved_metric_threshold: Optional[float] = None,
-    llm_request_timeout: float = 60.0,
+    llm_request_timeout: float = 300.0,
     plan_max_personas: int = 2,
     plan_degrade_personas: int = 1,
-    plan_max_implementation_tasks: int = 3,
-    execute_context_chars: int = 6000,
-    execute_max_task_attempts: int = 2,
+    plan_max_implementation_tasks: int = 0,
+    execute_context_chars: int = 24000,
+    execute_max_task_attempts: int = 3,
+    execute_behavior_check: bool = True,
+    execute_behavior_check_timeout_seconds: int = 300,
     wait_seconds: float = 180.0,
     detach: bool = False,
 ) -> str:
@@ -397,6 +402,7 @@ def auto_research_run_v2_tool(
             versioning_policy, plateau_patience, trace_rounds, debug_mode, solved_metric_threshold,
             llm_request_timeout, plan_max_personas, plan_degrade_personas,
             plan_max_implementation_tasks, execute_context_chars, execute_max_task_attempts,
+            execute_behavior_check, execute_behavior_check_timeout_seconds,
         )
         settings = AutoResearchSettings(**kwargs)
         preflight = git_preflight(settings.root()) if use_git_versioning else {"warnings": ["git versioning disabled"]}
@@ -604,16 +610,18 @@ def _v2_properties():
         "max_useful_failures": {"type": "integer", "description": "保留的失败摘要数。", "default": 3},
         "use_git_versioning": {"type": "boolean", "description": "已有 git 仓库中记录版本；非 git 安全降级。", "default": True},
         "versioning_policy": {"type": "string", "description": "中间版本策略。", "enum": ["artifact_only", "commit_pareto", "commit_all_trials", "branch_per_trial"], "default": "artifact_only"},
-        "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划/暂停(收敛信号 K)。", "default": 3},
+        "plateau_patience": {"type": "integer", "description": "连续多少轮 Pareto 无改进后触发重规划(收敛信号 K)。默认不会因为 plateau 暂停；autoresearch 会持续寻找更好解，除非预算耗尽、显式 solved 或用户停止。", "default": 3},
         "trace_rounds": {"type": "boolean", "description": "是否把每轮完整上下文(parent_context+system/user prompt+LLM 原始返回+选中动作+观察)dump 到 .autoresearch/round_traces/round_NNN_*.json 供事后排查；默认开启。", "default": True},
         "debug_mode": {"type": "boolean", "description": "是否开启 debug 模式：写 .autoresearch/debug/debug.jsonl 和 inflight.json，显示当前卡在 LLM/shell/phase 的哪一步。可删除 .autoresearch/DEBUG 或用 /autoresearch debug off 关闭。", "default": False},
         "solved_metric_threshold": {"type": "number", "description": "可选显式 solved 阈值。越小越好时 metric<=threshold 停止；越大越好时 metric>=threshold 停止。默认不设置，框架不会因固定阈值自动停止，需用户/预算/plateau 控制。", "default": None},
-        "llm_request_timeout": {"type": "number", "description": "单次 LLM 请求超时秒数。用于避免 Plan/Execute 长时间无进展；超时会记录到 debug/inflight 并让相位失败或降级。", "default": 60.0},
+        "llm_request_timeout": {"type": "number", "description": "单次 LLM 请求超时秒数。默认 300s，让 Execute 子进程有足够时间读写文件；超时会记录到 debug/inflight，并由任务 attempt 计数决定是否重试或 replan。", "default": 300.0},
         "plan_max_personas": {"type": "integer", "description": "Plan 阶段最多使用多少个非 leader persona；降低可减少慢模型调用。", "default": 2},
         "plan_degrade_personas": {"type": "integer", "description": "预算降级时 Plan 阶段使用多少个非 leader persona。", "default": 1},
-        "plan_max_implementation_tasks": {"type": "integer", "description": "把自然语言计划中的实现细节合并成最多多少个 Execute 任务，避免每个 bullet 都触发一次 LLM。", "default": 3},
-        "execute_context_chars": {"type": "integer", "description": "Execute LLM parent_context 字符上限；降低可减少每次改代码请求的延迟。", "default": 6000},
-        "execute_max_task_attempts": {"type": "integer", "description": "同一个 Execute 任务最多允许多少次未验证尝试；达到后标记 failed 并进入 Evaluate/Replan，避免死循环。", "default": 2},
+        "plan_max_implementation_tasks": {"type": "integer", "description": "把自然语言计划中的实现细节合并成最多多少个 Execute 任务；0=不强制合并，保留 DAG 粒度。", "default": 0},
+        "execute_context_chars": {"type": "integer", "description": "Execute LLM parent_context 字符上限；默认 24000，保留上次失败、artifact 和文件上下文以便继续执行。", "default": 24000},
+        "execute_max_task_attempts": {"type": "integer", "description": "同一个 Execute 任务最多允许多少次未验证尝试；默认 3，三次后才标记 failed 并进入 Evaluate/Replan。", "default": 3},
+        "execute_behavior_check": {"type": "boolean", "description": "Execute 写入后是否运行一次训练侧入口进行行为 smoke check，并把 submission/metrics/train_verification 摘要和 artifact 写回 last_result；不调用最终 eval。", "default": True},
+        "execute_behavior_check_timeout_seconds": {"type": "integer", "description": "Execute 行为 smoke check 的单次命令超时秒数；默认 300。", "default": 300},
         "background": {"type": "boolean", "description": "是否在独立子进程运行(存活于慢 LLM 相位)；默认 True。注意：调用默认仍会阻塞并轮询心跳最多 wait_seconds 秒后才返回，返回体带 completed 布尔标志——completed=false 表示仍在运行，禁止当作优化完成，必须继续用 auto_research_v2_status 轮询。", "default": True},
         "wait_seconds": {"type": "number", "description": "background=true 时，调用阻塞轮询心跳的最长秒数(默认 180，安全低于工具超时)。期间跑完则返回真实最终结果(experiments/best/budget)且 completed=true；超时未完成则返回 completed=false 且 status=running，需继续轮询。", "default": 180.0},
         "detach": {"type": "boolean", "description": "是否发射后不管：true 时启动子进程后立即返回(completed=false, status=queued)，不阻塞等待。默认 False(即有界等待)。", "default": False},

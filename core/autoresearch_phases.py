@@ -74,8 +74,6 @@ def budget_gate(sig: PhaseSignals) -> tuple[str, str]:
     """Gate after Compress: keep looping, or pause and notify the user."""
     if sig.budget_exhausted:
         return "pause", "budget exhausted: pausing for user"
-    if sig.plateau_counter >= max(1, sig.plateau_patience) and not sig.pareto_changed:
-        return "pause", "plateau with no improvement: pausing for user"
     return "gate", "budget available and not converged: continue"
 
 
@@ -99,7 +97,7 @@ def next_phase(sig: PhaseSignals) -> tuple[str, str]:
         if sig.execute_has_open_tasks:
             return "execute", "execute still has open plan tasks"
         if not sig.plan_still_valid:
-            return "evaluate", "current plan exhausted before run"
+            return "evaluate", "current plan exhausted/replan required before run"
         return "run", "changes applied: run project"
     if phase == "run":
         if sig.solved:

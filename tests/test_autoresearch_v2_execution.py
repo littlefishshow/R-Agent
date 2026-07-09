@@ -9,8 +9,10 @@ from core.autoresearch_execution import (
     _find_search_driver,
     _execution_attempt_item,
     _execute_parent_context,
+    _execute_fallback_context,
     _is_train_side_write_path,
     _preferred_write_target,
+    _metric_payload,
 )
 from core.autoresearch_phases import PhaseContext, PhaseSignals
 from core.autoresearch_memory import write_auto_note
@@ -204,7 +206,7 @@ def test_execute_prefers_write_action_surface(tmp_path):
     make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
     assert captured["allowed"][0] == "write"
     assert captured["allowed"].index("write") < captured["allowed"].index("apply_patch")
-    assert "PREFER a full-file 'write'" in captured["ctx"]
+    assert "Prefer a full-file write action" in captured["ctx"]
 
 
 def test_execute_context_lists_existing_files_and_tiers(tmp_path):
@@ -234,8 +236,186 @@ def test_execute_context_lists_existing_files_and_tiers(tmp_path):
     assert "train/train.sh" in ctx
     assert "train/search.py" in ctx
     # the minimal-change rule is present
-    assert "change surface minimal" in ctx
-    assert "prefer editing one existing train-side file" in ctx
+    assert "Fallback after direct-write" in ctx
+    assert "Prefer a full-file write action" in ctx
+
+
+def test_execute_direct_write_failure_falls_back_to_step_agent(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    captured = {}
+
+    class _Completions:
+        def create(self, **kwargs):
+            raise RuntimeError("direct channel unavailable")
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    class Agent:
+        model = "test-model"
+
+        def __init__(self):
+            self._tier = "exec"
+
+        def _client(self):
+            return _Client()
+
+        def _resolved_model(self):
+            return "test-model"
+
+        def plan_step(self, *, step, fallback_action, parent_context, round_index):
+            captured["ctx"] = parent_context
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="write", rationale="fallback write", path="train/fallback.py", content="x = 1\n")
+            )
+
+    loop.step_agent = Agent()
+    write_auto_note(tmp_path, "plan", "1. create helper\n")
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert (tmp_path / "train" / "fallback.py").read_text(encoding="utf-8") == "x = 1\n"
+    assert "1/1 verified" in result.summary
+    assert "previous_direct_write_error" in captured["ctx"]
+    assert "direct channel unavailable" in captured["ctx"]
+
+
+def test_execute_direct_write_timeout_does_not_start_second_llm(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "create helper", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_task_attempts=3)
+    loop = AutoResearchLoop(settings)
+    calls = {"plan_step": 0}
+
+    class _Completions:
+        def create(self, **kwargs):
+            raise TimeoutError("execute direct write exceeded framework deadline of 45.0s")
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    class Agent:
+        model = "test-model"
+
+        def __init__(self):
+            self._tier = "exec"
+
+        def _client(self):
+            return _Client()
+
+        def _resolved_model(self):
+            return "test-model"
+
+        def plan_step(self, **kwargs):
+            calls["plan_step"] += 1
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="write", rationale="should not run", path="train/x.py", content="x=1\n")
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert calls["plan_step"] == 0
+    assert "0/1 verified" in result.summary
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "in_progress"
+    assert task["last_result"]["attempts"] == 1
+    assert "exceeded framework deadline" in task["last_result"]["note"]
+
+    make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    third = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "failed"
+    assert task["last_result"]["attempts"] == 3
+    assert third.signals_update.get("major_error") is True
+
+
+def test_execute_fallback_context_is_compact_and_traceable(tmp_path):
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('train')\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "impl",
+                "goal": "edit train with trace",
+                "type": "implementation",
+                "status": "in_progress",
+                "last_result": {
+                    "note": "previous behavior stayed baseline",
+                    "artifacts": ["/tmp/artifact.json"],
+                    "behavior": {"metric": 10522.0, "command": "bash train/train.sh"},
+                },
+            }
+        ]
+    })
+    task = load_todo_state(tmp_path)["tasks"][0]
+    ctx = _ctx(tmp_path, "execute")
+    setattr(ctx, "_autoresearch_current_task", task)
+    text = _execute_fallback_context(ctx, "fix optimizer", "direct timeout", max_chars=2200)
+    assert len(text) <= 2200
+    assert "direct timeout" in text
+    assert "/tmp/artifact.json" in text
+    assert "previous behavior stayed baseline" in text
+    assert "train/train.py" in text
+
+
+def test_execute_read_action_retains_context_without_consuming_attempt(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('ctx')\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "inspect then edit", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    class _Completions:
+        def create(self, **kwargs):
+            raise RuntimeError("direct channel unavailable")
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    class Agent:
+        model = "test-model"
+
+        def __init__(self):
+            self._tier = "exec"
+
+        def _client(self):
+            return _Client()
+
+        def _resolved_model(self):
+            return "test-model"
+
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(type="read", rationale="need file context", path="train/train.py")
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert "0/1 verified" in result.summary
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "in_progress"
+    assert task["last_result"]["attempts"] == 0
+    assert task["last_result"]["artifacts"]
+    assert "read additional context" in task["last_result"]["note"]
 
 
 def test_train_side_inventory_skips_noise(tmp_path):
@@ -335,6 +515,179 @@ def test_execute_without_proposed_change_uses_step_agent_write(tmp_path):
     assert "1/1 verified" in result.summary
 
 
+def test_execute_write_runs_train_side_behavior_check_and_records_trace(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('old')\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "update train behavior", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(
+                    type="write",
+                    rationale="write train",
+                    path="train/train.py",
+                    content=(
+                        "import json\n"
+                        "from pathlib import Path\n"
+                        "Path('outputs').mkdir(exist_ok=True)\n"
+                        "Path('outputs/submission.json').write_text(json.dumps({'x': 3, 'y': 4}) + '\\n')\n"
+                        "Path('outputs/train_verification.json').write_text(json.dumps({'primary_metric': 7, 'z': 7, 'higher_is_better': False}) + '\\n')\n"
+                        "print('train_primary_metric=7')\n"
+                    ),
+                )
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert "1/1 verified" in result.summary
+    state = load_todo_state(tmp_path)
+    task = state["tasks"][0]
+    assert task["status"] == "verified"
+    behavior = task["last_result"]["behavior"]
+    assert behavior["status"] == "ok"
+    assert behavior["command"] == "python3 train/train.py"
+    assert behavior["metric"] == 7
+    assert behavior["submission"] == {"x": 3, "y": 4}
+    assert task["last_result"]["artifacts"]
+    report = (tmp_path / ".auto" / "execute_validation.md").read_text(encoding="utf-8")
+    assert "Execute Validation" in report
+    assert "metric: 7" in report
+
+
+def test_metric_payload_parses_string_false_direction_from_metrics(tmp_path):
+    (tmp_path / "outputs").mkdir()
+    (tmp_path / "outputs" / "submission.json").write_text(json.dumps({"x": 0, "y": 0}), encoding="utf-8")
+    (tmp_path / "outputs" / "train_verification.json").write_text(json.dumps({"z": 10}), encoding="utf-8")
+    (tmp_path / "metrics.json").write_text(json.dumps({"z": 10, "higher_is_better": "false"}), encoding="utf-8")
+    payload = _metric_payload(tmp_path)
+    assert payload["metric"] == 10.0
+    assert payload["higher_is_better"] is False
+
+
+def test_execute_direct_write_bundle_writes_multiple_files_and_verifies_once(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('old')\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "create train optimizer bundle", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    payload = {
+        "files": [
+            {
+                "path": "train/optimizer.py",
+                "content": (
+                    "import json\n"
+                    "from pathlib import Path\n"
+                    "def main():\n"
+                    "    Path('outputs').mkdir(exist_ok=True)\n"
+                    "    Path('outputs/submission.json').write_text(json.dumps({'x': 9, 'y': -2}) + '\\n')\n"
+                    "    Path('outputs/train_verification.json').write_text(json.dumps({'primary_metric': 5, 'z': 5, 'higher_is_better': False}) + '\\n')\n"
+                    "if __name__ == '__main__':\n"
+                    "    main()\n"
+                ),
+            },
+            {
+                "path": "train/train.sh",
+                "content": "#!/usr/bin/env bash\nset -e\npython3 train/optimizer.py\n",
+            },
+        ]
+    }
+    captured = {}
+
+    class _Completions:
+        def create(self, **kwargs):
+            captured["messages"] = kwargs.get("messages", [])
+            class _Msg:
+                content = json.dumps(payload)
+
+            class _Choice:
+                message = _Msg()
+
+            class _Resp:
+                choices = [_Choice()]
+
+            return _Resp()
+
+    class _Chat:
+        completions = _Completions()
+
+    class _Client:
+        chat = _Chat()
+
+    class _Agent:
+        model = "test-model"
+
+        def __init__(self):
+            self._tier = "exec"
+
+        def _client(self):
+            return _Client()
+
+        def _resolved_model(self):
+            return "test-model"
+
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    loop.step_agent = _Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert "1/1 verified" in result.summary
+    user_payload = json.loads(captured["messages"][1]["content"])
+    assert user_payload["preferred_path"] == "train/optimizer.py"
+    assert "train/train.sh" in user_payload["integration_hint"]
+    assert (tmp_path / "train" / "optimizer.py").exists()
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "verified"
+    behavior = task["last_result"]["behavior"]
+    assert behavior["files_written"] == ["train/optimizer.py", "train/train.sh"]
+    assert behavior["command"] == "bash train/train.sh"
+    assert behavior["metric"] == 5
+    assert behavior["submission"] == {"x": 9, "y": -2}
+
+
+def test_execute_behavior_check_failure_prevents_task_verification(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('old')\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "break train behavior", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_task_attempts=1)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(
+                    type="write",
+                    rationale="write broken train",
+                    path="train/train.py",
+                    content="raise SystemExit(3)\n",
+                )
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert "0/1 verified" in result.summary
+    assert result.signals_update.get("major_error") is True
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "failed"
+    assert task["last_result"]["behavior"]["status"] == "failed"
+    assert task["last_result"]["behavior"]["command"] == "python3 train/train.py"
+
+
 def test_default_run_records_metric_bearing_experiment(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "eval.sh").write_text("#!/usr/bin/env bash\necho 'primary_metric_name: score'\necho 'primary_metric: 0.5'\necho 'higher_is_better: true'\n", encoding="utf-8")
@@ -362,6 +715,19 @@ def test_parse_todo_fallback_to_body_when_no_list(tmp_path):
     items = parse_todo_from_plan(tmp_path)
     assert len(items) == 1
     assert "broad search" in items[0]
+
+
+def test_execute_without_plan_requests_replan_instead_of_llm_fallback(tmp_path):
+    called = []
+
+    def fake_execute(item, ctx):
+        called.append(item)
+        return {"item": item, "status": "ok", "verification": True}
+
+    result = make_execute_handler(fake_execute)(_ctx(tmp_path, "execute"))
+    assert called == []
+    assert result.signals_update == {"plan_still_valid": False}
+    assert "replan required" in result.summary
 
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +882,31 @@ def test_execute_failed_attempts_eventually_fail_task(tmp_path):
     assert second.signals_update.get("major_error") is True
 
 
+def test_execute_retries_same_failed_task_before_advancing_cursor(tmp_path):
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "a", "goal": "edit first", "type": "implementation", "status": "pending", "priority": 1},
+            {"task_id": "b", "goal": "edit second", "type": "implementation", "status": "pending", "priority": 2},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_actions_per_step=1, execute_max_task_attempts=3)
+    loop = AutoResearchLoop(settings)
+    seen = []
+
+    def fake_execute(item, ctx):
+        seen.append(item)
+        return {"item": item, "status": "tried", "verification": False, "note": "needs repair"}
+
+    handler = make_execute_handler(fake_execute)
+    handler(_ctx(tmp_path, "execute", loop=loop))
+    handler(_ctx(tmp_path, "execute", loop=loop))
+    assert seen == ["edit first", "edit first"]
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["status"] == "in_progress"
+    assert state["tasks"][1]["status"] == "pending"
+
+
 def test_execution_attempt_item_focuses_long_implementation_task():
     item = "Implement consolidated change covering: " + "; ".join([
         "Add optimizer " + ("x" * 300),
@@ -591,6 +982,8 @@ def test_execute_parent_context_truncation_keeps_todo_and_action_guidance(tmp_pa
 def test_direct_write_path_guard():
     assert _is_train_side_write_path("train/train.py") is True
     assert _is_train_side_write_path("src/model.py") is True
+    assert _is_train_side_write_path("README.md") is True
+    assert _is_train_side_write_path("notes/plan.md") is True
     assert _is_train_side_write_path("eval.py") is False
     assert _is_train_side_write_path("train/../eval.py") is False
     assert _is_train_side_write_path("blackbox_oracle.py") is False
@@ -602,6 +995,7 @@ def test_preferred_write_target_uses_goal_keywords(tmp_path):
     assert _preferred_write_target(tmp_path, "Implement train optimizer with history") == "train/optimizer.py"
     assert _preferred_write_target(tmp_path, "Update train.sh entrypoint") == "train/train.sh"
     assert _preferred_write_target(tmp_path, "Add search driver") == "train/search.py"
+    assert _preferred_write_target(tmp_path, "Improve the objective metric with candidate search") == "train/optimizer.py"
 
 
 # --------------------------------------------------------------------------- #
@@ -889,3 +1283,30 @@ def test_run_spec_long_job_runs_submit_and_one_monitor(tmp_path):
     assert (tmp_path / "outputs" / "job_status.txt").read_text(encoding="utf-8") == "submittedmonitored"
     task = load_todo_state(tmp_path)["tasks"][0]
     assert task["status"] == "verified"
+
+
+def test_run_task_failure_does_not_verify_from_stale_metrics_json(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "metrics.json").write_text(
+        json.dumps({"primary_metric": 1, "z": 1, "higher_is_better": False}) + "\n",
+        encoding="utf-8",
+    )
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "bad",
+                "goal": "bad validation",
+                "type": "validation",
+                "status": "pending",
+                "run_spec": {"mode": "single", "commands": ["false"]},
+            }
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    run_search_driver=False)
+    loop = AutoResearchLoop(settings)
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+    assert result.signals_update.get("major_error") is True
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "failed"
+    assert task["last_result"]["status"] == "failed"

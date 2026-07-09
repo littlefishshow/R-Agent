@@ -29,9 +29,9 @@ def test_phase_gate_branches():
     assert phase_gate(PhaseSignals(phase="gate", started=False, plan_still_valid=True))[0] == "execute"
 
 
-def test_budget_gate_pauses_on_exhaustion_and_plateau():
+def test_budget_gate_pauses_only_on_exhaustion_not_plateau():
     assert budget_gate(PhaseSignals(phase="compress", budget_exhausted=True))[0] == "pause"
-    assert budget_gate(PhaseSignals(phase="compress", plateau_counter=5, plateau_patience=3, pareto_changed=False))[0] == "pause"
+    assert budget_gate(PhaseSignals(phase="compress", plateau_counter=5, plateau_patience=3, pareto_changed=False))[0] == "gate"
     assert budget_gate(PhaseSignals(phase="compress", plateau_counter=0))[0] == "gate"
 
 
@@ -158,6 +158,29 @@ def test_evaluate_handler_writes_lesson_on_major_error(tmp_path):
     assert lessons.exists()
     rows = [json.loads(l) for l in lessons.read_text(encoding="utf-8").splitlines() if l.strip()]
     assert rows and rows[-1]["kind"] in {"operational_error", "directional_error"}
+
+
+def test_missing_execute_plan_invalidates_gate_and_replans(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    ctrl.ensure_scaffold()
+    from core.autoresearch_memory import write_phase
+    from core.autoresearch_gate_state import load_gate_state
+
+    ctrl._atomic_write(ctrl._project_path(), write_phase(ctrl.read_project(), "execute", "stale execute state"))
+    first = ctrl.step()
+    assert first["ran_phase"] == "execute"
+    assert first["next_phase"] == "evaluate"
+    assert "replan required" in first["reason"]
+
+    second = ctrl.step()
+    assert second["ran_phase"] == "evaluate"
+    gate = load_gate_state(tmp_path)
+    assert gate["plan_still_valid"] is False
+    assert gate["needs_replan"] is True
+
+    third = ctrl.step()
+    assert third["ran_phase"] == "compress"
+    assert third["next_phase"] == "plan"
 
 
 def test_compress_handler_trims_oversized_belief(tmp_path):

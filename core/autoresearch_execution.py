@@ -19,16 +19,18 @@ real work out of the box.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shlex
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Callable, Optional
 
 from core.autoresearch_memory import write_auto_note, read_auto_notes, append_lesson
 from core.autoresearch_phases import PhaseContext, PhaseResult
-from core.autoresearch_debug import inflight_finish, inflight_start
+from core.autoresearch_debug import debug_event, inflight_finish, inflight_start
 from core.autoresearch_timeout import call_with_deadline
 from core.autoresearch_todo_state import (
     has_open_tasks,
@@ -132,22 +134,24 @@ def _default_execute_fn(item: str, ctx: PhaseContext) -> dict:
             if action is None:
                 return {"item": item, "status": "planned", "verification": False,
                         "note": "no queued change spec and no execute step agent available"}
-            if action.type not in {"apply_patch", "write"}:
-                return {"item": item, "status": "tried", "verification": False,
-                        "note": f"execute step agent chose non-mutating action {action.type}; no change applied"}
-        obs = loop.execute_action(action)
-        verified = _verify_action_effect(loop, obs, action)
-        # A code-writing action that cannot be verified did not really land
-        # (e.g. git apply reported success but wrote nothing in a gitignored
-        # nested dir). Do not let it pass as ok — downgrade to failed so the
-        # handler counts it as not-done and the loop stops spinning on baseline.
-        status = obs.status
-        if action.type in {"apply_patch", "write"} and not verified and status in {"ok", "ok_metric_recovered"}:
-            status = "failed"
-        note = obs.summary[:400]
-        if status == "failed" and obs.status in {"ok", "ok_metric_recovered"}:
-            note = "unverified change (files not written on disk); " + note
-        return {"item": item, "status": status, "verification": verified, "note": note}
+            if action.type not in {"apply_patch", "write", "bundle", "read"}:
+                status = "tried"
+                result = {"item": item, "status": status, "verification": False,
+                          "note": f"execute step agent chose non-mutating action {action.type}; no change applied"}
+                if getattr(action, "content", ""):
+                    result["note"] += "; " + str(getattr(action, "content", ""))[:500]
+                return result
+        actions = _normalize_execute_actions(action)
+        if actions and all(getattr(a, "type", "") == "read" for a in actions):
+            return _execute_read_actions(loop, item, actions)
+        bad = [getattr(a, "type", "") for a in actions if getattr(a, "type", "") not in {"apply_patch", "write"}]
+        if bad:
+            note_action = next((a for a in actions if getattr(a, "type", "") == "note"), actions[0] if actions else action)
+            content = str(getattr(note_action, "content", "") or "")[:500]
+            extra = f"; note={content}" if content else ""
+            return {"item": item, "status": "tried", "verification": False,
+                    "note": f"execute step agent chose non-mutating action {bad[0]}; no change applied{extra}"}
+        return _execute_mutating_actions(loop, ctx, item, actions)
     except Exception as exc:
         return {"item": item, "status": "failed", "verification": False, "note": str(exc)}
 
@@ -175,19 +179,21 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
     if direct is not None:
         return direct
     direct_failed = getattr(ctx, "_autoresearch_direct_write_failed", "")
-    if direct_failed:
+    if str(direct_failed).startswith("unsafe:"):
         return AutoResearchAction(type="note", rationale="execute_direct_write_failed", content=direct_failed)
+    if "exceeded framework deadline" in str(direct_failed).lower():
+        return AutoResearchAction(type="note", rationale="execute_direct_write_timeout", content=direct_failed)
 
     step = AutoResearchWorkflowStep(
         name="apply_change",
         action_type="note",
         rationale=f"execute todo: {item}",
         content=item,
-        allowed_tools=("write", "apply_patch"),
+        allowed_tools=("write", "apply_patch", "read"),
     )
     fallback = AutoResearchAction(type="note", rationale="execute_no_safe_change", content=item)
     max_chars = int(getattr(getattr(ctx.loop, "settings", None), "execute_context_chars", 12000) or 12000)
-    parent_context = _execute_parent_context(ctx.root, ctx.project_text, item, max_chars=max_chars)
+    parent_context = _execute_fallback_context(ctx, item, direct_failed, max_chars=min(max_chars, 4500))
     try:
         result = agent.plan_step(step=step, fallback_action=fallback, parent_context=parent_context, round_index=0)
     finally:
@@ -232,19 +238,30 @@ def _direct_write_action(item: str, ctx: PhaseContext):
         except Exception:
             current = ""
     support_context = _direct_write_support_context(root, target)
+    task_context = _current_execute_task_context(ctx)
     system = (
-        "Return ONLY JSON with keys path and content. "
-        "Rewrite exactly one train-side file. The content must be the complete file body. "
-        "If the target is a Python script, include a runnable main entrypoint when appropriate. "
-        "Do not edit eval.py, eval.sh, or blackbox_oracle.py. "
-        "No markdown, no explanation."
+        "Return ONLY JSON. Preferred schema: {\"files\": [{\"path\": str, \"content\": str}, ...]}. "
+        "You may also return legacy {\"path\": str, \"content\": str}. "
+        "Rewrite up to 3 train-side files with complete content. "
+        "If you create a new optimizer/search module, include the train entrypoint file that calls it. "
+        "Do not edit eval.py, eval.sh, blackbox_oracle.py. No markdown."
     )
     user = json.dumps({
-        "todo": item,
+        "todo": str(item)[:900],
         "preferred_path": target,
-        "current_file": current[:3000],
+        "integration_hint": (
+            "If preferred_path is a new optimizer/search module, return files for both that module and train/train.sh "
+            "so bash train/train.sh executes the new code and writes outputs/submission.json."
+            if target in {"train/optimizer.py", "train/search.py"} else ""
+        ),
+        "current_file": current[:1200],
         "support_context": support_context,
-        "schema": {"path": "relative train-side path", "content": "complete new file content"},
+        "task_context": task_context,
+        "schema": {
+            "files": [{"path": "relative train-side path", "content": "complete new file content"}],
+            "path": "legacy single relative train-side path",
+            "content": "legacy single complete new file content",
+        },
     }, ensure_ascii=False)
     timeout = float(getattr(getattr(loop, "settings", None), "llm_request_timeout", 60.0) or 60.0)
     try:
@@ -280,14 +297,24 @@ def _direct_write_action(item: str, ctx: PhaseContext):
         )
         raw = getattr(resp.choices[0].message, "content", "") or ""
         data = extract_json_object(raw)
-        path = str(data.get("path") or "").strip()
-        content = str(data.get("content") or "")
-        if not path or not content:
+        files = data.get("files")
+        if isinstance(files, list):
+            items = [f for f in files if isinstance(f, dict)]
+        else:
+            items = [{"path": data.get("path"), "content": data.get("content")}]
+        actions = []
+        for f in items[:3]:
+            path = str(f.get("path") or "").strip()
+            content = str(f.get("content") or "")
+            if not path or not content:
+                continue
+            if not _is_train_side_write_path(path):
+                setattr(ctx, "_autoresearch_direct_write_failed", f"unsafe: direct write returned unsafe path: {path}")
+                return None
+            actions.append(AutoResearchAction(type="write", rationale=f"direct write for execute todo: {item[:120]}", path=path, content=content))
+        if not actions:
             return None
-        if not _is_train_side_write_path(path):
-            setattr(ctx, "_autoresearch_direct_write_failed", f"direct write returned unsafe path: {path}")
-            return None
-        return AutoResearchAction(type="write", rationale=f"direct write for execute todo: {item[:120]}", path=path, content=content)
+        return actions[0] if len(actions) == 1 else _ExecuteActionBundle(actions)
     except Exception as exc:
         inflight_finish(
             root,
@@ -307,17 +334,23 @@ def _preferred_write_target(root: Path, item: str = "") -> str:
         return "train/train.sh"
     if "optimizer.py" in lowered or "optimizer" in lowered:
         return "train/optimizer.py"
-    if "search.py" in lowered or "search" in lowered or "driver" in lowered:
+    if "search.py" in lowered or "driver" in lowered:
         return "train/search.py"
+    if any(token in lowered for token in (
+        "black-box", "black box", "objective", "minimize", "maximize", "metric",
+        "oracle", "incumbent", "candidate", "submission", "search", "exploration",
+        "refinement", "improve",
+    )):
+        return "train/optimizer.py"
     for rel in ("train/train.py", "train/train.sh", "train/search.py", "train/optimizer.py"):
         if (root / rel).exists():
             return rel
     return "train/train.py"
 
 
-def _direct_write_support_context(root: Path, target: str, max_chars: int = 2600) -> dict:
+def _direct_write_support_context(root: Path, target: str, max_chars: int = 1400) -> dict:
     """Small, high-signal context for a file-level write request."""
-    candidates = ["train/train.py", "train/train.sh", "program.md"]
+    candidates = ["train/train.py", "train/train.sh", ".auto/execute_validation.md", "program.md"]
     if target and target not in candidates:
         candidates.append(target)
     payload: dict[str, str] = {}
@@ -332,10 +365,30 @@ def _direct_write_support_context(root: Path, target: str, max_chars: int = 2600
             text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        snippet = _compact_support_snippet(rel, text, min(remaining, 1200))
+        snippet = _compact_support_snippet(rel, text, min(remaining, 700))
         payload[rel] = snippet
         remaining -= len(snippet)
     return payload
+
+
+def _current_execute_task_context(ctx: PhaseContext) -> dict:
+    task = getattr(ctx, "_autoresearch_current_task", None)
+    subgoal = getattr(ctx, "_autoresearch_current_subgoal", None)
+    if not isinstance(task, dict):
+        return {}
+    last = task.get("last_result") if isinstance(task.get("last_result"), dict) else {}
+    subgoal = subgoal if isinstance(subgoal, dict) else {}
+    return {
+        "task_id": task.get("task_id", ""),
+        "full_goal": str(task.get("goal") or "")[:1200],
+        "last_status": last.get("status", ""),
+        "last_note": str(last.get("note") or "")[:600],
+        "last_behavior": last.get("behavior", {}),
+        "last_artifacts": last.get("artifacts", []),
+        "attempts": last.get("attempts", 0),
+        "subgoal_index": subgoal.get("subgoal_index", last.get("subgoal_index", 0)),
+        "subgoal_count": subgoal.get("subgoal_count", last.get("subgoal_count", 1)),
+    }
 
 
 def _compact_support_snippet(rel: str, text: str, limit: int) -> str:
@@ -367,10 +420,98 @@ def _is_train_side_write_path(path: str) -> bool:
     parts = Path(path).parts
     if not parts or ".." in parts:
         return False
-    if parts[0] not in {"train", "src", "scripts"}:
-        return False
     name = Path(path).name
     return name not in {"eval.py", "eval.sh", "blackbox_oracle.py"}
+
+
+class _ExecuteActionBundle:
+    """Internal container for a small atomic-ish group of safe write actions."""
+
+    type = "bundle"
+
+    def __init__(self, actions: list):
+        self.actions = list(actions or [])
+        self.rationale = "; ".join(str(getattr(a, "rationale", "")) for a in self.actions)[:300]
+
+
+def _normalize_execute_actions(action) -> list:
+    if isinstance(action, _ExecuteActionBundle):
+        return list(action.actions)
+    return [action] if action is not None else []
+
+
+def _combined_observation(observations: list) -> SimpleNamespace:
+    status = "ok" if observations and all(getattr(o, "status", "") in {"ok", "ok_metric_recovered"} for o in observations) else "failed"
+    summary = "\n".join(str(getattr(o, "summary", "")) for o in observations if getattr(o, "summary", "")).strip()
+    artifact_path = ""
+    for obs in reversed(observations):
+        artifact_path = str(getattr(obs, "artifact_path", "") or "")
+        if artifact_path:
+            break
+    return SimpleNamespace(status=status, summary=summary, artifact_path=artifact_path)
+
+
+def _execute_read_actions(loop, item: str, actions: list) -> dict:
+    """Let Execute gather missing context without consuming a failed write attempt."""
+    observations = []
+    for action in actions:
+        obs = loop.execute_action(action)
+        observations.append(obs)
+        if getattr(obs, "status", "") not in {"ok", "ok_metric_recovered"}:
+            break
+    combined = _combined_observation(observations)
+    artifacts = [str(getattr(o, "artifact_path", "") or "") for o in observations if getattr(o, "artifact_path", "")]
+    return {
+        "item": item,
+        "status": "read_context" if combined.status in {"ok", "ok_metric_recovered"} else "tried",
+        "verification": False,
+        "note": ("read additional context; retry task with retained artifacts: " + combined.summary[:700]).strip(),
+        "artifacts": artifacts,
+        "attempt_delta": 0,
+    }
+
+
+def _execute_mutating_actions(loop, ctx: PhaseContext, item: str, actions: list) -> dict:
+    """Execute one or more safe mutating actions, then verify once."""
+    setattr(ctx, "_autoresearch_execute_before", _project_fingerprint(ctx.root))
+    observations = []
+    static_ok = True
+    for action in actions:
+        obs = loop.execute_action(action)
+        observations.append(obs)
+        if not _verify_action_effect(loop, obs, action):
+            static_ok = False
+        if getattr(obs, "status", "") not in {"ok", "ok_metric_recovered"}:
+            static_ok = False
+            break
+    combined_action = actions[0] if len(actions) == 1 else _ExecuteActionBundle(actions)
+    combined_obs = _combined_observation(observations)
+    behavior_result = {}
+    if observations and combined_obs.status in {"ok", "ok_metric_recovered"}:
+        behavior_result = _execute_behavior_check(ctx, item, combined_action, combined_obs, static_verified=static_ok)
+    verified = bool(static_ok and (behavior_result.get("ok", True)))
+    status = combined_obs.status
+    if not verified and status in {"ok", "ok_metric_recovered"}:
+        status = "failed"
+    note = combined_obs.summary[:500]
+    if status == "failed" and combined_obs.status in {"ok", "ok_metric_recovered"}:
+        note = "unverified change (files not written or behavior check failed); " + note
+    if behavior_result.get("note"):
+        note = (note + "; " + str(behavior_result.get("note")))[:1000]
+    artifacts = [str(getattr(o, "artifact_path", "") or "") for o in observations if getattr(o, "artifact_path", "")]
+    if behavior_result.get("artifact_path"):
+        artifacts.append(str(behavior_result["artifact_path"]))
+    behavior = behavior_result.get("behavior", {})
+    if len(actions) > 1:
+        behavior = {**behavior, "files_written": [str(getattr(a, "path", "")) for a in actions]}
+    return {
+        "item": item,
+        "status": status,
+        "verification": verified,
+        "note": note,
+        "behavior": behavior,
+        "artifacts": artifacts,
+    }
 
 
 _TRAIN_SIDE_DIRS = ("train", "src", "scripts")
@@ -474,10 +615,298 @@ def _execute_parent_context(root: str | Path, project_text: str, item: str, max_
     # and made Execute more likely to time out or return a non-mutating note.
     return data[: max(0, max_chars - 80)].rstrip() + "\n\n[execute context truncated]\n"
 
+
+def _execute_fallback_context(ctx: PhaseContext, item: str, direct_failed: str = "", max_chars: int = 4500) -> str:
+    """Compact fallback context for the full StepAgent action channel.
+
+    Direct-write already saw the tight file context. If it times out, feeding a
+    larger 10k+ parent_context into StepAgent tends to time out again. Keep this
+    fallback task-focused and refer to artifacts instead of expanding them.
+    """
+    root = Path(ctx.root)
+    task_context = _current_execute_task_context(ctx)
+    target = _preferred_write_target(root, item)
+    support = _direct_write_support_context(root, target, max_chars=1800)
+    inventory = _train_side_inventory(root, max_files=30)
+    notes = read_auto_notes(root, max_files=3, max_chars_per_file=900)
+    payload = {
+        "purpose": "Fallback after direct-write could not produce a safe edit. Return one mutating write/apply_patch action.",
+        "todo": str(item)[:1000],
+        "task_context": task_context,
+        "previous_direct_write_error": str(direct_failed or "")[:800],
+        "preferred_path": target,
+        "editable_train_side_files": inventory,
+        "support_context": support,
+        "recent_auto_notes": notes,
+        "constraints": [
+            "Do not edit eval.py, eval.sh, blackbox_oracle.py.",
+            "Prefer a full-file write action with complete file content.",
+            "Use artifact paths in task_context for trace; do not paste full old logs.",
+        ],
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2, default=str)
+    if len(text) <= max_chars:
+        return text
+    return text[: max(0, max_chars - 80)].rstrip() + "\n\n[execute fallback context truncated]\n"
+
+
 def _note_action(item: str):
     from core.autoresearch_loop import AutoResearchAction
 
     return AutoResearchAction(type="note", rationale="execute_apply_change", content=item)
+
+
+def _project_fingerprint(root: str | Path) -> dict:
+    root = Path(root)
+    payload: dict[str, dict] = {}
+    for rel in (
+        "outputs/submission.json",
+        "outputs/train_verification.json",
+        "metrics.json",
+        "train/candidate.json",
+    ):
+        path = root / rel
+        if not path.exists() or not path.is_file():
+            payload[rel] = {"exists": False}
+            continue
+        try:
+            data = path.read_bytes()
+        except Exception:
+            payload[rel] = {"exists": True, "readable": False}
+            continue
+        payload[rel] = {
+            "exists": True,
+            "size": len(data),
+            "sha1": hashlib.sha1(data).hexdigest()[:12],
+        }
+    return payload
+
+
+def _read_project_json(root: str | Path, rel: str) -> dict:
+    path = Path(root) / rel
+    if not path.exists():
+        return {}
+    data = _read_json(path)
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_higher_is_better(value, default: bool = True) -> bool:
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in {"false", "0", "no", "lower", "min", "minimize"}:
+            return False
+        if text in {"true", "1", "yes", "higher", "max", "maximize"}:
+            return True
+        return default
+    if value is None:
+        return default
+    return bool(value)
+
+
+def _compact_json_value(data: dict, *, max_chars: int = 900) -> dict:
+    """Return a JSON-safe small dict for prompt carry-forward."""
+    if not isinstance(data, dict):
+        return {}
+    out = {}
+    for key, value in data.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            out[str(key)] = value
+        elif isinstance(value, list):
+            out[str(key)] = value[:8]
+        elif isinstance(value, dict):
+            out[str(key)] = {str(k): v for k, v in list(value.items())[:8] if isinstance(v, (str, int, float, bool)) or v is None}
+        else:
+            out[str(key)] = str(value)[:200]
+    surface = json.dumps(out, ensure_ascii=False, default=str)
+    if len(surface) <= max_chars:
+        return out
+    return {"truncated": surface[: max_chars - 3].rstrip() + "..."}
+
+
+def _metric_payload(root: str | Path) -> dict:
+    train_v = _read_project_json(root, "outputs/train_verification.json")
+    metrics = _read_project_json(root, "metrics.json")
+    submission = _read_project_json(root, "outputs/submission.json")
+    metric_source = train_v or metrics
+    direction_source = metrics or train_v
+    metric = metric_source.get("z", metric_source.get("primary_metric"))
+    try:
+        metric_value = float(metric)
+    except Exception:
+        metric_value = None
+    higher = _parse_higher_is_better(direction_source.get("higher_is_better", True) if direction_source else True)
+    return {
+        "metric": metric_value,
+        "metric_name": metric_source.get("metric_name", "primary_metric") if metric_source else "",
+        "higher_is_better": higher,
+        "submission": _compact_json_value(submission, max_chars=500),
+        "train_verification": _compact_json_value(train_v, max_chars=900),
+        "metrics": _compact_json_value(metrics, max_chars=900),
+    }
+
+
+def _execute_behavior_command(root: Path, action=None) -> Optional[str]:
+    """Pick a project-owned train-side command for Execute smoke verification.
+
+    This intentionally avoids final eval files. It is only a post-edit behavior
+    check that proves the new training-side code can run and leave artifacts for
+    the later Run/Evaluate phases.
+    """
+    action_paths = []
+    if isinstance(action, _ExecuteActionBundle):
+        action_paths = [str(getattr(a, "path", "") or "") for a in action.actions]
+    else:
+        action_paths = [str(getattr(action, "path", "") or "")]
+    action_path = action_paths[0] if action_paths else ""
+    if "train/train.sh" in action_paths and (root / "train" / "train.sh").exists():
+        return "bash train/train.sh"
+    if "train/train.py" in action_paths and (root / "train" / "train.py").exists():
+        return "python3 train/train.py"
+    if action_path and action_path not in {"train/train.py", "train/train.sh"} and not (root / "train" / "train.sh").exists():
+        return None
+    if (root / "train" / "train.sh").exists():
+        return "bash train/train.sh"
+    if (root / "train" / "train.py").exists():
+        return "python3 train/train.py"
+    return None
+
+
+def _save_execute_behavior_artifact(loop, ctx: PhaseContext, payload: dict) -> str:
+    artifact_path = ""
+    artifacts = getattr(loop, "artifacts", None) if loop is not None else None
+    if artifacts is not None:
+        try:
+            artifact_path = artifacts.save(
+                kind="execute_behavior",
+                rationale="execute_behavior_check",
+                content=json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n",
+                extension="json",
+            )
+        except Exception:
+            artifact_path = ""
+    if not artifact_path:
+        path = Path(ctx.root) / ".autoresearch" / "artifacts" / f"{int(time.time() * 1000)}_execute_behavior.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+        artifact_path = str(path)
+    return artifact_path
+
+
+def _record_execute_behavior_note(ctx: PhaseContext, payload: dict, artifact_path: str) -> None:
+    result = payload.get("result", {})
+    command = payload.get("command") or "(none)"
+    metric = result.get("metric")
+    summary = [
+        "# Execute Validation",
+        "",
+        f"- task: {payload.get('item', '')}",
+        f"- command: `{command}`",
+        f"- status: {payload.get('status', '')}",
+        f"- static_verified: {payload.get('static_verified')}",
+        f"- behavior_verified: {payload.get('behavior_verified')}",
+        f"- artifact: {artifact_path}",
+    ]
+    if metric is not None:
+        summary.append(f"- metric: {metric} higher_is_better={result.get('higher_is_better')}")
+    submission = result.get("submission") or {}
+    if submission:
+        summary.append(f"- submission: `{json.dumps(submission, ensure_ascii=False, sort_keys=True)}`")
+    note = payload.get("note") or ""
+    if note:
+        summary.extend(["", "## Note", note[:1600]])
+    write_auto_note(ctx.root, "execute_validation", "\n".join(summary).rstrip() + "\n")
+
+
+def _execute_behavior_check(ctx: PhaseContext, item: str, action, obs, *, static_verified: bool) -> dict:
+    loop = ctx.loop
+    root = Path(ctx.root)
+    before = getattr(ctx, "_autoresearch_execute_before", None)
+    before = before if isinstance(before, dict) else {}
+    after_write = _project_fingerprint(root)
+    enabled = bool(getattr(getattr(loop, "settings", None), "execute_behavior_check", True)) if loop is not None else False
+    command = _execute_behavior_command(root, action) if enabled else None
+    command_result = None
+    behavior_verified = True
+    note = ""
+    if command and loop is not None:
+        timeout = int(getattr(getattr(loop, "settings", None), "execute_behavior_check_timeout_seconds", 60) or 60)
+        old_timeout = getattr(loop.runner, "timeout_seconds", None)
+        try:
+            if old_timeout is not None:
+                loop.runner.timeout_seconds = min(int(old_timeout), max(1, timeout))
+            command_result = loop.runner.run(command)
+        finally:
+            if old_timeout is not None:
+                loop.runner.timeout_seconds = old_timeout
+        behavior_verified = command_result.get("returncode") == 0
+        stdout = (command_result.get("stdout") or "")[-1200:]
+        stderr = (command_result.get("stderr") or "")[-1200:]
+        note = f"behavior command rc={command_result.get('returncode')} duration={command_result.get('duration_seconds')}s"
+        if stderr:
+            note += f"; stderr={stderr[:400]}"
+        elif stdout:
+            note += f"; stdout={stdout[:400]}"
+    after_behavior = _project_fingerprint(root)
+    metric_payload = _metric_payload(root)
+    changed_artifacts = [
+        rel for rel, value in after_behavior.items()
+        if value != before.get(rel) and value.get("exists")
+    ]
+    payload = {
+        "item": item,
+        "action": {
+            "type": getattr(action, "type", ""),
+            "path": getattr(action, "path", ""),
+            "rationale": getattr(action, "rationale", ""),
+        },
+        "observation": {
+            "status": getattr(obs, "status", ""),
+            "summary": getattr(obs, "summary", "")[:1000],
+            "artifact_path": getattr(obs, "artifact_path", ""),
+        },
+        "static_verified": bool(static_verified),
+        "behavior_verified": bool(behavior_verified),
+        "status": "ok" if static_verified and behavior_verified else "failed",
+        "command": command or "",
+        "command_result": {
+            "returncode": command_result.get("returncode") if isinstance(command_result, dict) else None,
+            "duration_seconds": command_result.get("duration_seconds") if isinstance(command_result, dict) else None,
+            "stdout_tail": (command_result.get("stdout") or "")[-2000:] if isinstance(command_result, dict) else "",
+            "stderr_tail": (command_result.get("stderr") or "")[-2000:] if isinstance(command_result, dict) else "",
+            "timeout": bool(command_result.get("timeout")) if isinstance(command_result, dict) else False,
+        },
+        "before": before,
+        "after_write": after_write,
+        "after_behavior": after_behavior,
+        "changed_artifacts": changed_artifacts,
+        "result": metric_payload,
+        "note": note,
+    }
+    artifact = _save_execute_behavior_artifact(loop, ctx, payload)
+    _record_execute_behavior_note(ctx, payload, artifact)
+    debug_event(
+        root,
+        "execute_behavior_check",
+        status=payload["status"],
+        command=command or "",
+        behavior_verified=payload["behavior_verified"],
+        static_verified=payload["static_verified"],
+        metric=metric_payload.get("metric"),
+        artifact_path=artifact,
+    )
+    return {
+        "ok": bool(static_verified and behavior_verified),
+        "behavior": {
+            "status": payload["status"],
+            "command": command or "",
+            "metric": metric_payload.get("metric"),
+            "higher_is_better": metric_payload.get("higher_is_better"),
+            "changed_artifacts": changed_artifacts,
+            "submission": metric_payload.get("submission", {}),
+        },
+        "artifact_path": artifact,
+        "note": note,
+    }
 
 
 def _verify_action_effect(loop, obs, action=None) -> bool:
@@ -582,7 +1011,9 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                     summary += "; run tasks are ready or waiting"
                 write_auto_note(ctx.root, "execute_report", "# Execute Report\n\n" + summary + "\n")
                 return PhaseResult(signals_update=signals_update, summary=summary)
-            items = ["(no explicit todo; execute current plan)"]
+            summary = "execute: no plan/todo found; replan required"
+            write_auto_note(ctx.root, "execute_report", "# Execute Report\n\n" + summary + "\n")
+            return PhaseResult(signals_update={"plan_still_valid": False}, summary=summary)
 
         # Bound the number of (possibly slow, LLM-backed) actions per Execute visit
         # so one step cannot exhaust the whole time/token budget on a long todo
@@ -622,6 +1053,9 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
                 any_verified = True
                 continue
             exec_item, subgoal_meta = _execution_attempt(task, item)
+            if task:
+                setattr(ctx, "_autoresearch_current_task", task)
+                setattr(ctx, "_autoresearch_current_subgoal", subgoal_meta)
             res = fn(exec_item, ctx) or {}
             res.update(subgoal_meta)
             if task and exec_item != item:
@@ -635,6 +1069,8 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
             results.append(res)
             _update_task_from_execute_result(todo_state, task, res)
             if task and _task_should_continue_subgoals(todo_state, task):
+                repeat_current_window = True
+            if task and res.get("status") in {"failed", "tried"} and not res.get("verification"):
                 repeat_current_window = True
             # verification hard-constraint: only verified items count as done.
             subgoal_done = int(res.get("subgoal_index") or 0) + 1 >= int(res.get("subgoal_count") or 1)
@@ -811,12 +1247,12 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
     last_result = dict(target.get("last_result") or {})
     attempts = int(last_result.get("attempts") or 0)
     if not verified and status not in {"skipped"}:
-        attempts += 1
-    max_attempts = 2
+        attempts += int(result.get("attempt_delta", 1))
+    max_attempts = 3
     try:
-        max_attempts = max(1, int(result.get("max_attempts") or 2))
+        max_attempts = max(1, int(result.get("max_attempts") or 3))
     except Exception:
-        max_attempts = 2
+        max_attempts = 3
     subgoal_index = int(result.get("subgoal_index") or 0)
     subgoal_count = int(result.get("subgoal_count") or 1)
     subgoal_complete = bool(status in {"ok", "done"} and verified and subgoal_index + 1 < subgoal_count)
@@ -826,8 +1262,10 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         target["status"] = "in_progress"
     elif status in {"ok", "done"} and verified:
         target["status"] = "verified"
-    elif status == "failed":
+    elif status == "failed" and attempts >= max_attempts:
         target["status"] = "failed"
+    elif status == "failed":
+        target["status"] = "in_progress"
     elif attempts >= max_attempts:
         target["status"] = "failed"
     else:
@@ -836,6 +1274,8 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         "status": status,
         "verification": verified,
         "note": str(result.get("note") or "")[:1000],
+        "behavior": result.get("behavior", {}) if isinstance(result.get("behavior"), dict) else {},
+        "artifacts": [str(p) for p in (result.get("artifacts") or [])][:6] if isinstance(result.get("artifacts"), list) else [],
         "attempts": attempts,
         "max_attempts": max_attempts,
         "subgoal_index": subgoal_index,
@@ -844,6 +1284,12 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
         "subgoal": str(result.get("subgoal") or "")[:1000],
         "updated_at": time.time(),
     }
+    if isinstance(result.get("artifacts"), list):
+        existing_artifacts = list(target.get("artifacts") or [])
+        for path in result.get("artifacts") or []:
+            if path and path not in existing_artifacts:
+                existing_artifacts.append(str(path))
+        target["artifacts"] = existing_artifacts[-12:]
 
 
 def _append_change_record(project_text: str, line: str) -> str:
@@ -1024,8 +1470,8 @@ def _metric_from_file(root: str | Path) -> tuple[Optional[float], bool]:
     try:
         metric = float(value)
     except Exception:
-        return None, bool(data.get("higher_is_better", True))
-    return metric, bool(data.get("higher_is_better", True))
+        return None, _parse_higher_is_better(data.get("higher_is_better", True))
+    return metric, _parse_higher_is_better(data.get("higher_is_better", True))
 
 
 def _search_log_rows(root: str | Path) -> list[dict]:
@@ -1129,7 +1575,7 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     inner_evals = max(len(observations), len(_search_log_rows(ctx.root)) - start_rows)
     if run_task:
         _update_run_task_result(ctx.root, run_task, obs, inner_evals=inner_evals)
-    status = "ok" if obs.status in {"ok", "ok_metric_recovered"} else "failed"
+    status = "ok" if obs.status == "ok" else "failed"
     stdout = obs.summary
     if len(observations) > 1:
         stdout = f"{stdout}\ninner_evals={inner_evals} elapsed_seconds={round(time.time() - started, 3)}"
@@ -1144,7 +1590,7 @@ def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: i
     for existing in state.get("tasks", []):
         if existing.get("task_id") != task.get("task_id"):
             continue
-        command_ok = getattr(obs, "status", "") in {"ok", "ok_metric_recovered"}
+        command_ok = getattr(obs, "status", "") == "ok"
         ok = command_ok and _verification_passed(existing.get("verification") or {}, metric, higher)
         existing["status"] = "verified" if ok else "failed"
         existing["last_result"] = {

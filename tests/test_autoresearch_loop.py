@@ -800,15 +800,15 @@ def test_generic_nonzero_run_still_fails(tmp_path):
     assert obs.status == "failed"
 
 
-def test_baseline_nonzero_exit_recovers_from_metrics_file(tmp_path):
-    """Baseline whose wrapper fails but metrics.json is valid should recover."""
+def test_baseline_nonzero_exit_does_not_recover_from_stale_metrics_file(tmp_path):
+    """A failed run must not be marked ok solely because an old metrics.json exists."""
     (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
     (tmp_path / "metrics.json").write_text('{"z": 2.0, "primary_metric": 2.0}', encoding="utf-8")
     settings = AutoResearchSettings(project_dir=tmp_path, project_id="base-rec", max_rounds=0, use_git_versioning=False)
     loop = AutoResearchLoop(settings)
-    # No metric on stdout; broken summary exits 1; metrics.json carries the result.
+    # No metric on stdout; metrics.json may be stale from an earlier run.
     obs = loop.execute_action(AutoResearchAction(type="run", rationale="experiment_result_baseline", command="exit 1", role="baseline"))
-    assert obs.status == "ok_metric_recovered"
+    assert obs.status == "failed"
 
 
 def test_search_feedback_digest_surfaces_range_and_best(tmp_path):

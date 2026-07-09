@@ -64,6 +64,28 @@ def test_debate_leader_forces_a_decision():
     assert result["detailed_plan"].startswith("1.")
 
 
+def test_debate_personas_run_in_parallel_before_leader():
+    order = []
+
+    def chat(system, user):  # noqa: ARG001
+        if system.startswith("You are the LEADER"):
+            order.append("leader")
+            return json.dumps({"belief": "b", "plan": "p", "detailed_plan": "d"})
+        time.sleep(0.2)
+        if system.startswith("You are the DIVERGENT"):
+            order.append("divergent")
+            return json.dumps({"opinion": "wide"})
+        order.append("pragmatic")
+        return json.dumps({"opinion": "feasible"})
+
+    started = time.time()
+    result = PlanDebate(chat, config=DebateConfig(max_personas=2)).run(program_text="", project_text="")
+    elapsed = time.time() - started
+    assert elapsed < 0.35
+    assert result["personas_used"] == ["divergent", "pragmatic", "leader"]
+    assert order[-1] == "leader"
+
+
 def test_debate_survives_persona_failure():
     def flaky_chat(system, user):
         if system.startswith("You are the DIVERGENT"):
@@ -83,6 +105,7 @@ def test_plan_item_classification_prefers_implementation_verbs():
     assert _classify_plan_item("Add a persistent history file containing every evaluated x,y,z") == "implementation"
     assert _classify_plan_item("Run bash train/train.sh, then bash eval.sh and compare metrics") == "validation"
     assert _classify_plan_item("Run deterministic global exploration over several boxes") == "implementation"
+    assert _classify_plan_item("run a broad but bounded deterministic global design") == "implementation"
     assert _classify_plan_item("Run local refinement from the best few incumbents") == "implementation"
     assert _classify_plan_item("Evaluate candidates with the oracle and update incumbent") == "implementation"
     assert _classify_plan_item("Inspect existing train structure") == "analysis"
@@ -113,7 +136,17 @@ def test_plan_items_coalesce_many_implementation_bullets():
     assert coalesced[-1].startswith("Run bash")
 
 
-def test_plan_to_todo_state_validation_depends_only_on_prior_execute_tasks():
+def test_plan_items_can_preserve_dag_granularity_without_coalescing():
+    items = [
+        "Inspect train files",
+        "Implement optimizer",
+        "Add history logging",
+        "Run bash train/train.sh and bash eval.sh",
+    ]
+    assert _coalesce_plan_items(items, max_implementation_tasks=0) == items
+
+
+def test_plan_to_todo_state_validation_depends_on_recent_execute_slice():
     state = _plan_to_todo_state(
         "1. Implement optimizer\n"
         "2. Run bash train/train.sh and bash eval.sh\n"
@@ -122,7 +155,7 @@ def test_plan_to_todo_state_validation_depends_only_on_prior_execute_tasks():
     )
     tasks = state["tasks"]
     assert tasks[1]["depends_on"] == ["t1"]
-    assert tasks[3]["depends_on"] == ["t1", "t3"]
+    assert tasks[3]["depends_on"] == ["t3"]
 
 
 def test_baseline_checkpoint_inserted_before_first_implementation():
@@ -137,6 +170,43 @@ def test_baseline_checkpoint_inserted_before_first_implementation():
     assert tasks[1]["type"] == "validation"
     assert tasks[1]["depends_on"] == ["t1"]
     assert tasks[1]["run_spec"]["commands"] == ["bash train/train.sh", "bash eval.sh"]
+
+
+def test_leader_typed_tasks_preserve_explicit_dag_dependencies(tmp_path):
+    chat, _ = _fake_chat_factory()
+
+    def typed_chat(system, user):
+        if system.startswith("You are the LEADER"):
+            return json.dumps({
+                "belief": "use dag",
+                "plan": "typed dag",
+                "detailed_plan": "",
+                "tasks": [
+                    {"task_id": "survey", "type": "analysis", "goal": "inspect files"},
+                    {"task_id": "impl", "type": "implementation", "goal": "write optimizer", "depends_on": ["survey"]},
+                    {"task_id": "check", "type": "validation", "goal": "run eval", "depends_on": ["impl"], "run_spec": {"commands": ["python -m json.tool outputs/submission.json", "python - <<'PY'\nprint('ok')\nPY"]}},
+                    {"task_id": "polish", "type": "implementation", "goal": "improve optimizer"},
+                ],
+            })
+        return chat(system, user)
+
+    loop = _make_loop(tmp_path)
+    program_text = ensure_program_scaffold((tmp_path / "program.md").read_text(encoding="utf-8"))
+    ctx = PhaseContext(
+        phase="plan",
+        root=tmp_path,
+        program_text=program_text,
+        project_text="# Project State\n\n## 当前计划\nold\n",
+        signals=PhaseSignals(phase="plan"),
+        loop=loop,
+    )
+    make_plan_handler(typed_chat)(ctx)
+    tasks = load_todo_state(tmp_path)["tasks"]
+    by_id = {task["task_id"]: task for task in tasks}
+    assert by_id["check"]["depends_on"] == ["impl"]
+    assert by_id["check"]["run_spec"]["commands"][0].startswith("python3 -m")
+    assert by_id["check"]["run_spec"]["commands"][1].startswith("python3 -")
+    assert by_id["polish"]["depends_on"] == ["survey"]
 
 
 def test_baseline_checkpoint_not_duplicated_when_run_precedes_implementation():
@@ -188,7 +258,7 @@ def test_plan_handler_writes_belief_plan_auto_and_transcript(tmp_path):
     assert todo_state["tasks"][2]["type"] == "validation"
     assert todo_state["tasks"][2]["run_spec"]["commands"] == ["bash train/train.sh", "bash eval.sh"]
     assert todo_state["tasks"][2]["depends_on"] == ["t1"]
-    assert todo_state["tasks"][3]["depends_on"] == ["t1"]
+    assert todo_state["tasks"][3]["depends_on"] == []
     # transcript archived to L4, not project.md
     artifacts = list((tmp_path / ".autoresearch" / "artifacts").glob("*plan_debate*"))
     assert artifacts
