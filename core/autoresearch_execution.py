@@ -242,7 +242,7 @@ def _direct_write_action(item: str, ctx: PhaseContext):
     user = json.dumps({
         "todo": item,
         "preferred_path": target,
-        "current_file": current[:6000],
+        "current_file": current[:3000],
         "support_context": support_context,
         "schema": {"path": "relative train-side path", "content": "complete new file content"},
     }, ensure_ascii=False)
@@ -315,9 +315,9 @@ def _preferred_write_target(root: Path, item: str = "") -> str:
     return "train/train.py"
 
 
-def _direct_write_support_context(root: Path, target: str, max_chars: int = 5000) -> dict:
+def _direct_write_support_context(root: Path, target: str, max_chars: int = 2600) -> dict:
     """Small, high-signal context for a file-level write request."""
-    candidates = ["program.md", "train/train.py", "train/train.sh"]
+    candidates = ["train/train.py", "train/train.sh", "program.md"]
     if target and target not in candidates:
         candidates.append(target)
     payload: dict[str, str] = {}
@@ -332,10 +332,35 @@ def _direct_write_support_context(root: Path, target: str, max_chars: int = 5000
             text = path.read_text(encoding="utf-8", errors="replace")
         except Exception:
             continue
-        snippet = text[: min(remaining, 1800)]
+        snippet = _compact_support_snippet(rel, text, min(remaining, 1200))
         payload[rel] = snippet
         remaining -= len(snippet)
     return payload
+
+
+def _compact_support_snippet(rel: str, text: str, limit: int) -> str:
+    if limit <= 0:
+        return ""
+    if rel.endswith("train.py"):
+        keep = []
+        capture = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if (
+                stripped.startswith(("ROOT", "OUTPUTS", "SUBMISSION", "VERIFICATION", "DEFAULT_CANDIDATE"))
+                or stripped.startswith("def _verify_with_oracle")
+                or "blackbox_oracle" in stripped
+                or stripped.startswith("def main")
+            ):
+                capture = True
+            if capture:
+                keep.append(line)
+            if capture and stripped.startswith("return ") and len(keep) > 8:
+                capture = False
+        compact = "\n".join(keep).strip()
+        if compact:
+            return compact[:limit]
+    return text[:limit]
 
 
 def _is_train_side_write_path(path: str) -> bool:
