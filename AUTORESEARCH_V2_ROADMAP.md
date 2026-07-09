@@ -199,7 +199,8 @@ Deliverables:
 - [ ] Phase 2b: Bounded Execute inner loop with per-task read/edit/verify cycles.
 - [x] Phase 3a: Run reads per-task `run_spec.commands` and updates task result.
 - [ ] Phase 3b: richer run spec modes (`single`, `loop`, `long_job`) with monitoring semantics.
-- [ ] Evaluate writes real gate signals.
+- [x] Phase 4a: Evaluate writes `gate_signals.json`; PhaseController reads it into `PhaseSignals`.
+- [ ] Phase 4b: Evaluate updates per-task status and richer replan reasons.
 - [ ] Git preflight validation.
 - [ ] Debug diagnostic summary.
 - [ ] Large-project docs.

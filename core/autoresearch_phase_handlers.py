@@ -20,6 +20,7 @@ from core.autoresearch_memory import (
     gc_auto_dir,
     append_lesson,
 )
+from core.autoresearch_gate_state import update_gate_state_from_experiment_state
 from core.autoresearch_phases import PhaseContext, PhaseResult
 
 
@@ -111,6 +112,7 @@ def make_evaluate_handler():
     def handler(ctx: PhaseContext) -> PhaseResult:
         root = Path(ctx.root)
         state_path = root / ".autoresearch" / "state.json"
+        state = {}
         best = None
         pareto = []
         if state_path.exists():
@@ -122,7 +124,8 @@ def make_evaluate_handler():
                 pass
 
         major = bool(ctx.signals.major_error)
-        pareto_changed = bool(ctx.signals.pareto_changed)
+        gate = update_gate_state_from_experiment_state(root, state if isinstance(state, dict) else {}, major_error=major)
+        pareto_changed = bool(gate.get("pareto_changed"))
 
         if major:
             append_lesson(

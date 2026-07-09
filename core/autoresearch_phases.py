@@ -29,6 +29,7 @@ from core.autoresearch_memory import (
     normalize_phase,
 )
 from core.autoresearch_debug import debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
+from core.autoresearch_gate_state import load_gate_state
 
 
 # --------------------------------------------------------------------------- #
@@ -207,9 +208,13 @@ class PhaseController:
 
     def build_signals(self, phase: str, extra: Optional[dict] = None) -> PhaseSignals:
         budget = getattr(self.loop, "budget", None)
+        gate = load_gate_state(self.root)
         sig = PhaseSignals(
             phase=phase,
             plateau_patience=int(getattr(self.settings, "plateau_patience", 3)),
+            pareto_changed=bool(gate.get("pareto_changed")),
+            plateau_counter=int(gate.get("plateau_counter") or 0),
+            plan_still_valid=bool(gate.get("plan_still_valid", True)),
             budget_exhausted=bool(budget.is_exhausted()) if budget is not None else False,
             budget_degrade=bool(budget.should_degrade()) if budget is not None else False,
         )

@@ -12,6 +12,7 @@ from core.autoresearch_phases import (
 )
 from core.autoresearch_phase_handlers import default_handlers, survey_project
 from core.autoresearch_memory import read_phase, split_program
+from core.autoresearch_gate_state import save_gate_state
 
 
 # --------------------------------------------------------------------------- #
@@ -115,6 +116,19 @@ def test_controller_budget_exhaustion_pauses(tmp_path):
     reports = ctrl.run(max_steps=10)
     # run() stops once budget is exhausted
     assert len(reports) >= 1
+
+
+def test_controller_build_signals_reads_gate_state(tmp_path):
+    ctrl = _make_controller(tmp_path)
+    save_gate_state(tmp_path, {
+        "pareto_changed": True,
+        "plateau_counter": 2,
+        "plan_still_valid": False,
+    })
+    sig = ctrl.build_signals("gate")
+    assert sig.pareto_changed is True
+    assert sig.plateau_counter == 2
+    assert sig.plan_still_valid is False
 
 
 def test_evaluate_handler_writes_lesson_on_major_error(tmp_path):
