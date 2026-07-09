@@ -20,6 +20,7 @@ def test_auto_research_run_v2_end_to_end_deterministic(tmp_path):
     ))
 
     assert payload["success"] is True
+    assert "preflight" in payload
     # program.md was scaffolded into L0/L1
     prog = (tmp_path / "program.md").read_text(encoding="utf-8")
     assert split_program(prog).has_markers is True

@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from core.autoresearch_loop import AutoResearchLoop, AutoResearchSettings, normalize_versioning_policy
+from core.autoresearch_preflight import git_preflight
 from tools.registry import registry
 
 
@@ -382,6 +383,7 @@ def auto_research_run_v2_tool(
             versioning_policy, plateau_patience, trace_rounds, debug_mode, solved_metric_threshold,
         )
         settings = AutoResearchSettings(**kwargs)
+        preflight = git_preflight(settings.root()) if use_git_versioning else {"warnings": ["git versioning disabled"]}
         if debug_mode:
             from core.autoresearch_debug import set_debug
 
@@ -420,6 +422,7 @@ def auto_research_run_v2_tool(
                 "budget_path": str(settings.budget_file()),
                 "project_path": str(settings.project_state_file()),
                 "created_at": time.time(),
+                "preflight": preflight,
             }
 
             # Fire-and-forget: return immediately, but still mark completed=false
@@ -470,7 +473,7 @@ def auto_research_run_v2_tool(
             return json.dumps(base, ensure_ascii=False, indent=2)
 
         result = run_phase_loop(settings, max_steps=max_steps)
-        return json.dumps({"success": True, "background": False, "completed": True, **result}, ensure_ascii=False, indent=2)
+        return json.dumps({"success": True, "background": False, "completed": True, "preflight": preflight, **result}, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 

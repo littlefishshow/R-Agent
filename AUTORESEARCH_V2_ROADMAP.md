@@ -201,7 +201,8 @@ Deliverables:
 - [ ] Phase 3b: richer run spec modes (`single`, `loop`, `long_job`) with monitoring semantics.
 - [x] Phase 4a: Evaluate writes `gate_signals.json`; PhaseController reads it into `PhaseSignals`.
 - [ ] Phase 4b: Evaluate updates per-task status and richer replan reasons.
-- [ ] Git preflight validation.
+- [x] Phase 5a: git preflight reports non-repo, nested repo, missing HEAD, and dirty worktree warnings.
+- [ ] Phase 5b: optional strict preflight mode for versioning-sensitive runs.
 - [ ] Debug diagnostic summary.
 - [ ] Large-project docs.
 
