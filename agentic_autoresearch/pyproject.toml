@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agentic-autoresearch"
+version = "0.1.0"
+description = "A small R-Agent-style three-step autoresearch runner"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+agentic-autoresearch = "agentic_autoresearch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
