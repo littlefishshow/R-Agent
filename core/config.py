@@ -105,6 +105,52 @@ def get_self_evolution_review_interval():
         n = 3
     return max(0, n)
 
+
+def get_llm_context_window():
+    """显式模型最大上下文窗口；0 表示使用本地模型映射。"""
+    raw = (
+        os.environ.get("LLM_CONTEXT_WINDOW")
+        or os.environ.get("MODEL_CONTEXT_WINDOW")
+        or os.environ.get("CONTEXT_WINDOW_TOKENS")
+        or "0"
+    )
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+def get_context_compression_trigger_ratio():
+    """上下文压缩触发比例；默认达到最大窗口 80% 触发。"""
+    try:
+        ratio = float(os.environ.get("CONTEXT_COMPRESSION_TRIGGER_RATIO", "0.8"))
+    except ValueError:
+        ratio = 0.8
+    if ratio <= 0 or ratio >= 1:
+        ratio = 0.8
+    return ratio
+
+
+def get_context_compression_target_ratio():
+    """上下文压缩后的目标比例。"""
+    try:
+        ratio = float(os.environ.get("CONTEXT_COMPRESSION_TARGET_RATIO", "0.55"))
+    except ValueError:
+        ratio = 0.55
+    if ratio <= 0 or ratio >= 1:
+        ratio = 0.55
+    return ratio
+
+
+def get_context_compression_preserve_recent_messages():
+    """自动压缩时至少尝试保留的最近完整 message 数。"""
+    try:
+        n = int(os.environ.get("CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES", "16"))
+    except ValueError:
+        n = 16
+    return max(4, n)
+
 def create_llm_client(api_key=None):
     """
     根据环境变量统一创建 LLM 客户端。

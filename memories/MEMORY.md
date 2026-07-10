@@ -6,3 +6,5 @@
 - 用户读论文工作流偏好：当用户要求读论文并给出链接时，将论文下载到 `outputs/papers/指定类目/` 下，然后调用 `read_paper` skill 读取；论文保存命名使用 `日期_命名简称.pdf`，便于后续归档。
 - 项目约定：sandbox/ 属于本地运行/验证产物，关闭对话后可清理，且不应被 git 跟踪；tests/ 保留为可跟踪的自动测试目录。
 - autoresearch 设计偏好：避免每轮完整上下文无限累积导致溢出；长期 loop 应采用演化算法式选择/压缩，仅保留优秀或帕累托代表性修改的摘要与 artifact，失败/无用轮次可归档或丢弃；多目标优化需支持 Pareto 前沿；代码修改版本管理优先使用 git。
+- R-Agent autoresearch mode 设计约定：第一版是受控小型研究闭环，主界面基本不变；用户输入项目路径回车开始，运行期间输入锁定，仅查看进程，Esc 可中断；角色拆为 Plan/Execute/Conclude 三个独立 worker，由 Main Loop 串行状态机调度 Plan→Execute→Conclude→Plan；项目内使用 .autoresearch/ 保存 state.json、plan.json、execute_result.json、conclude_result.json、memory.md、lessons.md、results.tsv、runs/exp_xxx/ 等；第一版只做最小闭环，不做复杂 GUI、长训练、大下载、自动 reset hard 或无限循环。
+- 用户希望在维护 R-Agent autoresearch mode 时，同时维护 autoresearch.md：用中文、按小学生都能懂的方式描述当前已修改进程。

@@ -230,6 +230,7 @@ class GuiSession:
             "children_token_usage": self.agent.get_delegated_token_usage_total(),
             "total_token_usage_including_children": self.agent.get_total_token_usage_including_children(),
             "token_usage_breakdown": self.agent.get_token_usage_summary(include_children=True),
+            "context_usage": self.agent.get_context_usage(),
         }
 
 

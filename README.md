@@ -466,6 +466,33 @@ pip install PyNaCl>=1.5.0
 - **新增已读论文历史脚本**：新增 `skills/productivity/paper_research_scout/scripts/paper_read_history.py`，支持 `add`、`check`、`import-outputs`、`list`、`filter` 等操作，帮助 paper scouting 过滤已读或重复推荐的论文。
 - **`read_paper` skill 联动更新**：更新 `skills/productivity/read_paper/SKILL.md`，要求确认阅读论文后尽量登记到 `paper_read_history.py`，登记失败不阻塞阅读流程但需在结果中说明。
 
+#### Autoresearch debug trace 与上下文归档
+
+- **新增 `AutoresearchTracer`**：`core/autoresearch.py` 现在会为 Main / Plan / Execute / Conclude 记录结构化 debug trace，包含开始、结束、命令执行、上下文快照等事件。
+- **分类保存 worker 事件**：每个目标项目的 `.autoresearch/traces/` 下新增 `trace.jsonl`、`plan.jsonl`、`execute.jsonl`、`conclude.jsonl`，既能按全局时间线查看，也能只看某个小进程。
+- **保存上下文快照和流程说明**：新增 `.autoresearch/traces/contexts/` 保存各 worker 的 latest/context JSON，同时生成 `.autoresearch/traces/flow.md` 和每轮 `runs/exp_xxx/flow.md`，方便之后人工 debug。
+- **终端结果暴露 trace 路径**：`/autoresearch` 完成摘要会显示 Debug Trace、流程归档和上下文快照目录，用户无需翻目录即可定位。
+- **补充回归测试与文档**：扩展 `tests/test_autoresearch_mode.py` 覆盖 trace、分类事件、上下文快照和 flow 生成；同步更新 `autoresearch.md` 的小白说明。
+
+#### 小型 autoresearch mode 最小闭环
+
+- **新增 `/autoresearch` 本地命令**：CLI 聊天框支持输入 `/autoresearch` 后再填写项目路径，也支持 `/autoresearch /path/to/project` 直接启动小型 autoresearch mode；运行期间复用现有 Rich 状态动画与 `Esc` 中断机制，用户输入锁定，只查看进程。
+- **新增 autoresearch 核心运行器**：新增 `core/autoresearch.py`，实现第一版受控串行闭环 `Plan → Execute → Conclude`；Plan 只生成只读计划，Execute 只执行短时安全只读命令并写日志，Conclude 解析结果并输出 `keep/crash` 决策。
+- **落地 `.autoresearch/` 状态目录**：每个目标项目下会生成 `.autoresearch/state.json`、`plan.json`、`execute_result.json`、`conclude_result.json`、`memory.md`、`lessons.md`、`results.tsv` 与 `runs/exp_xxx/` 日志目录，主进程只展示摘要。
+- **明确第一版安全边界**：当前不会自动大改代码、不会长训练、不会下载大文件、不会自动 `git reset --hard`、不会无限循环；先跑通可中断、可追踪、可沉淀的最小研究闭环。
+- **补充小白向说明文档**：新增 `autoresearch.md`，用中文和简单语言说明 autoresearch mode 怎么进入、三个 worker 各做什么、文件保存在哪里、第一版不会做什么。
+- **补充回归测试**：新增 `tests/test_autoresearch_mode.py`，覆盖状态文件生成、中断状态标记、结果摘要格式和固定 run 路径初始化。
+
+#### 上下文控制与自动压缩
+
+- **新增上下文控制核心模块**：新增 `core/context_control.py`，提供模型上下文窗口本地映射、`messages + tools` token 估算、80% 阈值判别、压缩目标比例和完整 message 级压缩能力。
+- **合并上下文压缩工具入口**：将新增压缩能力并入既有 `archive_subtask`，不再额外暴露重复的 `context_compress` 工具 schema；旧用法继续支持只传 `summary/next_steps`，新用法可传完整 `messages/tools` 返回 `compressed_messages`、摘要和统计信息。
+- **主流程请求前自动判别压缩**：`core/agent.py` 在每次 LLM 请求前估算上下文占用，默认达到最大窗口 80% 时触发压缩，默认压缩到 55%；保留最近完整 message，不从单条保留 message 中间截断，并避免拆散 assistant tool_calls 与后续 tool result；`archive_subtask` 手动归档也复用同一套完整 message 压缩逻辑。
+- **补充上下文窗口配置**：`core/config.py` 新增 `LLM_CONTEXT_WINDOW` / `MODEL_CONTEXT_WINDOW` / `CONTEXT_WINDOW_TOKENS` 显式覆盖，以及 `CONTEXT_COMPRESSION_TRIGGER_RATIO`、`CONTEXT_COMPRESSION_TARGET_RATIO`、`CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES` 调参入口；确认 API usage 只能提供本次 token 用量，不提供最大上下文窗口。
+- **GUI 暴露上下文占用**：`app_gui/runtime.py` 的 session state 增加 `context_usage`，方便 Cockpit 后续查看估算 token、窗口上限、占用比例和自动压缩次数。
+- **补充回归测试**：新增 `tests/test_context_control.py`，覆盖完整 message 保留、tool result 摘要、低于阈值不压缩、80% 阈值判定和 Agent 请求前自动压缩；相关最小测试已通过。
+
+
 ### 2026-07-09
 
 #### `paper_research_scout` 结构化指标采集升级

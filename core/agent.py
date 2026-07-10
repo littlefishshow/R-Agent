@@ -4,6 +4,7 @@ import json
 import threading
 from pathlib import Path
 from core import config
+from core.context_control import compress_messages, resolve_context_window, should_compress_context
 from tools.registry import registry
 from core.context.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
 from core.sandbox_cleanup import maybe_cleanup_sandbox
@@ -272,6 +273,12 @@ class RAgent:
             "total_tokens": 0,
             "available": False,
         }
+        self.context_usage = {
+            "estimated_tokens": 0,
+            "max_context_tokens": 0,
+            "usage_ratio": None,
+            "compressed_count": 0,
+        }
         # 截断状态：bool。被强制收尾后置 True，下次正常 run 前会自动复位。
         setattr(self, _TRUNCATED_FLAG, False)
         # 软提醒幂等标记：避免在同一段 run 里重复注入 system 提示。
@@ -284,6 +291,44 @@ class RAgent:
         self._background_errors = []
 
     def _compress_after_archive(self, summary: str, next_steps: str = ""):
+        """兼容 archive_subtask 旧入口，同时复用统一上下文压缩语义。"""
+        manual_parts = []
+        if summary:
+            manual_parts.append("【archive_subtask 手动归档摘要】\n" + str(summary))
+        if next_steps:
+            manual_parts.append("【下一步】\n" + str(next_steps))
+        manual_text = "\n\n".join(manual_parts)
+        try:
+            result = compress_messages(
+                self.messages,
+                [],
+                model=self.model,
+                max_context_tokens=resolve_context_window(self.model, config.get_llm_context_window()),
+                trigger_ratio=config.get_context_compression_trigger_ratio(),
+                target_ratio=config.get_context_compression_target_ratio(),
+                preserve_recent_messages=min(
+                    config.get_context_compression_preserve_recent_messages(),
+                    max(1, len(self.messages) // 2),
+                ),
+                force=True,
+            )
+            if result.get("success") and result.get("compressed"):
+                compressed = result.get("compressed_messages") or []
+                if manual_text:
+                    insert_at = 1 if compressed and isinstance(compressed[0], dict) and compressed[0].get("role") == "system" else 0
+                    if insert_at < len(compressed) and isinstance(compressed[insert_at], dict) and compressed[insert_at].get("role") == "system":
+                        compressed[insert_at] = {
+                            **compressed[insert_at],
+                            "content": manual_text + "\n\n" + str(compressed[insert_at].get("content", "")),
+                        }
+                    else:
+                        compressed.insert(insert_at, {"role": "system", "content": manual_text})
+                self.messages = compressed
+                return
+        except Exception:
+            pass
+
+        # 最小安全兜底：保持旧行为，避免归档失败导致上下文不收敛。
         system_msgs = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "system"][:1]
         recent_user = [m for m in self.messages if isinstance(m, dict) and m.get("role") == "user"][-1:]
         archive_msg = {
@@ -291,6 +336,55 @@ class RAgent:
             "content": "【archive_subtask 压缩摘要】\n" + str(summary) + ("\n下一步：" + str(next_steps) if next_steps else ""),
         }
         self.messages = system_msgs + [archive_msg] + recent_user
+
+
+    def _maybe_compress_context(self, tools=None) -> None:
+        """在每次 LLM 请求前做上下文窗口判别，必要时自动压缩。
+
+        Chat completion response 的 usage 只告诉本次请求用量，不告诉模型最大
+        context window；R-Agent 使用 config 显式覆盖或本地模型映射。保留的
+        message 总是按完整条目保留，较早历史被合并为一条 system 摘要。
+        """
+        max_context = resolve_context_window(self.model, config.get_llm_context_window())
+        trigger_ratio = config.get_context_compression_trigger_ratio()
+        check = should_compress_context(
+            self.messages,
+            tools or [],
+            max_context_tokens=max_context,
+            trigger_ratio=trigger_ratio,
+        )
+        self.context_usage.update({
+            "estimated_tokens": check.get("estimated_tokens", 0),
+            "max_context_tokens": max_context,
+            "usage_ratio": check.get("usage_ratio"),
+        })
+        if not check.get("should_compress"):
+            return
+
+        result = compress_messages(
+            self.messages,
+            tools or [],
+            model=self.model,
+            max_context_tokens=max_context,
+            trigger_ratio=trigger_ratio,
+            target_ratio=config.get_context_compression_target_ratio(),
+            preserve_recent_messages=config.get_context_compression_preserve_recent_messages(),
+            force=True,
+        )
+        if result.get("success") and result.get("compressed"):
+            self.messages = result.get("compressed_messages", self.messages)
+            stats = result.get("stats") or {}
+            self.context_usage.update({
+                "estimated_tokens": stats.get("compressed_estimated_tokens", check.get("estimated_tokens", 0)),
+                "max_context_tokens": max_context,
+                "usage_ratio": stats.get("usage_ratio_after"),
+                "compressed_count": int(self.context_usage.get("compressed_count") or 0) + 1,
+                "last_compression": stats,
+            })
+
+    def get_context_usage(self):
+        """返回下一次请求的估算上下文窗口占用信息。"""
+        return dict(self.context_usage)
 
     def _run_self_evolution_review(self, snapshot):
         from tools.self_evolution_tool import self_evolution_review
@@ -716,6 +810,8 @@ class RAgent:
                     schema for schema in tools
                     if schema.get("function", {}).get("name") not in excluded
                 ]
+            self._maybe_compress_context(tools)
+
             kwargs = {"model": self.model, "messages": self.messages}
             if tools:
                 kwargs["tools"] = tools

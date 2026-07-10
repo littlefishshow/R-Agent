@@ -22,6 +22,7 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.agent import AgentInterrupted, RAgent
+from core.autoresearch import AutoresearchInterrupted, run_autoresearch_cycle
 from core import config
 from tools.registry import registry
 from core.skills import skill_manager
@@ -933,6 +934,7 @@ def get_completions():
     completer_dict = {
         "/help": None,
         "/bbb": None,
+        "/autoresearch": None,
         "/project_list": None,
         "/skill": skills_dict,
         "/tool": tools_dict,
@@ -965,6 +967,7 @@ def handle_slash_command(command_str: str, console) -> bool:
             "**本地可用命令:**\n"
             "- `/help`: 显示此帮助信息\n"
             "- `/bbb`: 开始语音输入；按 Enter 停止并识别，按 Esc 取消\n"
+            "- `/autoresearch [项目路径]`: 进入小型 autoresearch mode，运行中输入锁定，按 Esc 中断\n"
             "- `/project_list`: 列出项目进度，并手动选择载入当前上下文\n"
             "- `/skill [list|name]`: 列出或查看技能\n"
             "- `/tool [list|name]`: 列出或查看基础工具\n"
@@ -1069,6 +1072,100 @@ def handle_slash_command(command_str: str, console) -> bool:
     console.print(f"[bold red]未知的命令: {cmd}[/bold red]")
     return True
 
+
+def _format_autoresearch_result(result: dict) -> str:
+    conclude = result.get("conclude_result") or {}
+    execute = result.get("execute_result") or {}
+    command_results = execute.get("command_results") or []
+    trace = result.get("trace") or {}
+    lines = [
+        "## Autoresearch 本轮完成",
+        "",
+        f"- 项目：`{result.get('project_root')}`",
+        f"- 状态目录：`{result.get('state_dir')}`",
+        f"- 日志目录：`{result.get('run_dir')}`",
+        f"- Debug Trace：`{trace.get('trace_jsonl') or '未生成'}`",
+        f"- 流程归档：`{trace.get('flow_md') or '未生成'}`",
+        f"- 上下文快照：`{trace.get('contexts_dir') or '未生成'}`",
+        f"- 决策：`{conclude.get('decision')}`",
+        f"- 状态：`{conclude.get('status')}`",
+        f"- 执行命令数：{len(command_results)}",
+        "",
+        conclude.get("summary") or "已完成 Plan → Execute → Conclude 最小闭环。",
+    ]
+    failed = conclude.get("failed_commands") or []
+    if failed:
+        lines.extend(["", "### 失败命令", ""])
+        for command in failed:
+            lines.append(f"- `{' '.join(command) if isinstance(command, list) else command}`")
+    return "\n".join(lines)
+
+
+def run_autoresearch_mode(console, session: PromptSession, initial_path: str = "") -> None:
+    """运行小型 autoresearch mode 的第一版最小闭环。
+
+    交互边界：用户输入项目路径后开始；运行期间只展示进程，输入锁定；Esc 可中断。
+    """
+    project_path = (initial_path or "").strip()
+    if not project_path:
+        project_path = session.prompt(
+            HTML('<ansicyan><b>🔬 Autoresearch 项目路径&gt;</b></ansicyan> ')
+        ).strip()
+    if not project_path:
+        console.print("[yellow]未输入项目路径，已返回聊天框。[/yellow]")
+        return
+
+    console.print(
+        Panel(
+            Markdown(
+                "小型 autoresearch mode 即将开始：\n\n"
+                "1. Plan 先做只读计划；\n"
+                "2. Execute 执行安全短命令并写日志；\n"
+                "3. Conclude 解析结果并写总结；\n"
+                "4. 运行中输入锁定，按 Esc 可以中断。"
+            ),
+            title="[bold cyan]🔬 Autoresearch[/bold cyan]",
+            border_style="cyan",
+            expand=False,
+        )
+    )
+
+    status_ref = {"status": None}
+
+    def update_status(message: str):
+        current_status = status_ref.get("status")
+        if current_status is not None:
+            current_status.update(_with_interrupt_status_hint(message))
+
+    try:
+        result = _run_with_esc_interrupt(
+            lambda cancel_event: run_autoresearch_cycle(
+                project_path,
+                cancel_event=cancel_event,
+                on_status=update_status,
+            ),
+            "[bold cyan]🔬 Autoresearch 正在运行...[/bold cyan]",
+            status_ref=status_ref,
+        )
+    except AutoresearchInterrupted:
+        console.print("[yellow]已中断 autoresearch，本轮状态已标记为 interrupted。[/yellow]")
+        console.print()
+        return
+    except Exception as exc:
+        console.print(f"[bold red]Autoresearch 启动失败：{exc}[/bold red]")
+        console.print()
+        return
+
+    console.print(
+        Panel(
+            Markdown(_format_autoresearch_result(result)),
+            title="[bold blue]🔬 Autoresearch Result[/bold blue]",
+            border_style="blue",
+            expand=False,
+        )
+    )
+    console.print()
+
 def _shutdown_agent(agent: RAgent, console, timeout: float = 1.0) -> None:
     """退出 CLI 前收敛 Agent 后台任务，避免 exit 时与后台复盘竞争资源。"""
     try:
@@ -1125,6 +1222,12 @@ def main():
                 if not voice_text:
                     continue
                 user_input = voice_text
+
+            elif user_input.strip().lower().startswith("/autoresearch"):
+                parts = user_input.strip().split(maxsplit=1)
+                initial_path = parts[1] if len(parts) > 1 else ""
+                run_autoresearch_mode(console, session, initial_path=initial_path)
+                continue
 
             elif user_input.strip().lower() == "/project_list":
                 load_project_progress_context(console, session, agent, system_prompt)
