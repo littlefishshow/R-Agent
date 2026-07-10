@@ -58,6 +58,52 @@ Use these for citation counts, related work, influential prior/follow-up papers,
 
 Citation counts must include the source and retrieval date, e.g. `Citations: 128 (Semantic Scholar, retrieved YYYY-MM-DD)`. If not available, write `Citations: N/A` rather than guessing.
 
+### Structured Metrics Lookup (Use Skill-Local Scripts First)
+For volatile metrics, prefer structured APIs through the skill-local script before using generic `web_extract` on web pages. The script is intentionally kept under this skill and is **not** registered as a global Agent Loop tool.
+
+Run from the project root with `run_command`:
+
+```bash
+python3 skills/productivity/paper_research_scout/scripts/paper_metrics_lookup.py \
+  --title "<paper title>" \
+  --doi "<doi-if-known>" \
+  --arxiv-id "<arxiv-id-if-known>" \
+  --github-repo "owner/repo" \
+  --pretty \
+  --output sandbox/paper_research_scout/<safe_name>_metrics.json
+```
+
+Read-history filtering is also skill-local. Before showing final recommendations, check candidates against `references/read_papers.json`:
+
+```bash
+python3 skills/productivity/paper_research_scout/scripts/paper_read_history.py check --title "<paper title>" --arxiv-id "<arxiv-id-if-known>" --doi "<doi-if-known>" --url "<paper-url-if-known>"
+```
+
+For batch candidate filtering, write candidates to `sandbox/paper_research_scout/candidates.json` and run:
+
+```bash
+python3 skills/productivity/paper_research_scout/scripts/paper_read_history.py filter --input sandbox/paper_research_scout/candidates.json --output sandbox/paper_research_scout/candidates_unread.json
+```
+
+If a paper is already read, omit it from top recommendations by default. Mention it only in a short "Already Read / Suppressed" note when useful, unless the user explicitly asks to include previously read papers.
+
+Environment variables supported by the script:
+- `SEMANTIC_SCHOLAR_API_KEY` for higher Semantic Scholar limits.
+- `GITHUB_TOKEN` for higher GitHub API limits.
+- `OPENALEX_MAILTO` / `CROSSREF_MAILTO` for polite OpenAlex/Crossref requests.
+- `SERPAPI_API_KEY` only when the user explicitly needs Google Scholar-style citation lookup through SerpApi.
+
+The script annotates API records with `title_match_confidence` when a target title is provided. Treat low-confidence or `ok=false` mismatch results as unusable for citation counts, even if the source returned a number. Semantic Scholar `429` should be handled by setting `SEMANTIC_SCHOLAR_API_KEY` and retrying later with backoff, not by repeated anonymous calls.
+
+Structured source priority:
+1. **Citations**: Semantic Scholar `citationCount` by DOI/arXiv/title → DataCite `citationCount` for DataCite/arXiv DOIs → OpenAlex `cited_by_count` by DOI/title with strict title validation → Crossref `is-referenced-by-count` by DOI → optional SerpApi Google Scholar. Do not directly scrape Google Scholar as a default workflow.
+2. **Hugging Face heat**: use official Hugging Face Papers JSON endpoints (`/api/daily_papers`, `/api/papers/search`, `/api/papers/{paperId}`) via the script. Avoid parsing the rendered Daily Papers page except as last-resort evidence.
+3. **OpenReview**: do not treat a browser verification page as unavailable paper evidence. For public single-forum lookup, use the script's `--openreview-forum`; for venue-wide/private data use official `openreview-py` (`api2.openreview.net` for newer venues, `api.openreview.net` for legacy venues) and respect permissions.
+4. **GitHub/code signal**: use GitHub API fields beyond stars: forks, open issues, pushed/released dates, license, language, archive status, topics. Stars are a weak community-interest signal, not a quality proof.
+
+When metrics disagree, report multiple source-specific values with retrieval dates instead of silently reconciling them. Example: `Semantic Scholar: 117; DataCite: 9; OpenAlex: discarded due to title mismatch; Crossref: N/A (retrieved YYYY-MM-DD)`. If an API result title does not match the target paper, discard that citation count and state the mismatch.
+
+
 ### Tier 3: Discovery Feeds and Community Signals
 Use for freshness and popularity, not as sole quality evidence:
 - Hugging Face Daily Papers and paper pages.
@@ -125,11 +171,13 @@ Always show enough evidence that the user can understand why a paper ranked wher
 ### 2. Build a Longlist
 Use live searches appropriate to the task. Example source sequence:
 1. Search official venue/proceeding pages and arXiv for the topic/time window.
-2. Search Semantic Scholar/OpenAlex/Google Scholar-style indexes for citations and related papers.
-3. Search Hugging Face Daily Papers and arXiv Sanity for recent community visibility.
-4. Search GitHub/Papers with Code for official implementations and star counts.
-5. Search X/Twitter/social web only if the tool/search environment can access it; otherwise state it was unavailable.
-6. Search Connected Papers or graph tools for seed expansion when a seed paper is provided.
+2. Normalize each candidate by DOI/arXiv ID/title, then call `scripts/paper_metrics_lookup.py` for structured citation, HF, GitHub, and OpenReview metrics before falling back to generic webpage extraction.
+3. Check normalized candidates against `scripts/paper_read_history.py` / `references/read_papers.json`; remove already-read papers from recommendations unless the user asks otherwise.
+4. Search Semantic Scholar/OpenAlex-style indexes for related papers; use Google Scholar only through an approved SERP API or manual/user-provided evidence.
+5. Search Hugging Face Papers through `/api/daily_papers`, `/api/papers/search`, and `/api/papers/{paperId}` for recent community visibility and upvotes.
+6. Search GitHub/Papers with Code for official implementations; record forks/activity/license/issues in addition to stars.
+7. Search X/Twitter/social web only if the tool/search environment can access it; otherwise state it was unavailable.
+8. Search Connected Papers or graph tools for seed expansion when a seed paper is provided.
 
 Record for each candidate:
 - title,
@@ -138,7 +186,7 @@ Record for each candidate:
 - venue/status,
 - URL/DOI/arXiv ID,
 - citation source/count or `N/A`,
-- code/repo URL and stars or `N/A`,
+- code/repo URL, stars, forks, activity/license signals, or `N/A`,
 - discovery source(s),
 - retrieval date for volatile metrics.
 
@@ -147,6 +195,7 @@ Record for each candidate:
 - Prefer the peer-reviewed/proceedings version as canonical, while preserving arXiv link if useful.
 - Normalize title variants, author order, year, venue, and repo links.
 - Mark withdrawn, superseded, or non-paper items clearly.
+- Filter out papers already present in `references/read_papers.json` using arXiv ID, DOI, URL, or normalized title.
 
 ### 4. Score and Filter
 - Apply the selected scoring weights.
@@ -190,7 +239,7 @@ Limitations: <unavailable sources, blocked pages, missing metrics>
 ## Top Recommendations
 | Rank | Score | Paper | Why it matters | Venue/Status | Citations | Heat | Code |
 |---:|---:|---|---|---|---|---|---|
-| 1 | 87 | <Title> (<Year>) | <1-2 line rationale> | <venue/status> | <count + source/date or N/A> | <HF/X/arXiv/GitHub signal or N/A> | <repo + stars/date or N/A> |
+| 1 | 87 | <Title> (<Year>) | <1-2 line rationale> | <venue/status> | <S2/DataCite/OpenAlex/Crossref counts + date or N/A> | <HF upvotes/comments, X/arXiv signal or N/A> | <repo stars/forks/activity/license + date or N/A> |
 
 ## Candidate Notes
 ### 1. <Title>
@@ -198,6 +247,7 @@ Limitations: <unavailable sources, blocked pages, missing metrics>
 - Link: <paper URL>
 - Core contribution: <...>
 - Evidence for ranking: <quality, relevance, novelty, citation/social/code signals>
+- Structured metrics checked: <script output path or API sources; include retrieval date>
 - Caveats: <...>
 - Recommended next action: <read_paper / paper_repo_code_research / monitor>
 
@@ -205,6 +255,11 @@ Limitations: <unavailable sources, blocked pages, missing metrics>
 | Paper | Reason |
 |---|---|
 | <Title> | <out of scope / duplicate / weak evidence / too old / missing code> |
+
+## Already Read / Suppressed
+| Paper | Matched read-history key | Local note/path |
+|---|---|---|
+| <Title> | <arXiv/DOI/title match> | <outputs/papers/... or N/A> |
 
 ## Next Monitoring Queries
 - <venue/feed/query to repeat weekly>
@@ -261,11 +316,11 @@ Graph/citation sources checked: <Connected Papers/Semantic Scholar/OpenAlex/etc.
 ## Degradation Strategies and Boundaries
 
 ### Degradation Strategies
-- If Google Scholar is inaccessible, use Semantic Scholar/OpenAlex/Crossref/PubMed/DBLP and mark Google Scholar as unavailable.
+- If Google Scholar is inaccessible or no approved SERP API key is available, use OpenAlex/Semantic Scholar/Crossref/PubMed/DBLP and mark Google Scholar as unavailable rather than scraping it.
 - If X/Twitter search is inaccessible, do not infer social heat; use HF Daily Papers, GitHub, arXiv Sanity, newsletters, or mark `N/A`.
 - If Connected Papers is inaccessible, approximate graph expansion with Semantic Scholar references/citations, OpenAlex concepts, or manual citation chasing.
 - If citation counts differ across sources, report the source used and optionally list multiple counts with dates rather than reconciling silently.
-- If current trending pages cannot be accessed, state the limitation and avoid ranking by trend.
+- If current trending pages cannot be accessed, first try structured APIs (HF Papers API, GitHub API, OpenReview API/openreview-py). If APIs also fail, state the limitation and avoid ranking by trend.
 - If the topic is too broad, first produce subtopics and ask the user to choose or run a broad scan with explicit low confidence.
 
 ### Boundaries
@@ -291,11 +346,13 @@ Before finalizing a paper scouting answer, verify:
 
 - [ ] The user's topic, time window, ranking objective, and output size are stated.
 - [ ] Sources actually checked are listed; unavailable sources are not implied.
+- [ ] For top candidates, structured metrics were attempted via `scripts/paper_metrics_lookup.py` or an equivalent official API path before generic page extraction.
 - [ ] Any current/trending/ranking/social/star/citation metrics were retrieved live and include retrieval date.
-- [ ] Citation counts include a named source, or are marked `N/A`.
-- [ ] GitHub stars/forks include source and retrieval date, or are marked `N/A`.
+- [ ] Citation counts include named sources (Semantic Scholar/DataCite/OpenAlex/Crossref/optional SerpApi GS), retrieval dates, and title-match validation where applicable, or are marked `N/A` with reason.
+- [ ] GitHub stars/forks/activity/license signals include source and retrieval date, or are marked `N/A`.
 - [ ] Paper status/venue is not overstated; preprint vs. peer-reviewed is clear.
 - [ ] Duplicates and version conflicts are handled.
+- [ ] Already-read papers were checked via `scripts/paper_read_history.py`; filtered papers are not shown as new recommendations unless requested.
 - [ ] Ranking criteria and weights are transparent.
 - [ ] Caveats and limitations are included.
 - [ ] Recommended next step is clear, including handoff to `read_paper` or `paper_repo_code_research` when appropriate.

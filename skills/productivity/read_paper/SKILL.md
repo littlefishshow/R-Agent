@@ -53,6 +53,11 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
   - `paper_locator.py`：论文定位与输出路径计算。
   - `pdf_snapshot.py`：PDF Figure/Table caption 定位、智能裁剪和渲染。
 - 不再保留 `tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py` 全局 wrapper；维护算法逻辑时只改 skill-local scripts。
+- 每次确认要阅读某篇论文后，同时调用 `paper_research_scout` 的 skill-local read history 脚本登记该论文，避免后续论文调研重复推荐已经读过的文章：
+  ```bash
+  python3 skills/productivity/paper_research_scout/scripts/paper_read_history.py add --title "<paper title or inferred title>" --path "<outputs/papers/...pdf>" --arxiv-id "<arxiv-id-if-known>" --doi "<doi-if-known>" --url "<paper-url-if-known>" --category "<category>" --source read_paper
+  ```
+  该脚本写入 `skills/productivity/paper_research_scout/references/read_papers.json`，是 skill-local reference，不注册为全局工具。
 
 ## Inputs
 - `query`：日期、标题关键词、文件名片段、arXiv ID 等，例如 `2025-02-20`、`STeCa`。
@@ -71,6 +76,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
    - `status="ambiguous"`：如果上下文不能明显决定，列出候选路径让用户选择。
    - `status="no_match"` 或 `no_files`：告知没有找到，并列出使用的查询条件和默认目录。
 4. 在 Markdown 基本信息中记录：论文路径、类别目录、输出路径、搜索线索。
+5. 确认选定论文后，调用 `paper_research_scout/scripts/paper_read_history.py add` 登记已读历史；若只知道本地 PDF 路径，也必须至少记录 `--path`、推断标题和 `--category`。若知道 arXiv ID/DOI/URL，应一并记录，便于后续调研精确过滤。
 
 ## Output Requirements
 - 每篇论文生成一份 Markdown 总结，保存到 `paper_locator.py` 返回 JSON 中的 `output_path`。
@@ -88,11 +94,12 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ### 1. 定位与抽取论文内容
 1. 使用 `run_command` 调用 `paper_locator.py`，或根据明确路径选定论文文件，并确定输出 Markdown 路径。
-2. 抽取文本：PDF 优先使用 PyMuPDF、pdftotext 或 OCR/文档工具；若 PDF 是扫描件或图表文字缺失，使用 OCR/截图辅助理解。抽取全文、分块文本、索引 JSON 等中间文件必须写入 `sandbox/read_paper/<paper_stem>/`，不要写入 `outputs/papers_output/`。
-3. 建立章节索引：记录 Abstract、Introduction、Related Work、Method、Experiments、Ablation、Analysis、Conclusion、Limitations、Appendix 等位置。
-4. 建立术语/简称表：从标题、摘要、引言、方法和实验设置中抽取所有高频简称、方法名、数据集名、指标名、算法名和任务名；尽量回查原文首次定义，记录完整英文名、中文解释、所在章节/页码。若原文未展开，标注“原文未展开”。
-5. 如果论文方法依赖任何中间监督或评测信号（如 step label、critique、proxy、reward、preference、verifier、judge、oracle、ground truth、confidence/belief readout、tool/evaluator signal），在章节索引阶段必须建立“监督信号来源表”：逐项记录信号名称、取值空间、由谁/什么产生、是否使用 ground truth 或 benchmark evaluator、训练时是否可见、公式/规则、所在主文与附录位置。不得只写“easy-to-obtain / rule-based / automatic”而不展开具体构造。
-6. 如果全文过长，分阶段阅读：先全局扫描，再按 Method/Experiments/Appendix/Limitations 深读。
+2. 调用 `paper_research_scout/scripts/paper_read_history.py add` 登记该论文为已读/正在读，防止后续 `paper_research_scout` 重复推荐。登记失败不应阻塞阅读，但必须在最终说明中标注。
+3. 抽取文本：PDF 优先使用 PyMuPDF、pdftotext 或 OCR/文档工具；若 PDF 是扫描件或图表文字缺失，使用 OCR/截图辅助理解。抽取全文、分块文本、索引 JSON 等中间文件必须写入 `sandbox/read_paper/<paper_stem>/`，不要写入 `outputs/papers_output/`。
+4. 建立章节索引：记录 Abstract、Introduction、Related Work、Method、Experiments、Ablation、Analysis、Conclusion、Limitations、Appendix 等位置。
+5. 建立术语/简称表：从标题、摘要、引言、方法和实验设置中抽取所有高频简称、方法名、数据集名、指标名、算法名和任务名；尽量回查原文首次定义，记录完整英文名、中文解释、所在章节/页码。若原文未展开，标注“原文未展开”。
+6. 如果论文方法依赖任何中间监督或评测信号（如 step label、critique、proxy、reward、preference、verifier、judge、oracle、ground truth、confidence/belief readout、tool/evaluator signal），在章节索引阶段必须建立“监督信号来源表”：逐项记录信号名称、取值空间、由谁/什么产生、是否使用 ground truth 或 benchmark evaluator、训练时是否可见、公式/规则、所在主文与附录位置。不得只写“easy-to-obtain / rule-based / automatic”而不展开具体构造。
+7. 如果全文过长，分阶段阅读：先全局扫描，再按 Method/Experiments/Appendix/Limitations 深读。
 
 ### 1.5 术语、简称与符号消歧
 论文阅读笔记必须主动降低缩写带来的理解成本：

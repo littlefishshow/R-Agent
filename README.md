@@ -455,6 +455,33 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-07-10
+
+#### paper scouting 与论文阅读工作流整理
+
+- **README 文档更新**：按本次准备 push 的变更补充更新日志，便于提交前集中审阅文档、skill 与新增支持文件。
+- **`paper_research_scout` skill 更新**：完善结构化论文指标采集流程，要求优先使用 skill-local 脚本或官方 API 获取引用、Hugging Face Papers、OpenReview 与 GitHub 代码热度等信号，并在输出中记录来源、检索日期、N/A 原因和产物路径。
+- **新增 references 说明与已读历史数据**：新增 `skills/productivity/paper_research_scout/references/README.md` 与 `references/read_papers.json`，用于说明已读论文历史的维护方式，并保存从现有 `outputs/papers/` 导入的初始已读论文记录。
+- **新增指标查询脚本**：新增 `skills/productivity/paper_research_scout/scripts/paper_metrics_lookup.py`，提供 OpenAlex、Semantic Scholar、Crossref、DataCite、Hugging Face Papers、OpenReview 与 GitHub 等结构化查询入口，同时保留标题匹配、限流提示和保守降级策略。
+- **新增已读论文历史脚本**：新增 `skills/productivity/paper_research_scout/scripts/paper_read_history.py`，支持 `add`、`check`、`import-outputs`、`list`、`filter` 等操作，帮助 paper scouting 过滤已读或重复推荐的论文。
+- **`read_paper` skill 联动更新**：更新 `skills/productivity/read_paper/SKILL.md`，要求确认阅读论文后尽量登记到 `paper_read_history.py`，登记失败不阻塞阅读流程但需在结果中说明。
+
+### 2026-07-09
+
+#### `paper_research_scout` 结构化指标采集升级
+
+- **新增 skill-local 指标脚本**：在 `skills/productivity/paper_research_scout/scripts/paper_metrics_lookup.py` 中实现论文指标查询脚本，保持在 skill 目录内，不注册为全局 Agent Loop 工具。
+- **引用数改为结构化 API 优先**：脚本支持 OpenAlex `cited_by_count`、Semantic Scholar `citationCount`、Crossref `is-referenced-by-count`，并将 Google Scholar 明确降级为可选 SerpApi/人工校验路径，避免默认爬取不稳定页面。
+- **Hugging Face 热度改用官方 JSON 端点**：支持 Hugging Face Papers `/api/daily_papers`、`/api/papers/search`、`/api/papers/{paperId}`，用于获取 upvotes、comments、GitHub stars 与关联模型/数据集/Spaces 等社区信号。
+- **OpenReview 改为 API 路径**：脚本提供公开 forum 的 API 查询入口，skill 文档要求 venue/private 数据优先使用官方 `openreview-py` / API2 / API1，不再把 browser verification 页面误判为论文不可访问。
+- **GitHub 代码信号扩展**：脚本通过 GitHub API 获取 stars、forks、open issues、pushed/updated 时间、license、language、archived、topics 等字段；skill 文档明确 stars 只是弱热度信号，不等同论文质量。
+- **更新 skill 工作流与验收清单**：`paper_research_scout` 现在要求 top candidates 先尝试结构化指标脚本或等价官方 API，再使用通用网页抽取；输出中需记录 source、retrieval date、N/A 原因和脚本产物路径。
+- **补充 DataCite 与标题校验**：`paper_metrics_lookup.py` 新增 DataCite DOI 查询，用于 arXiv/DataCite DOI 的保守 `citationCount`；OpenAlex、Semantic Scholar、DataCite、Crossref 结果会在提供标题时标注 `title_match_confidence`，低置信度匹配会自动置为不可用，避免 DOI 元数据错配导致误报引用数。
+- **优化限流提示**：Semantic Scholar 匿名请求遇到 429 时返回明确 `hint`，提示设置 `SEMANTIC_SCHOLAR_API_KEY` 并退避重试，而不是反复匿名请求。
+- **新增已读论文历史过滤**：新增 `skills/productivity/paper_research_scout/scripts/paper_read_history.py` 与 `references/read_papers.json`，支持 `add/check/import-outputs/list/filter`，用于记录 `read_paper` 已读论文并在后续 paper scouting 时按 arXiv ID、DOI、URL 或归一化标题过滤重复推荐。
+- **导入现有已读论文**：从 `outputs/papers/` 导入当前 29 篇 PDF 到 `paper_research_scout/references/read_papers.json`，作为初始已读历史；验证产物保存在 `sandbox/paper_research_scout/import_read_history.json`。
+- **联动 `read_paper` 工作流**：更新 `read_paper` skill，要求每次确认阅读论文后调用 `paper_read_history.py add` 登记路径、标题、类别以及可用的 arXiv/DOI/URL，登记失败不阻塞阅读但需说明。
+
 ### 2026-07-08
 
 #### auto_research 中间版本管理说明
