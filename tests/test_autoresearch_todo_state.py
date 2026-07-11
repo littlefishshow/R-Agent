@@ -1,8 +1,9 @@
 import json
 
-from core.autoresearch_todo_state import (
+from autoresearch.autoresearch_todo_state import (
     dependencies_satisfied,
     empty_todo_state,
+    has_blocking_failed_tasks,
     has_open_tasks,
     has_failed_tasks,
     load_todo_state,
@@ -12,6 +13,7 @@ from core.autoresearch_todo_state import (
     open_tasks,
     ready_execute_tasks,
     ready_tasks,
+    repair_failed_run_tasks,
     render_todo_markdown,
     save_todo_state,
     task_phase,
@@ -91,6 +93,56 @@ def test_has_failed_tasks_can_filter_by_phase():
     assert has_failed_tasks(state) is True
     assert has_failed_tasks(state, phase="execute") is True
     assert has_failed_tasks(state, phase="run") is False
+
+
+def test_failed_run_before_open_execute_does_not_block_repair():
+    state = normalize_todo_state({
+        "tasks": [
+            {"task_id": "baseline", "type": "validation", "status": "failed", "priority": 1},
+            {"task_id": "impl", "type": "implementation", "status": "pending", "priority": 2},
+        ]
+    })
+    assert has_failed_tasks(state) is True
+    assert has_blocking_failed_tasks(state) is False
+
+
+def test_repair_failed_run_tasks_adds_implementation_and_redirects_deps():
+    state = normalize_todo_state({
+        "tasks": [
+            {
+                "task_id": "baseline",
+                "goal": "run baseline",
+                "type": "validation",
+                "status": "failed",
+                "priority": 1,
+                "last_result": {"summary": "python3: can't open file train/optimizer.py"},
+            },
+            {
+                "task_id": "final",
+                "goal": "run final eval",
+                "type": "validation",
+                "status": "pending",
+                "priority": 2,
+                "depends_on": ["baseline"],
+            },
+        ]
+    })
+
+    repaired = repair_failed_run_tasks(state)
+    ids = [task["task_id"] for task in repaired["tasks"]]
+
+    assert ids[:3] == ["baseline", "repair_baseline", "final"]
+    repair = next(task for task in repaired["tasks"] if task["task_id"] == "repair_baseline")
+    assert repair["type"] == "implementation"
+    assert repair["repairs_task_id"] == "baseline"
+    assert "can't open file" not in repair["goal"]
+    assert "can't open file" in repair["failure_evidence"]
+    final = next(task for task in repaired["tasks"] if task["task_id"] == "final")
+    assert final["depends_on"] == ["repair_baseline"]
+
+    # Idempotent: repeated repair pass should not add another repair task.
+    repaired_again = repair_failed_run_tasks(repaired)
+    assert [task["task_id"] for task in repaired_again["tasks"]].count("repair_baseline") == 1
 
 
 def test_ready_execute_tasks_stops_before_ready_run_checkpoint():

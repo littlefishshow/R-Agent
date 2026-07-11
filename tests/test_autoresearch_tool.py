@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from core.autoresearch_loop import AutoResearchLoop, AutoResearchSettings, DEFAULT_CONTEXT_BUCKETS
-from tools.autoresearch_tool import auto_research_run_tool
+from autoresearch.autoresearch_loop import AutoResearchLoop, AutoResearchSettings, DEFAULT_CONTEXT_BUCKETS
+from autoresearch.autoresearch_tool import auto_research_run_tool
 from tools.registry import registry
 
 
@@ -64,7 +64,7 @@ class _FakeStepAgent:
         self.calls = []
 
     def plan_step(self, *, step, fallback_action, parent_context, round_index):
-        from core.autoresearch_loop import AutoResearchAction, AutoResearchStepResult
+        from autoresearch.autoresearch_loop import AutoResearchAction, AutoResearchStepResult
 
         self.calls.append((step.name, tuple(step.allowed_tools), parent_context))
         return AutoResearchStepResult(
@@ -79,7 +79,7 @@ class _FakeStepAgent:
 
 
 def test_llm_step_agent_can_override_allowed_action_and_update_buckets(tmp_path):
-    from core.autoresearch_loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
+    from autoresearch.autoresearch_loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
 
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=1, use_llm_step_agents=True)
@@ -107,7 +107,7 @@ def test_llm_step_agent_can_override_allowed_action_and_update_buckets(tmp_path)
 
 class _BadStepAgent:
     def plan_step(self, *, step, fallback_action, parent_context, round_index):
-        from core.autoresearch_loop import AutoResearchAction, AutoResearchStepResult
+        from autoresearch.autoresearch_loop import AutoResearchAction, AutoResearchStepResult
 
         return AutoResearchStepResult(
             action=AutoResearchAction(type="run", rationale="not_allowed", command="echo bad"),
@@ -116,7 +116,7 @@ class _BadStepAgent:
 
 
 def test_llm_step_agent_disallowed_action_falls_back(tmp_path):
-    from core.autoresearch_loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
+    from autoresearch.autoresearch_loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
 
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=1, use_llm_step_agents=True)
@@ -140,17 +140,24 @@ def test_llm_step_agent_disallowed_action_falls_back(tmp_path):
 
 
 def test_extract_json_object_handles_markdown_fence_and_embedded_text():
-    from core.autoresearch_loop import extract_json_object
+    from autoresearch.autoresearch_loop import extract_json_object
 
     assert extract_json_object('```json\n{"a": 1}\n```') == {"a": 1}
     assert extract_json_object('prefix {"b": {"c": 2}} suffix') == {"b": {"c": 2}}
 
 
 def test_metric_and_progress_helpers():
-    from core.autoresearch_loop import parse_primary_metric, decide_experiment, extract_progress_percent
+    from autoresearch.autoresearch_loop import parse_primary_metric, decide_experiment, extract_progress_percent
 
     info = parse_primary_metric('primary_metric_name: accuracy\nprimary_metric: 0.82\nhigher_is_better: true')
     assert info == {"metric": 0.82, "metric_name": "accuracy", "higher_is_better": True}
+    shell_artifact = json.dumps({
+        "returncode": 0,
+        "duration_seconds": 0.1,
+        "stdout": '{"primary_metric": 0.91, "primary_metric_name": "score", "higher_is_better": true}',
+        "stderr": "",
+    })
+    assert parse_primary_metric(shell_artifact) == {"metric": 0.91, "metric_name": "score", "higher_is_better": True}
     assert decide_experiment(0.83, baseline=0.82, higher_is_better=True) == "keep"
     assert decide_experiment(0.81, baseline=0.82, higher_is_better=True) == "discard"
     assert extract_progress_percent('epoch 1 20% ... epoch 4 80%') == 80
@@ -174,7 +181,7 @@ def test_progress_markdown_is_written(tmp_path):
 
 def test_auto_research_background_run_and_status(tmp_path):
     import time
-    from tools.autoresearch_tool import auto_research_status_tool
+    from autoresearch.autoresearch_tool import auto_research_status_tool
 
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
     payload = json.loads(auto_research_run_tool(str(tmp_path), project_id="bg", rounds=2, background=True, use_llm_step_agents=False, planner="fixed"))
@@ -199,7 +206,7 @@ def test_auto_research_background_run_and_status(tmp_path):
 
 
 def test_apply_patch_action_changes_project_file(tmp_path):
-    from core.autoresearch_loop import AutoResearchAction
+    from autoresearch.autoresearch_loop import AutoResearchAction
 
     target = tmp_path / "hello.txt"
     target.write_text("old\n", encoding="utf-8")
@@ -220,7 +227,7 @@ def test_apply_patch_action_changes_project_file(tmp_path):
 
 
 def test_metrics_are_written_to_state_and_results_tsv(tmp_path):
-    from core.autoresearch_loop import AutoResearchAction
+    from autoresearch.autoresearch_loop import AutoResearchAction
 
     settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
     loop = AutoResearchLoop(settings)
@@ -252,7 +259,7 @@ def test_progress_markdown_includes_log_tail_and_eta(tmp_path):
 
 
 def test_apply_patch_uses_git_apply_for_new_file(tmp_path):
-    from core.autoresearch_loop import AutoResearchAction
+    from autoresearch.autoresearch_loop import AutoResearchAction
 
     patch = """diff --git a/new_file.txt b/new_file.txt
 new file mode 100644
@@ -277,7 +284,7 @@ index 0000000..3e75765
 def test_apply_patch_recovers_from_wrong_hunk_count(tmp_path):
     """LLM diffs often carry wrong @@ counts; recount recovery must apply them."""
     import subprocess
-    from core.autoresearch_loop import AutoResearchAction
+    from autoresearch.autoresearch_loop import AutoResearchAction
 
     (tmp_path / "target.py").write_text('x = 0.0\ny = 0.0\nz = 1\n', encoding="utf-8")
     subprocess.run(["git", "init", "-q"], cwd=tmp_path)
@@ -304,7 +311,7 @@ def test_apply_patch_recovers_from_wrong_hunk_count(tmp_path):
 
 
 def test_git_apply_rejects_escape_and_failed_check_without_modifying(tmp_path):
-    from core.autoresearch_loop import AutoResearchAction
+    from autoresearch.autoresearch_loop import AutoResearchAction
 
     target = tmp_path / "safe.txt"
     target.write_text("old\n", encoding="utf-8")
@@ -355,7 +362,7 @@ def test_auto_research_run_schema_exposes_versioning_policy_enum_and_tool_passes
                 "use_git_versioning": captured["use_git_versioning"],
             }
 
-    monkeypatch.setattr("tools.autoresearch_tool.AutoResearchLoop", _FakeLoop)
+    monkeypatch.setattr("autoresearch.autoresearch_tool.AutoResearchLoop", _FakeLoop)
     payload = json.loads(auto_research_run_tool(
         str(tmp_path),
         project_id="schema",

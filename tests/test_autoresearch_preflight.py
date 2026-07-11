@@ -1,6 +1,6 @@
 import subprocess
 
-from core.autoresearch_preflight import git_preflight
+from autoresearch.autoresearch_preflight import git_preflight
 
 
 def test_git_preflight_non_repo_warns(tmp_path):

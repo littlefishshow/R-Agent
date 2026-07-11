@@ -23,11 +23,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from core.autoresearch_debug import inflight_finish, inflight_start
-from core.autoresearch_memory import update_belief, split_program, write_auto_note
-from core.autoresearch_phases import PhaseContext, PhaseResult
-from core.autoresearch_timeout import call_with_deadline
-from core.autoresearch_todo_state import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
+from autoresearch.autoresearch_debug import inflight_finish, inflight_start
+from autoresearch.autoresearch_memory import update_belief, split_program, write_auto_note
+from autoresearch.autoresearch_phases import PhaseContext, PhaseResult
+from autoresearch.autoresearch_timeout import call_with_deadline
+from autoresearch.autoresearch_todo_state import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -192,7 +192,7 @@ def _extract_opinion(raw: str) -> str:
 
 def _extract_json(raw: str) -> dict:
     try:
-        from core.autoresearch_loop import extract_json_object
+        from autoresearch.autoresearch_loop import extract_json_object
 
         return extract_json_object(raw)
     except Exception:
@@ -216,10 +216,21 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         degrade = bool(getattr(ctx.signals, "budget_degrade", False))
 
         if chat_fn is None:
-            # No model available: keep belief, record that planning was skipped.
-            note = "plan: no LLM client; kept existing belief and plan (deterministic)"
-            write_auto_note(ctx.root, "plan", "# Plan\n(no LLM available; retained previous plan)\n")
-            return PhaseResult(summary=note)
+            # No model available: still create a structured, recoverable DAG so
+            # Execute/Run never spin on a prose "no LLM" placeholder.
+            plan_text = _fallback_plan_text(ctx.program_text, ctx.project_text)
+            max_implementation_tasks = int(getattr(getattr(ctx.loop, "settings", None), "plan_max_implementation_tasks", 0) or 0)
+            planned_todo_state = _plan_to_todo_state(plan_text, max_implementation_tasks=max_implementation_tasks)
+            if not _has_metric_experiment(ctx.root):
+                planned_todo_state = _ensure_baseline_checkpoint(planned_todo_state)
+            todo_state = merge_todo_state(load_todo_state(ctx.root), planned_todo_state)
+            save_todo_state(ctx.root, todo_state)
+            write_auto_note(ctx.root, "plan", render_todo_markdown(todo_state))
+            project_text = _update_plan_section(ctx.project_text, plan_text)
+            return PhaseResult(
+                project_text=project_text,
+                summary=f"plan: no LLM client; deterministic fallback DAG tasks={len(todo_state.get('tasks') or [])}",
+            )
 
         debate_config = config or _debate_config_from_settings(getattr(ctx.loop, "settings", None))
         debate = PlanDebate(
@@ -680,7 +691,7 @@ def build_loop_chat_fn(loop, *, tier: str = "plan", root: str | Path | None = No
     if step_agent is None:
         # Build a transient step agent if the loop supports it.
         try:
-            from core.autoresearch_loop import AutoResearchStepAgent
+            from autoresearch.autoresearch_loop import AutoResearchStepAgent
 
             step_agent = AutoResearchStepAgent(loop.settings, loop=loop)
         except Exception:

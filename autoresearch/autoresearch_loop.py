@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Literal, Optional
 
-from tools.web_tools import web_extract_tool, web_search_tool
-from core.autoresearch_debug import inflight_finish, inflight_start
-from core.autoresearch_timeout import call_with_deadline
+from autoresearch.autoresearch_debug import inflight_finish, inflight_start
+from autoresearch.autoresearch_memory import append_lesson
+from autoresearch.autoresearch_timeout import call_with_deadline
 
 Decision = Literal["run", "read", "write", "apply_patch", "web_search", "web_extract", "note", "stop"]
 
@@ -76,22 +78,28 @@ class AutoResearchSettings:
     plan_max_personas: int = 2
     plan_degrade_personas: int = 1
     plan_max_implementation_tasks: int = 0
+    planner_project_context_chars: int = 18_000
     execute_context_chars: int = 24_000
     execute_max_task_attempts: int = 3
     execute_behavior_check: bool = True
     execute_behavior_check_timeout_seconds: int = 300
+    autoresearch_step_agent_loop: bool = False
+    autoresearch_step_max_iterations: int = 12
     # --- v2 execute/run tuning ---
     # Cap LLM-backed actions per Execute phase visit so one step cannot burn the
     # whole time/token budget on a long todo list; remaining items advance on the
     # next Execute visit via a cursor.
-    execute_max_actions_per_step: int = 0
+    execute_max_actions_per_step: int = 1
+    # V3 ownership boundary: Run records experiment observations; Conclude
+    # finalizes best/Pareto, versioning, rollback, and lessons. Legacy
+    # AutoResearchLoop.run keeps immediate finalization for compatibility.
+    defer_experiment_finalization: bool = False
     # When Execute wrote a self-iterating search driver, let Run execute it so it
     # performs many internal evaluations from a single LLM decision.
     run_search_driver: bool = True
     run_max_inner_seconds: float = 20.0
     run_max_inner_evals: int = 100
     run_cheap_eval_threshold_seconds: float = 2.0
-    solved_metric_threshold: Optional[float] = None
     search_driver_globs: tuple[str, ...] = (
         "train/search.py", "train/search_driver.py", "train/*search*.py",
         "train/*driver*.py", "train/*exploration*.py", "search.py",
@@ -355,13 +363,39 @@ def parse_primary_metric(text: str) -> dict:
     metric_name = "primary_metric"
     metric = None
     higher_is_better = True
-    name_match = re.search(r"primary_metric_name\s*[:=]\s*([A-Za-z0-9_.-]+)", surface)
+
+    # Shell artifacts are persisted as JSON wrappers:
+    # {"returncode": 0, "stdout": "...primary_metric...", "stderr": "..."}.
+    # Parse the project-owned output first so wrapper metadata such as
+    # returncode/duration_seconds cannot become the primary metric.
+    try:
+        data = json.loads(surface)
+        if isinstance(data, dict):
+            nested = []
+            if isinstance(data.get("stdout"), str):
+                nested.append(data.get("stdout") or "")
+            if isinstance(data.get("stderr"), str):
+                nested.append(data.get("stderr") or "")
+            for nested_text in nested:
+                parsed = parse_primary_metric(nested_text)
+                if parsed.get("metric") is not None:
+                    return parsed
+            direct = data.get("primary_metric")
+            if isinstance(direct, (int, float)) and not isinstance(direct, bool):
+                metric = float(direct)
+                metric_name = str(data.get("primary_metric_name") or data.get("metric_name") or metric_name)
+                higher_is_better = bool(data.get("higher_is_better", higher_is_better))
+                return {"metric": metric, "metric_name": metric_name, "higher_is_better": higher_is_better}
+    except Exception:
+        pass
+
+    name_match = re.search(r'"?(?:primary_metric_name|metric_name)"?\s*[:=]\s*"?([A-Za-z0-9_.-]+)"?', surface)
     if name_match:
         metric_name = name_match.group(1)
-    metric_match = re.search(r"primary_metric\s*[:=]\s*(-?\d+(?:\.\d+)?)", surface)
+    metric_match = re.search(r'"?primary_metric"?\s*[:=]\s*(-?\d+(?:\.\d+)?)', surface)
     if metric_match:
         metric = float(metric_match.group(1))
-    hib_match = re.search(r"higher_is_better\s*[:=]\s*(true|false|1|0|yes|no)", surface, re.I)
+    hib_match = re.search(r'"?higher_is_better"?\s*[:=]\s*(true|false|1|0|yes|no)', surface, re.I)
     if hib_match:
         higher_is_better = hib_match.group(1).lower() in {"true", "1", "yes"}
     if metric is None:
@@ -665,6 +699,21 @@ class ProjectConfinedCommandRunner:
         self.boundary = ProjectBoundary(project_dir)
         self.timeout_seconds = timeout_seconds
 
+    def _command_env(self) -> dict[str, str]:
+        shim_dir = self.boundary.project_dir / ".autoresearch" / "bin"
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        python_shim = shim_dir / "python"
+        if not python_shim.exists():
+            python_shim.write_text(
+                "#!/usr/bin/env sh\n"
+                f"exec {shlex.quote(sys.executable)} \"$@\"\n",
+                encoding="utf-8",
+            )
+            python_shim.chmod(0o755)
+        env = os.environ.copy()
+        env["PATH"] = str(shim_dir) + os.pathsep + env.get("PATH", "")
+        return env
+
     def run(self, command: str, cwd: str | Path = ".") -> dict:
         workdir = self.boundary.resolve(cwd)
         self.boundary.validate_command_surface(command)
@@ -678,6 +727,7 @@ class ProjectConfinedCommandRunner:
                 capture_output=True,
                 text=True,
                 timeout=self.timeout_seconds,
+                env=self._command_env(),
             )
             result = {
                 "command": command,
@@ -736,6 +786,7 @@ class AutoResearchContextManager:
             "pareto_front": [],
             "best_experiment": None,
             "useful_failures": [],
+            "last_finalized_experiment_count": 0,
             "versioning_policy": normalize_versioning_policy(self.settings.versioning_policy),
             "use_git_versioning": bool(self.settings.use_git_versioning),
         }
@@ -756,6 +807,7 @@ class AutoResearchContextManager:
         data.setdefault("pareto_front", [])
         data.setdefault("best_experiment", None)
         data.setdefault("useful_failures", [])
+        data.setdefault("last_finalized_experiment_count", 0)
         data["versioning_policy"] = normalize_versioning_policy(self.settings.versioning_policy)
         data["use_git_versioning"] = bool(self.settings.use_git_versioning)
         buckets = data.setdefault("buckets", {})
@@ -779,6 +831,7 @@ class AutoResearchContextManager:
 
         state["versioning_policy"] = normalize_versioning_policy(self.settings.versioning_policy)
         state["use_git_versioning"] = bool(self.settings.use_git_versioning)
+        state.setdefault("last_finalized_experiment_count", 0)
         path = self.boundary.ensure_inside(self.settings.state_file())
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
@@ -1067,7 +1120,7 @@ class AutoResearchStepAgent:
             inner = config.create_llm_client()
             ledger = getattr(self.loop, "budget", None)
             if ledger is not None:
-                from core.autoresearch_budget import MeteredLLMClient
+                from autoresearch.autoresearch_budget import MeteredLLMClient
 
                 self.client = MeteredLLMClient(
                     inner,
@@ -1643,7 +1696,7 @@ class AutoResearchLoop:
             bind_loop(self)
 
     def _build_budget_ledger(self):
-        from core.autoresearch_budget import BudgetLedger, BudgetLimits
+        from autoresearch.autoresearch_budget import BudgetLedger, BudgetLimits
 
         limits = BudgetLimits(
             max_usd=float(self.settings.max_usd or 0.0),
@@ -1653,7 +1706,7 @@ class AutoResearchLoop:
         return BudgetLedger(self.settings.budget_file(), limits)
 
     def _build_model_tiers(self):
-        from core.autoresearch_budget import ModelTiers
+        from autoresearch.autoresearch_budget import ModelTiers
 
         base = self.settings.llm_model or ""
         tiers = ModelTiers.from_env(base=base)
@@ -1985,10 +2038,14 @@ class AutoResearchLoop:
                 artifact = self.artifacts.save(kind="apply_patch", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("apply_patch", self.summarizer(action, raw), artifact, "ok")
             if action.type == "web_search":
+                from tools.web_tools import web_search_tool
+
                 raw = web_search_tool(action.query, limit=action.max_results)
                 artifact = self.artifacts.save(kind="web_search", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("web_search", self.summarizer(action, raw), artifact, "ok")
             if action.type == "web_extract":
+                from tools.web_tools import web_extract_tool
+
                 raw = web_extract_tool(action.urls)
                 artifact = self.artifacts.save(kind="web_extract", rationale=action.rationale, content=raw, extension="json")
                 return AutoResearchObservation("web_extract", self.summarizer(action, raw), artifact, "ok")
@@ -2165,24 +2222,62 @@ class AutoResearchLoop:
         }
         existing.append(record)
         state["experiments"] = existing[-max(1, int(self.settings.max_experiments)) :]
+        self.context.save_state(state)
+        if not getattr(self.settings, "defer_experiment_finalization", False):
+            self.finalize_experiments()
 
-        # Recompute multi-objective governance artifacts before version decisions so
-        # commit_pareto can use the same best/Pareto view written to state.
+    def finalize_experiments(self) -> dict:
+        """Finalize recorded experiments: best/Pareto, versioning, rollback, lessons.
+
+        V3 calls this from Conclude. Legacy AutoResearchLoop.run calls it
+        immediately after recording to preserve existing behavior.
+        """
+        state = self.context.load_state()
+        experiments = list(state.get("experiments") or [])
+        if not experiments:
+            state["pareto_front"] = []
+            state["best_experiment"] = None
+            state["last_finalized_experiment_count"] = 0
+            self.context.save_state(state)
+            self._write_evolution_artifacts(state)
+            return {"finalized": 0, "best_experiment": None, "pareto_count": 0}
+
         all_directions = {}
-        for exp in state.get("experiments") or []:
+        primary_name = ""
+        for exp in experiments:
             all_directions.update(exp.get("metric_directions") or {})
-        front = pareto_front(state.get("experiments") or [], all_directions, self.settings.max_pareto_items)
-        best = choose_best_experiment(state.get("experiments") or [], all_directions, primary_name)
+            if exp.get("primary_metric_name"):
+                primary_name = exp.get("primary_metric_name")
+        front = pareto_front(experiments, all_directions, self.settings.max_pareto_items)
+        best = choose_best_experiment(experiments, all_directions, primary_name)
         state["pareto_front"] = front
         state["best_experiment"] = best
 
+        finalized = 0
+        for record in experiments:
+            if record.get("version_finalized"):
+                continue
+            self._finalize_experiment_record(record, state, front, best)
+            finalized += 1
+        state["experiments"] = experiments[-max(1, int(self.settings.max_experiments)) :]
+        state["last_finalized_experiment_count"] = len(state["experiments"])
+        feedback = self._search_feedback_digest()
+        if feedback:
+            self.context.add_to_bucket(state, "experiment_results", feedback)
+        self.context.save_state(state)
+        self._write_evolution_artifacts(state)
+        return {"finalized": finalized, "best_experiment": best, "pareto_count": len(front)}
+
+    def _finalize_experiment_record(self, record: dict, state: dict, front: list[dict], best: dict | None) -> None:
+        policy = normalize_versioning_policy(record.get("version_policy") or self.settings.versioning_policy)
+        git_available = bool(record.get("git_available"))
+        base_clean = not str(record.get("git_status_before") or "").strip() and git_available
+        base_commit = str(record.get("base_commit") or "")
+        experiment_id = str(record.get("experiment_id") or "")
         front_ids = {str(item.get("experiment_id")) for item in front or []}
         best_id = str((best or {}).get("experiment_id") or "")
-        has_metrics = bool(metrics)
-        invalid = obs.status == "failed" or decision in {"needs_metrics", "failed"} or not has_metrics
-        # commit_pareto is intentionally strict: only the current best or
-        # non-dominated Pareto candidates are committed. A merely improved but
-        # dominated trial stays as a patch artifact and is rolled back below.
+        has_metrics = bool(record.get("metrics"))
+        invalid = record.get("status") == "failed" or record.get("decision") in {"needs_metrics", "failed"} or not has_metrics
         pareto_kept = experiment_id in front_ids or experiment_id == best_id
         should_commit = False
         should_branch = False
@@ -2207,7 +2302,7 @@ class AutoResearchLoop:
                 should_branch = not invalid
                 should_rollback = invalid
             if should_commit:
-                result = git_commit_trial(self.settings.root(), experiment_id, action.rationale)
+                result = git_commit_trial(self.settings.root(), experiment_id, record.get("hypothesis", ""))
                 record["version_action"] = result.get("action", "commit_attempted")
                 record["commit_sha"] = result.get("commit_sha", "")
                 record["git_commit"] = record["commit_sha"]
@@ -2216,7 +2311,7 @@ class AutoResearchLoop:
                 if result.get("action") in {"commit_failed", "committed_branch_failed"}:
                     should_rollback = True
             elif should_branch:
-                result = git_branch_trial(self.settings.root(), experiment_id, action.rationale, base_commit)
+                result = git_branch_trial(self.settings.root(), experiment_id, record.get("hypothesis", ""), base_commit)
                 record["version_action"] = result.get("action", "branch_attempted")
                 record["commit_sha"] = result.get("commit_sha", "")
                 record["git_commit"] = record["commit_sha"]
@@ -2230,19 +2325,29 @@ class AutoResearchLoop:
                 rollback = git_safe_rollback_to_base(self.settings.root(), base_commit)
                 record["rollback_status"] = rollback.get("status", "unknown")
                 record["version_error"] = record.get("version_error", "") or rollback.get("error", "")
-
         git_final = git_snapshot(self.settings.root(), enabled=self.settings.use_git_versioning)
         record["git_status_final"] = git_final.get("status", "") if isinstance(git_final, dict) else ""
         record["version_summary"] = f"policy={policy} action={record.get('version_action')} rollback={record.get('rollback_status')} commit={record.get('commit_sha','')} branch={record.get('branch','')}"
-
-        if obs.status == "failed" or decision in {"discard", "needs_metrics", "failed"}:
+        record["version_finalized"] = True
+        if invalid or record.get("decision") in {"discard", "needs_metrics", "failed"}:
             self._archive_useful_failure(record, state=state)
-        self.context.add_to_bucket(state, "current_changes", f"Versioning: {record['version_summary']} diff={diff_path}")
-        feedback = self._search_feedback_digest()
-        if feedback:
-            self.context.add_to_bucket(state, "experiment_results", feedback)
-        self.context.save_state(state)
-        self._write_evolution_artifacts(state)
+        self.context.add_to_bucket(state, "current_changes", f"Versioning: {record['version_summary']} diff={record.get('diff_path', '')}")
+        if not record.get("lesson_recorded"):
+            lesson_kind = "operational_error" if record.get("status") == "failed" else (
+                "insight" if record.get("experiment_id") in {str(item.get("experiment_id")) for item in front or []} else "dead_end"
+            )
+            append_lesson(
+                self.settings.root(),
+                kind=lesson_kind,
+                summary=(
+                    f"{record.get('experiment_id')}: decision={record.get('decision')} "
+                    f"metrics={record.get('metrics')} version={record.get('version_action')} "
+                    f"rollback={record.get('rollback_status')}"
+                ),
+                detail=str(record.get("summary") or "")[:2000],
+                experiment_id=str(record.get("experiment_id") or ""),
+            )
+            record["lesson_recorded"] = True
 
     def _search_feedback_digest(self) -> str:
         """Compact digest of a train-side search's own summary/history, if present.

@@ -2,11 +2,11 @@ import json
 import time
 from pathlib import Path
 
-from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
-from core.autoresearch_monitor import RunMonitor, read_monitor, render_monitor_text
-from core.autoresearch_phases import run_phase_loop
-from core.autoresearch_three_step import ThreeStepController
-from tools.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
+from autoresearch.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
+from autoresearch.autoresearch_monitor import RunMonitor, read_monitor, render_monitor_text
+from autoresearch.autoresearch_phases import run_phase_loop
+from autoresearch.autoresearch_three_step import ThreeStepController
+from autoresearch.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
 
 
 def test_run_monitor_writes_and_reads_heartbeat(tmp_path):
@@ -51,24 +51,25 @@ def test_render_monitor_text_has_rounds_and_tokens(tmp_path):
 
 
 def test_monitor_renders_inflight(tmp_path):
-    from core.autoresearch_debug import inflight_start, set_debug
+    from autoresearch.autoresearch_debug import inflight_start, set_debug
 
     set_debug(tmp_path, True)
-    inflight_start(tmp_path, "llm", phase="execute", detail="apply_change attempt 1/1")
+    inflight_start(tmp_path, "llm", run_id="rI", phase="execute", detail="apply_change attempt 1/1")
     mon = RunMonitor(tmp_path / ".autoresearch" / "monitor.json", run_id="rI")
     mon.set_max_steps(10)
     mon.start()
     data = read_monitor(mon.path)
     text = render_monitor_text(data)
     assert data["inflight"]["kind"] == "llm"
+    assert data["inflight"]["run_id"] == "rI"
     assert "inflight: llm" in text
     assert "phase=execute" in text
 
 
 def test_debug_summary_includes_monitor_budget_events_and_tasks(tmp_path):
-    from core.autoresearch_debug import build_debug_summary, debug_event, inflight_start, set_debug
-    from core.autoresearch_gate_state import save_gate_state
-    from core.autoresearch_todo_state import save_todo_state
+    from autoresearch.autoresearch_debug import build_debug_summary, debug_event, inflight_start, set_debug
+    from autoresearch.autoresearch_gate_state import save_gate_state
+    from autoresearch.autoresearch_todo_state import save_todo_state
 
     set_debug(tmp_path, True)
     mon = RunMonitor(tmp_path / ".autoresearch" / "monitor.json", run_id="rD", project_id="p")

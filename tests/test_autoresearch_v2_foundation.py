@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from core.autoresearch_budget import (
+from autoresearch.autoresearch_budget import (
     BudgetLedger,
     BudgetLimits,
     ModelTiers,
@@ -9,7 +9,7 @@ from core.autoresearch_budget import (
     estimate_usd,
     price_per_1k,
 )
-from core.autoresearch_memory import (
+from autoresearch.autoresearch_memory import (
     split_program,
     update_belief,
     ensure_program_scaffold,
@@ -231,14 +231,14 @@ def test_phase_roundtrip():
     assert phase == "plan"
     assert reason == "pareto changed"
     # overwrite is idempotent, single marker
-    text2 = write_phase(text, "execute", "plan approved")
+    text2 = write_phase(text, "attempt", "plan approved")
     assert text2.count("<!-- PHASE:") == 1
-    assert read_phase(text2) == ("execute", "plan approved")
+    assert read_phase(text2) == ("attempt", "plan approved")
 
 
 def test_normalize_phase_defaults_to_init():
     assert normalize_phase("garbage") == "init"
-    assert normalize_phase("EVALUATE") == "evaluate"
+    assert normalize_phase("CONCLUDE") == "conclude"
 
 
 # --------------------------------------------------------------------------- #

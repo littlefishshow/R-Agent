@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from core.autoresearch_memory import (
+from autoresearch.autoresearch_memory import (
     split_program,
     update_belief,
     write_auto_note,
@@ -22,8 +22,8 @@ from core.autoresearch_memory import (
     append_lesson,
     read_phase,
 )
-from core.autoresearch_gate_state import update_gate_state_from_experiment_state
-from core.autoresearch_phases import PhaseContext, PhaseResult
+from autoresearch.autoresearch_gate_state import update_gate_state_from_experiment_state
+from autoresearch.autoresearch_phases import PhaseContext, PhaseResult
 
 
 # --------------------------------------------------------------------------- #
@@ -103,16 +103,17 @@ def make_init_handler():
 # --------------------------------------------------------------------------- #
 
 def make_evaluate_handler():
-    """Deterministic evaluate: read machine state, record lesson, note conclusion.
+    """Conclude phase: finalize experiments, versioning, rollback, and lessons.
 
-    The heavy lifting (metrics parse, Pareto, git commit/rollback) already runs
-    inside ``AutoResearchLoop._maybe_record_experiment`` during Run.  Here we
-    read the resulting ``state.json`` to classify the outcome and persist a
-    rollback-surviving lesson.
+    Run records experiment observations. Conclude owns the governance decision:
+    best/Pareto, commit/rollback according to versioning_policy, and the
+    rollback-surviving lessons ledger.
     """
 
     def handler(ctx: PhaseContext) -> PhaseResult:
         root = Path(ctx.root)
+        finalize = getattr(ctx.loop, "finalize_experiments", None)
+        finalize_result = finalize() if callable(finalize) else {"finalized": 0}
         state_path = root / ".autoresearch" / "state.json"
         state = {}
         best = None
@@ -133,6 +134,7 @@ def make_evaluate_handler():
         major = bool(ctx.signals.major_error or prior_unrecoverable)
         gate = update_gate_state_from_experiment_state(root, state if isinstance(state, dict) else {}, major_error=major)
         pareto_changed = bool(gate.get("pareto_changed"))
+        finalized_count = int((finalize_result or {}).get("finalized") or 0) if isinstance(finalize_result, dict) else 0
 
         if major:
             append_lesson(
@@ -143,16 +145,9 @@ def make_evaluate_handler():
             )
             summary = "evaluate: major error recorded to lessons.jsonl"
         elif best:
-            append_lesson(
-                root,
-                kind="insight" if pareto_changed else "dead_end",
-                summary=(f"best={best.get('experiment_id')} metrics={best.get('metrics')}" if pareto_changed
-                         else "trial did not improve Pareto front"),
-                experiment_id=str(best.get("experiment_id") or ""),
-            )
-            summary = f"evaluate: best={best.get('experiment_id')} pareto_changed={pareto_changed}"
+            summary = f"evaluate: best={best.get('experiment_id')} pareto_changed={pareto_changed} finalized={finalized_count}"
         else:
-            summary = "evaluate: no metric-bearing experiment yet"
+            summary = f"evaluate: no metric-bearing experiment yet finalized={finalized_count}"
 
         # Append a short conclusion into project.md.
         project = ctx.project_text

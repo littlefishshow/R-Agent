@@ -1,4 +1,4 @@
-from core.autoresearch_gate_state import (
+from autoresearch.autoresearch_gate_state import (
     default_gate_state,
     load_gate_state,
     save_gate_state,

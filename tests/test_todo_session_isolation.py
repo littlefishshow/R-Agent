@@ -181,3 +181,19 @@ def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
         "self_evolution_review",
     }.issubset(excluded)
 
+
+def test_delegate_task_passes_child_allowed_tools_and_still_excludes_delegate(monkeypatch):
+    _CapturingExcludeAgent.captured_kwargs = None
+    monkeypatch.setattr(core.agent, "RAgent", _CapturingExcludeAgent)
+
+    payload = json.loads(delegate_tool.delegate_task(
+        tasks=json.dumps([{"goal": "capture allowed tools"}]),
+        max_workers=1,
+        default_max_iterations=1,
+        default_wall_timeout_seconds=5,
+        child_allowed_tools=["read_file", "search_files", "delegate_task"],
+    ))
+
+    assert payload["tasks"][0]["status"] == "success"
+    assert set(_CapturingExcludeAgent.captured_kwargs["allowed_tools"]) == {"read_file", "search_files", "delegate_task"}
+    assert "delegate_task" in set(_CapturingExcludeAgent.captured_kwargs["exclude_tools"])

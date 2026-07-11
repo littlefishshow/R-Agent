@@ -2,8 +2,8 @@ import json
 import time
 from pathlib import Path
 
-from core.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
-from core.autoresearch_personas import (
+from autoresearch.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
+from autoresearch.autoresearch_personas import (
     PlanDebate,
     DebateConfig,
     make_plan_handler,
@@ -15,14 +15,14 @@ from core.autoresearch_personas import (
     _planner_project_context,
     _split_inline_plan_items,
 )
-from core.autoresearch_phases import PhaseContext, PhaseSignals
-from core.autoresearch_memory import (
+from autoresearch.autoresearch_phases import PhaseContext, PhaseSignals
+from autoresearch.autoresearch_memory import (
     ensure_program_scaffold,
     split_program,
     read_phase,
     write_phase,
 )
-from core.autoresearch_todo_state import load_todo_state, save_todo_state
+from autoresearch.autoresearch_todo_state import load_todo_state, save_todo_state
 
 
 def _fake_chat_factory():
@@ -296,6 +296,10 @@ def test_plan_handler_no_llm_is_deterministic_noop(tmp_path):
     result = handler(ctx)
     assert "plan" in result.summary
     assert (tmp_path / ".auto" / "plan.md").exists()
+    state = load_todo_state(tmp_path)
+    assert state["tasks"]
+    first_impl_index = next(i for i, task in enumerate(state["tasks"]) if task["type"] == "implementation")
+    assert any(task["type"] == "validation" and task.get("run_spec") for task in state["tasks"][:first_impl_index])
 
 
 def test_plan_handler_framework_deadline_records_fallback_plan(tmp_path):

@@ -38,10 +38,12 @@ def debug_event(root: str | Path, event: str, **payload) -> None:
         return
     d = debug_dir(root)
     d.mkdir(parents=True, exist_ok=True)
+    run_id = payload.pop("run_id", "") or os.environ.get("AUTORESEARCH_RUN_ID", "")
     row = {
         "ts": time.time(),
         "time": time.strftime("%F %T"),
         "event": event,
+        "run_id": run_id,
         **payload,
     }
     path = d / "debug.jsonl"
@@ -54,8 +56,10 @@ def inflight_start(root: str | Path, kind: str, **payload) -> None:
         return
     d = debug_dir(root)
     d.mkdir(parents=True, exist_ok=True)
+    run_id = payload.pop("run_id", "") or os.environ.get("AUTORESEARCH_RUN_ID", "")
     row = {
         "pid": os.getpid(),
+        "run_id": run_id,
         "started_at": time.time(),
         "started_time": time.strftime("%F %T"),
         "kind": kind,
@@ -68,6 +72,7 @@ def inflight_start(root: str | Path, kind: str, **payload) -> None:
 def inflight_finish(root: str | Path, kind: str, **payload) -> None:
     if not debug_enabled(root):
         return
+    run_id = payload.pop("run_id", "") or os.environ.get("AUTORESEARCH_RUN_ID", "")
     p = debug_dir(root) / "inflight.json"
     old = {}
     try:
@@ -77,7 +82,7 @@ def inflight_finish(root: str | Path, kind: str, **payload) -> None:
     elapsed = None
     if old.get("started_at"):
         elapsed = round(time.time() - float(old["started_at"]), 3)
-    debug_event(root, f"{kind}_finish", elapsed_seconds=elapsed, **payload)
+    debug_event(root, f"{kind}_finish", run_id=run_id, elapsed_seconds=elapsed, **payload)
     try:
         p.unlink(missing_ok=True)
     except Exception:

@@ -2,7 +2,7 @@ import time
 
 import pytest
 
-from core.autoresearch_timeout import AutoResearchTimeoutError, call_with_deadline
+from autoresearch.autoresearch_timeout import AutoResearchTimeoutError, call_with_deadline
 
 
 def test_call_with_deadline_returns_value():

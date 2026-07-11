@@ -26,15 +26,17 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable, Optional
 
-from core.autoresearch_memory import write_auto_note, read_auto_notes, append_lesson
-from core.autoresearch_phases import PhaseContext, PhaseResult
-from core.autoresearch_debug import debug_event, inflight_finish, inflight_start
-from core.autoresearch_timeout import call_with_deadline
-from core.autoresearch_todo_state import (
+from autoresearch.autoresearch_memory import write_auto_note, read_auto_notes, append_lesson
+from autoresearch.autoresearch_phases import PhaseContext, PhaseResult
+from autoresearch.autoresearch_debug import debug_event, inflight_finish, inflight_start
+from autoresearch.autoresearch_timeout import call_with_deadline
+from autoresearch.autoresearch_completion import is_metric_solved, parse_completion_criteria
+from autoresearch.autoresearch_todo_state import (
     has_open_tasks,
     load_todo_state,
     ready_execute_tasks,
     ready_tasks,
+    repair_failed_run_tasks,
     save_todo_state,
     task_phase,
 )
@@ -171,16 +173,18 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
         agent._tier = "exec"
     except Exception:
         pass
-    from core.autoresearch_loop import AutoResearchAction, AutoResearchWorkflowStep
+    from autoresearch.autoresearch_loop import AutoResearchAction, AutoResearchWorkflowStep
 
-    direct = _direct_write_action(item, ctx)
-    if direct is not None:
-        return direct
-    direct_failed = getattr(ctx, "_autoresearch_direct_write_failed", "")
+    direct_failed = ""
+    if not _skip_direct_write(ctx):
+        direct = _direct_write_action(item, ctx)
+        if direct is not None:
+            return direct
+        direct_failed = getattr(ctx, "_autoresearch_direct_write_failed", "")
+    else:
+        direct_failed = "skipped direct write after previous direct-write timeout; using compact fallback"
     if str(direct_failed).startswith("unsafe:"):
         return AutoResearchAction(type="note", rationale="execute_direct_write_failed", content=direct_failed)
-    if "exceeded framework deadline" in str(direct_failed).lower():
-        return AutoResearchAction(type="note", rationale="execute_direct_write_timeout", content=direct_failed)
 
     step = AutoResearchWorkflowStep(
         name="apply_change",
@@ -194,6 +198,16 @@ def _llm_execute_action(item: str, ctx: PhaseContext):
     parent_context = _execute_fallback_context(ctx, item, direct_failed, max_chars=min(max_chars, 4500))
     try:
         result = agent.plan_step(step=step, fallback_action=fallback, parent_context=parent_context, round_index=0)
+        _save_execute_llm_trace(ctx, "execute_fallback_step_agent", {
+            "system": getattr(result, "system_prompt", ""),
+            "user": getattr(result, "user_payload", ""),
+            "raw_response": getattr(result, "raw_response", ""),
+            "used_fallback": getattr(result, "used_fallback", False),
+            "error": getattr(result, "error", ""),
+            "action": getattr(getattr(result, "action", None), "__dict__", {}),
+            "bucket_updates": getattr(result, "bucket_updates", {}),
+            "task": item,
+        })
     finally:
         try:
             agent._tier = old_tier
@@ -216,7 +230,7 @@ def _direct_write_action(item: str, ctx: PhaseContext):
     except Exception:
         return None
     try:
-        from core.autoresearch_loop import AutoResearchAction, extract_json_object
+        from autoresearch.autoresearch_loop import AutoResearchAction, extract_json_object
     except Exception:
         return None
     model = ""
@@ -240,7 +254,8 @@ def _direct_write_action(item: str, ctx: PhaseContext):
     system = (
         "Return ONLY JSON. Preferred schema: {\"files\": [{\"path\": str, \"content\": str}, ...]}. "
         "You may also return legacy {\"path\": str, \"content\": str}. "
-        "Rewrite up to 3 train-side files with complete content. "
+        "Rewrite up to 3 train-side files with complete content. Keep the first slice small and runnable; "
+        "prefer a minimal correct implementation over a large all-in-one optimizer. "
         "If you create a new optimizer/search module, include the train entrypoint file that calls it. "
         "Do not edit eval.py, eval.sh, blackbox_oracle.py. No markdown."
     )
@@ -294,6 +309,13 @@ def _direct_write_action(item: str, ctx: PhaseContext):
             model=model or "gpt-4o",
         )
         raw = getattr(resp.choices[0].message, "content", "") or ""
+        _save_execute_llm_trace(ctx, "execute_direct_write", {
+            "system": system,
+            "user": user,
+            "raw_response": raw,
+            "model": model or "gpt-4o",
+            "task": item,
+        })
         data = extract_json_object(raw)
         files = data.get("files")
         if isinstance(files, list):
@@ -314,6 +336,14 @@ def _direct_write_action(item: str, ctx: PhaseContext):
             return None
         return actions[0] if len(actions) == 1 else _ExecuteActionBundle(actions)
     except Exception as exc:
+        _save_execute_llm_trace(ctx, "execute_direct_write_error", {
+            "system": system,
+            "user": user,
+            "raw_response": "",
+            "model": model or "gpt-4o",
+            "task": item,
+            "error": str(exc),
+        })
         inflight_finish(
             root,
             "llm",
@@ -326,6 +356,135 @@ def _direct_write_action(item: str, ctx: PhaseContext):
         return None
 
 
+def _save_execute_llm_trace(ctx: PhaseContext, name: str, payload: dict) -> str:
+    root = Path(ctx.root)
+    d = root / ".autoresearch" / "step_traces"
+    d.mkdir(parents=True, exist_ok=True)
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name or "execute_llm")).strip("_")[:80] or "execute_llm"
+    path = d / f"{int(time.time() * 1000)}_{safe}.json"
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _skip_direct_write(ctx: PhaseContext) -> bool:
+    """Avoid repeating the same expensive direct-write request after timeouts."""
+    task = getattr(ctx, "_autoresearch_current_task", None)
+    if not isinstance(task, dict):
+        return False
+    last = task.get("last_result") if isinstance(task.get("last_result"), dict) else {}
+    note = str(last.get("note") or "").lower()
+    attempts = int(last.get("attempts") or 0)
+    return attempts > 0 and "direct write" in note and "exceeded framework deadline" in note
+
+
+_TARGET_LOAD_RE = re.compile(r"spec_from_file_location\([^\n]*?Path\(['\"]([^'\"]+)['\"]\)", re.DOTALL)
+_DEF_RE = re.compile(r"^def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+
+
+def _eval_contract_digest(root: str | Path, *, max_chars: int = 5000) -> str:
+    """Create a compact, factual digest of how eval.py evaluates the project.
+
+    The digest deliberately does not choose the edit target. It exposes facts the
+    model needs: fixed eval files, import targets, function names, metric fields,
+    and current failure examples.
+    """
+    root = Path(root)
+    eval_path = root / "eval.py"
+    if not eval_path.exists():
+        return ""
+    try:
+        eval_text = eval_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return ""
+    metrics = _read_json(root / "metrics.json")
+    targets = sorted(set(_TARGET_LOAD_RE.findall(eval_text)))
+    function_names = []
+    for target in targets:
+        path = root / target
+        if path.exists() and path.is_file():
+            try:
+                source = path.read_text(encoding="utf-8", errors="replace")
+                function_names.extend(_DEF_RE.findall(source)[:12])
+            except Exception:
+                pass
+    for name in ("solve_case", "solve", "rank", "normalize", "repair_json", "decode_text", "is_anomaly", "clean_row"):
+        if re.search(r"\." + re.escape(name) + r"\b|\b" + re.escape(name) + r"\(", eval_text):
+            function_names.append(name)
+    function_names = sorted(set(function_names))
+    failures = metrics.get("failures") if isinstance(metrics, dict) else []
+    lines = [
+        "# Eval Contract Digest",
+        "",
+        "Facts extracted mechanically from eval.py and metrics.json. Use these facts to decide what to edit; the framework is not prescribing a target file.",
+        "",
+        f"- eval_file: eval.py ({len(eval_text)} chars)",
+    ]
+    if targets:
+        lines.append(f"- eval_import_targets: {', '.join(targets)}")
+    if function_names:
+        lines.append(f"- referenced_or_available_functions: {', '.join(function_names[:16])}")
+    if isinstance(metrics, dict) and metrics:
+        metric_name = metrics.get("primary_metric_name") or metrics.get("metric_name") or "primary_metric"
+        metric_value = metrics.get("primary_metric", metrics.get(metric_name))
+        lines.append(f"- current_metric: {metric_name}={metric_value} higher_is_better={metrics.get('higher_is_better')}")
+        for key in ("accuracy", "row_accuracy", "cell_accuracy", "exact_accuracy", "top1_accuracy", "runtime_sec", "runtime_seconds", "score"):
+            if key in metrics:
+                lines.append(f"- {key}: {metrics.get(key)}")
+    lines.extend(["", "## Eval head", "```python", eval_text[:1800].rstrip(), "```"])
+    if isinstance(failures, list) and failures:
+        lines.extend(["", "## Current failures from metrics.json"])
+        for item in failures[:10]:
+            lines.append("- " + json.dumps(item, ensure_ascii=False, sort_keys=True)[:800])
+    text = "\n".join(lines).rstrip() + "\n"
+    if len(text) > max_chars:
+        text = text[: max_chars - 40].rstrip() + "\n...<eval contract clipped>...\n"
+    return text
+
+
+def _write_eval_contract_digest(root: str | Path) -> str:
+    text = _eval_contract_digest(root)
+    if not text:
+        return ""
+    return str(write_auto_note(root, "eval_contract", text))
+
+
+def _failure_digest(root: str | Path, *, max_chars: int = 5000) -> str:
+    root = Path(root)
+    metrics = _read_json(root / "metrics.json")
+    if not isinstance(metrics, dict) or not metrics:
+        return ""
+    metric_name = metrics.get("primary_metric_name") or metrics.get("metric_name") or "primary_metric"
+    metric_value = metrics.get("primary_metric", metrics.get(metric_name))
+    failures = metrics.get("failures")
+    lines = [
+        "# Failure Digest",
+        "",
+        "Facts extracted mechanically after the latest official evaluation. Use this to make the next patch narrow and evidence-driven.",
+        "",
+        f"- metric: {metric_name}={metric_value} higher_is_better={metrics.get('higher_is_better')}",
+    ]
+    for key in ("accuracy", "row_accuracy", "cell_accuracy", "exact_accuracy", "top1_accuracy", "runtime_sec", "runtime_seconds", "score"):
+        if key in metrics:
+            lines.append(f"- {key}: {metrics.get(key)}")
+    if isinstance(failures, list) and failures:
+        lines.extend(["", "## Failed cases"])
+        for item in failures[:12]:
+            lines.append("- " + json.dumps(item, ensure_ascii=False, sort_keys=True)[:900])
+    else:
+        lines.append("- failures: none listed in metrics.json")
+    text = "\n".join(lines).rstrip() + "\n"
+    if len(text) > max_chars:
+        text = text[: max_chars - 40].rstrip() + "\n...<failure digest clipped>...\n"
+    return text
+
+
+def _write_failure_digest(root: str | Path) -> str:
+    text = _failure_digest(root)
+    if not text:
+        return ""
+    return str(write_auto_note(root, "failure_digest", text))
+
+
 def _preferred_write_target(root: Path, item: str = "") -> str:
     lowered = str(item or "").lower()
     if "train.sh" in lowered:
@@ -335,9 +494,8 @@ def _preferred_write_target(root: Path, item: str = "") -> str:
     if "search.py" in lowered or "driver" in lowered:
         return "train/search.py"
     if any(token in lowered for token in (
-        "black-box", "black box", "objective", "minimize", "maximize", "metric",
-        "oracle", "incumbent", "candidate", "submission", "search", "exploration",
-        "refinement", "improve",
+        "black-box", "black box", "oracle", "incumbent", "candidate search",
+        "optimizer", "search", "exploration", "refinement",
     )):
         return "train/optimizer.py"
     for rel in ("train/train.py", "train/train.sh", "train/search.py", "train/optimizer.py"):
@@ -346,9 +504,12 @@ def _preferred_write_target(root: Path, item: str = "") -> str:
     return "train/train.py"
 
 
-def _direct_write_support_context(root: Path, target: str, max_chars: int = 1400) -> dict:
+def _direct_write_support_context(root: Path, target: str, max_chars: int = 2200) -> dict:
     """Small, high-signal context for a file-level write request."""
-    candidates = ["train/train.py", "train/train.sh", ".auto/execute_validation.md", "program.md"]
+    candidates = [
+        "train/train.py", "train/train.sh", "solution.py",
+        ".auto/eval_contract.md", ".auto/failure_digest.md", ".auto/execute_validation.md", "program.md",
+    ]
     if target and target not in candidates:
         candidates.append(target)
     payload: dict[str, str] = {}
@@ -575,7 +736,7 @@ def _train_side_snippets(root: str | Path, max_files: int = 4, max_chars_per_fil
 
 
 def _execute_parent_context(root: str | Path, project_text: str, item: str, max_chars: int = 12000) -> str:
-    notes = read_auto_notes(root, max_files=3)
+    notes = read_auto_notes(root, max_files=6, max_chars_per_file=1400)
     inventory = _train_side_inventory(root)
     inv_block = "\n".join(f"- {f}" for f in inventory) if inventory else "(no train-side files yet)"
     snippet_block = "\n\n".join(_train_side_snippets(root)) or "(no readable train-side snippets)"
@@ -626,7 +787,7 @@ def _execute_fallback_context(ctx: PhaseContext, item: str, direct_failed: str =
     target = _preferred_write_target(root, item)
     support = _direct_write_support_context(root, target, max_chars=1800)
     inventory = _train_side_inventory(root, max_files=30)
-    notes = read_auto_notes(root, max_files=3, max_chars_per_file=900)
+    notes = read_auto_notes(root, max_files=6, max_chars_per_file=1200)
     payload = {
         "purpose": "Fallback after direct-write could not produce a safe edit. Return one mutating write/apply_patch action.",
         "todo": str(item)[:1000],
@@ -649,20 +810,27 @@ def _execute_fallback_context(ctx: PhaseContext, item: str, direct_failed: str =
 
 
 def _note_action(item: str):
-    from core.autoresearch_loop import AutoResearchAction
+    from autoresearch.autoresearch_loop import AutoResearchAction
 
     return AutoResearchAction(type="note", rationale="execute_apply_change", content=item)
+
+
+_RESULT_ARTIFACT_PATHS = (
+    "outputs/submission.json",
+    "outputs/train_verification.json",
+    "outputs/predictions.json",
+    "submission/predictions.json",
+    "predictions.json",
+    "metrics.json",
+    "results.json",
+    "train/candidate.json",
+)
 
 
 def _project_fingerprint(root: str | Path) -> dict:
     root = Path(root)
     payload: dict[str, dict] = {}
-    for rel in (
-        "outputs/submission.json",
-        "outputs/train_verification.json",
-        "metrics.json",
-        "train/candidate.json",
-    ):
+    for rel in _RESULT_ARTIFACT_PATHS:
         path = root / rel
         if not path.exists() or not path.is_file():
             payload[rel] = {"exists": False}
@@ -678,6 +846,21 @@ def _project_fingerprint(root: str | Path) -> dict:
             "sha1": hashlib.sha1(data).hexdigest()[:12],
         }
     return payload
+
+
+def _changed_result_artifacts(before: dict, after: dict) -> list[str]:
+    return [
+        rel for rel, value in (after or {}).items()
+        if value != (before or {}).get(rel) and value.get("exists")
+    ]
+
+
+def _has_visible_result_artifacts(*snapshots: dict) -> bool:
+    for snapshot in snapshots:
+        for value in (snapshot or {}).values():
+            if isinstance(value, dict) and value.get("exists"):
+                return True
+    return False
 
 
 def _read_project_json(root: str | Path, rel: str) -> dict:
@@ -725,6 +908,7 @@ def _metric_payload(root: str | Path) -> dict:
     train_v = _read_project_json(root, "outputs/train_verification.json")
     metrics = _read_project_json(root, "metrics.json")
     submission = _read_project_json(root, "outputs/submission.json")
+    predictions = _read_project_json(root, "submission/predictions.json") or _read_project_json(root, "predictions.json")
     metric_source = train_v or metrics
     direction_source = metrics or train_v
     metric = metric_source.get("z", metric_source.get("primary_metric"))
@@ -738,6 +922,7 @@ def _metric_payload(root: str | Path) -> dict:
         "metric_name": metric_source.get("metric_name", "primary_metric") if metric_source else "",
         "higher_is_better": higher,
         "submission": _compact_json_value(submission, max_chars=500),
+        "predictions": _compact_json_value(predictions, max_chars=500),
         "train_verification": _compact_json_value(train_v, max_chars=900),
         "metrics": _compact_json_value(metrics, max_chars=900),
     }
@@ -846,10 +1031,11 @@ def _execute_behavior_check(ctx: PhaseContext, item: str, action, obs, *, static
             note += f"; stdout={stdout[:400]}"
     after_behavior = _project_fingerprint(root)
     metric_payload = _metric_payload(root)
-    changed_artifacts = [
-        rel for rel, value in after_behavior.items()
-        if value != before.get(rel) and value.get("exists")
-    ]
+    changed_artifacts = _changed_result_artifacts(before, after_behavior)
+    expects_result_artifact = bool(command and _has_visible_result_artifacts(before, after_write, after_behavior))
+    if expects_result_artifact and not changed_artifacts:
+        behavior_verified = False
+        note = (note + "; " if note else "") + "no result artifact updated by behavior check"
     payload = {
         "item": item,
         "action": {
@@ -877,6 +1063,7 @@ def _execute_behavior_check(ctx: PhaseContext, item: str, action, obs, *, static
         "after_write": after_write,
         "after_behavior": after_behavior,
         "changed_artifacts": changed_artifacts,
+        "expects_result_artifact": expects_result_artifact,
         "result": metric_payload,
         "note": note,
     }
@@ -991,6 +1178,8 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
     fn = execute_fn or _default_execute_fn
 
     def handler(ctx: PhaseContext) -> PhaseResult:
+        _write_eval_contract_digest(ctx.root)
+        _write_failure_digest(ctx.root)
         todo_state = load_todo_state(ctx.root)
         structured_tasks = bool(todo_state.get("tasks"))
         ready = ready_execute_tasks(todo_state)
@@ -1068,6 +1257,13 @@ def make_execute_handler(execute_fn: Optional[ExecuteFn] = None):
             _update_task_from_execute_result(todo_state, task, res)
             if task and _task_should_continue_subgoals(todo_state, task):
                 repeat_current_window = True
+                # Stop this Execute visit after a successful focused subgoal.
+                # The next visit will continue the same task with the updated
+                # subgoal cursor. Continuing to unrelated ready tasks in the
+                # same window makes broad implementation plans expensive and
+                # hides the useful intermediate behavior check.
+                if res.get("status") in {"ok", "done"} and res.get("verification"):
+                    break
             if task and res.get("status") in {"failed", "tried"} and not res.get("verification"):
                 repeat_current_window = True
             # verification hard-constraint: only verified items count as done.
@@ -1129,6 +1325,8 @@ def _execution_attempt(task: Optional[dict], item: str) -> tuple[str, dict]:
     """Select a small current subgoal from an oversized implementation task."""
     empty_meta = {"subgoal_index": 0, "subgoal_count": 1}
     if not task:
+        return item, empty_meta
+    if task.get("repairs_task_id"):
         return item, empty_meta
     text = str(item or "").strip()
     pieces = _split_implementation_goal(text)
@@ -1290,6 +1488,21 @@ def _update_task_from_execute_result(state: dict, task: Optional[dict], result: 
             if path and path not in existing_artifacts:
                 existing_artifacts.append(str(path))
         target["artifacts"] = existing_artifacts[-12:]
+    if target.get("repairs_task_id") and target.get("status") == "verified":
+        repaired_id = str(target.get("repairs_task_id") or "")
+        for existing in state.get("tasks", []):
+            if existing.get("task_id") != repaired_id:
+                continue
+            if existing.get("status") == "failed":
+                existing["status"] = "pending"
+                deps = list(existing.get("depends_on") or [])
+                if target["task_id"] not in deps:
+                    deps.append(target["task_id"])
+                existing["depends_on"] = deps
+                last = dict(existing.get("last_result") or {})
+                last["reopened_by_repair"] = target["task_id"]
+                existing["last_result"] = last
+            break
 
 
 def _append_change_record(project_text: str, line: str) -> str:
@@ -1536,7 +1749,7 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         poll_interval = 0.0
         max_evals_override = None
         max_seconds_override = None
-    from core.autoresearch_loop import AutoResearchAction, git_snapshot
+    from autoresearch.autoresearch_loop import AutoResearchAction, git_snapshot
 
     action = AutoResearchAction(type="run", rationale=rationale, command=command, role="trial")
     base_git = git_snapshot(loop.settings.root(), enabled=loop.settings.use_git_versioning)
@@ -1603,6 +1816,7 @@ def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: i
             "updated_at": time.time(),
         }
         break
+    state = repair_failed_run_tasks(state)
     save_todo_state(root, state)
 
 
@@ -1635,15 +1849,15 @@ def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[Autofi
             result = run(ctx)
         major = result.get("status") == "failed"
         metric, higher = _metric_from_file(ctx.root)
-        threshold = getattr(getattr(ctx.loop, "settings", None), "solved_metric_threshold", None)
-        solved = False
-        if threshold is not None and metric is not None:
-            threshold = float(threshold)
-            solved = bool((not higher and metric <= threshold) or (higher and metric >= threshold))
+        _write_eval_contract_digest(ctx.root)
+        _write_failure_digest(ctx.root)
+        criteria = parse_completion_criteria(ctx.program_text)
+        solved = is_metric_solved(metric, criteria)
         driver = result.get("search_driver") or "(single train+eval)"
         write_auto_note(ctx.root, "run_report",
                         f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} "
-                        f"autofix_attempts={attempts} driver={driver} inner_evals={result.get('inner_evals', 1)} solved={solved}\n")
+                        f"autofix_attempts={attempts} driver={driver} inner_evals={result.get('inner_evals', 1)} "
+                        f"solved={solved} criteria={criteria}\n")
         if major:
             append_lesson(ctx.root, kind="operational_error",
                           summary=f"run failed after {attempts} autofix attempts",

@@ -36,7 +36,7 @@ def normalize_task(task: dict, *, fallback_index: int = 1) -> dict:
         status = "pending"
     if task_type not in VALID_TYPES:
         task_type = "implementation"
-    return {
+    normalized = {
         "task_id": task_id,
         "goal": str(task.get("goal") or task.get("title") or "").strip(),
         "type": task_type,
@@ -52,6 +52,14 @@ def normalize_task(task: dict, *, fallback_index: int = 1) -> dict:
         "last_result": _dict(task.get("last_result")),
         "lessons": _string_list(task.get("lessons")),
     }
+    # Preserve non-scheduling metadata used by higher-level loop helpers.  Keep
+    # this intentionally narrow so arbitrary planner output does not bloat the
+    # persisted task state.
+    if task.get("repairs_task_id"):
+        normalized["repairs_task_id"] = str(task.get("repairs_task_id"))
+    if task.get("failure_evidence"):
+        normalized["failure_evidence"] = _single_line(str(task.get("failure_evidence")), limit=700)
+    return normalized
 
 
 def normalize_todo_state(data: dict | None) -> dict:
@@ -185,6 +193,32 @@ def has_failed_tasks(state: dict, *, phase: str | None = None) -> bool:
     return bool(tasks)
 
 
+def has_blocking_failed_tasks(state: dict, *, phase: str | None = None) -> bool:
+    """Return failures that should force replanning.
+
+    A failed Run checkpoint is often useful evidence, not proof that the plan is
+    dead. If there is still open Execute work later in the DAG, the attempt loop
+    should get a chance to repair the failure before the controller throws away
+    the whole plan.
+    """
+    normalized = normalize_todo_state(state)
+    failed = [t for t in normalized["tasks"] if t.get("status") in {"failed", "blocked"}]
+    if phase:
+        failed = [t for t in failed if task_phase(t) == phase]
+    if not failed:
+        return False
+    open_execute = [t for t in normalized["tasks"] if t.get("status") in OPEN_STATUSES and task_phase(t) == "execute"]
+    if not open_execute:
+        return True
+    min_open_execute_priority = min(int(t.get("priority") or 0) for t in open_execute)
+    for task in failed:
+        if task_phase(task) == "execute":
+            return True
+        if int(task.get("priority") or 0) >= min_open_execute_priority:
+            return True
+    return False
+
+
 def ready_execute_tasks(state: dict, *, limit: int | None = None) -> list[dict]:
     """Return ready Execute tasks before the next ready Run checkpoint."""
     normalized = normalize_todo_state(state)
@@ -219,6 +253,77 @@ def ready_tasks(
     return tasks[:limit] if limit is not None else tasks
 
 
+def repair_failed_run_tasks(state: dict) -> dict:
+    """Convert failed run checkpoints into explicit implementation repair work.
+
+    This closes a common loop failure: `train/eval` fails, the run task becomes
+    failed, and dependencies prevent the next implementation from ever becoming
+    ready. Instead, add one implementation task right after the failed run and
+    redirect later tasks that depended on the failed run to depend on the repair.
+    """
+    normalized = normalize_todo_state(state)
+    tasks = list(normalized["tasks"])
+    if not tasks:
+        return normalized
+    existing_ids = {task["task_id"] for task in tasks}
+    existing_repairs = {
+        str(task.get("repairs_task_id") or "")
+        for task in tasks
+        if str(task.get("repairs_task_id") or "")
+    }
+    changed = False
+    result: list[dict] = []
+    for task in tasks:
+        result.append(task)
+        if task.get("status") != "failed" or task_phase(task) != "run":
+            continue
+        failed_id = str(task.get("task_id") or "")
+        if failed_id in existing_repairs:
+            continue
+        repair_id = normalize_task_id(f"repair_{failed_id}", fallback_index=len(result) + 1)
+        suffix = 2
+        base = repair_id
+        while repair_id in existing_ids:
+            repair_id = f"{base}_{suffix}"
+            suffix += 1
+        existing_ids.add(repair_id)
+        last = task.get("last_result") or {}
+        summary = _single_line(str(last.get("summary") or last.get("note") or ""), limit=700)
+        repair = normalize_task({
+            "task_id": repair_id,
+            "goal": (
+                "Fix the train-side pipeline so the failed run checkpoint can execute. "
+                "Create or update the missing train-side entrypoint and preserve submission JSON generation."
+            ),
+            "type": "implementation",
+            "status": "pending",
+            "priority": int(task.get("priority") or len(result)) + 1,
+            "allowed_paths": ["train/**"],
+            "context_paths": ["program.md", "README.md", "train/train.sh", "train/train.py"],
+            "depends_on": [],
+            "plan_summary": "Repair failed train/eval checkpoint before continuing experiments.",
+            "repairs_task_id": failed_id,
+            "failure_evidence": summary,
+        }, fallback_index=len(result) + 1)
+        result.append(repair)
+        changed = True
+    if not changed:
+        return normalized
+    repair_ids = {
+        str(task.get("repairs_task_id")): task["task_id"]
+        for task in result
+        if str(task.get("repairs_task_id") or "")
+    }
+    for task in result:
+        deps = list(task.get("depends_on") or [])
+        replaced = [repair_ids.get(dep, dep) for dep in deps]
+        if replaced != deps:
+            task["depends_on"] = replaced
+    for index, task in enumerate(result, start=1):
+        task["priority"] = index
+    return normalize_todo_state({"version": 1, "tasks": result})
+
+
 def render_todo_markdown(state: dict) -> str:
     tasks = normalize_todo_state(state)["tasks"]
     lines = ["# Todo State", ""]
@@ -250,6 +355,11 @@ def _dict(value: Any) -> dict:
     return dict(value) if isinstance(value, dict) else {}
 
 
+def _single_line(value: str, *, limit: int = 700) -> str:
+    text = " ".join(str(value or "").split())
+    return text[: max(0, int(limit))]
+
+
 __all__ = [
     "VALID_STATUSES",
     "VALID_TYPES",
@@ -257,6 +367,7 @@ __all__ = [
     "empty_todo_state",
     "has_open_tasks",
     "has_failed_tasks",
+    "has_blocking_failed_tasks",
     "has_ready_execute_tasks",
     "load_todo_state",
     "merge_todo_state",
@@ -266,6 +377,7 @@ __all__ = [
     "open_tasks",
     "ready_execute_tasks",
     "ready_tasks",
+    "repair_failed_run_tasks",
     "render_todo_markdown",
     "save_todo_state",
     "task_phase",

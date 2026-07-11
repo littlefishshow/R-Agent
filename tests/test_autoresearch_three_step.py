@@ -1,10 +1,10 @@
 from pathlib import Path
 import json
 
-from core.autoresearch_loop import AutoResearchLoop, AutoResearchSettings
-from core.autoresearch_memory import read_phase
-from core.autoresearch_three_step import ThreeStepController
-from core.autoresearch_todo_state import load_todo_state, save_todo_state
+from autoresearch.autoresearch_loop import AutoResearchLoop, AutoResearchSettings
+from autoresearch.autoresearch_memory import read_phase
+from autoresearch.autoresearch_three_step import ThreeStepController
+from autoresearch.autoresearch_todo_state import load_todo_state, save_todo_state
 
 
 def _settings(tmp_path):
@@ -14,6 +14,7 @@ def _settings(tmp_path):
 
 def test_three_step_attempt_runs_execute_and_ready_run_checkpoint(tmp_path):
     settings = _settings(tmp_path)
+    settings.trace_rounds = True
     (tmp_path / "project.md").write_text(
         "# Project State\n\n<!-- PHASE: attempt -->\n<!-- PHASE_REASON: test -->\n",
         encoding="utf-8",
@@ -52,8 +53,59 @@ def test_three_step_attempt_runs_execute_and_ready_run_checkpoint(tmp_path):
     assert payload["task"]["task_id"] == "impl"
     assert payload["todo_digest"]["ready_execute"][0]["task_id"] == "impl"
     assert payload["policy"]["parent_role"].startswith("schedule")
+    assert payload["done_tag"] == "ATTEMPT_DONE"
+    assert payload["step_context"]["tool_policy"]["child_allowed_tools"]
+    assert "delegate_task" in payload["step_context"]["tool_policy"]["child_excluded_tools"]
     phase, _ = read_phase((tmp_path / "project.md").read_text(encoding="utf-8"))
     assert phase == "conclude"
+    trace = tmp_path / ".autoresearch" / "step_traces" / "step_000_attempt.json"
+    assert trace.exists()
+    trace_payload = json.loads(trace.read_text(encoding="utf-8"))
+    assert trace_payload["phase"] == "attempt"
+    assert trace_payload["next_phase"] == "conclude"
+    assert trace_payload["todo_digest"]["total"] == 2
+    assert "program_excerpt" in trace_payload
+
+
+def test_three_step_attempt_pauses_when_run_marks_solved(tmp_path):
+    settings = _settings(tmp_path)
+    (tmp_path / "program.md").write_text(
+        "Goal: minimize z\n\n## Completion Criteria\n- metric_name: z\n- higher_is_better: false\n- z <= 0.1\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "project.md").write_text(
+        "# Project State\n\n<!-- PHASE: attempt -->\n<!-- PHASE_REASON: test -->\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text(
+        "#!/usr/bin/env bash\nprintf '{\"primary_metric\":0,\"z\":0,\"higher_is_better\":false}\\n' > metrics.json\n",
+        encoding="utf-8",
+    )
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "analysis", "type": "analysis", "status": "pending", "priority": 1},
+            {
+                "task_id": "val",
+                "goal": "run eval",
+                "type": "validation",
+                "status": "pending",
+                "priority": 2,
+                "depends_on": ["impl"],
+                "run_spec": {"mode": "single", "commands": ["bash train/train.sh"]},
+            },
+        ]
+    })
+    loop = AutoResearchLoop(settings)
+    controller = ThreeStepController(settings, loop=loop)
+
+    report = controller.step()
+
+    assert report["ran_phase"] == "attempt"
+    assert report["next_phase"] == "pause"
+    phase, reason = read_phase((tmp_path / "project.md").read_text(encoding="utf-8"))
+    assert phase == "pause"
+    assert "solved" in reason
 
 
 def test_three_step_conclude_continues_current_dag_instead_of_replanning(tmp_path):
@@ -75,3 +127,58 @@ def test_three_step_conclude_continues_current_dag_instead_of_replanning(tmp_pat
     assert report["next_phase"] == "attempt"
     phase, _ = read_phase((tmp_path / "project.md").read_text(encoding="utf-8"))
     assert phase == "attempt"
+
+
+class _CapturingStepAgent:
+    calls = []
+
+    def __init__(self, max_iterations=None, session_id=None):
+        self.max_iterations = max_iterations
+        self.session_id = session_id
+
+    def run_conversation(self, **kwargs):
+        type(self).calls.append(kwargs)
+        data = json.loads(kwargs["user_message"])
+        if data["step"] == "plan":
+            return json.dumps({
+                "summary": "agent plan",
+                "tasks": [
+                    {"task_id": "a1", "goal": "inspect", "type": "analysis", "status": "pending", "priority": 1}
+                ],
+                "done_tag": data["done_tag"],
+            }, ensure_ascii=False)
+        return f"finished {data['step']} {data['done_tag']}"
+
+
+def test_three_step_optional_agent_loop_uses_step_tool_policy(tmp_path, monkeypatch):
+    import core.agent
+
+    _CapturingStepAgent.calls = []
+    monkeypatch.setattr(core.agent, "RAgent", _CapturingStepAgent)
+    settings = _settings(tmp_path)
+    settings.autoresearch_step_agent_loop = True
+    settings.autoresearch_step_max_iterations = 3
+    (tmp_path / "project.md").write_text(
+        "# Project State\n\n<!-- PHASE: plan -->\n<!-- PHASE_REASON: test -->\n",
+        encoding="utf-8",
+    )
+    loop = AutoResearchLoop(settings)
+    controller = ThreeStepController(settings, loop=loop)
+
+    report = controller.step()
+
+    assert report["ran_phase"] == "plan"
+    assert report["next_phase"] == "attempt"
+    call = _CapturingStepAgent.calls[0]
+    assert "delegate_task" in call["allowed_tools"]
+    assert call["exclude_tools"] == ()
+    assert call["tool_call_guard"]("write_file", "{}").startswith("tool write_file is not allowed")
+    assert "codebase_scout" in call["system_message"]
+    assert "child_allowed_tools" in call["system_message"]
+    user_payload = json.loads(call["user_message"])
+    assert user_payload["done_tag"] == "PLAN_DONE"
+    assert user_payload["context"]["tool_policy"]["child_excluded_tools"]
+    assert user_payload["context"]["tool_policy"]["allowed_skills"] == ["codebase_scout"]
+    state = load_todo_state(tmp_path)
+    assert state["tasks"][0]["task_id"] == "a1"
+    assert (tmp_path / ".auto" / "plan.md").exists()

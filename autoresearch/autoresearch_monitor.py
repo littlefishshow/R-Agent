@@ -1,4 +1,4 @@
-"""AutoResearch v2 — non-LLM run monitor + heartbeat.
+"""AutoResearch V3 — non-LLM run monitor + heartbeat.
 
 Writes a small ``.autoresearch/monitor.json`` heartbeat every phase step so the
 loop can run as a detached subprocess while anything else (a parent agent, a
@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from core.autoresearch_debug import read_inflight
+from autoresearch.autoresearch_debug import read_inflight
 
 
 class RunMonitor:
@@ -141,6 +141,10 @@ def read_monitor(path: str | Path) -> dict:
         age = time.time() - float(data.get("updated_at") or 0)
         data["heartbeat_age_seconds"] = round(age, 1)
         data["stale"] = age > 300  # 5 min without an update => suspicious
+        pid = int(data.get("pid") or 0)
+        if pid > 0 and not _pid_exists(pid):
+            data["stale"] = True
+            data["stale_reason"] = "pid_not_found"
     try:
         root = p.parent.parent
         inflight = read_inflight(root)
@@ -149,6 +153,18 @@ def read_monitor(path: str | Path) -> dict:
     except Exception:
         pass
     return data
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return True
 
 
 def render_monitor_text(data: dict, bar_width: int = 20) -> str:
@@ -183,7 +199,8 @@ def render_monitor_text(data: dict, bar_width: int = 20) -> str:
             + (f" detail={inflight.get('detail')}" if inflight.get("detail") else "")
         )
     if data.get("stale"):
-        lines.append(f"⚠️ heartbeat stale ({data.get('heartbeat_age_seconds')}s, pid {data.get('pid')})")
+        reason = f", reason={data.get('stale_reason')}" if data.get("stale_reason") else ""
+        lines.append(f"⚠️ heartbeat stale ({data.get('heartbeat_age_seconds')}s, pid {data.get('pid')}{reason})")
     if data.get("error"):
         lines.append(f"error: {data.get('error')}")
     return "\n".join(lines)
