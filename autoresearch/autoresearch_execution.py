@@ -485,6 +485,41 @@ def _write_failure_digest(root: str | Path) -> str:
     return str(write_auto_note(root, "failure_digest", text))
 
 
+def _eval_import_targets(root: str | Path) -> list[str]:
+    root = Path(root)
+    eval_path = root / "eval.py"
+    if not eval_path.exists():
+        return []
+    try:
+        text = eval_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return []
+    return sorted(set(_TARGET_LOAD_RE.findall(text)))
+
+
+def _is_direct_eval_target(root: str | Path, rel_path: str) -> bool:
+    rel = str(rel_path or "").lstrip("./")
+    return rel in set(_eval_import_targets(root))
+
+
+def _direct_eval_import_check(loop, rel_path: str) -> dict:
+    from autoresearch.autoresearch_loop import AutoResearchAction
+
+    rel = str(rel_path or "").lstrip("./")
+    module_name = "_autoresearch_smoke_" + re.sub(r"[^A-Za-z0-9_]+", "_", Path(rel).stem)
+    code = (
+        "import importlib.util\n"
+        "from pathlib import Path\n"
+        f"path = Path({rel!r})\n"
+        f"spec = importlib.util.spec_from_file_location({module_name!r}, path)\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        "print('import_ok')\n"
+    )
+    action = AutoResearchAction(type="run", rationale="execute direct eval import smoke", command="python3 -c " + shlex.quote(code))
+    return loop.runner.run(action.command)
+
+
 def _preferred_write_target(root: Path, item: str = "") -> str:
     lowered = str(item or "").lower()
     if "train.sh" in lowered:
@@ -507,7 +542,8 @@ def _preferred_write_target(root: Path, item: str = "") -> str:
 def _direct_write_support_context(root: Path, target: str, max_chars: int = 2200) -> dict:
     """Small, high-signal context for a file-level write request."""
     candidates = [
-        "train/train.py", "train/train.sh", "solution.py",
+        "train/train.py", "train/train.sh",
+        *(_eval_import_targets(root) or ["solution.py"]),
         ".auto/eval_contract.md", ".auto/failure_digest.md", ".auto/execute_validation.md", "program.md",
     ]
     if target and target not in candidates:
@@ -794,6 +830,7 @@ def _execute_fallback_context(ctx: PhaseContext, item: str, direct_failed: str =
         "task_context": task_context,
         "previous_direct_write_error": str(direct_failed or "")[:800],
         "preferred_path": target,
+        "eval_import_targets": _eval_import_targets(root),
         "editable_train_side_files": inventory,
         "support_context": support,
         "recent_auto_notes": notes,
@@ -1007,11 +1044,37 @@ def _execute_behavior_check(ctx: PhaseContext, item: str, action, obs, *, static
     before = before if isinstance(before, dict) else {}
     after_write = _project_fingerprint(root)
     enabled = bool(getattr(getattr(loop, "settings", None), "execute_behavior_check", True)) if loop is not None else False
-    command = _execute_behavior_command(root, action) if enabled else None
+    action_paths = [str(getattr(a, "path", "") or "") for a in action.actions] if isinstance(action, _ExecuteActionBundle) else [str(getattr(action, "path", "") or "")]
+    direct_eval_targets = [path for path in action_paths if _is_direct_eval_target(root, path)]
+    command = ""
     command_result = None
     behavior_verified = True
     note = ""
-    if command and loop is not None:
+    if enabled and loop is not None and direct_eval_targets:
+        command = "python3 -m py_compile " + " ".join(shlex.quote(path) for path in direct_eval_targets) + " && import smoke"
+        compile_result = loop.runner.run("python3 -m py_compile " + " ".join(shlex.quote(path) for path in direct_eval_targets))
+        if compile_result.get("returncode") == 0:
+            import_result = _direct_eval_import_check(loop, direct_eval_targets[0])
+            command_result = {
+                "returncode": import_result.get("returncode"),
+                "duration_seconds": round(float(compile_result.get("duration_seconds") or 0) + float(import_result.get("duration_seconds") or 0), 3),
+                "stdout": (compile_result.get("stdout") or "") + (import_result.get("stdout") or ""),
+                "stderr": (compile_result.get("stderr") or "") + (import_result.get("stderr") or ""),
+                "timeout": bool(compile_result.get("timeout") or import_result.get("timeout")),
+            }
+        else:
+            command_result = compile_result
+        behavior_verified = command_result.get("returncode") == 0
+        stdout = (command_result.get("stdout") or "")[-1200:]
+        stderr = (command_result.get("stderr") or "")[-1200:]
+        note = f"direct eval target smoke rc={command_result.get('returncode')} duration={command_result.get('duration_seconds')}s"
+        if stderr:
+            note += f"; stderr={stderr[:400]}"
+        elif stdout:
+            note += f"; stdout={stdout[:400]}"
+    else:
+        command = _execute_behavior_command(root, action) if enabled else None
+    if command and loop is not None and not direct_eval_targets:
         timeout = int(getattr(getattr(loop, "settings", None), "execute_behavior_check_timeout_seconds", 60) or 60)
         old_timeout = getattr(loop.runner, "timeout_seconds", None)
         try:
@@ -1032,7 +1095,7 @@ def _execute_behavior_check(ctx: PhaseContext, item: str, action, obs, *, static
     after_behavior = _project_fingerprint(root)
     metric_payload = _metric_payload(root)
     changed_artifacts = _changed_result_artifacts(before, after_behavior)
-    expects_result_artifact = bool(command and _has_visible_result_artifacts(before, after_write, after_behavior))
+    expects_result_artifact = bool(command and not direct_eval_targets and _has_visible_result_artifacts(before, after_write, after_behavior))
     if expects_result_artifact and not changed_artifacts:
         behavior_verified = False
         note = (note + "; " if note else "") + "no result artifact updated by behavior check"

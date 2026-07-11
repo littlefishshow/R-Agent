@@ -1493,3 +1493,55 @@ def test_execute_direct_write_prompt_includes_eval_and_failure_digests(tmp_path)
     assert "failure_digest" in user
     assert "solution.py" in user
     assert "expected" in user and "pred" in user
+
+
+def test_direct_eval_solution_write_uses_import_smoke_not_result_artifact(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "eval.py").write_text(
+        "import importlib.util\nfrom pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location('solution', Path('solution.py'))\n"
+        "mod = importlib.util.module_from_spec(spec); spec.loader.exec_module(mod)\n"
+        "print(mod.solve('x'))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "solution.py").write_text("def solve(x):\n    return x\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "update solution implementation", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(
+                    type="write",
+                    rationale="write solution",
+                    path="solution.py",
+                    content="def solve(x):\n    return 'ok'\n",
+                )
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert "1/1 verified" in result.summary
+    assert task["status"] == "verified"
+    assert "direct eval target smoke" in task["last_result"]["note"]
+    assert task["last_result"]["behavior"]["command"].startswith("python3 -m py_compile solution.py")
+
+
+def test_fallback_context_lists_eval_import_targets(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "eval.py").write_text(
+        "import importlib.util\nfrom pathlib import Path\n"
+        "spec = importlib.util.spec_from_file_location('solution', Path('solution.py'))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "solution.py").write_text("def solve(x):\n    return x\n", encoding="utf-8")
+    ctx = _ctx(tmp_path, "execute")
+    payload = json.loads(_execute_fallback_context(ctx, "improve implementation", max_chars=10000))
+    assert payload["eval_import_targets"] == ["solution.py"]
+    assert "solution.py" in payload["support_context"]
