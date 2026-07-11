@@ -520,7 +520,24 @@ def _direct_eval_import_check(loop, rel_path: str) -> dict:
     return loop.runner.run(action.command)
 
 
+def _explicit_project_path_from_text(root: Path, text: str) -> str:
+    for match in re.finditer(r"`?([A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*\.(?:py|sh|json|md|txt|yaml|yml|toml))`?", str(text or "")):
+        rel = match.group(1).lstrip("./")
+        parts = Path(rel).parts
+        if not parts or ".." in parts:
+            continue
+        name = Path(rel).name
+        if name in {"eval.py", "eval.sh", "blackbox_oracle.py"}:
+            continue
+        if (root / rel).exists() or (len(parts) > 1 and len(parts) <= 3):
+            return rel
+    return ""
+
+
 def _preferred_write_target(root: Path, item: str = "") -> str:
+    explicit = _explicit_project_path_from_text(root, item)
+    if explicit:
+        return explicit
     lowered = str(item or "").lower()
     if "train.sh" in lowered:
         return "train/train.sh"

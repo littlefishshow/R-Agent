@@ -1545,3 +1545,13 @@ def test_fallback_context_lists_eval_import_targets(tmp_path):
     payload = json.loads(_execute_fallback_context(ctx, "improve implementation", max_chars=10000))
     assert payload["eval_import_targets"] == ["solution.py"]
     assert "solution.py" in payload["support_context"]
+
+
+def test_preferred_write_target_respects_explicit_project_path(tmp_path):
+    (tmp_path / "solution.py").write_text("def solve():\n    pass\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("print('train')\n", encoding="utf-8")
+
+    assert _preferred_write_target(tmp_path, "Patch solution.py to fix failures") == "solution.py"
+    assert _preferred_write_target(tmp_path, "Update submission/solver.py generator") == "submission/solver.py"
+    assert _preferred_write_target(tmp_path, "Do not touch eval.py; improve implementation") == "train/train.py"
