@@ -1017,3 +1017,43 @@ def test_auto_research_stop_tool_creates_and_clears_sentinel(tmp_path):
     resume = json.loads(auto_research_stop_tool(str(tmp_path), resume=True))
     assert resume["success"] is True and resume["removed"] is True
     assert not (tmp_path / ".autoresearch" / "STOP").exists()
+
+
+def test_artifact_only_restores_best_source_snapshot_without_git(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmaximize score\n", encoding="utf-8")
+    (tmp_path / "solution.py").write_text("VALUE = 'base'\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="restore-best",
+        max_rounds=0,
+        use_git_versioning=False,
+        versioning_policy="artifact_only",
+        defer_experiment_finalization=True,
+        max_experiments=4,
+    )
+    loop = AutoResearchLoop(settings)
+
+    good_action = AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="good trial",
+        command="printf good > solution.py && printf '{\"primary_metric\": 0.9, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\n' > metrics.json && cat metrics.json",
+    )
+    good_obs = loop.execute_action(good_action)
+    loop._maybe_record_experiment(good_action, good_obs, {"git_available": False}, "run_experiment")
+
+    bad_action = AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="bad trial",
+        command="printf bad > solution.py && printf '{\"primary_metric\": 0.1, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\n' > metrics.json && cat metrics.json",
+    )
+    bad_obs = loop.execute_action(bad_action)
+    loop._maybe_record_experiment(bad_action, bad_obs, {"git_available": False}, "run_experiment")
+
+    result = loop.finalize_experiments()
+    state = loop.context.load_state()
+
+    assert result["best_experiment"]["hypothesis"] == "good trial"
+    assert (tmp_path / "solution.py").read_text(encoding="utf-8") == "good"
+    assert state["best_restore"]["restored"] == ["solution.py"]

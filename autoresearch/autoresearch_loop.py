@@ -2160,6 +2160,92 @@ class AutoResearchLoop:
             return False
         return "baseline" in (action.rationale or "").lower()
 
+    _SOURCE_SNAPSHOT_SUFFIXES = (".py", ".sh", ".json", ".md", ".txt", ".yaml", ".yml", ".toml")
+    _SOURCE_SNAPSHOT_SKIP_DIRS = {".git", ".autoresearch", ".auto", "__pycache__", "outputs", ".pytest_cache"}
+
+    def _source_snapshot_files(self) -> list[str]:
+        root = self.settings.root()
+        candidates: list[str] = []
+        for rel in ("solution.py", "train/train.py", "train/train.sh", "submission/solver.py", "submission/matcher.py", "submission/cleaner.py"):
+            if (root / rel).is_file():
+                candidates.append(rel)
+        for base_rel in ("train", "submission"):
+            base = root / base_rel
+            if not base.is_dir():
+                continue
+            for path in sorted(base.rglob("*")):
+                if not path.is_file():
+                    continue
+                try:
+                    rel = str(path.relative_to(root))
+                except ValueError:
+                    continue
+                if any(part in self._SOURCE_SNAPSHOT_SKIP_DIRS for part in Path(rel).parts):
+                    continue
+                if path.suffix.lower() in self._SOURCE_SNAPSHOT_SUFFIXES and rel not in candidates:
+                    candidates.append(rel)
+                if len(candidates) >= 60:
+                    break
+        return candidates[:60]
+
+    def _save_source_snapshot(self, experiment_id: str) -> str:
+        root = self.settings.root()
+        files = {}
+        for rel in self._source_snapshot_files():
+            path = root / rel
+            try:
+                files[rel] = path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+        if not files:
+            return ""
+        return self.artifacts.save(
+            kind="source_snapshot",
+            rationale=experiment_id,
+            content=json.dumps({"files": files}, ensure_ascii=False, indent=2) + "\n",
+            extension="json",
+        )
+
+    def _restore_source_snapshot(self, snapshot_path: str) -> dict:
+        if not snapshot_path:
+            return {"restored": [], "error": "no snapshot"}
+        path = Path(snapshot_path)
+        if not path.exists():
+            return {"restored": [], "error": "snapshot missing"}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            return {"restored": [], "error": str(exc)}
+        files = data.get("files") if isinstance(data, dict) else {}
+        if not isinstance(files, dict):
+            return {"restored": [], "error": "invalid snapshot"}
+        restored = []
+        for rel, content in files.items():
+            try:
+                target = self.boundary.resolve(str(rel))
+                self._ensure_not_readonly_eval(target)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(str(content), encoding="utf-8")
+                restored.append(str(rel))
+            except Exception:
+                continue
+        return {"restored": restored, "error": ""}
+
+    def _restore_best_source_snapshot(self, state: dict) -> None:
+        best = state.get("best_experiment") if isinstance(state, dict) else None
+        if not isinstance(best, dict) or not best.get("source_snapshot_path"):
+            return
+        current = self._save_source_snapshot("current-before-best-restore")
+        if current:
+            state["pre_restore_source_snapshot_path"] = current
+        result = self._restore_source_snapshot(best.get("source_snapshot_path", ""))
+        state["best_restore"] = {
+            "experiment_id": best.get("experiment_id", ""),
+            "source_snapshot_path": best.get("source_snapshot_path", ""),
+            **result,
+            "updated_at": time.time(),
+        }
+
     def _maybe_record_experiment(self, action: AutoResearchAction, obs: AutoResearchObservation, base_git: dict, step_name: str) -> None:
         if not self._is_experiment_action(action, step_name):
             return
@@ -2192,6 +2278,7 @@ class AutoResearchLoop:
         git_available = bool(git_after.get("git_available"))
         changed_files = git_changed_files(self.settings.root()) if git_available else []
         diff_path = save_project_diff(self.settings.root(), self.artifacts, experiment_id, git_available=git_available)
+        source_snapshot_path = self._save_source_snapshot(experiment_id)
         base_commit = base_git.get("head", "") if isinstance(base_git, dict) else ""
         base_clean = _git_worktree_clean(base_git)
         record = {
@@ -2207,6 +2294,7 @@ class AutoResearchLoop:
             "decision": decision,
             "changed_files": changed_files,
             "diff_path": diff_path,
+            "source_snapshot_path": source_snapshot_path,
             "artifact_path": obs.artifact_path,
             "git_commit": "",
             "commit_sha": "",
@@ -2264,6 +2352,8 @@ class AutoResearchLoop:
         feedback = self._search_feedback_digest()
         if feedback:
             self.context.add_to_bucket(state, "experiment_results", feedback)
+        if normalize_versioning_policy(self.settings.versioning_policy) == "artifact_only" and not bool(self.settings.use_git_versioning):
+            self._restore_best_source_snapshot(state)
         self.context.save_state(state)
         self._write_evolution_artifacts(state)
         return {"finalized": finalized, "best_experiment": best, "pareto_count": len(front)}

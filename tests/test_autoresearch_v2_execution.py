@@ -207,7 +207,7 @@ def test_execute_prefers_write_action_surface(tmp_path):
     make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
     assert captured["allowed"][0] == "write"
     assert captured["allowed"].index("write") < captured["allowed"].index("apply_patch")
-    assert "Prefer a full-file write action" in captured["ctx"]
+    assert "Prefer a small JSON change spec" in captured["ctx"]
 
 
 def test_execute_context_lists_existing_files_and_tiers(tmp_path):
@@ -238,7 +238,7 @@ def test_execute_context_lists_existing_files_and_tiers(tmp_path):
     assert "train/search.py" in ctx
     # the minimal-change rule is present
     assert "Fallback after direct-write" in ctx
-    assert "Prefer a full-file write action" in ctx
+    assert "Prefer a small JSON change spec" in ctx
 
 
 def test_execute_direct_write_failure_falls_back_to_step_agent(tmp_path):
@@ -1555,3 +1555,39 @@ def test_preferred_write_target_respects_explicit_project_path(tmp_path):
     assert _preferred_write_target(tmp_path, "Patch solution.py to fix failures") == "solution.py"
     assert _preferred_write_target(tmp_path, "Update submission/solver.py generator") == "submission/solver.py"
     assert _preferred_write_target(tmp_path, "Do not touch eval.py; improve implementation") == "train/train.py"
+
+
+def test_execute_fallback_note_change_spec_is_applied(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text("value = 'old'\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "patch train/train.py", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_behavior_check=False)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(
+                    type="note",
+                    rationale="small patch",
+                    content=json.dumps({
+                        "kind": "search_replace",
+                        "path": "train/train.py",
+                        "old": "value = 'old'",
+                        "new": "value = 'new'",
+                    }),
+                )
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    assert "1/1 verified" in result.summary
+    assert (tmp_path / "train" / "train.py").read_text(encoding="utf-8") == "value = 'new'\n"
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "verified"

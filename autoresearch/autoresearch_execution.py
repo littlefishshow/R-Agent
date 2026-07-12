@@ -134,6 +134,10 @@ def _default_execute_fn(item: str, ctx: PhaseContext) -> dict:
             if action is None:
                 return {"item": item, "status": "planned", "verification": False,
                         "note": "no queued change spec and no execute step agent available"}
+            note_spec_action = _note_change_spec_action(action)
+            if note_spec_action is not None:
+                spec_path.write_text(str(getattr(note_spec_action, "content", "")) + "\n", encoding="utf-8")
+                action = loop._maybe_hydrate_apply_change("apply_change", note_spec_action)
             if action.type not in {"apply_patch", "write", "bundle", "read"}:
                 status = "tried"
                 result = {"item": item, "status": status, "verification": False,
@@ -842,7 +846,7 @@ def _execute_fallback_context(ctx: PhaseContext, item: str, direct_failed: str =
     inventory = _train_side_inventory(root, max_files=30)
     notes = read_auto_notes(root, max_files=6, max_chars_per_file=1200)
     payload = {
-        "purpose": "Fallback after direct-write could not produce a safe edit. Return one mutating write/apply_patch action.",
+        "purpose": "Fallback after direct-write could not produce a safe edit. Prefer a small search_replace/write JSON change spec in a note, or one mutating write/apply_patch action.",
         "todo": str(item)[:1000],
         "task_context": task_context,
         "previous_direct_write_error": str(direct_failed or "")[:800],
@@ -853,7 +857,8 @@ def _execute_fallback_context(ctx: PhaseContext, item: str, direct_failed: str =
         "recent_auto_notes": notes,
         "constraints": [
             "Do not edit eval.py, eval.sh, blackbox_oracle.py.",
-            "Prefer a full-file write action with complete file content.",
+            "Prefer a small JSON change spec when possible: {kind: search_replace, path, old, new} or {kind: write, path, content}.",
+            "Use full-file write only when a small patch is not enough.",
             "Use artifact paths in task_context for trace; do not paste full old logs.",
         ],
     }
@@ -867,6 +872,20 @@ def _note_action(item: str):
     from autoresearch.autoresearch_loop import AutoResearchAction
 
     return AutoResearchAction(type="note", rationale="execute_apply_change", content=item)
+
+
+def _note_change_spec_action(action):
+    try:
+        from autoresearch.autoresearch_loop import AutoResearchAction, _extract_change_spec
+    except Exception:
+        return None
+    if getattr(action, "type", "") != "note":
+        return None
+    spec = _extract_change_spec(str(getattr(action, "content", "") or ""))
+    if not spec:
+        return None
+    content = json.dumps(spec, ensure_ascii=False)
+    return AutoResearchAction(type="note", rationale=getattr(action, "rationale", "execute_change_spec"), content=content)
 
 
 _RESULT_ARTIFACT_PATHS = (
