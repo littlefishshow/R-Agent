@@ -23,11 +23,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
-from autoresearch.autoresearch_debug import inflight_finish, inflight_start
-from autoresearch.autoresearch_memory import update_belief, split_program, write_auto_note
-from autoresearch.autoresearch_phases import PhaseContext, PhaseResult
-from autoresearch.autoresearch_timeout import call_with_deadline
-from autoresearch.autoresearch_todo_state import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
+from autoresearch.observability.debug import inflight_finish, inflight_start
+from autoresearch.state.memory import update_belief, split_program, write_auto_note
+from autoresearch.phases import PhaseContext, PhaseResult
+from autoresearch.observability.timeout import call_with_deadline
+from autoresearch.state.todo import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
 
 
 # --------------------------------------------------------------------------- #
@@ -192,7 +192,7 @@ def _extract_opinion(raw: str) -> str:
 
 def _extract_json(raw: str) -> dict:
     try:
-        from autoresearch.autoresearch_loop import extract_json_object
+        from autoresearch.legacy.loop import extract_json_object
 
         return extract_json_object(raw)
     except Exception:
@@ -272,6 +272,8 @@ def make_plan_handler(chat: Optional[ChatFn] = None, *, config: Optional[DebateC
         )
         if not _has_metric_experiment(ctx.root):
             planned_todo_state = _ensure_baseline_checkpoint(planned_todo_state)
+        else:
+            planned_todo_state = _compact_repair_plan(planned_todo_state)
         todo_state = merge_todo_state(load_todo_state(ctx.root), planned_todo_state)
         save_todo_state(ctx.root, todo_state)
         write_auto_note(ctx.root, "plan", render_todo_markdown(todo_state))
@@ -364,6 +366,9 @@ def _planner_project_context(root: str | Path, *, max_chars: int = 18000) -> str
     candidates: list[Path] = []
     priority = [
         "README.md", "program.md", "project.md", "pyproject.toml", "requirements.txt",
+        ".autoresearch/experiment_memory.md", ".autoresearch/experiment_memory.json",
+        ".autoresearch/regression_cases.json",
+        ".auto/failure_digest.md", ".auto/eval_contract.md",
         "train/train.py", "train/train.sh", "eval.py", "eval.sh",
     ]
     for rel in priority:
@@ -472,6 +477,39 @@ def _leader_tasks_to_todo_state(raw_tasks: list) -> dict:
         tasks.append(task)
     _assign_default_dag_dependencies(tasks)
     return {"version": 1, "tasks": tasks}
+
+
+def _compact_repair_plan(state: dict) -> dict:
+    """Keep replans focused after a metric-bearing attempt exists.
+
+    Late replans were creating long DAGs full of inspect/record tasks and often
+    exhausted max_steps before the next useful patch. In repair mode keep the
+    first implementation task and the first validation checkpoint that follows
+    it. If there is no implementation, keep the first analysis plus validation.
+    """
+    tasks = list((state or {}).get("tasks") or [])
+    if len(tasks) <= 2:
+        return state
+    first_impl = next((task for task in tasks if task.get("type") == "implementation"), None)
+    selected = []
+    if first_impl is not None:
+        selected.append(first_impl)
+    else:
+        first_analysis = next((task for task in tasks if task.get("type") == "analysis"), None)
+        if first_analysis is not None:
+            selected.append(first_analysis)
+    first_run = next((task for task in tasks if _task_runs_in_phase(task) == "run"), None)
+    if first_run is not None and first_run not in selected:
+        selected.append(first_run)
+    if not selected:
+        selected = tasks[:2]
+    for index, task in enumerate(selected, start=1):
+        task["priority"] = index
+        if index == 1:
+            task["depends_on"] = []
+        elif not task.get("depends_on"):
+            task["depends_on"] = [selected[index - 2].get("task_id")]
+    return {"version": 1, "tasks": selected}
 
 
 def _split_inline_plan_items(text: str) -> list[str]:
@@ -691,7 +729,7 @@ def build_loop_chat_fn(loop, *, tier: str = "plan", root: str | Path | None = No
     if step_agent is None:
         # Build a transient step agent if the loop supports it.
         try:
-            from autoresearch.autoresearch_loop import AutoResearchStepAgent
+            from autoresearch.legacy.loop import AutoResearchStepAgent
 
             step_agent = AutoResearchStepAgent(loop.settings, loop=loop)
         except Exception:

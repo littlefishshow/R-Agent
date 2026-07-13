@@ -520,6 +520,7 @@ def delegate_task(
     session_id: str = "",
     default_wall_timeout_seconds=None,
     event_sink=None,
+    child_allowed_tools=None,
     return_mode: str = "compact",
     include_todo_digest: bool = True,
     include_goal: bool = False,
@@ -551,6 +552,12 @@ def delegate_task(
     include_goal = bool(include_goal)
     include_token_detail = bool(include_token_detail)
     include_context_artifacts = bool(include_context_artifacts)
+    if isinstance(child_allowed_tools, str):
+        child_allowed_tools = [child_allowed_tools] if child_allowed_tools.strip() else None
+    elif isinstance(child_allowed_tools, list):
+        child_allowed_tools = [str(x) for x in child_allowed_tools if str(x).strip()]
+    else:
+        child_allowed_tools = None
     if default_wall_timeout_seconds is None:
         default_wall_timeout_seconds = config.get_delegate_task_wall_timeout()
     try:
@@ -667,6 +674,7 @@ def delegate_task(
                 on_tool_start=on_tool_start,
                 on_tool_end=on_tool_end,
                 exclude_tools=DELEGATE_CHILD_EXCLUDED_TOOLS,
+                allowed_tools=child_allowed_tools,
                 cancel_event=cancel_event,
             )
             truncated = _is_truncated_result(result, sub_agent)
@@ -976,6 +984,11 @@ registry.register(
             "event_sink": {
                 "type": "object",
                 "description": "内部 GUI 事件接收器；模型不应手动设置。"
+            },
+            "child_allowed_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "可选：子 Agent 允许看到/调用的工具白名单。即使这里包含 delegate_task，也仍会被强制排除，防止递归委托。"
             },
             "return_mode": {
                 "type": "string",

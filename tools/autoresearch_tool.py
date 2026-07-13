@@ -1,6 +1,6 @@
 """Compatibility shim for tool registry discovery.
 
-The autoresearch implementation lives in ``autoresearch.autoresearch_tool``.
+The autoresearch implementation lives in ``autoresearch.tool``.
 This thin module remains under ``tools/`` because ``ToolRegistry.reload_all()``
 discovers tool registrations by importing every module in this directory.
 
@@ -11,7 +11,7 @@ not re-run its ``registry.register(...)`` calls.  Reload it explicitly here.
 
 from importlib import import_module, reload
 
-_impl = reload(import_module("autoresearch.autoresearch_tool"))
+_impl = reload(import_module("autoresearch.tool"))
 
 for _name in dir(_impl):
     if not _name.startswith("_"):

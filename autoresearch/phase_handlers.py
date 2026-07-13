@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from autoresearch.autoresearch_memory import (
+from autoresearch.state.memory import (
     split_program,
     update_belief,
     write_auto_note,
@@ -22,8 +22,8 @@ from autoresearch.autoresearch_memory import (
     append_lesson,
     read_phase,
 )
-from autoresearch.autoresearch_gate_state import update_gate_state_from_experiment_state
-from autoresearch.autoresearch_phases import PhaseContext, PhaseResult
+from autoresearch.state.gates import update_gate_state_from_experiment_state
+from autoresearch.phases import PhaseContext, PhaseResult
 
 
 # --------------------------------------------------------------------------- #

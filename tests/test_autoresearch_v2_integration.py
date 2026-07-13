@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from autoresearch.autoresearch_tool import auto_research_run_v2_tool
-from autoresearch.autoresearch_memory import read_phase, split_program
+from autoresearch.tool import auto_research_run_v2_tool
+from autoresearch.state.memory import read_phase, split_program
 
 
 def test_auto_research_run_v2_end_to_end_deterministic(tmp_path):

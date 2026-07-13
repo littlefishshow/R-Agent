@@ -78,7 +78,7 @@ Planned schema:
 
 Deliverables:
 
-- Parser/writer helpers in `core/autoresearch_memory.py` or a new `core/autoresearch_todo_state.py`.
+- Parser/writer helpers in `autoresearch/autoresearch_memory.py` or `autoresearch/autoresearch_todo_state.py`.
 - Plan handler writes structured tasks.
 - Execute handler reads ready tasks from `todo_state.json`.
 - Ready-task selection honors `depends_on` and phase ownership (`execute` vs `run`).
@@ -197,7 +197,7 @@ Deliverables:
 - [x] Non-blocking `/autoresearch run`, `/autoresearch show`, `/autoresearch kill`.
 - [x] Debug files: `.autoresearch/debug/debug.jsonl`, `.autoresearch/debug/inflight.json`.
 - [x] Monitor shows completed token count and in-flight state.
-- [x] Hard-coded solved threshold removed; solved now requires explicit `solved_metric_threshold`.
+- [x] Hard-coded solved threshold removed; solved now requires project-owned completion criteria in `program.md`.
 - [x] Hard-coded numeric black-box probe removed from the generic run loop.
 - [x] Phase 1a: pure `todo_state.json` helpers and tests.
 - [x] Phase 1b: Plan writes structured tasks into `todo_state.json` and mirrors them into `.auto/plan.md`.

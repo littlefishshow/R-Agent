@@ -1063,8 +1063,8 @@ def _kill_pid(pid: int) -> bool:
 def _handle_autoresearch_command(args: list[str], console) -> None:
     """`/autoresearch run <dir>` launches a fire-and-forget v2 loop;
     `/autoresearch show [dir]` prints progress from monitor.json (no LLM)."""
-    from autoresearch.autoresearch_tool import auto_research_run_v2_tool, auto_research_v2_status_tool
-    from autoresearch.autoresearch_debug import build_debug_summary, set_debug
+    from autoresearch.tool import auto_research_run_v2_tool, auto_research_v2_status_tool
+    from autoresearch.observability.debug import build_debug_summary, set_debug
 
     sub = (args[0].lower() if args else "")
 

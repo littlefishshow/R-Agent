@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from autoresearch.autoresearch_loop import AutoResearchSettings, AutoResearchLoop, AutoResearchAction, AutoResearchStepResult
-from autoresearch.autoresearch_execution import (
+from autoresearch.legacy.loop import AutoResearchSettings, AutoResearchLoop, AutoResearchAction, AutoResearchStepResult
+from autoresearch.execution import (
     parse_todo_from_plan,
     make_execute_handler,
     make_run_handler,
@@ -12,11 +12,11 @@ from autoresearch.autoresearch_execution import (
     _execute_fallback_context,
     _is_train_side_write_path,
     _preferred_write_target,
-    _metric_payload,
 )
-from autoresearch.autoresearch_phases import PhaseContext, PhaseSignals
-from autoresearch.autoresearch_memory import write_auto_note
-from autoresearch.autoresearch_todo_state import load_todo_state, save_todo_state
+from autoresearch.diagnostics import metric_payload, write_failure_digest
+from autoresearch.phases import PhaseContext, PhaseSignals
+from autoresearch.state.memory import write_auto_note
+from autoresearch.state.todo import load_todo_state, save_todo_state
 
 
 def _ctx(tmp_path, phase, loop=None, project_text="# Project State\n"):
@@ -168,7 +168,7 @@ def test_execute_apply_patch_false_success_downgraded_to_failed(tmp_path):
 
     # Fake execute_action: mimic a successful git-apply that lists a file which
     # was never actually written (the exact bug seen in nested/gitignored dirs).
-    import autoresearch.autoresearch_execution as ex
+    import autoresearch.execution as ex
 
     class Obs:
         status = "ok"
@@ -431,7 +431,7 @@ def test_execute_read_action_retains_context_without_consuming_attempt(tmp_path)
 
 
 def test_train_side_inventory_skips_noise(tmp_path):
-    from autoresearch.autoresearch_execution import _train_side_inventory
+    from autoresearch.execution import _train_side_inventory
 
     (tmp_path / "train").mkdir()
     (tmp_path / "train" / "train.sh").write_text("x\n", encoding="utf-8")
@@ -579,7 +579,7 @@ def test_metric_payload_parses_string_false_direction_from_metrics(tmp_path):
     (tmp_path / "outputs" / "submission.json").write_text(json.dumps({"x": 0, "y": 0}), encoding="utf-8")
     (tmp_path / "outputs" / "train_verification.json").write_text(json.dumps({"z": 10}), encoding="utf-8")
     (tmp_path / "metrics.json").write_text(json.dumps({"z": 10, "higher_is_better": "false"}), encoding="utf-8")
-    payload = _metric_payload(tmp_path)
+    payload = metric_payload(tmp_path)
     assert payload["metric"] == 10.0
     assert payload["higher_is_better"] is False
 
@@ -705,7 +705,7 @@ def test_execute_behavior_check_failure_prevents_task_verification(tmp_path):
     assert task["last_result"]["behavior"]["command"] == "python3 train/train.py"
 
 
-def test_execute_behavior_check_requires_existing_result_artifact_update(tmp_path):
+def test_execute_behavior_check_warns_when_existing_result_artifact_unchanged(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "train").mkdir()
     (tmp_path / "submission").mkdir()
@@ -742,12 +742,12 @@ def test_execute_behavior_check_requires_existing_result_artifact_update(tmp_pat
 
     loop.step_agent = Agent()
     result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
-    assert "0/1 verified" in result.summary
+    assert "1/1 verified" in result.summary
     task = load_todo_state(tmp_path)["tasks"][0]
-    assert task["status"] == "failed"
-    assert task["last_result"]["behavior"]["status"] == "failed"
+    assert task["status"] == "verified"
+    assert task["last_result"]["behavior"]["status"] == "ok"
     assert task["last_result"]["behavior"]["changed_artifacts"] == []
-    assert "no result artifact updated" in task["last_result"]["note"]
+    assert "warning: no tracked result artifact changed" in task["last_result"]["note"]
 
 
 def test_default_run_records_metric_bearing_experiment(tmp_path):
@@ -760,6 +760,42 @@ def test_default_run_records_metric_bearing_experiment(tmp_path):
     state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
     assert state["experiments"][0]["metrics"]["score"] == 0.5
     assert state["experiments"][0]["primary_metric_name"] == "score"
+
+
+def test_run_spec_train_only_refreshes_eval_metrics(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.sh").write_text("#!/usr/bin/env bash\necho train-only\n", encoding="utf-8")
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > metrics.json <<'JSON'\n"
+        "{\"primary_metric\": 0.75, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\n"
+        "JSON\n"
+        "cat metrics.json\n",
+        encoding="utf-8",
+    )
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "run-train",
+                "type": "validation",
+                "status": "pending",
+                "priority": 1,
+                "run_spec": {"mode": "single", "commands": ["bash train/train.sh"]},
+            }
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+
+    assert result.signals_update == {}
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    exp = state["experiments"][0]
+    assert exp["metrics"]["score"] == 0.75
+    assert exp["primary_metric_name"] == "score"
+    assert "bash train/train.sh && bash eval.sh && cat metrics.json" in exp["summary"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1175,6 +1211,38 @@ def test_run_uses_todo_state_run_spec_and_updates_task(tmp_path):
     assert "inner_evals=1" in report
 
 
+def test_run_task_accepts_metric_recovered_nonzero_wrapper(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "v1",
+                "goal": "custom validation",
+                "type": "validation",
+                "status": "pending",
+                "priority": 1,
+                "run_spec": {
+                    "mode": "single",
+                    "commands": [
+                        "printf '{\"primary_metric\":1.0,\"metric_name\":\"score\",\"higher_is_better\":true}\n' > metrics.json",
+                        "cat metrics.json",
+                        "python3 -c 'raise SystemExit(1)'",
+                    ],
+                },
+            }
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+
+    result = make_run_handler()(_ctx(tmp_path, "run", loop=loop))
+
+    assert result.signals_update == {}
+    task = load_todo_state(tmp_path)["tasks"][0]
+    assert task["status"] == "verified"
+    assert task["last_result"]["status"] == "ok_metric_recovered"
+
+
 def test_run_does_not_fallback_when_structured_run_task_is_blocked(tmp_path):
     (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
     (tmp_path / "train").mkdir()
@@ -1428,10 +1496,13 @@ def test_run_writes_eval_contract_and_failure_digest(tmp_path):
 
     contract = (tmp_path / ".auto" / "eval_contract.md").read_text(encoding="utf-8")
     failure = (tmp_path / ".auto" / "failure_digest.md").read_text(encoding="utf-8")
+    regression = json.loads((tmp_path / ".autoresearch" / "regression_cases.json").read_text(encoding="utf-8"))
     assert "solution.py" in contract
     assert "solve" in contract
     assert "accuracy=0.5" in failure
     assert "expected" in failure and "pred" in failure
+    assert regression["closeout"] is True
+    assert regression["must_fix"][0]["expected"] == "b"
 
 
 def test_execute_direct_write_prompt_includes_eval_and_failure_digests(tmp_path):
@@ -1491,8 +1562,62 @@ def test_execute_direct_write_prompt_includes_eval_and_failure_digests(tmp_path)
     user = captured["user"]
     assert "eval_contract" in user
     assert "failure_digest" in user
+    assert "regression_cases" in user
+    assert "Use the must_fix cases" in user
     assert "solution.py" in user
     assert "expected" in user and "pred" in user
+
+
+def test_closeout_regression_context_does_not_hard_block_execution(tmp_path):
+    (tmp_path / "program.md").write_text("Goal\n", encoding="utf-8")
+    (tmp_path / "train").mkdir()
+    (tmp_path / "train" / "train.py").write_text(
+        "import json\n"
+        "from pathlib import Path\n"
+        "Path('metrics.json').write_text(json.dumps({'primary_metric': 0.4, 'metric_name': 'score', 'higher_is_better': True}))\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "metrics.json").write_text(json.dumps({
+        "primary_metric": 0.8,
+        "metric_name": "score",
+        "higher_is_better": True,
+        "failures": [{"input": "x", "expected": "y", "pred": "z"}],
+    }), encoding="utf-8")
+    (tmp_path / ".autoresearch").mkdir()
+    (tmp_path / ".autoresearch" / "regression_cases.json").write_text(json.dumps({
+        "closeout": True,
+        "best": {"metric_name": "score", "metric": 0.8},
+        "current": {"metric_name": "score", "metric": 0.8},
+        "must_fix": [{"input": "x", "expected": "y", "pred": "z"}],
+        "instructions": ["Use the must_fix cases to focus the patch and verify with the official eval."],
+    }), encoding="utf-8")
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {"task_id": "impl", "goal": "small patch", "type": "implementation", "status": "pending", "priority": 1},
+        ]
+    })
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False,
+                                    execute_max_task_attempts=1)
+    loop = AutoResearchLoop(settings)
+
+    class Agent:
+        def plan_step(self, **kwargs):
+            return AutoResearchStepResult(
+                action=AutoResearchAction(
+                    type="write",
+                    rationale="exploratory patch",
+                    path="train/train.py",
+                    content=(tmp_path / "train" / "train.py").read_text(encoding="utf-8"),
+                )
+            )
+
+    loop.step_agent = Agent()
+    result = make_execute_handler()(_ctx(tmp_path, "execute", loop=loop))
+    task = load_todo_state(tmp_path)["tasks"][0]
+
+    assert "1/1 verified" in result.summary
+    assert task["status"] == "verified"
+    assert "regression metric floor failed" not in task["last_result"]["note"]
 
 
 def test_direct_eval_solution_write_uses_import_smoke_not_result_artifact(tmp_path):
@@ -1591,3 +1716,35 @@ def test_execute_fallback_note_change_spec_is_applied(tmp_path):
     assert (tmp_path / "train" / "train.py").read_text(encoding="utf-8") == "value = 'new'\n"
     task = load_todo_state(tmp_path)["tasks"][0]
     assert task["status"] == "verified"
+
+
+def test_failure_digest_derives_mapping_diffs_when_metrics_has_no_failures(tmp_path):
+    (tmp_path / "data").mkdir()
+    (tmp_path / "submission").mkdir()
+    (tmp_path / "metrics.json").write_text(
+        json.dumps({
+            "primary_metric": 0.8,
+            "primary_metric_name": "score",
+            "higher_is_better": True,
+            "accuracy": 1.0,
+            "runtime_sec": 0.42,
+            "score": 0.8,
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "data" / "truth.json").write_text(json.dumps({
+        "r1": {"name": "Alice", "age": "34"},
+        "r2": {"name": "Bob", "age": "40"},
+    }), encoding="utf-8")
+    (tmp_path / "submission" / "predictions.json").write_text(json.dumps({
+        "r1": {"name": "alice", "age": "34"},
+        "r2": {"name": "Bob", "age": "41"},
+    }), encoding="utf-8")
+
+    path = write_failure_digest(tmp_path)
+    text = Path(path).read_text(encoding="utf-8")
+
+    assert "performance optimization problem" in text
+    assert "derived mismatch rows" in text
+    assert '"id": "r1"' in text
+    assert '"actual": "alice"' in text

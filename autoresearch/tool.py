@@ -7,8 +7,8 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-from autoresearch.autoresearch_loop import AutoResearchLoop, AutoResearchSettings, normalize_versioning_policy
-from autoresearch.autoresearch_preflight import git_preflight
+from autoresearch.legacy.loop import AutoResearchLoop, AutoResearchSettings, normalize_versioning_policy
+from autoresearch.preflight import git_preflight
 from tools.registry import registry
 
 
@@ -97,7 +97,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from autoresearch.autoresearch_loop import AutoResearchLoop, AutoResearchSettings
+from autoresearch.legacy.loop import AutoResearchLoop, AutoResearchSettings
 
 settings_data = json.loads(sys.argv[1])
 run_id = sys.argv[2]
@@ -233,8 +233,8 @@ import json
 import sys
 import time
 from pathlib import Path
-from autoresearch.autoresearch_loop import AutoResearchSettings
-from autoresearch.autoresearch_phases import run_phase_loop
+from autoresearch.legacy.loop import AutoResearchSettings
+from autoresearch.phases import run_phase_loop
 
 payload = json.loads(sys.argv[1])
 run_id = sys.argv[2]
@@ -328,7 +328,7 @@ def _wait_for_v2_completion(settings, run_id: str, wait_seconds: float, poll_int
     wait_seconds so the foreground tool call cannot be killed by the harness
     wall-clock timeout; the child subprocess keeps running regardless.
     """
-    from autoresearch.autoresearch_monitor import read_monitor
+    from autoresearch.observability.monitor import read_monitor
 
     monitor_path = settings.monitor_file()
     deadline = time.time() + max(0.0, float(wait_seconds))
@@ -394,7 +394,7 @@ def auto_research_run_v2_tool(
     synchronously in-process (short deterministic runs/tests only).
     """
     try:
-        from autoresearch.autoresearch_phases import run_phase_loop
+        from autoresearch.phases import run_phase_loop
 
         kwargs = _v2_settings_kwargs(
             project_dir, project_id, program_path, project_state_path, use_llm_step_agents,
@@ -408,7 +408,7 @@ def auto_research_run_v2_tool(
         settings = AutoResearchSettings(**kwargs)
         preflight = git_preflight(settings.root()) if use_git_versioning else {"warnings": ["git versioning disabled"]}
         if debug_mode:
-            from autoresearch.autoresearch_debug import set_debug
+            from autoresearch.observability.debug import set_debug
 
             set_debug(settings.root(), True)
         else:
@@ -418,7 +418,7 @@ def auto_research_run_v2_tool(
             settings.stop_file().unlink(missing_ok=True)
 
         if background:
-            from autoresearch.autoresearch_monitor import RunMonitor, read_monitor, render_monitor_text
+            from autoresearch.observability.monitor import RunMonitor, read_monitor, render_monitor_text
 
             run_id = f"arv2-{uuid.uuid4().hex[:10]}"
             # Seed a queued monitor file synchronously so a watcher can find it
@@ -504,7 +504,7 @@ def auto_research_run_v2_tool(
 def auto_research_v2_status_tool(project_dir: str = ".", monitor_path: str = "") -> str:
     """Read the v2 run monitor heartbeat (rounds + token/usd + phase). Pure file read, no LLM."""
     try:
-        from autoresearch.autoresearch_monitor import read_monitor, render_monitor_text
+        from autoresearch.observability.monitor import read_monitor, render_monitor_text
 
         if monitor_path:
             path = Path(monitor_path).expanduser()

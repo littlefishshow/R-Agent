@@ -20,23 +20,23 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from autoresearch.autoresearch_debug import debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
-from autoresearch.autoresearch_gate_state import load_gate_state
-from autoresearch.autoresearch_memory import (
+from autoresearch.observability.debug import debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
+from autoresearch.state.gates import load_gate_state
+from autoresearch.state.memory import (
     DEFAULT_PROJECT_TEMPLATE,
     ensure_program_scaffold,
     read_phase,
     write_auto_note,
     write_phase,
 )
-from autoresearch.autoresearch_phase_handlers import (
+from autoresearch.phase_handlers import (
     make_compress_handler,
     make_evaluate_handler,
     make_init_handler,
 )
-from autoresearch.autoresearch_phases import PhaseContext, PhaseResult, PhaseSignals
-from autoresearch.autoresearch_step_runtime import allowed_tools_for_step, build_step_context, excluded_tools_for_step, step_policy
-from autoresearch.autoresearch_todo_state import (
+from autoresearch.phases import PhaseContext, PhaseResult, PhaseSignals
+from autoresearch.runtime_policy import allowed_tools_for_step, build_step_context, excluded_tools_for_step, step_policy
+from autoresearch.state.todo import (
     has_blocking_failed_tasks,
     has_failed_tasks,
     has_open_tasks,
@@ -59,8 +59,8 @@ class ThreeStepController:
         self.run_id = run_id
         self._step_index = 0
         self._init_handler = make_init_handler()
-        from autoresearch.autoresearch_personas import make_plan_handler
-        from autoresearch.autoresearch_execution import make_execute_handler, make_run_handler
+        from autoresearch.planner import make_plan_handler
+        from autoresearch.execution import make_execute_handler, make_run_handler
 
         self._plan_handler = make_plan_handler()
         self._execute_handler = make_execute_handler()
@@ -394,7 +394,7 @@ class ThreeStepController:
         if step_name != "plan":
             return None
         try:
-            from autoresearch.autoresearch_loop import extract_json_object
+            from autoresearch.legacy.loop import extract_json_object
 
             data = extract_json_object(str(result))
         except Exception:
@@ -515,6 +515,17 @@ class ThreeStepController:
                     break
                 if getattr(self.loop, "budget", None) and self.loop.budget.is_exhausted():
                     break
+            # Do not leave a bounded run between evidence collection and
+            # governance. If the last allowed public step ended at "conclude",
+            # run that cheap deterministic phase once so best/Pareto/source
+            # restoration and lessons are finalized before returning.
+            if reports and reports[-1].get("next_phase") == "conclude":
+                report = self.step(extra_signals)
+                reports.append(report)
+            else:
+                finalize = getattr(self.loop, "finalize_experiments", None)
+                if callable(finalize):
+                    finalize()
         except Exception as exc:
             error = str(exc)
             raise
@@ -532,8 +543,8 @@ class ThreeStepController:
 
 
 def run_three_step_loop(settings, *, max_steps: int = 24, loop=None, run_id: str = "", monitor=None) -> dict:
-    from autoresearch.autoresearch_loop import AutoResearchLoop
-    from autoresearch.autoresearch_monitor import RunMonitor
+    from autoresearch.legacy.loop import AutoResearchLoop
+    from autoresearch.observability.monitor import RunMonitor
 
     ensure_debug_from_settings(settings)
     settings.defer_experiment_finalization = True

@@ -1,6 +1,6 @@
 import json
 
-from autoresearch.autoresearch_step_runtime import (
+from autoresearch.runtime_policy import (
     allowed_tools_for_step,
     build_step_context,
     excluded_tools_for_step,

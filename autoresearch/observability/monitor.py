@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from autoresearch.autoresearch_debug import read_inflight
+from autoresearch.observability.debug import read_inflight
 
 
 class RunMonitor:

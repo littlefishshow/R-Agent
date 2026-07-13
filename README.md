@@ -17,7 +17,7 @@ R-Agent 当前主要包含以下能力：
 - **长期记忆系统**：使用 `memories/USER.md` 和 `memories/MEMORY.md` 区分用户偏好与项目/环境事实，并在启动时注入 Agent 上下文。
 - **Skill 系统**：将稳定、可复用的工作流程保存为 `skills/**/SKILL.md`，让 Agent 能复用已有经验，而不是每次从零规划。
 - **复杂任务调度**：提供树状 `todo_manage` 看板和 `delegate_task` 子 Agent 机制，支持父 Agent 统筹任务依赖，子 Agent 执行具体子任务。
-- **auto_research 专用运行时**：提供 `auto_research_run` / `auto_research_status`，用于在项目目录内围绕 `program.md` 执行固定 workflow、归档实验输出，并通过 `.autoresearch/` 保存 bounded context、progress 和候选结果。
+- **auto_research 专用运行时**：实现代码集中在 R-Agent 仓库的 `autoresearch/` Python 包中，并通过 `tools/autoresearch_tool.py` 薄 shim 接入工具注册；提供 `auto_research_run` / `auto_research_status`，用于在项目目录内围绕 `program.md` 执行固定 workflow、归档实验输出，并通过 `.autoresearch/` 保存 bounded context、progress 和候选结果。
 - **自我维护能力**：Agent 可以在授权边界内创建/修改工具、维护技能、更新项目文档，并通过安全审批机制控制高风险操作。
 
 本项目围绕个人使用场景逐步演进的本地 Agent 框架。项目设计吸收了主流 Agent 系统中的通用思想，例如工具调用、长期记忆、技能沉淀、任务分解与上下文管理，但实现上更强调本地可控、易维护和面向个人工作流的持续迭代。
@@ -25,6 +25,15 @@ R-Agent 当前主要包含以下能力：
 ### 1.1 auto_research 使用说明
 
 `auto_research_run` 是 R-Agent 内部用于研究/实验型项目的轻量子进程运行时，适合项目根目录已有明确 `program.md`、需要分步检查项目、运行可用 eval/train、记录实验指标和保留压缩上下文的场景。它不是通用“自动完成所有研究”的承诺；当前实现以固定 workflow、可选每 step LLM 子 Agent 和 deterministic fallback 为边界。
+
+实现位置：
+
+- `autoresearch/tool.py`：工具实现入口，注册 `auto_research_run`、`auto_research_run_v2`、status、stop。
+- `autoresearch/controller.py`、`planner.py`、`execution.py`、`phases.py`：当前三步循环主路径。
+- `autoresearch/state/`：`program.md`、`project.md`、todo、gate、completion 等文件态。
+- `autoresearch/observability/`：monitor、debug、budget、timeout。
+- `autoresearch/legacy/loop.py`：旧 loop 和仍在复用的安全/metric/versioning 服务。
+- `tools/autoresearch_tool.py`：R-Agent 工具注册 shim。它保留在 `tools/` 下是因为 `ToolRegistry.reload_all()` 会扫描这个目录；真正的工具实现位于 `autoresearch/tool.py`。
 
 基本调用参数：
 
@@ -51,6 +60,14 @@ R-Agent 当前主要包含以下能力：
 - `best.json` / `pareto_front.json`：在有可解析实验指标时记录当前最佳实验和多目标 Pareto 候选；若无指标，只会保留空或待补充状态，不虚构结果。
 
 ## 2. 环境配置
+
+先安装 Python 依赖（请使用 Python 3；若系统的 `python` 仍指向 Python 2，请改用 `python3`）：
+
+```bash
+python3 -m pip install -r requirements.txt
+```
+
+`python-dotenv` 仍是推荐依赖；若尚未安装，`core/config.py` 会自动降级到项目内置的轻量 `.env` loader，因此 `python3 main.py` / `import core.config` 不会仅因缺少 `dotenv` 模块而崩溃。内置 loader 支持常见 `KEY=VALUE`、`export KEY=VALUE`、引号和注释，并且不会覆盖已经存在的环境变量。
 
 R-Agent 采用纯环境变量配置，不再使用任何本地 JSON 配置文件。请在项目根目录下创建一个 `.env` 文件（可以参考 `.env.example`）来配置你的环境：
 
@@ -457,6 +474,19 @@ pip install PyNaCl>=1.5.0
 
 ### 2026-07-08
 
+#### dotenv 运行时降级修复
+
+- **避免缺失 `python-dotenv` 时启动崩溃**：`core/config.py` 改为优先使用已安装的 `python-dotenv`，未安装时自动使用内置轻量 `.env` loader，确保 `python3 main.py` / `import core.config` 不会因 `from dotenv import load_dotenv` 缺失依赖而直接失败。
+- **保留常见 `.env` 加载能力**：fallback loader 支持 `KEY=VALUE`、`export KEY=VALUE`、单/双引号和注释，并遵循不覆盖已有环境变量的行为，方便用户稍后再按需执行 `python3 -m pip install -r requirements.txt`。
+
+#### dotenv 依赖声明与启动说明修复
+
+- **明确 `python-dotenv` 项目依赖**：在 `requirements.txt` 中标注 `python-dotenv` 为 `core/config.py` 的 `dotenv.load_dotenv` 来源，避免误装名为 `dotenv` 的非目标包或漏装依赖。
+- **补充 Python 3 安装与启动提示**：README 环境配置说明新增 `python3 -m pip install -r requirements.txt`，并提示系统 `python` 若仍指向 Python 2，应使用 `python3` 运行项目，避免 `from dotenv import load_dotenv` 在错误解释器环境中失败。
+
+- **修复 AutoResearch v2 execute/run 断链**：当 `.autoresearch/proposed_change.json` 不存在时，execute phase 会调用已有 step agent 在安全 action surface 内尝试 `apply_patch`/`write`，不再只记录 plan-only；默认 run phase 会先运行 train/run，再在存在 `eval.sh` 时继续执行 eval，并以 trial action 写入 metric-bearing experiment/Pareto 状态。
+
+
 #### auto_research 中间版本管理说明
 
 - 更新“1.1 auto_research 使用说明”，补充 `versioning_policy` 的四种策略语义：`artifact_only`、`commit_pareto`、`commit_all_trials`、`branch_per_trial`。
@@ -483,12 +513,12 @@ pip install PyNaCl>=1.5.0
 
 #### auto_research 专用 Agent Loop MVP
 
-- **新增专用运行时骨架**：新增 `core/autoresearch_loop.py`，提供 `AutoResearchSettings`、`AutoResearchAction`、`AutoResearchObservation`、`AutoResearchLoop`、`AutoResearchContextManager`、`AutoResearchArtifactStore`、`ProjectBoundary` 与 `ProjectConfinedCommandRunner`，用于承载面向 autoresearch 的轻量 Agent Loop。
+- **新增专用运行时骨架**：最初新增 `core/autoresearch_loop.py`，后续已迁移并整理到 `autoresearch/legacy/loop.py`；提供 `AutoResearchSettings`、`AutoResearchAction`、`AutoResearchObservation`、`AutoResearchLoop`、`AutoResearchContextManager`、`AutoResearchArtifactStore`、`ProjectBoundary` 与 `ProjectConfinedCommandRunner`，用于承载面向 autoresearch 的轻量 Agent Loop 和当前三步循环复用的安全服务。
 - **围绕 `program.md` 控制父上下文**：父 loop 每轮只读取 `program.md`、`.autoresearch/state.json` 和最近 observations，并通过 `context_char_budget`、`program_char_budget`、`summary_char_budget` 严格裁剪，避免普通对话式 messages 无限膨胀。
 - **原始输出外置归档**：shell、file、web、note 等 action 的 raw output 统一写入 `.autoresearch/artifacts/`，文件名包含 `timestamp_project_id_trial_rationale_kind`；父上下文只保留 compact summary 与 artifact path。
 - **项目内快速命令执行**：新增 `ProjectConfinedCommandRunner`，不调用全局 `run_command` 审批门，允许 autoresearch 在项目目录内快速执行实验命令；同时拒绝 `~`、绝对路径越界和 `../` 逃逸，避免放宽全局工具安全策略。
 - **支持可插拔规划与总结**：`AutoResearchLoop` 支持注入 planner/summarizer，当前 MVP 默认执行安全 bootstrap inspect，后续可接入轻量 LLM planner，根据 `program.md` 自动提出实验、运行、总结和更新状态。
-- **接入 R-Agent 子进程工具**：新增 `tools/autoresearch_tool.py` 并注册 `auto_research_run`，R-Agent 调用该工具时会通过现有 isolated tool process 运行 auto_research loop，使其成为主 Agent 可直接调度的子进程型运行时。
+- **接入 R-Agent 子进程工具**：新增 `tools/autoresearch_tool.py` 并注册 `auto_research_run`；当前该文件是注册 shim，真实实现位于 `autoresearch/tool.py`。R-Agent 调用该工具时会通过现有 isolated tool process 运行 auto_research loop，使其成为主 Agent 可直接调度的子进程型运行时。
 - **固定 auto_research workflow 骨架**：新增 `AutoResearchWorkflowStep` 与 `FixedAutoResearchPlanner`，默认分步执行 `inspect_project`、`read_program`、`plan_change`、`run_eval_if_available`、`summarize_result`，每步声明允许的 action/tool surface 并在 loop 内校验，避免无边界工具调用。
 - **模块化上下文 buckets**：新增 `DEFAULT_CONTEXT_BUCKETS` 与 `ContextBucket`，按 `project_understanding`、`current_changes`、`experiment_results`、`conclusions`、`modification_plans`、`open_questions`、`raw_observations` 分类保存上下文，每个 bucket 由 `bucket_max_items` 与 `bucket_item_char_budget` 控制长度，父上下文输出 `modular_context`。
 - **引入每 step 的 LLM 子 Agent**：新增 `AutoResearchStepAgent` 与 `AutoResearchStepResult`，在 `use_llm_step_agents=true` 时，每个固定 workflow step 会把 bounded parent context、step 定义和 allowed tools 发给独立 LLM 子 Agent，要求返回结构化 JSON action 与 bucket updates；父 loop 继续负责校验、执行和归档。
@@ -964,4 +994,3 @@ flowchart LR
 - **规划核心模块**：初步划分 LLM client、`RAgent.messages`、工具注册表、memory 文件、skills 目录、todo 看板、delegate 子 Agent 和项目人格文件。
 - **确定本地可控方向**：项目不追求通用云端平台形态，而面向个人工作流，强调可读、可维护、可审计和可持续迭代。
 - **建立后续演进路线**：优先补齐工具能力、长期记忆、安全审批、复杂任务调度、上下文管理和维护文档体系。
-

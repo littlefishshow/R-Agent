@@ -2,8 +2,8 @@ import json
 import time
 from pathlib import Path
 
-from autoresearch.autoresearch_loop import AutoResearchSettings, AutoResearchLoop
-from autoresearch.autoresearch_personas import (
+from autoresearch.legacy.loop import AutoResearchSettings, AutoResearchLoop
+from autoresearch.planner import (
     PlanDebate,
     DebateConfig,
     make_plan_handler,
@@ -15,14 +15,14 @@ from autoresearch.autoresearch_personas import (
     _planner_project_context,
     _split_inline_plan_items,
 )
-from autoresearch.autoresearch_phases import PhaseContext, PhaseSignals
-from autoresearch.autoresearch_memory import (
+from autoresearch.phases import PhaseContext, PhaseSignals
+from autoresearch.state.memory import (
     ensure_program_scaffold,
     split_program,
     read_phase,
     write_phase,
 )
-from autoresearch.autoresearch_todo_state import load_todo_state, save_todo_state
+from autoresearch.state.todo import load_todo_state, save_todo_state
 
 
 def _fake_chat_factory():

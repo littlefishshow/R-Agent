@@ -38,6 +38,24 @@ description: 构建和运行受控 autoresearch 实验框架：参考 karpathy/a
 6. **资源有边界**：不要继承原始 `program.md` 的无限循环；必须设置轮数、时间、预算或用户确认边界。
 7. **用户需求优先**：指标、数据集、训练任务、成功标准都来自用户提示、论文或目标仓库，而不是固定使用 val_bpb。
 
+## Codebase reading before building the autoresearch project
+
+本 skill 的用途是帮助 R-Agent **构建一个 autoresearch 项目脚手架**，例如生成/整理 `eval.py`、`eval.sh`、`train/`、`program.md`、baseline 和实验记录流程。它不是 autoresearch loop 自己的 Planner。
+
+当输入是已有代码仓库，尤其是大型仓库或复杂项目时，R-Agent 在构建 autoresearch 项目前应先完整理解仓库。可以使用 `skills/agent_ops/codebase_scout/SKILL.md` 的流程建立项目地图：
+
+- 小仓库：父进程可以直接读取 README、配置、入口、测试和关键模块。
+- 大仓库：先扫目录，再把目录或问题拆给只读子 Agent，父进程只收结构化摘要和文件证据。
+- 输出必须包含 train/eval/smoke/full/long_job 命令候选、可修改范围、保护范围、核心入口、模块地图和风险。
+
+构建 autoresearch 项目时，应把 codebase scout 的结构化结果转化为项目脚手架内容：
+
+- 写入 `program.md`：研究目标、允许修改范围、禁止修改范围、运行协议、停止条件；
+- 写入 `eval.py` / `eval.sh`：固定评估入口和机器可解析指标；
+- 写入 `train/train.sh`：训练或实验入口；
+- 写入 `README.md` 或 `reports/autoresearch_report.md`：仓库地图、验证命令和当前 baseline；
+- 必要时将完整阅读报告保存到 `.auto/survey.md` 或 `reports/codebase_scout.md`，在 `program.md` 中只保留摘要和路径。
+
 ## Target project structure
 
 为用户项目构建如下框架：

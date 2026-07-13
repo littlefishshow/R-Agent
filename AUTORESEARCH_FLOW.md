@@ -2,8 +2,10 @@
 
 > 目标读者：想快速搞懂 `autoresearch` 是怎么工作的、"每一步 LLM 看到什么"、以及 skill/tool/loop 三层之间怎么协作的人。
 > 覆盖代码：
-> - `tools/autoresearch_tool.py`（R-Agent 调用入口）
-> - `core/autoresearch_loop.py`（真正的循环 + 上下文管理 + 版本化）
+> - `tools/autoresearch_tool.py`（R-Agent 工具注册入口，薄 shim）
+> - `autoresearch/tool.py`（真正的工具实现）
+> - `autoresearch/legacy/loop.py`（legacy 循环 + 上下文管理 + 版本化）
+> - `autoresearch/controller.py`（当前 3-step 控制器）
 > - `skills/productivity/autoresearch/SKILL.md`（人给 R-Agent 用的手工搭脚手架说明）
 
 ---
@@ -15,8 +17,9 @@
 ```mermaid
 flowchart LR
     U["👤 用户"] -->|自然语言| RA["R-Agent 主对话<br/>(外层 LLM)"]
-    RA -->|工具调用 auto_research_run| TL["autoresearch_tool.py<br/>(纯 Python 桥接)"]
-    TL -->|构造 settings + 启动| LP["AutoResearchLoop.run()<br/>(核心循环)"]
+    RA -->|工具调用 auto_research_run| TS["tools/autoresearch_tool.py<br/>(工具注册 shim)"]
+    TS -->|reload/import| TL["autoresearch/tool.py<br/>(纯 Python 桥接)"]
+    TL -->|构造 settings + 启动| LP["AutoResearchLoop / ThreeStepController<br/>(核心循环)"]
     LP -->|每一 step 单独一次调用| SA["Step-Agent<br/>(内层 LLM, 可选)"]
     SA -->|返回 JSON action| LP
     LP -->|artifact/state/progress| FS[".autoresearch/*"]
@@ -71,9 +74,14 @@ flowchart LR
 
 ---
 
-## 2. Tool 层：`autoresearch_tool.py` 是薄薄的桥
+## 2. Tool 层：工具 shim 和真实实现
 
-这个文件是 R-Agent 能看到的对外 API，只做四件事：
+这里有两个文件，作用不一样：
+
+- `tools/autoresearch_tool.py`：保留在 `tools/` 下，是因为 R-Agent 的 `ToolRegistry.reload_all()` 会扫描 `tools/*.py`。它只负责重新加载 `autoresearch.tool`，让工具注册函数重新执行。
+- `autoresearch/tool.py`：真正的实现文件，负责构造 settings、启动前台/后台运行、读取状态、stop/kill 等。
+
+真实实现做这些事：
 
 1. 定义两个 tool：`auto_research_run`、`auto_research_status`。
 2. 把 R-Agent 传的参数塞进 `AutoResearchSettings`（`_make_settings`）。
@@ -110,9 +118,9 @@ flowchart LR
 
 ---
 
-## 3. Loop 层：`core/autoresearch_loop.py` 里的每个组件
+## 3. Loop 层：`autoresearch/` 包里的每个组件
 
-`AutoResearchLoop` 是把很多小 helper 组合成的一个 orchestrator。先把角色列清楚：
+`autoresearch/` 是 R-Agent 仓库里的 AutoResearch 子包。旧的说明里经常写 `core/autoresearch_*.py`，现在这些运行时代码已经集中到这个包里。`AutoResearchLoop` 和 `ThreeStepController` 会把很多小 helper 组合成 orchestrator。先把角色列清楚：
 
 ```mermaid
 flowchart TB

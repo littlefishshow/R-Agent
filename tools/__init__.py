@@ -8,7 +8,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 # 动态加载所有的 python 文件。
 #
 # `tools/autoresearch_tool.py` is a registry-discovery shim that reloads the
-# real implementation in `autoresearch.autoresearch_tool`.  Importing it while
+# real implementation in `autoresearch.tool`.  Importing it while
 # the `tools` package itself is still initializing can recurse back into a
 # partially initialized autoresearch module, so leave it to ToolRegistry.reload_all().
 for file_path in glob.glob(os.path.join(current_dir, "*.py")):

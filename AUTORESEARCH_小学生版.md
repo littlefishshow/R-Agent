@@ -4,7 +4,7 @@
 
 你可以把 AutoResearch 想成一个会做项目作业的小队伍。它不是一次聊天就把所有事情都做完，而是每次只做一小步，把结果写进文件，下次再从文件里接着做。
 
-当前 R-Agent 仓库里，AutoResearch 的主要代码放在 `autoresearch/` 文件夹。`tools/autoresearch_tool.py` 只是一个很薄的入口，因为 R-Agent 的工具注册器会扫描 `tools/`。真正运行的是 `autoresearch/autoresearch_tool.py`。
+当前 R-Agent 仓库里，AutoResearch 的主要代码放在 `autoresearch/` 文件夹。`tools/autoresearch_tool.py` 只是一个很薄的入口，因为 R-Agent 的工具注册器会扫描 `tools/`。真正运行的新入口是 `autoresearch/tool.py`。
 
 ## 一、先记住一句话
 
@@ -27,21 +27,26 @@ R-Agent 是整座房子，AutoResearch 是其中一个房间。这个房间里�
 
 | 文件 | 小学生版解释 | 实际作用 |
 |---|---|---|
-| `autoresearch/autoresearch_tool.py` | 对外开关 | 实现 `auto_research_run_v2`、status、stop 等工具 |
+| `autoresearch/tool.py` | 对外开关 | 实现 `auto_research_run_v2`、status、stop 等工具 |
 | `tools/autoresearch_tool.py` | 门牌 | 让 R-Agent 工具注册器能找到真正的 AutoResearch 工具 |
 | `main.py` | 斜杠命令入口 | `/autoresearch run/show/debug/kill` 从这里进来 |
-| `autoresearch/autoresearch_three_step.py` | 总调度员 | 控制 `plan -> attempt -> conclude -> ...` |
-| `autoresearch/autoresearch_personas.py` | 计划会议 | Plan 阶段的多角色讨论和任务 DAG 生成 |
-| `autoresearch/autoresearch_execution.py` | 干活的人 | Attempt 阶段写代码、跑命令、修失败任务 |
-| `autoresearch/autoresearch_todo_state.py` | 任务清单管理员 | 读写 `.autoresearch/todo_state.json` |
-| `autoresearch/autoresearch_completion.py` | 验收员 | 从 `program.md` 读取项目自己的完成标准 |
-| `autoresearch/autoresearch_monitor.py` | 黑板报 | 写 `.autoresearch/monitor.json`，供 `/autoresearch show` 查看 |
-| `autoresearch/autoresearch_debug.py` | 详细流水账 | 写 debug 事件和 `inflight.json` |
-| `autoresearch/autoresearch_budget.py` | 记账本 | 记录 token、花费、调用次数和耗时 |
-| `autoresearch/autoresearch_loop.py` | 老底座 | 保存 action、artifact、runner、metric、版本治理等通用服务 |
-| `autoresearch/autoresearch_step_runtime.py` | 工具规则表 | 定义 plan/attempt/conclude 能用什么工具和 skill |
+| `autoresearch/phases.py` | 流程入口 | 定义 phase 数据结构，并调用三步循环 |
+| `autoresearch/controller.py` | 总调度员 | 控制 `plan -> attempt -> conclude -> ...` |
+| `autoresearch/planner.py` | 计划会议 | Plan 阶段的多角色讨论和任务 DAG 生成 |
+| `autoresearch/execution.py` | 干活的人 | Attempt 阶段写代码、跑命令、修失败任务 |
+| `autoresearch/runtime_policy.py` | 工具规则表 | 定义 plan/attempt/conclude 能用什么工具和 skill |
+| `autoresearch/state/todo.py` | 任务清单管理员 | 读写 `.autoresearch/todo_state.json` |
+| `autoresearch/state/completion.py` | 验收员 | 从 `program.md` 读取项目自己的完成标准 |
+| `autoresearch/state/memory.py` | 记事本管理员 | 读写 `program.md`、`project.md`、`.auto/`、lessons |
+| `autoresearch/observability/monitor.py` | 黑板报 | 写 `.autoresearch/monitor.json`，供 `/autoresearch show` 查看 |
+| `autoresearch/observability/debug.py` | 详细流水账 | 写 debug 事件和 `inflight.json` |
+| `autoresearch/observability/budget.py` | 记账本 | 记录 token、花费、调用次数和耗时 |
+| `autoresearch/legacy/loop.py` | 老底座和安全工具箱 | 保存 action、artifact、runner、metric、版本治理等通用服务 |
+| `autoresearch/unknown_tools/` | 暂存箱 | 放还没确认价值的旧功能或实验工具 |
 
-还有一个容易混淆的点：`agentic_autoresearch/` 不是 `/autoresearch` 斜杠命令当前调用的主实现。当前 `/autoresearch` 调的是 `autoresearch/autoresearch_tool.py` 这一套。
+还有一个容易混淆的点：
+
+- `agentic_autoresearch/` 不是 `/autoresearch` 斜杠命令当前调用的主实现。当前 `/autoresearch` 调的是 `autoresearch/tool.py` 这一套。
 
 ## 三、上下文视角：它每一步到底看什么
 
@@ -275,7 +280,7 @@ Conclude 可能会追：
 flowchart TD
     User["用户输入 /autoresearch run 项目目录"]
     Main["main.py<br/>_handle_autoresearch_command"]
-    Tool["autoresearch/autoresearch_tool.py<br/>auto_research_run_v2_tool"]
+    Tool["autoresearch/tool.py<br/>auto_research_run_v2_tool"]
     Child["后台 Python 子进程"]
     Loop["ThreeStepController"]
     Monitor[".autoresearch/monitor.json"]
@@ -287,10 +292,10 @@ flowchart TD
 `main.py` 直接 import：
 
 ```python
-from autoresearch.autoresearch_tool import auto_research_run_v2_tool
+from autoresearch.tool import auto_research_run_v2_tool
 ```
 
-所以 `/autoresearch` 调的是当前 `autoresearch/` 包，不是旧的 `core/autoresearch_*.py`。
+所以 `/autoresearch` 调的是当前 `autoresearch/` 包里的 `tool.py`，不是旧的 `core/autoresearch_*.py`。
 
 `tools/autoresearch_tool.py` 仍然存在，但它只是工具注册 shim。它的作用是让工具注册器扫描 `tools/` 时能找到 AutoResearch 工具。
 
@@ -541,7 +546,7 @@ program.md 里写了 z <= 0.001；
 所以这个项目完成了。
 ```
 
-判断代码在 `autoresearch/autoresearch_completion.py`。
+判断代码在 `autoresearch/state/completion.py`。
 
 Run 阶段调用：
 
@@ -689,7 +694,7 @@ metrics.json 里 z = 0.0
 ```mermaid
 flowchart TD
     Slash["/autoresearch run project"] --> Main["main.py 斜杠命令"]
-    Main --> Tool["autoresearch_tool.py 真工具"]
+    Main --> Tool["autoresearch/tool.py 真工具"]
     Tool --> Child["后台或同步子进程"]
     Child --> Controller["ThreeStepController"]
 

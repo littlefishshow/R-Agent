@@ -1,4 +1,4 @@
-from autoresearch.autoresearch_completion import is_metric_solved, parse_completion_criteria
+from autoresearch.state.completion import is_metric_solved, parse_completion_criteria
 
 
 def test_parse_completion_criteria_from_metric_expression():

@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from autoresearch.autoresearch_budget import (
+from autoresearch.observability.budget import (
     BudgetLedger,
     BudgetLimits,
     ModelTiers,
@@ -9,7 +9,7 @@ from autoresearch.autoresearch_budget import (
     estimate_usd,
     price_per_1k,
 )
-from autoresearch.autoresearch_memory import (
+from autoresearch.state.memory import (
     split_program,
     update_belief,
     ensure_program_scaffold,

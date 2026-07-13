@@ -1,6 +1,6 @@
 import json
 
-from autoresearch.autoresearch_todo_state import (
+from autoresearch.state.todo import (
     dependencies_satisfied,
     empty_todo_state,
     has_blocking_failed_tasks,

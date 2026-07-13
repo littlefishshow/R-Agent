@@ -2,7 +2,7 @@
 
 > 目标：一个**成本可控**、可**无限运行**的 autoresearch 框架。
 > 本文是权威计划书：架构原则、文件契约、相位状态机、成本闸门、以及分阶段 roadmap。
-> 代码基准：`core/autoresearch_loop.py`、`tools/autoresearch_tool.py`（R-Agent `autoresearch` 分支）。
+> 代码基准：当前实现已整理到 `autoresearch/` Python 包中；`tools/autoresearch_tool.py` 只保留为 R-Agent 工具注册 shim。
 
 ---
 
@@ -251,18 +251,21 @@ BudgetGate: 有预算且未收敛 → Gate ; 触顶或 plateau → Pause(通知�
 
 | 模块 | 职责 | 关键导出 |
 |---|---|---|
-| `core/autoresearch_budget.py` | 成本闸门 | `BudgetLedger`(usd/token 上限, degrade/exhaust), `MeteredLLMClient`, `ModelTiers` |
-| `core/autoresearch_memory.py` | 分层记忆 | `split_program`/`update_belief`(L0/L1), `read_phase`/`write_phase`(L2), `.auto` 读写+`gc_auto_dir`(L3), `append_lesson`/`read_lessons`(扛 rollback) |
-| `core/autoresearch_phases.py` | 相位状态机 | 纯转移 `phase_gate`/`budget_gate`/`next_phase`, `PhaseController`, `run_phase_loop`(v2 入口) |
-| `core/autoresearch_phase_handlers.py` | 确定性相位 | P1 `survey_project`, P5 evaluate(+lessons), P6 compress, `default_handlers()` |
-| `core/autoresearch_personas.py` | P2 多性格 | `PlanDebate`(预算感知性格数), `DIVERGENT`/`PRAGMATIC`/`LEADER`, `make_plan_handler` |
-| `core/autoresearch_execution.py` | P3/P4 | `make_execute_handler`(验证硬约束), `make_run_handler`(有界 autofix) |
-| `tools/autoresearch_tool.py` | 工具入口 | `auto_research_run`(legacy fixed/evolutionary), `auto_research_run_v2`(相位机) |
+| `autoresearch/observability/budget.py` | 成本闸门 | `BudgetLedger`(usd/token 上限, degrade/exhaust), `MeteredLLMClient`, `ModelTiers` |
+| `autoresearch/state/memory.py` | 分层记忆 | `split_program`/`update_belief`(L0/L1), `read_phase`/`write_phase`(L2), `.auto` 读写+`gc_auto_dir`(L3), `append_lesson`/`read_lessons`(扛 rollback) |
+| `autoresearch/phases.py` | 相位入口 | `PhaseContext`/`PhaseResult`, `run_phase_loop` |
+| `autoresearch/phase_handlers.py` | 确定性相位 | P1 `survey_project`, P5 evaluate(+lessons), P6 compress |
+| `autoresearch/planner.py` | P2 多性格 | `PlanDebate`(预算感知性格数), `DIVERGENT`/`PRAGMATIC`/`LEADER`, `make_plan_handler` |
+| `autoresearch/execution.py` | P3/P4 | `make_execute_handler`(验证硬约束), `make_run_handler`(有界 autofix) |
+| `autoresearch/controller.py` | 当前 3-step 控制器 | `ThreeStepController`, `run_three_step_loop` |
+| `autoresearch/runtime_policy.py` | step agent 策略 | `StepRuntimePolicy`, tool/skill whitelist, done tags |
+| `autoresearch/tool.py` | 工具实现 | `auto_research_run`(legacy fixed/evolutionary), `auto_research_run_v2`(相位机), status/stop/kill |
+| `tools/autoresearch_tool.py` | 工具注册 shim | 重新加载 `autoresearch.tool`，让 `ToolRegistry.reload_all()` 能发现注册项 |
 
 ### 运行方式
 
 ```python
-from tools.autoresearch_tool import auto_research_run_v2_tool
+from autoresearch.tool import auto_research_run_v2_tool
 auto_research_run_v2_tool(
     "/path/to/project",
     max_steps=24,

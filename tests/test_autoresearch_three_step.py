@@ -1,10 +1,10 @@
 from pathlib import Path
 import json
 
-from autoresearch.autoresearch_loop import AutoResearchLoop, AutoResearchSettings
-from autoresearch.autoresearch_memory import read_phase
-from autoresearch.autoresearch_three_step import ThreeStepController
-from autoresearch.autoresearch_todo_state import load_todo_state, save_todo_state
+from autoresearch.legacy.loop import AutoResearchLoop, AutoResearchSettings
+from autoresearch.state.memory import read_phase
+from autoresearch.controller import ThreeStepController
+from autoresearch.state.todo import load_todo_state, save_todo_state
 
 
 def _settings(tmp_path):
@@ -127,6 +127,44 @@ def test_three_step_conclude_continues_current_dag_instead_of_replanning(tmp_pat
     assert report["next_phase"] == "attempt"
     phase, _ = read_phase((tmp_path / "project.md").read_text(encoding="utf-8"))
     assert phase == "attempt"
+
+
+def test_three_step_run_finalizes_conclude_when_step_budget_ends_after_attempt(tmp_path):
+    settings = _settings(tmp_path)
+    settings.trace_rounds = True
+    (tmp_path / "project.md").write_text(
+        "# Project State\n\n<!-- PHASE: attempt -->\n<!-- PHASE_REASON: test -->\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "cat > metrics.json <<'JSON'\n"
+        "{\"primary_metric\": 0.5, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\n"
+        "JSON\n"
+        "cat metrics.json\n",
+        encoding="utf-8",
+    )
+    save_todo_state(tmp_path, {
+        "tasks": [
+            {
+                "task_id": "val",
+                "goal": "run eval",
+                "type": "validation",
+                "status": "pending",
+                "priority": 1,
+                "run_spec": {"mode": "single", "commands": ["bash eval.sh"]},
+            },
+        ]
+    })
+    loop = AutoResearchLoop(settings)
+    controller = ThreeStepController(settings, loop=loop)
+
+    reports = controller.run(max_steps=1)
+
+    assert [report["ran_phase"] for report in reports] == ["attempt", "conclude"]
+    assert reports[-1]["next_phase"] in {"plan", "attempt"}
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert state["best_experiment"]["primary_metric_name"] == "score"
 
 
 class _CapturingStepAgent:

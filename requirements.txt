@@ -1,6 +1,6 @@
 openai>=1.0.0
 rich>=13.0.0
-python-dotenv>=1.0.0
+python-dotenv>=1.0.0  # provides dotenv.load_dotenv for core/config.py
 pytest>=8.0.0
 PyNaCl>=1.5.0
 # /bbb 终端语音输入录音后端；系统也可用 sox/rec/arecord/ffmpeg 替代

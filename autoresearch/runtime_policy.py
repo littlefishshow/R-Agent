@@ -226,6 +226,9 @@ def build_step_context(root: str | Path, step_name: str, *, task: dict | None = 
             "todo_state_json": _read_text(root / ".autoresearch" / "todo_state.json", 3000),
             "gate_signals_json": _read_text(root / ".autoresearch" / "gate_signals.json", 1200),
             "state_json": _read_text(root / ".autoresearch" / "state.json", 3000),
+            "experiment_memory_json": _read_text(root / ".autoresearch" / "experiment_memory.json", 3500),
+            "experiment_memory_md": _read_text(root / ".autoresearch" / "experiment_memory.md", 2500),
+            "regression_cases_json": _read_text(root / ".autoresearch" / "regression_cases.json", 3500),
             "execute_validation_md": _read_text(root / ".auto" / "execute_validation.md", 1200),
         },
         "tool_policy": {
@@ -239,7 +242,7 @@ def build_step_context(root: str | Path, step_name: str, *, task: dict | None = 
     if len(text) <= max_chars:
         return payload
     # Drop heaviest optional fields in a deterministic order.
-    for key in ("state_json", "todo_state_json", "project_md", "program_md"):
+    for key in ("state_json", "experiment_memory_json", "regression_cases_json", "todo_state_json", "project_md", "program_md"):
         payload["files"][key] = payload["files"].get(key, "")[:1000]
         text = json.dumps(payload, ensure_ascii=False, default=str)
         if len(text) <= max_chars:

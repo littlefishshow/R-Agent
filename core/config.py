@@ -1,13 +1,112 @@
 import os
-from dotenv import load_dotenv
+
+try:
+    from dotenv import load_dotenv as _python_dotenv_load_dotenv
+except ImportError:  # pragma: no cover - exercised when python-dotenv is absent
+    _python_dotenv_load_dotenv = None
+
+
+def _strip_inline_comment(value: str) -> str:
+    """Strip dotenv-style inline comments while preserving # inside quotes."""
+    quote = None
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and quote == '"':
+            escaped = True
+            continue
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in ("'", '"'):
+            quote = char
+            continue
+        if char == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.rstrip()
+
+
+def _unescape_double_quoted(value: str) -> str:
+    """Handle the most common dotenv double-quoted escape sequences."""
+    replacements = {
+        "\\n": "\n",
+        "\\r": "\r",
+        "\\t": "\t",
+        '\\"': '"',
+        "\\\\": "\\",
+        "\\$": "$",
+    }
+    for old, new in replacements.items():
+        value = value.replace(old, new)
+    return value
+
+
+def _parse_env_line(line: str):
+    """Parse a lightweight dotenv line into (key, value), or None if ignored."""
+    stripped = line.strip()
+    if not stripped or stripped.startswith("#"):
+        return None
+    if stripped.startswith("export "):
+        stripped = stripped[len("export "):].lstrip()
+    if "=" not in stripped:
+        return None
+
+    key, value = stripped.split("=", 1)
+    key = key.strip()
+    if not key or not (key[0].isalpha() or key[0] == "_"):
+        return None
+    if any(not (char.isalnum() or char == "_") for char in key):
+        return None
+
+    value = _strip_inline_comment(value.strip())
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        quote = value[0]
+        value = value[1:-1]
+        if quote == '"':
+            value = _unescape_double_quoted(value)
+    return key, value
+
+
+def _fallback_load_dotenv(dotenv_path: str) -> bool:
+    """
+    Minimal .env loader used when python-dotenv is not installed.
+
+    Supports common KEY=VALUE lines, optional leading export, single/double
+    quotes, and comments. Existing environment variables are never overwritten,
+    matching python-dotenv's default override=False behavior.
+    """
+    loaded_any = False
+    try:
+        with open(dotenv_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                parsed = _parse_env_line(raw_line.lstrip("\ufeff"))
+                if not parsed:
+                    continue
+                key, value = parsed
+                if key not in os.environ:
+                    os.environ[key] = value
+                    loaded_any = True
+    except OSError:
+        return False
+    return loaded_any
+
+
+def _load_dotenv(dotenv_path: str) -> bool:
+    if _python_dotenv_load_dotenv is not None:
+        return bool(_python_dotenv_load_dotenv(dotenv_path, override=False))
+    return _fallback_load_dotenv(dotenv_path)
+
 
 # Ensure absolute path based on this file's location
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# 自动加载根目录下的 .env 文件
+# 自动加载根目录下的 .env 文件；python-dotenv 缺失时使用轻量 fallback。
 env_path = os.path.join(BASE_DIR, ".env")
 if os.path.exists(env_path):
-    load_dotenv(env_path)
+    _load_dotenv(env_path)
 
 def get_api_key():
     # 从环境变量读取。防范空字符串 ""

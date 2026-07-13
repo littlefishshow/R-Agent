@@ -1,6 +1,6 @@
 """AutoResearch V3 shared types and public loop entrypoint.
 
-V3 keeps the control loop in ``autoresearch.autoresearch_three_step``:
+V3 keeps the control loop in ``autoresearch.controller``:
 ``plan -> attempt -> conclude``.  This module remains as the stable import
 surface used by tools and handlers: shared phase context/result dataclasses plus
 ``run_phase_loop`` for the public `/autoresearch` path.
@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from autoresearch.autoresearch_debug import ensure_debug_from_settings
+from autoresearch.observability.debug import ensure_debug_from_settings
 
 @dataclass
 class PhaseSignals:
@@ -70,9 +70,9 @@ def run_phase_loop(settings, *, max_steps: int = 24, handlers: Optional[dict] = 
                    run_id: str = "", monitor=None) -> dict:
     """Run the V3 plan -> attempt -> conclude loop."""
     import os
-    from autoresearch.autoresearch_loop import AutoResearchLoop
-    from autoresearch.autoresearch_monitor import RunMonitor
-    from autoresearch.autoresearch_three_step import run_three_step_loop
+    from autoresearch.legacy.loop import AutoResearchLoop
+    from autoresearch.observability.monitor import RunMonitor
+    from autoresearch.controller import run_three_step_loop
 
     if run_id:
         os.environ["AUTORESEARCH_RUN_ID"] = run_id
