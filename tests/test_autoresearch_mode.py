@@ -1,118 +1,131 @@
 import json
-import threading
-from pathlib import Path
 
-import pytest
+from rich.console import Console
 
-from core.autoresearch import (
-    AutoresearchInterrupted,
-    build_paths,
-    init_state,
-    run_autoresearch_cycle,
-)
-from main import _format_autoresearch_result
+import autoresearch.tool as autoresearch_tool
+from main import _handle_autoresearch_command, get_completions
 
 
-def test_autoresearch_cycle_creates_minimal_state_files(tmp_path):
-    result = run_autoresearch_cycle(tmp_path, objective="测试最小闭环")
+def _recording_console() -> Console:
+    return Console(record=True, width=120)
 
+
+def test_autoresearch_run_command_launches_v2_background(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_run(project_dir, **kwargs):
+        calls.append((project_dir, kwargs))
+        return json.dumps({
+            "success": True,
+            "project_dir": project_dir,
+            "run_id": "arv2-test",
+            "monitor_path": str(tmp_path / ".autoresearch" / "monitor.json"),
+        })
+
+    monkeypatch.setattr(autoresearch_tool, "auto_research_run_v2_tool", fake_run)
+    console = _recording_console()
+
+    _handle_autoresearch_command(["run", str(tmp_path)], console)
+
+    assert calls == [(str(tmp_path), {"background": True, "detach": True, "debug_mode": True})]
+    output = console.export_text()
+    assert "已在后台启动 autoresearch" in output
+    assert "arv2-test" in output
+
+
+def test_autoresearch_show_reads_monitor_without_llm(tmp_path, monkeypatch):
+    (tmp_path / "project.md").write_text(
+        "# Project State\n\n"
+        "## 当前计划\nImprove the optimizer and validate it.\n\n"
+        "## 短期结论\n- best improved and completion is not met yet.\n",
+        encoding="utf-8",
+    )
     state_dir = tmp_path / ".autoresearch"
-    assert result["success"] is True
-    assert state_dir.exists()
-    assert (state_dir / "state.json").exists()
-    assert (state_dir / "plan.json").exists()
-    assert (state_dir / "execute_result.json").exists()
-    assert (state_dir / "conclude_result.json").exists()
-    assert (state_dir / "memory.md").exists()
-    assert (state_dir / "lessons.md").exists()
-    assert (state_dir / "results.tsv").exists()
+    state_dir.mkdir()
+    (state_dir / "todo_state.json").write_text(json.dumps({
+        "tasks": [
+            {"task_id": "baseline", "status": "verified"},
+            {"task_id": "impl", "status": "pending"},
+        ]
+    }), encoding="utf-8")
+    (state_dir / "state.json").write_text(json.dumps({
+        "experiments": [
+            {
+                "experiment_id": "exp-baseline",
+                "status": "ok",
+                "primary_metric_name": "score",
+                "metrics": {"score": 10.0},
+                "metric_directions": {"score": False},
+            },
+            {
+                "experiment_id": "exp-best",
+                "status": "ok",
+                "primary_metric_name": "score",
+                "metrics": {"score": 7.0},
+                "metric_directions": {"score": False},
+            },
+        ],
+        "best_experiment": {
+            "experiment_id": "exp-best",
+            "primary_metric_name": "score",
+            "metrics": {"score": 7.0},
+            "metric_directions": {"score": False},
+        },
+    }), encoding="utf-8")
 
-    state = json.loads((state_dir / "state.json").read_text(encoding="utf-8"))
-    assert state["phase"] == "completed"
-    assert state["decision"] == "keep"
+    def fake_status(project_dir=".", monitor_path=""):
+        return json.dumps({
+            "success": True,
+            "monitor_text": f"status for {project_dir}",
+        })
 
-    plan = json.loads((state_dir / "plan.json").read_text(encoding="utf-8"))
-    assert plan["role"] == "Plan"
-    assert plan["experiments"][0]["commands"]
+    monkeypatch.setattr(autoresearch_tool, "auto_research_v2_status_tool", fake_status)
+    console = _recording_console()
 
-    execute_result = json.loads((state_dir / "execute_result.json").read_text(encoding="utf-8"))
-    assert execute_result["role"] == "Execute"
-    assert len(execute_result["command_results"]) >= 1
+    _handle_autoresearch_command(["show", str(tmp_path)], console)
 
-    conclude_result = json.loads((state_dir / "conclude_result.json").read_text(encoding="utf-8"))
-    assert conclude_result["role"] == "Conclude"
-    assert "本轮没有自动修改项目代码。" in conclude_result["notes"]
-
-
-def test_autoresearch_cancel_marks_state_interrupted(tmp_path):
-    cancel_event = threading.Event()
-    cancel_event.set()
-
-    with pytest.raises(AutoresearchInterrupted):
-        run_autoresearch_cycle(tmp_path, cancel_event=cancel_event)
-
-    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
-    assert state["phase"] == "interrupted"
-    assert state["interrupted"] is True
-
-
-def test_autoresearch_format_result_is_user_facing(tmp_path):
-    result = {
-        "project_root": str(tmp_path),
-        "state_dir": str(tmp_path / ".autoresearch"),
-        "run_dir": str(tmp_path / ".autoresearch" / "runs" / "exp_test"),
-        "execute_result": {"command_results": [{"returncode": 0}]},
-        "conclude_result": {"decision": "keep", "status": "completed", "summary": "ok"},
-    }
-
-    text = _format_autoresearch_result(result)
-
-    assert "Autoresearch 本轮完成" in text
-    assert "执行命令数：1" in text
-    assert "决策：`keep`" in text
-
-
-def test_init_state_preserves_expected_paths(tmp_path):
-    paths = build_paths(tmp_path, run_id="exp_fixed")
-    init_state(paths, objective="固定 run")
-
-    assert paths.run_dir.name == "exp_fixed"
-    assert paths.state_json.exists()
-    assert paths.results_tsv.read_text(encoding="utf-8").startswith("run_id\tstarted_at")
+    output = console.export_text()
+    assert f"status for {tmp_path}" in output
+    assert "Project progress" in output
+    assert "tasks: 1/2 done" in output
+    assert "Current plan" in output
+    assert "Improve the optimizer" in output
+    assert "Latest conclusion" in output
+    assert "Metric progress" in output
+    assert "baseline=10" in output
+    assert "improvement=+3" in output
 
 
-def test_autoresearch_debug_trace_archives_workers_contexts_and_flow(tmp_path):
-    result = run_autoresearch_cycle(tmp_path, objective="测试 debug trace")
+def test_autoresearch_debug_routes_to_debug_helpers(tmp_path, monkeypatch):
+    import autoresearch.observability.debug as debug_module
 
-    trace = result["trace"]
-    trace_jsonl = Path(trace["trace_jsonl"])
-    flow_md = Path(trace["flow_md"])
-    contexts_dir = Path(trace["contexts_dir"])
-    run_dir = Path(result["run_dir"])
+    states = []
+    monkeypatch.setattr(debug_module, "set_debug", lambda root, enabled: states.append((root, enabled)) or root / ".autoresearch" / "DEBUG")
+    monkeypatch.setattr(debug_module, "build_debug_summary", lambda root: f"debug summary: {root}")
+    console = _recording_console()
 
-    assert trace_jsonl.exists()
-    assert flow_md.exists()
-    assert contexts_dir.exists()
-    assert (run_dir / "trace.jsonl").exists()
-    assert (run_dir / "flow.md").exists()
+    _handle_autoresearch_command(["debug", "on", str(tmp_path)], console)
+    _handle_autoresearch_command(["debug", "show", str(tmp_path)], console)
 
-    records = [json.loads(line) for line in trace_jsonl.read_text(encoding="utf-8").splitlines() if line.strip()]
-    workers = {record["worker"] for record in records}
-    assert {"Main", "Plan", "Execute", "Conclude"}.issubset(workers)
-    assert any(record["worker"] == "Execute" and record["event"] == "command_finish" for record in records)
+    assert states == [(tmp_path, True)]
+    assert "debug summary" in console.export_text()
 
-    assert (tmp_path / ".autoresearch" / "traces" / "plan.jsonl").exists()
-    assert (tmp_path / ".autoresearch" / "traces" / "execute.jsonl").exists()
-    assert (tmp_path / ".autoresearch" / "traces" / "conclude.jsonl").exists()
-    assert (contexts_dir / "plan_latest.json").exists()
-    assert (contexts_dir / "execute_latest.json").exists()
-    assert (contexts_dir / "conclude_latest.json").exists()
 
-    flow_text = flow_md.read_text(encoding="utf-8")
-    assert "Plan.start" in flow_text
-    assert "Execute.command_finish" in flow_text
-    assert "Conclude.finish" in flow_text
+def test_autoresearch_kill_reports_no_processes(monkeypatch):
+    import main
 
-    conclude_result = json.loads((tmp_path / ".autoresearch" / "conclude_result.json").read_text(encoding="utf-8"))
-    assert trace["trace_jsonl"] in conclude_result["kept_files"]
-    assert trace["flow_md"] in conclude_result["kept_files"]
+    monkeypatch.setattr(main, "_find_autoresearch_processes", lambda: [])
+    console = _recording_console()
+
+    _handle_autoresearch_command(["kill"], console)
+
+    assert "没有发现正在运行的 autoresearch 进程" in console.export_text()
+
+
+def test_autoresearch_slash_completion_exposes_subcommands():
+    completer = get_completions()
+
+    autoresearch = completer.options["/autoresearch"]
+    assert {"run", "show", "debug", "kill"}.issubset(autoresearch.options)
+    assert {"on", "off", "show"}.issubset(autoresearch.options["debug"].options)
+

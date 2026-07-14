@@ -22,7 +22,6 @@ from pathlib import Path
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from core.agent import AgentInterrupted, RAgent
-from core.autoresearch import AutoresearchInterrupted, run_autoresearch_cycle
 from core import config
 from tools.registry import registry
 from core.skills import skill_manager
@@ -930,11 +929,22 @@ def get_completions():
     for schema in schemas:
         tools_dict[schema.get("function", {}).get("name")] = None
         
+    autoresearch_dict = {
+        "run": None,
+        "show": None,
+        "debug": {
+            "on": None,
+            "off": None,
+            "show": None,
+        },
+        "kill": None,
+    }
+
     # 构造 NestedCompleter 的字典
     completer_dict = {
         "/help": None,
         "/bbb": None,
-        "/autoresearch": None,
+        "/autoresearch": autoresearch_dict,
         "/project_list": None,
         "/skill": skills_dict,
         "/tool": tools_dict,
@@ -953,6 +963,316 @@ def get_completions():
     
     return NestedCompleter.from_nested_dict(completer_dict)
 
+
+_AUTORESEARCH_LAST_DIR = Path.home() / ".r_agent_autoresearch_last.json"
+
+
+def _remember_autoresearch_dir(project_dir: str) -> None:
+    """Persist the last project autoresearch was launched on, so `show` can find it."""
+    try:
+        _AUTORESEARCH_LAST_DIR.write_text(
+            json.dumps({"project_dir": str(Path(project_dir).expanduser().resolve()), "ts": time.time()}),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _recall_autoresearch_dir() -> str | None:
+    try:
+        data = json.loads(_AUTORESEARCH_LAST_DIR.read_text(encoding="utf-8"))
+        return data.get("project_dir")
+    except Exception:
+        return None
+
+
+def _find_autoresearch_processes() -> list[dict]:
+    """Discover running autoresearch child processes via ps (no psutil dependency)."""
+    self_pid = os.getpid()
+    procs: list[dict] = []
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,etime=,args="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except Exception:
+        return procs
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid_str, etime, args = parts
+        try:
+            pid = int(pid_str)
+        except ValueError:
+            continue
+        if pid == self_pid:
+            continue
+        is_v2 = "run_phase_loop" in args
+        is_legacy = ("AutoResearchLoop" in args or "auto_research" in args) and "run_phase_loop" not in args
+        if not (is_v2 or is_legacy):
+            continue
+        run_id = ""
+        m = re.search(r"\b(arv2-[0-9a-f]+|ar-[0-9a-f]+)\b", args)
+        if m:
+            run_id = m.group(1)
+        procs.append({
+            "pid": pid,
+            "etime": etime,
+            "run_kind": "v2" if is_v2 else "legacy",
+            "run_id": run_id or "?",
+        })
+    return procs
+
+
+def _kill_pid(pid: int) -> bool:
+    """SIGTERM then SIGKILL a pid; return True if it is gone afterward."""
+    import signal
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    for _ in range(6):
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except Exception:
+            return False
+    try:
+        os.kill(pid, signal.SIGKILL)
+        time.sleep(0.5)
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except Exception:
+        return False
+    return False
+
+
+def _read_json_file(path: Path, default=None):
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _extract_project_section(text: str, marker: str, *, max_chars: int = 1200) -> str:
+    if marker not in text:
+        return ""
+    _head, _sep, rest = text.partition(marker)
+    body = rest.split("\n## ", 1)[0].strip()
+    return body[:max_chars].rstrip()
+
+
+def _format_metric_value(value) -> str:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"{float(value):.6g}"
+    if value is None:
+        return "unknown"
+    return str(value)
+
+
+def _metric_delta_text(best: dict, baseline: dict | None) -> str:
+    if not best or not isinstance(best, dict):
+        return "best metric: unknown"
+    metrics = best.get("metrics") if isinstance(best.get("metrics"), dict) else {}
+    name = str(best.get("primary_metric_name") or "")
+    if not name and metrics:
+        name = str(next(iter(metrics)))
+    value = metrics.get(name) if name else None
+    if value is None:
+        value = metrics.get("primary_metric")
+    direction = (best.get("metric_directions") or {}).get(name)
+    if direction is None:
+        direction = (best.get("metric_directions") or {}).get("primary_metric")
+    higher = bool(direction) if direction is not None else True
+    line = f"best: {name or 'metric'}={_format_metric_value(value)} ({best.get('experiment_id', 'unknown')})"
+    if not baseline:
+        return line + "; baseline: unavailable"
+    base_metrics = baseline.get("metrics") if isinstance(baseline.get("metrics"), dict) else {}
+    baseline_value = base_metrics.get(name) if name else None
+    if baseline_value is None:
+        baseline_value = base_metrics.get("primary_metric")
+    try:
+        cur = float(value)
+        base = float(baseline_value)
+        delta = cur - base
+        improved = delta if higher else -delta
+        pct = (improved / abs(base) * 100.0) if base else 0.0
+        sign = "+" if improved >= 0 else ""
+        return (
+            f"{line}; baseline={_format_metric_value(base)}; "
+            f"improvement={sign}{_format_metric_value(improved)} ({sign}{pct:.2f}%)"
+        )
+    except Exception:
+        return f"{line}; baseline={_format_metric_value(baseline_value)}"
+
+
+def _format_todo_progress(root: Path) -> str:
+    state = _read_json_file(root / ".autoresearch" / "todo_state.json", default={}) or {}
+    tasks = state.get("tasks") if isinstance(state.get("tasks"), list) else []
+    if not tasks:
+        return "tasks: no todo_state yet"
+    statuses = ("pending", "in_progress", "verified", "failed", "blocked", "skipped")
+    counts = {status: sum(1 for task in tasks if task.get("status") == status) for status in statuses}
+    total = len(tasks)
+    done = counts["verified"] + counts["skipped"]
+    ready = [
+        str(task.get("task_id") or "?")
+        for task in tasks
+        if task.get("status") in {"pending", "in_progress"}
+    ][:5]
+    line = (
+        f"tasks: {done}/{total} done; "
+        f"verified={counts['verified']} pending={counts['pending']} "
+        f"in_progress={counts['in_progress']} failed={counts['failed']} blocked={counts['blocked']}"
+    )
+    if ready:
+        line += f"; next={', '.join(ready)}"
+    return line
+
+
+def _format_autoresearch_show_summary(project_dir: str, monitor_text: str) -> str:
+    root = Path(project_dir).expanduser().resolve()
+    project_text = ""
+    project_path = root / "project.md"
+    if project_path.exists():
+        project_text = project_path.read_text(encoding="utf-8", errors="replace")
+    plan = _extract_project_section(project_text, "## 当前计划", max_chars=900)
+    conclusion = _extract_project_section(project_text, "## 短期结论", max_chars=900)
+    state = _read_json_file(root / ".autoresearch" / "state.json", default={}) or {}
+    experiments = state.get("experiments") if isinstance(state.get("experiments"), list) else []
+    baseline = next(
+        (
+            exp for exp in experiments
+            if isinstance(exp, dict)
+            and exp.get("status") != "failed"
+            and exp.get("metrics")
+        ),
+        None,
+    )
+    best = state.get("best_experiment") if isinstance(state.get("best_experiment"), dict) else {}
+    lines = [
+        monitor_text,
+        "",
+        "Project progress",
+        _format_todo_progress(root),
+    ]
+    if conclusion:
+        lines.extend(["", "Latest conclusion", conclusion])
+    if plan:
+        lines.extend(["", "Current plan", plan])
+    lines.extend(["", "Metric progress", _metric_delta_text(best, baseline)])
+    return "\n".join(line for line in lines if line is not None).strip()
+
+
+def _handle_autoresearch_command(args: list[str], console) -> None:
+    """`/autoresearch run <dir>` launches v2; `show` reads monitor.json without LLM calls."""
+    from autoresearch.tool import auto_research_run_v2_tool, auto_research_v2_status_tool
+    from autoresearch.observability.debug import build_debug_summary, set_debug
+
+    sub = (args[0].lower() if args else "")
+
+    if sub == "run":
+        if len(args) < 2:
+            console.print("[bold red]用法: /autoresearch run <项目文件夹>[/bold red]")
+            return
+        project_dir = args[1]
+        root = Path(project_dir).expanduser()
+        if not root.is_dir():
+            console.print(f"[bold red]目录不存在: {project_dir}[/bold red]")
+            return
+        payload = json.loads(auto_research_run_v2_tool(str(root), background=True, detach=True, debug_mode=True))
+        if not payload.get("success"):
+            console.print(f"[bold red]启动失败: {payload.get('error')}[/bold red]")
+            return
+        _remember_autoresearch_dir(str(root))
+        text = (
+            "已在后台启动 autoresearch (v2)，主进程不阻塞。\n\n"
+            f"- 项目目录: `{payload.get('project_dir')}`\n"
+            f"- run_id: `{payload.get('run_id')}`\n"
+            f"- monitor: `{payload.get('monitor_path')}`\n\n"
+            "> 用 `/autoresearch show` 查看进度（读取 monitor.json，不调用 LLM）。debug 默认开启，可 `/autoresearch debug off` 关闭。"
+        )
+        console.print(Panel(Markdown(text), title="🔬 AutoResearch 已启动", border_style="cyan", expand=False))
+        return
+
+    if sub == "show":
+        project_dir = args[1] if len(args) > 1 else _recall_autoresearch_dir()
+        if not project_dir:
+            console.print("[bold red]没有可查看的运行；用 /autoresearch show <项目文件夹> 指定目录。[/bold red]")
+            return
+        status = json.loads(auto_research_v2_status_tool(project_dir=str(Path(project_dir).expanduser())))
+        if not status.get("success"):
+            console.print(f"[bold red]读取进度失败: {status.get('error')}[/bold red]")
+            return
+        monitor_text = status.get("monitor_text") or "(暂无进度：monitor.json 尚未生成或不可读)"
+        monitor_text = _format_autoresearch_show_summary(str(Path(project_dir).expanduser()), monitor_text)
+        console.print(Panel(monitor_text, title=f"🔬 AutoResearch 进度: {project_dir}", border_style="cyan", expand=False))
+        return
+
+    if sub == "debug":
+        mode = args[1].lower() if len(args) > 1 else "show"
+        project_dir = args[2] if len(args) > 2 else _recall_autoresearch_dir()
+        if not project_dir:
+            console.print("[bold red]没有可操作的目录；用 /autoresearch debug <on|off|show> <项目文件夹> 指定目录。[/bold red]")
+            return
+        root = Path(project_dir).expanduser()
+        if mode == "on":
+            flag = set_debug(root, True)
+            console.print(f"debug 已开启: {flag}")
+            return
+        if mode == "off":
+            flag = set_debug(root, False)
+            console.print(f"debug 已关闭: {flag}")
+            return
+        if mode == "show":
+            console.print(Panel(build_debug_summary(root), title=f"🔬 AutoResearch Debug: {project_dir}", border_style="cyan", expand=False))
+            return
+        console.print("[bold red]用法: /autoresearch debug [on|off|show] [项目文件夹][/bold red]")
+        return
+
+    if sub == "kill":
+        procs = _find_autoresearch_processes()
+        if not procs:
+            console.print("[dim]没有发现正在运行的 autoresearch 进程。[/dim]")
+            return
+        lines = [f"发现 {len(procs)} 个 autoresearch 进程:"]
+        for p in procs:
+            lines.append(f"- pid {p['pid']}  {p['run_kind']}  run_id={p['run_id']}  elapsed={p['etime']}")
+        console.print(Panel("\n".join(lines), title="🛑 待终止的 AutoResearch 进程", border_style="yellow", expand=False))
+        killed, failed = [], []
+        for p in procs:
+            if _kill_pid(p["pid"]):
+                killed.append(p["pid"])
+            else:
+                failed.append(p["pid"])
+        msg = f"已终止 {len(killed)} 个进程: {killed}" if killed else "未终止任何进程。"
+        if failed:
+            msg += f"\n[bold red]无法终止: {failed}[/bold red]"
+        console.print(msg)
+        return
+
+    console.print(
+        "[bold red]未知子命令。[/bold red]\n"
+        "用法:\n"
+        "  /autoresearch run <项目文件夹>   # 后台启动，主进程不阻塞\n"
+        "  /autoresearch show [项目文件夹]  # 查看进度（缺省用最近一次）\n"
+        "  /autoresearch debug [on|off|show] [项目文件夹]\n"
+        "  /autoresearch kill              # 列出并终止所有正在运行的 autoresearch 进程"
+    )
+
+
 def handle_slash_command(command_str: str, console) -> bool:
     """处理本地斜杠命令，返回 True 表示已拦截处理，False 表示继续传递给 Agent"""
     parts = command_str.strip().split()
@@ -967,8 +1287,8 @@ def handle_slash_command(command_str: str, console) -> bool:
             "**本地可用命令:**\n"
             "- `/help`: 显示此帮助信息\n"
             "- `/bbb`: 开始语音输入；按 Enter 停止并识别，按 Esc 取消\n"
-            "- `/autoresearch [项目路径]`: 进入小型 autoresearch mode，运行中输入锁定，按 Esc 中断\n"
             "- `/project_list`: 列出项目进度，并手动选择载入当前上下文\n"
+            "- `/autoresearch [run <目录>|show [目录]|debug [on|off|show] [目录]|kill]`: 后台启动 autoresearch、查看进度、调试或终止运行中的进程\n"
             "- `/skill [list|name]`: 列出或查看技能\n"
             "- `/tool [list|name]`: 列出或查看基础工具\n"
             "- `/mem [list|USER|MEMORY]`: 查看环境记忆与用户偏好\n"
@@ -977,6 +1297,13 @@ def handle_slash_command(command_str: str, console) -> bool:
             "- `/apikey [新密钥]`: 修改当前 API Key\n"
         )
         console.print(Panel(Markdown(help_text), title="[bold cyan]帮助[/bold cyan]", border_style="cyan", expand=False))
+        return True
+
+    if cmd == "/autoresearch":
+        args = parts[1:]
+        if args and args[0].lower() not in {"run", "show", "debug", "kill"}:
+            args = ["run", args[0]]
+        _handle_autoresearch_command(args, console)
         return True
 
     if cmd == "/skill":
@@ -1073,99 +1400,6 @@ def handle_slash_command(command_str: str, console) -> bool:
     return True
 
 
-def _format_autoresearch_result(result: dict) -> str:
-    conclude = result.get("conclude_result") or {}
-    execute = result.get("execute_result") or {}
-    command_results = execute.get("command_results") or []
-    trace = result.get("trace") or {}
-    lines = [
-        "## Autoresearch 本轮完成",
-        "",
-        f"- 项目：`{result.get('project_root')}`",
-        f"- 状态目录：`{result.get('state_dir')}`",
-        f"- 日志目录：`{result.get('run_dir')}`",
-        f"- Debug Trace：`{trace.get('trace_jsonl') or '未生成'}`",
-        f"- 流程归档：`{trace.get('flow_md') or '未生成'}`",
-        f"- 上下文快照：`{trace.get('contexts_dir') or '未生成'}`",
-        f"- 决策：`{conclude.get('decision')}`",
-        f"- 状态：`{conclude.get('status')}`",
-        f"- 执行命令数：{len(command_results)}",
-        "",
-        conclude.get("summary") or "已完成 Plan → Execute → Conclude 最小闭环。",
-    ]
-    failed = conclude.get("failed_commands") or []
-    if failed:
-        lines.extend(["", "### 失败命令", ""])
-        for command in failed:
-            lines.append(f"- `{' '.join(command) if isinstance(command, list) else command}`")
-    return "\n".join(lines)
-
-
-def run_autoresearch_mode(console, session: PromptSession, initial_path: str = "") -> None:
-    """运行小型 autoresearch mode 的第一版最小闭环。
-
-    交互边界：用户输入项目路径后开始；运行期间只展示进程，输入锁定；Esc 可中断。
-    """
-    project_path = (initial_path or "").strip()
-    if not project_path:
-        project_path = session.prompt(
-            HTML('<ansicyan><b>🔬 Autoresearch 项目路径&gt;</b></ansicyan> ')
-        ).strip()
-    if not project_path:
-        console.print("[yellow]未输入项目路径，已返回聊天框。[/yellow]")
-        return
-
-    console.print(
-        Panel(
-            Markdown(
-                "小型 autoresearch mode 即将开始：\n\n"
-                "1. Plan 先做只读计划；\n"
-                "2. Execute 执行安全短命令并写日志；\n"
-                "3. Conclude 解析结果并写总结；\n"
-                "4. 运行中输入锁定，按 Esc 可以中断。"
-            ),
-            title="[bold cyan]🔬 Autoresearch[/bold cyan]",
-            border_style="cyan",
-            expand=False,
-        )
-    )
-
-    status_ref = {"status": None}
-
-    def update_status(message: str):
-        current_status = status_ref.get("status")
-        if current_status is not None:
-            current_status.update(_with_interrupt_status_hint(message))
-
-    try:
-        result = _run_with_esc_interrupt(
-            lambda cancel_event: run_autoresearch_cycle(
-                project_path,
-                cancel_event=cancel_event,
-                on_status=update_status,
-            ),
-            "[bold cyan]🔬 Autoresearch 正在运行...[/bold cyan]",
-            status_ref=status_ref,
-        )
-    except AutoresearchInterrupted:
-        console.print("[yellow]已中断 autoresearch，本轮状态已标记为 interrupted。[/yellow]")
-        console.print()
-        return
-    except Exception as exc:
-        console.print(f"[bold red]Autoresearch 启动失败：{exc}[/bold red]")
-        console.print()
-        return
-
-    console.print(
-        Panel(
-            Markdown(_format_autoresearch_result(result)),
-            title="[bold blue]🔬 Autoresearch Result[/bold blue]",
-            border_style="blue",
-            expand=False,
-        )
-    )
-    console.print()
-
 def _shutdown_agent(agent: RAgent, console, timeout: float = 1.0) -> None:
     """退出 CLI 前收敛 Agent 后台任务，避免 exit 时与后台复盘竞争资源。"""
     try:
@@ -1224,9 +1458,10 @@ def main():
                 user_input = voice_text
 
             elif user_input.strip().lower().startswith("/autoresearch"):
-                parts = user_input.strip().split(maxsplit=1)
-                initial_path = parts[1] if len(parts) > 1 else ""
-                run_autoresearch_mode(console, session, initial_path=initial_path)
+                args = shlex.split(user_input.strip())[1:]
+                if args and args[0].lower() not in {"run", "show", "debug", "kill"}:
+                    args = ["run", args[0]]
+                _handle_autoresearch_command(args, console)
                 continue
 
             elif user_input.strip().lower() == "/project_list":

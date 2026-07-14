@@ -137,6 +137,7 @@ runtime_seconds: 12.4
 必须包含：
 
 - 项目目标和当前 baseline；
+- `Completion Criteria` / solved 标准，必须使用 runtime 可解析格式（例如 `metric_name`、`higher_is_better`、阈值表达式如 `<metric_name> >= <threshold>`）；若用户已给官方指标则填入，若未给则优先从 README、eval 文件或 `metrics.json` 推断，否则必须向用户澄清，不要省略；
 - 允许修改的文件；
 - 禁止修改的文件，尤其是 `eval.py`/`eval.sh`/固定测试集；
 - 数据准备步骤；
@@ -271,6 +272,7 @@ tail -n 80 eval.log
 - 不要自动修改 evaluation harness，除非用户明确要求重新定义任务。
 - 不要把论文结论当成已验证事实；实验结果必须来自实际日志/指标。
 - 不要继承原始 autoresearch 的无限循环；必须有明确预算或停止条件。
+- 明确区分 solved criteria 与预算/停止条件：`Completion Criteria` 中的官方指标阈值才表示项目已解决；轮数、时间、资源耗尽或无下一假设只表示应暂停/停止并汇报未解决，不得当作 solved。
 - 如果涉及语音输出，必须遵守 `voice_enabled` 显式开关，默认安静。
 
 ## Minimal command checklist

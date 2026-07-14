@@ -1,7 +1,8 @@
 import json
+import time
 from pathlib import Path
 
-from core.autoresearch_loop import (
+from autoresearch.legacy.loop import (
     AutoResearchAction,
     AutoResearchContextManager,
     AutoResearchLoop,
@@ -9,6 +10,8 @@ from core.autoresearch_loop import (
     AutoResearchSafetyError,
     ProjectConfinedCommandRunner,
 )
+from autoresearch.phase_handlers import make_evaluate_handler
+from autoresearch.phases import PhaseContext, PhaseSignals
 
 
 def test_autoresearch_loop_archives_raw_output_and_keeps_bounded_context(tmp_path):
@@ -56,6 +59,16 @@ def test_project_confined_runner_allows_project_local_rm_without_global_approval
 
     assert result["returncode"] == 0
     assert not target.exists()
+
+
+def test_project_confined_runner_shims_bare_python_to_current_python3(tmp_path):
+    runner = ProjectConfinedCommandRunner(tmp_path, timeout_seconds=10)
+
+    result = runner.run("python -c 'print(f\"py{3}\")'")
+
+    assert result["returncode"] == 0
+    assert "py3" in result["stdout"]
+    assert (tmp_path / ".autoresearch" / "bin" / "python").exists()
 
 
 def test_project_confined_runner_rejects_workspace_escape(tmp_path):
@@ -140,7 +153,7 @@ def test_evolution_artifacts_budget_and_non_git_degradation(tmp_path):
 
 
 def test_git_snapshot_disabled_and_non_git_safe_degrade(tmp_path):
-    from core.autoresearch_loop import git_snapshot, save_project_diff
+    from autoresearch.legacy.loop import git_snapshot, save_project_diff
 
     (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
     disabled = git_snapshot(tmp_path, enabled=False)
@@ -157,7 +170,7 @@ def test_git_snapshot_disabled_and_non_git_safe_degrade(tmp_path):
 
 
 def test_multi_objective_pareto_front_keeps_only_non_dominated_candidates():
-    from core.autoresearch_loop import choose_best_experiment, pareto_front
+    from autoresearch.legacy.loop import choose_best_experiment, pareto_front
 
     experiments = [
         {"experiment_id": "accurate-but-slow", "created_at": 1, "status": "ok", "metrics": {"accuracy": 0.90, "latency": 100}, "primary_metric_name": "accuracy"},
@@ -176,6 +189,50 @@ def test_multi_objective_pareto_front_keeps_only_non_dominated_candidates():
 
     best = choose_best_experiment(experiments, directions, primary_name="accuracy")
     assert best["experiment_id"] == "accurate-but-slow"
+
+
+def test_pareto_ignores_wall_clock_telemetry_as_objective():
+    """A metric-worse experiment must not survive the front just by being faster."""
+    from autoresearch.legacy.loop import pareto_front
+
+    experiments = [
+        {"experiment_id": "best", "created_at": 1, "status": "ok",
+         "metrics": {"positive_f1": 0.94, "runtime_seconds": 0.010, "duration_seconds": 0.10, "returncode": 0}},
+        {"experiment_id": "worse-but-faster", "created_at": 2, "status": "ok",
+         "metrics": {"positive_f1": 0.80, "runtime_seconds": 0.001, "duration_seconds": 0.01, "returncode": 0}},
+    ]
+    directions = {"positive_f1": True, "runtime_seconds": False, "duration_seconds": False}
+    front = pareto_front(experiments, directions, max_items=8)
+    front_ids = {item["experiment_id"] for item in front}
+    # With telemetry excluded, the lower-f1 point is dominated and drops off.
+    # (If runtime/duration counted, "worse-but-faster" would falsely survive.)
+    assert front_ids == {"best"}
+
+
+def test_is_objective_metric_excludes_telemetry_and_counts():
+    from autoresearch.legacy.services import is_objective_metric
+
+    assert is_objective_metric("primary_metric") is True
+    assert is_objective_metric("positive_f1") is True
+    assert is_objective_metric("exact_match_accuracy") is True
+    for noise in ("runtime_seconds", "runtime_sec", "duration_seconds", "returncode",
+                  "num_cases", "total_rows", "tp", "fp", "fn", "tn", "step_duration"):
+        assert is_objective_metric(noise) is False, noise
+
+
+def test_extract_metrics_ignores_json_escaped_newline_prefixes():
+    """Regression: '\\n' before a key must not leak an 'nprimary_metric' axis."""
+    from autoresearch.legacy.services import extract_metrics_from_text
+
+    text = (
+        '{"stdout": "{\\n  \\"primary_metric\\": 0.9444,\\n'
+        '  \\"metric_name\\": \\"exact_match_accuracy\\",\\n'
+        '  \\"runtime_seconds\\": 0.0007\\n}\\n", "returncode": 0}'
+    )
+    metrics, _ = extract_metrics_from_text(text)
+    assert not any(k.startswith("nprimary") or k.startswith("nruntime") for k in metrics)
+    assert "exact_match_accuracy" in metrics
+
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -290,6 +347,105 @@ def test_versioning_policy_commit_pareto_commits_only_best_or_pareto_and_rolls_b
     assert state["best_experiment"]["experiment_id"] == first["experiment_id"]
 
 
+def test_deferred_versioning_finalizes_only_when_conclude_calls_finalize(tmp_path):
+    repo = _init_tiny_git_repo(tmp_path)
+    initial_head = _git(repo, "rev-parse", "HEAD")
+    settings = AutoResearchSettings(
+        project_dir=repo,
+        project_id="deferred",
+        max_rounds=0,
+        max_experiments=2,
+        versioning_policy="commit_pareto",
+        use_git_versioning=True,
+        defer_experiment_finalization=True,
+        max_useful_failures=5,
+    )
+    loop = AutoResearchLoop(settings)
+
+    base_git = {
+        "git_available": True,
+        "head": initial_head,
+        "status": "",
+    }
+    action = AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="deferred trial",
+        command="",
+    )
+    obs = loop.execute_action(AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="deferred trial",
+        command="printf deferred > model.txt && printf 'primary_metric_name: accuracy\nprimary_metric: 0.91\nhigher_is_better: true\n'",
+    ))
+    loop._maybe_record_experiment(action, obs, base_git, "run_experiment")
+
+    state = json.loads((repo / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    record = state["experiments"][0]
+    assert record["version_action"] == "artifact_only"
+    assert not record.get("version_finalized")
+    assert _git(repo, "rev-parse", "HEAD") == initial_head
+    assert "M model.txt" in _git(repo, "status", "--porcelain=v1")
+
+    result = loop.finalize_experiments()
+    state = json.loads((repo / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    record = state["experiments"][0]
+    assert result["finalized"] == 1
+    assert record["version_finalized"] is True
+    assert record["version_action"] == "committed"
+    assert record["commit_sha"]
+    assert _git(repo, "rev-parse", "HEAD") != initial_head
+    assert (repo / ".autoresearch" / "lessons.jsonl").exists()
+
+
+def test_conclude_evaluate_handler_finalizes_deferred_experiments(tmp_path):
+    repo = _init_tiny_git_repo(tmp_path)
+    initial_head = _git(repo, "rev-parse", "HEAD")
+    settings = AutoResearchSettings(
+        project_dir=repo,
+        project_id="deferred-conclude",
+        max_rounds=0,
+        max_experiments=1,
+        versioning_policy="commit_pareto",
+        use_git_versioning=True,
+        defer_experiment_finalization=True,
+    )
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="conclude trial",
+        command="printf conclude > model.txt && printf 'primary_metric_name: accuracy\nprimary_metric: 0.93\nhigher_is_better: true\n'",
+    ))
+    loop._maybe_record_experiment(
+        AutoResearchAction(type="run", role="trial", rationale="conclude trial", command=""),
+        obs,
+        {"git_available": True, "head": initial_head, "status": ""},
+        "run_experiment",
+    )
+    assert _git(repo, "rev-parse", "HEAD") == initial_head
+
+    ctx = PhaseContext(
+        phase="conclude",
+        root=repo,
+        program_text=(repo / "program.md").read_text(encoding="utf-8"),
+        project_text="# Project\n\n## 短期结论\n",
+        signals=PhaseSignals(phase="conclude"),
+        loop=loop,
+    )
+    result = make_evaluate_handler()(ctx)
+
+    state = json.loads((repo / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    record = state["experiments"][0]
+    assert record["version_finalized"] is True
+    assert record["version_action"] == "committed"
+    assert record["commit_sha"]
+    assert state["best_experiment"]["experiment_id"] == record["experiment_id"]
+    assert "finalized=1" in result.summary
+    assert (repo / ".autoresearch" / "lessons.jsonl").exists()
+
+
 def test_versioning_policy_branch_per_trial_creates_branch_record_and_returns_to_base(tmp_path):
     repo = _init_tiny_git_repo(tmp_path)
     initial_head = _git(repo, "rev-parse", "HEAD")
@@ -359,3 +515,671 @@ def test_versioning_policy_non_git_safely_degrades_to_manifest_without_git_init(
     assert record["diff_path"].endswith("manifest.json")
     assert Path(record["diff_path"]).exists()
     assert not (tmp_path / ".git").exists()
+
+
+def test_default_rounds_reaches_record_decision(tmp_path):
+    """With the fixed planner, rounds must be large enough to reach record_decision.
+
+    Pinned to the deterministic fixed planner (LLM off) so this stays fast and
+    hermetic; the aggressive tool defaults (evolutionary + LLM on) are exercised
+    elsewhere. This guards the off-by-one that previously skipped record_decision.
+    """
+    from autoresearch.legacy.loop import FixedAutoResearchPlanner
+    from autoresearch.tool import auto_research_run_tool
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    payload = json.loads(auto_research_run_tool(
+        str(tmp_path), project_id="rounds-default",
+        rounds=len(FixedAutoResearchPlanner.DEFAULT_STEPS),
+        planner="fixed", use_llm_step_agents=False,
+    ))
+
+    assert payload["success"] is True
+    assert payload["rounds_completed"] == len(FixedAutoResearchPlanner.DEFAULT_STEPS)
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    rationales = [obs.get("summary", "") for obs in state["observations"]]
+    assert any("conclusion_record_decision" in r for r in rationales)
+
+
+def test_tool_defaults_are_aggressive():
+    """The user-facing tool defaults must be the aggressive config (main agent can't set them)."""
+    import inspect
+    from autoresearch.tool import auto_research_run_tool, auto_research_run_v2_tool
+
+    d1 = {p.name: p.default for p in inspect.signature(auto_research_run_tool).parameters.values()}
+    assert d1["rounds"] == 100
+    assert d1["use_llm_step_agents"] is True
+    assert d1["planner"] == "evolutionary"
+    assert d1["max_experiments"] == 40
+    assert d1["trace_rounds"] is True
+
+    d2 = {p.name: p.default for p in inspect.signature(auto_research_run_v2_tool).parameters.values()}
+    assert d2["max_steps"] == 100
+    assert d2["use_llm_step_agents"] is True
+    assert d2["max_experiments"] == 40
+    assert d2["trace_rounds"] is True
+    # v2 must default to background: a full loop of slow LLM phases exceeds a
+    # foreground tool timeout, so the main agent (which cannot set params) needs
+    # the non-blocking path by default.
+    assert d2["background"] is True
+
+
+def test_action_role_drives_experiment_recording(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="role", max_rounds=1, max_experiments=1)
+    action = AutoResearchAction(
+        type="run",
+        rationale="just_running_something",
+        command="printf 'primary_metric: 0.5\nprimary_metric_name: accuracy\n'",
+        role="trial",
+    )
+
+    def planner(parent_context, round_index):
+        return action
+
+    AutoResearchLoop(settings, planner=planner).run()
+
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert len(state["experiments"]) == 1
+    assert state["experiments"][0]["hypothesis"] == "just_running_something"
+
+
+def test_action_role_baseline_does_not_consume_trial_budget(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="role-baseline", max_rounds=1, max_experiments=1)
+    action = AutoResearchAction(
+        type="run",
+        rationale="an_evaluation",
+        command="printf 'primary_metric: 0.5\nprimary_metric_name: accuracy\n'",
+        role="baseline",
+    )
+
+    def planner(parent_context, round_index):
+        return action
+
+    AutoResearchLoop(settings, planner=planner).run()
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert state.get("experiments", []) == []
+    assert state.get("baseline_metric") == 0.5
+
+
+def test_rationale_fallback_still_recognizes_trial(tmp_path):
+    """Legacy planners without explicit role should still be counted as trials."""
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="legacy", max_rounds=1, max_experiments=1)
+    action = AutoResearchAction(
+        type="run",
+        rationale="experiment_result_trial_legacy",
+        command="printf 'primary_metric: 0.7\nprimary_metric_name: accuracy\n'",
+    )
+
+    def planner(parent_context, round_index):
+        return action
+
+    AutoResearchLoop(settings, planner=planner).run()
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert len(state["experiments"]) == 1
+
+
+def test_apply_change_from_write_spec_creates_new_file(tmp_path):
+    """plan_change note carrying a JSON write spec should upgrade apply_change to apply_patch."""
+    from autoresearch.legacy.loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    spec = {"kind": "write", "path": "greeting.txt", "content": "hello autoresearch\n"}
+    plan_step = AutoResearchWorkflowStep(
+        name="plan_change",
+        action_type="note",
+        rationale="proposed_write",
+        content=json.dumps(spec),
+        allowed_tools=("note", "read"),
+    )
+    apply_step = AutoResearchWorkflowStep(
+        name="apply_change",
+        action_type="note",
+        rationale="apply_change_placeholder",
+        content="fallback note",
+        allowed_tools=("apply_patch", "note", "read"),
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="spec-write", max_rounds=2)
+    result = AutoResearchLoop(settings, planner=FixedAutoResearchPlanner([plan_step, apply_step])).run()
+
+    assert result["rounds_completed"] == 2
+    assert (tmp_path / "greeting.txt").read_text(encoding="utf-8") == "hello autoresearch\n"
+    apply_obs = result["observations"][1]
+    assert apply_obs["kind"] == "apply_patch"
+    assert apply_obs["status"] == "ok"
+
+
+def test_apply_change_from_search_replace_spec(tmp_path):
+    from autoresearch.legacy.loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    (tmp_path / "model.py").write_text("dropout = 0.3\n", encoding="utf-8")
+    spec = {"kind": "search_replace", "path": "model.py", "old": "dropout = 0.3", "new": "dropout = 0.1"}
+    plan_step = AutoResearchWorkflowStep(
+        name="propose_experiment",
+        action_type="note",
+        rationale="proposed_edit",
+        content=json.dumps(spec),
+        allowed_tools=("note", "read"),
+    )
+    apply_step = AutoResearchWorkflowStep(
+        name="apply_change",
+        action_type="note",
+        rationale="apply_change_placeholder",
+        content="fallback note",
+        allowed_tools=("apply_patch", "note", "read"),
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="spec-sr", max_rounds=2)
+    AutoResearchLoop(settings, planner=FixedAutoResearchPlanner([plan_step, apply_step])).run()
+
+    assert (tmp_path / "model.py").read_text(encoding="utf-8") == "dropout = 0.1\n"
+    assert (tmp_path / ".autoresearch" / "proposed_change.json").exists()
+
+
+def test_apply_change_without_spec_keeps_note_fallback(tmp_path):
+    from autoresearch.legacy.loop import AutoResearchWorkflowStep, FixedAutoResearchPlanner
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    apply_step = AutoResearchWorkflowStep(
+        name="apply_change",
+        action_type="note",
+        rationale="apply_change_placeholder",
+        content="no spec available",
+        allowed_tools=("apply_patch", "note", "read"),
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="no-spec", max_rounds=1)
+    result = AutoResearchLoop(settings, planner=FixedAutoResearchPlanner([apply_step])).run()
+
+    assert result["observations"][0]["kind"] == "note"
+    assert result["observations"][0]["status"] == "ok"
+
+
+def test_evolutionary_planner_uses_full_experiment_budget(tmp_path):
+    """With max_experiments=3 and enough rounds, evolutionary planner should record 3 trials."""
+    from autoresearch.legacy.loop import EvolutionaryAutoResearchPlanner
+
+    (tmp_path / "program.md").write_text("# Program\nmax accuracy\n", encoding="utf-8")
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'primary_metric_name: accuracy\\nprimary_metric: 0.5\\nhigher_is_better: true\\n'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").chmod(0o755)
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="evo",
+        max_rounds=22,
+        max_experiments=3,
+        planner_kind="evolutionary",
+        use_git_versioning=False,
+    )
+    AutoResearchLoop(settings).run()
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert len(state["experiments"]) == 3
+
+
+def test_evolutionary_planner_respects_max_experiments_of_one(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmax accuracy\n", encoding="utf-8")
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\nprintf 'primary_metric_name: accuracy\\nprimary_metric: 0.5\\n'\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "eval.sh").chmod(0o755)
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="evo-1",
+        max_rounds=22,
+        max_experiments=1,
+        planner_kind="evolutionary",
+        use_git_versioning=False,
+    )
+    AutoResearchLoop(settings).run()
+    state = json.loads((tmp_path / ".autoresearch" / "state.json").read_text(encoding="utf-8"))
+    assert len(state["experiments"]) == 1
+
+
+def test_collect_metric_files_ignores_root_state_json(tmp_path):
+    """A user-owned state.json in project root must not be misread as metrics."""
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    (tmp_path / "state.json").write_text(json.dumps({"accuracy": 0.999, "confidence": 0.9}), encoding="utf-8")
+
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="state-json", max_rounds=1, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    metrics, _ = loop._collect_metric_files()
+    assert "accuracy" not in metrics
+    assert "confidence" not in metrics
+
+
+def test_normalize_planner_kind_and_settings_defaults():
+    from autoresearch.legacy.loop import normalize_planner_kind
+
+    assert normalize_planner_kind(None) == "fixed"
+    assert normalize_planner_kind("evolutionary") == "evolutionary"
+    assert normalize_planner_kind("Weird") == "fixed"
+
+
+def test_step_agent_retries_before_falling_back(tmp_path):
+    from autoresearch.legacy.loop import AutoResearchStepAgent, AutoResearchWorkflowStep
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="retry",
+        max_rounds=1,
+        use_llm_step_agents=True,
+        llm_request_timeout=1.0,
+        llm_retry_attempts=1,
+    )
+
+    class _FakeChat:
+        def __init__(self):
+            self.calls = 0
+
+        class _Completions:
+            def __init__(self, outer):
+                self.outer = outer
+
+            def create(self, **kwargs):
+                self.outer.calls += 1
+                if self.outer.calls == 1:
+                    raise RuntimeError("boom")
+
+                class _Msg:
+                    content = '{"action": {"type": "note", "rationale": "ok", "content": "recovered"}, "bucket_updates": {}}'
+
+                class _Choice:
+                    message = _Msg()
+
+                class _Resp:
+                    choices = [_Choice()]
+
+                return _Resp()
+
+        def __init__wrap(self):
+            self.completions = _FakeChat._Completions(self)
+
+        # attach in constructor
+        @property
+        def completions(self):
+            if not hasattr(self, "_completions"):
+                self._completions = _FakeChat._Completions(self)
+            return self._completions
+
+    class _FakeClient:
+        def __init__(self):
+            self.chat = _FakeChat()
+
+    client = _FakeClient()
+    agent = AutoResearchStepAgent(settings, client=client, model="test-model")
+    step = AutoResearchWorkflowStep(name="apply_change", action_type="note", rationale="fb", content="fb", allowed_tools=("note",))
+    result = agent.plan_step(step=step, fallback_action=step.to_action(), parent_context="{}", round_index=0)
+
+    assert client.chat.calls == 2
+    assert result.action.type == "note"
+    assert "recovered" in result.action.content
+
+
+def test_step_agent_framework_deadline_falls_back_quickly(tmp_path):
+    from autoresearch.legacy.loop import AutoResearchStepAgent, AutoResearchWorkflowStep
+
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="timeout",
+        max_rounds=1,
+        use_llm_step_agents=True,
+        llm_request_timeout=0.05,
+        llm_retry_attempts=0,
+    )
+
+    class _SlowCompletions:
+        def create(self, **kwargs):  # noqa: ARG002
+            import time
+
+            time.sleep(1.0)
+
+    class _SlowChat:
+        completions = _SlowCompletions()
+
+    class _SlowClient:
+        chat = _SlowChat()
+
+    agent = AutoResearchStepAgent(settings, client=_SlowClient(), model="test-model")
+    step = AutoResearchWorkflowStep(name="apply_change", action_type="note", rationale="fb", content="fallback", allowed_tools=("note",))
+    started = time.time()
+    result = agent.plan_step(step=step, fallback_action=step.to_action(), parent_context="{}", round_index=0)
+    assert time.time() - started < 0.5
+    assert result.used_fallback is True
+    assert result.action.content == "fallback"
+
+
+def test_eval_readonly_guard_blocks_apply_patch_to_prepare_py(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    (tmp_path / "prepare.py").write_text("print('eval harness')\n", encoding="utf-8")
+    patch = """--- a/prepare.py
++++ b/prepare.py
+@@ -1 +1 @@
+-print('eval harness')
++print('tampered')
+"""
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="apply_patch", rationale="tamper_eval", patch=patch))
+    assert obs.status == "failed"
+    assert (tmp_path / "prepare.py").read_text(encoding="utf-8") == "print('eval harness')\n"
+
+
+def test_eval_readonly_guard_blocks_write_action_to_eval_dir(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="write", rationale="tamper", path="eval/metric.py", content="x"))
+    assert obs.status == "failed"
+    assert not (tmp_path / "eval" / "metric.py").exists()
+
+
+def test_eval_readonly_guard_allows_non_eval_write(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="write", rationale="ok", path="train/model.py", content="ok"))
+    assert obs.status == "ok"
+    assert (tmp_path / "train" / "model.py").read_text(encoding="utf-8") == "ok"
+
+
+def test_loop_builds_budget_ledger_and_tiers(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, max_tokens=5000, model_tier_util="cheap-model")
+    loop = AutoResearchLoop(settings)
+    assert loop.budget is not None
+    assert loop.budget.limits.max_tokens == 5000
+    assert loop.model_tiers.resolve("util") == "cheap-model"
+    assert str(loop.settings.budget_file()).endswith(".autoresearch/budget.json")
+
+
+def test_round_trace_disabled_by_default(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="notrace", max_rounds=2)
+    AutoResearchLoop(settings).run()
+    assert not (tmp_path / ".autoresearch" / "round_traces").exists()
+
+
+def test_round_trace_dumps_full_context_when_enabled(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmax accuracy\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path, project_id="trace", max_rounds=3, trace_rounds=True
+    )
+    AutoResearchLoop(settings).run()
+
+    trace_dir = tmp_path / ".autoresearch" / "round_traces"
+    assert trace_dir.exists()
+    files = sorted(trace_dir.glob("round_*.json"))
+    assert len(files) == 3
+    trace = json.loads(files[0].read_text(encoding="utf-8"))
+    for key in ("round_index", "step_name", "parent_context", "llm", "chosen_action", "observation"):
+        assert key in trace
+    assert "system_prompt" in trace["llm"]
+    assert "raw_response" in trace["llm"]
+    assert trace["chosen_action"]["type"]
+    # deterministic path (no step agent) => used_fallback True
+    assert trace["used_fallback"] is True
+
+
+def test_apply_change_allows_write_scope():
+    """apply_change must permit a full-file write (option b), not only apply_patch."""
+    from autoresearch.legacy.loop import FixedAutoResearchPlanner
+
+    planner = FixedAutoResearchPlanner()
+    apply_round = [s.name for s in planner.steps].index("apply_change")
+    assert "write" in planner.allowed_tools_for_round(apply_round)
+
+
+def test_trial_nonzero_exit_recovers_when_metric_is_valid(tmp_path):
+    """A trial whose summary wrapper exits nonzero but produced a valid metric must not be marked failed."""
+    (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="recover", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    # eval prints a valid metric, then a broken summary step exits 1.
+    cmd = "printf 'primary_metric: 3.0\\nmetric_name: z\\n'; exit 1"
+    obs = loop.execute_action(AutoResearchAction(type="run", rationale="experiment_result_trial", command=cmd, role="trial"))
+    assert obs.status == "ok_metric_recovered"
+
+
+def test_shell_artifact_primary_metric_beats_wrapper_metadata(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmaximize score\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="shellmetric", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    action = AutoResearchAction(
+        type="run",
+        rationale="experiment_result_trial",
+        command="printf '{\"primary_metric\": 0.91, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\\n'",
+        role="trial",
+    )
+
+    obs = loop.execute_action(action)
+    loop._maybe_record_experiment(action, obs, {}, "run_experiment")
+    state = loop.context.load_state()
+    exp = state["experiments"][0]
+
+    assert exp["primary_metric_name"] == "score"
+    assert exp["metrics"]["score"] == 0.91
+
+
+def test_metrics_json_primary_metric_beats_wrapper_returncode(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmaximize score\n", encoding="utf-8")
+    (tmp_path / "metrics.json").write_text(
+        '{"primary_metric": 0.75, "primary_metric_name": "score", "higher_is_better": true}\n',
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="filemetric", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    action = AutoResearchAction(type="run", rationale="trial_train_only", command="echo train", role="trial")
+
+    obs = loop.execute_action(action)
+    loop._maybe_record_experiment(action, obs, {}, "run_experiment")
+    exp = loop.context.load_state()["experiments"][0]
+
+    assert exp["primary_metric_name"] == "score"
+    assert exp["metrics"]["score"] == 0.75
+    assert exp["decision"] == "baseline_recorded"
+
+
+def test_best_restore_refreshes_metrics_json(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmaximize score\n", encoding="utf-8")
+    (tmp_path / "solution.py").write_text("bad\n", encoding="utf-8")
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\n"
+        "if grep -q '^best' solution.py; then score=0.9; else score=0.1; fi\n"
+        "printf '{\"primary_metric\": %s, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\\n' \"$score\" > metrics.json\n"
+        "cat metrics.json\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    good_snapshot = loop.artifacts.save(
+        kind="source_snapshot",
+        rationale="best",
+        content=json.dumps({"files": {"solution.py": "best\n"}}, indent=2) + "\n",
+        extension="json",
+    )
+    state = loop.context.load_state()
+    state["experiments"] = [
+        {
+            "experiment_id": "best",
+            "created_at": 1,
+            "status": "ok",
+            "decision": "keep",
+            "metrics": {"score": 0.9},
+            "metric_directions": {"score": True},
+            "primary_metric_name": "score",
+            "source_snapshot_path": good_snapshot,
+            "version_policy": "artifact_only",
+            "git_available": False,
+            "git_status_before": "",
+        },
+        {
+            "experiment_id": "bad",
+            "created_at": 2,
+            "status": "ok",
+            "decision": "discard",
+            "metrics": {"score": 0.1},
+            "metric_directions": {"score": True},
+            "primary_metric_name": "score",
+            "source_snapshot_path": "",
+            "version_policy": "artifact_only",
+            "git_available": False,
+            "git_status_before": "",
+        },
+    ]
+    loop.context.save_state(state)
+
+    loop.finalize_experiments()
+
+    assert (tmp_path / "solution.py").read_text(encoding="utf-8") == "best\n"
+    metrics = json.loads((tmp_path / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["primary_metric"] == 0.9
+    refreshed = loop.context.load_state()["best_restore"]["metric_refresh"]
+    assert refreshed["status"] == "ok"
+    memory = json.loads((tmp_path / ".autoresearch" / "experiment_memory.json").read_text(encoding="utf-8"))
+    assert memory["best"]["experiment_id"] == "best"
+    assert memory["best"]["metric"] == 0.9
+    assert memory["attempts"]
+    assert (tmp_path / ".autoresearch" / "experiment_memory.md").exists()
+
+
+def test_generic_nonzero_run_still_fails(tmp_path):
+    """A non-baseline/trial run with no metric must still report failed."""
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    obs = loop.execute_action(AutoResearchAction(type="run", rationale="inspect", command="echo hi; exit 1"))
+    assert obs.status == "failed"
+
+
+def test_baseline_nonzero_exit_does_not_recover_from_stale_metrics_file(tmp_path):
+    """A failed run must not be marked ok solely because an old metrics.json exists."""
+    (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
+    (tmp_path / "metrics.json").write_text('{"z": 2.0, "primary_metric": 2.0}', encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="base-rec", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    # No metric on stdout; metrics.json may be stale from an earlier run.
+    obs = loop.execute_action(AutoResearchAction(type="run", rationale="experiment_result_baseline", command="exit 1", role="baseline"))
+    assert obs.status == "failed"
+
+
+def test_search_feedback_digest_surfaces_range_and_best(tmp_path):
+    """After a trial, the search summary/history should be digested into experiment_results."""
+    (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
+    outputs = tmp_path / "outputs"
+    outputs.mkdir()
+    (outputs / "train_search_summary.json").write_text(
+        json.dumps({"best_z": 126.9, "best_x": 50.0, "best_y": -77.8, "eval_count": 160, "status": "ok"}),
+        encoding="utf-8",
+    )
+    (outputs / "train_search_history.jsonl").write_text(
+        "\n".join(json.dumps({"x": x, "y": y, "z": 1.0}) for x, y in [(-100, -100), (100, 100), (50, -77.8)]),
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="feedback", max_rounds=0, use_git_versioning=False)
+    loop = AutoResearchLoop(settings)
+    digest = loop._search_feedback_digest()
+    assert "best_z=126.9" in digest
+    assert "sampled_x_range=[-100,100]" in digest
+    assert "sampled_y_range=[-100,100]" in digest
+    assert "widen range" in digest
+
+
+def test_step_guidance_mentions_python3_and_cross_round_improvement():
+    from autoresearch.legacy.loop import AutoResearchStepAgent
+
+    g = AutoResearchStepAgent.STEP_GUIDANCE
+    assert "python3" in g["baseline_eval"]
+    assert "python3" in g["run_experiment_if_available"]
+    assert "IMPROVE ACROSS ROUNDS" in g["propose_experiment"]
+    assert "submission.json" in g["propose_experiment"]
+
+
+def test_stop_sentinel_ends_loop_early(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    # Pre-create the STOP sentinel so the loop stops before round 0 runs.
+    (tmp_path / ".autoresearch").mkdir(parents=True, exist_ok=True)
+    (tmp_path / ".autoresearch" / "STOP").write_text("stop\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="stop", max_rounds=50)
+    result = AutoResearchLoop(settings).run()
+    assert result["stopped_early"] is True
+    assert result["rounds_completed"] == 0
+
+
+def test_stop_sentinel_mid_run_is_respected(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\n", encoding="utf-8")
+    settings = AutoResearchSettings(project_dir=tmp_path, project_id="stopmid", max_rounds=50)
+    loop = AutoResearchLoop(settings)
+    # Plant the sentinel after the 2nd round via a planner side effect.
+    calls = {"n": 0}
+    orig = loop.planner
+
+    def planner(parent_context, round_index):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            loop.settings.stop_file().parent.mkdir(parents=True, exist_ok=True)
+            loop.settings.stop_file().write_text("stop\n", encoding="utf-8")
+        return orig(parent_context, round_index)
+
+    loop.planner = planner
+    result = loop.run()
+    assert result["stopped_early"] is True
+    # ran a couple rounds, then stopped well before 50
+    assert 0 < result["rounds_completed"] < 50
+
+
+def test_auto_research_stop_tool_creates_and_clears_sentinel(tmp_path):
+    from autoresearch.tool import auto_research_stop_tool
+
+    stop = json.loads(auto_research_stop_tool(str(tmp_path)))
+    assert stop["success"] is True and stop["action"] == "stop"
+    assert (tmp_path / ".autoresearch" / "STOP").exists()
+
+    resume = json.loads(auto_research_stop_tool(str(tmp_path), resume=True))
+    assert resume["success"] is True and resume["removed"] is True
+    assert not (tmp_path / ".autoresearch" / "STOP").exists()
+
+
+def test_artifact_only_restores_best_source_snapshot_without_git(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmaximize score\n", encoding="utf-8")
+    (tmp_path / "solution.py").write_text("VALUE = 'base'\n", encoding="utf-8")
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="restore-best",
+        max_rounds=0,
+        use_git_versioning=False,
+        versioning_policy="artifact_only",
+        defer_experiment_finalization=True,
+        max_experiments=4,
+    )
+    loop = AutoResearchLoop(settings)
+
+    good_action = AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="good trial",
+        command="printf good > solution.py && printf '{\"primary_metric\": 0.9, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\n' > metrics.json && cat metrics.json",
+    )
+    good_obs = loop.execute_action(good_action)
+    loop._maybe_record_experiment(good_action, good_obs, {"git_available": False}, "run_experiment")
+
+    bad_action = AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="bad trial",
+        command="printf bad > solution.py && printf '{\"primary_metric\": 0.1, \"primary_metric_name\": \"score\", \"higher_is_better\": true}\n' > metrics.json && cat metrics.json",
+    )
+    bad_obs = loop.execute_action(bad_action)
+    loop._maybe_record_experiment(bad_action, bad_obs, {"git_available": False}, "run_experiment")
+
+    result = loop.finalize_experiments()
+    state = loop.context.load_state()
+
+    assert result["best_experiment"]["hypothesis"] == "good trial"
+    assert (tmp_path / "solution.py").read_text(encoding="utf-8") == "good"
+    assert state["best_restore"]["restored"] == ["solution.py"]

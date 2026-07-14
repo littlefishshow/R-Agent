@@ -1,15 +1,33 @@
 ---
 name: "autoresearch_mode_minimal_loop"
-description: "实现 R-Agent 小型 autoresearch 最小闭环"
+description: "历史说明：旧 R-Agent 小型 autoresearch 最小闭环已被顶层 autoresearch 包替代"
 ---
 
 # Autoresearch Mode Minimal Loop
 
-## When to Use
+## Status
 
-- 用户要求为 R-Agent 增加或维护小型 autoresearch mode。
-- 需要实现受控研究闭环：Plan → Execute → Conclude。
-- 需要接入 CLI 本地命令、状态目录、Esc 中断和最小验证。
+这个 skill 是历史记录，不再作为当前实现指南使用。
+
+当前 autoresearch 实现已经迁移到顶层 `autoresearch/` 包：
+
+- `autoresearch/tool.py`：真实工具注册和 handler。
+- `autoresearch/phases.py`：V3 `run_phase_loop` 入口。
+- `autoresearch/controller.py`：`plan -> attempt -> conclude` 控制器。
+- `tools/autoresearch_tool.py`：仅保留为工具注册 shim。
+
+当前 CLI 控制面：
+
+- `/autoresearch run <项目目录>`
+- `/autoresearch show [项目目录]`
+- `/autoresearch debug [on|off|show] [项目目录]`
+- `/autoresearch kill`
+
+不要再新增或维护 `core/autoresearch.py` 小闭环作为主入口；旧 `run_autoresearch_cycle()` 路径只应作为历史参考。
+
+## Historical Notes
+
+以下内容描述的是早期最小闭环方案，仅用于理解历史演进。
 
 ## Procedure
 
@@ -18,7 +36,7 @@ description: "实现 R-Agent 小型 autoresearch 最小闭环"
    - `core/agent.py` 已有 `AgentInterrupted` 与 `cancel_event`，可复用取消语义。
    - autoresearch 不应默认进入普通 LLM Agent Loop，而应作为本地 mode 先跑受控状态机。
 
-2. **核心实现位置**
+2. **旧核心实现位置**
    - 新增或维护 `core/autoresearch.py`。
    - 暴露 `run_autoresearch_cycle(project_path, objective, cancel_event, on_status)`。
    - 第一版只做串行 `Plan → Execute → Conclude`。
@@ -53,10 +71,9 @@ description: "实现 R-Agent 小型 autoresearch 最小闭环"
    - 维护 `autoresearch.md`：用中文、小学生也能懂的方式解释 mode、worker、文件和安全边界。
    - 维护 R-Agent 项目时同步更新 `README.md` 日期更新日志，写清本次升级内容。
 
-7. **验证**
-   - 运行 `python3 -m py_compile main.py core/autoresearch.py tests/test_autoresearch_mode.py`。
-   - 定向运行 `pytest -q tests/test_autoresearch_mode.py tests/test_status_hint.py`。
-   - 可用临时目录 smoke test 调 `run_autoresearch_cycle()`，确认 `.autoresearch/state.json` phase 为 `completed`。
+7. **当前验证参考**
+   - 运行 `python3 -m compileall -q main.py autoresearch tools/autoresearch_tool.py tests/test_autoresearch_mode.py`。
+   - 定向运行 `python3 -m pytest tests/test_autoresearch*.py -q`。
    - 如果完整 `pytest -q` 因环境缺依赖失败，最终说明要标注失败原因和是否与本次改动无关。
 
 ## Notes

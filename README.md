@@ -17,38 +17,48 @@ R-Agent 当前主要包含以下能力：
 - **长期记忆系统**：使用 `memories/USER.md` 和 `memories/MEMORY.md` 区分用户偏好与项目/环境事实，并在启动时注入 Agent 上下文。
 - **Skill 系统**：将稳定、可复用的工作流程保存为 `skills/**/SKILL.md`，让 Agent 能复用已有经验，而不是每次从零规划。
 - **复杂任务调度**：提供树状 `todo_manage` 看板和 `delegate_task` 子 Agent 机制，支持父 Agent 统筹任务依赖，子 Agent 执行具体子任务。
-- **auto_research 专用运行时**：提供 `auto_research_run` / `auto_research_status`，用于在项目目录内围绕 `program.md` 执行固定 workflow、归档实验输出，并通过 `.autoresearch/` 保存 bounded context、progress 和候选结果。
+- **auto_research 专用运行时**：实现代码集中在 R-Agent 仓库的 `autoresearch/` Python 包中，并通过 `tools/autoresearch_tool.py` 薄 shim 接入工具注册；提供 legacy workflow 与 V3 `plan -> attempt -> conclude` 两条入口，围绕 `program.md`、`project.md`、todo/gate state、monitor 和 `.autoresearch/` 产物持续运行。
 - **自我维护能力**：Agent 可以在授权边界内创建/修改工具、维护技能、更新项目文档，并通过安全审批机制控制高风险操作。
 
 本项目围绕个人使用场景逐步演进的本地 Agent 框架。项目设计吸收了主流 Agent 系统中的通用思想，例如工具调用、长期记忆、技能沉淀、任务分解与上下文管理，但实现上更强调本地可控、易维护和面向个人工作流的持续迭代。
 
-### 1.1 auto_research 使用说明
+### 1.1 autoresearch 使用说明
 
-`auto_research_run` 是 R-Agent 内部用于研究/实验型项目的轻量子进程运行时，适合项目根目录已有明确 `program.md`、需要分步检查项目、运行可用 eval/train、记录实验指标和保留压缩上下文的场景。它不是通用“自动完成所有研究”的承诺；当前实现以固定 workflow、可选每 step LLM 子 Agent 和 deterministic fallback 为边界。
+当前 autoresearch 实现已经迁移到顶层 `autoresearch/` 包。`tools/autoresearch_tool.py` 只保留为工具注册 shim，负责在 `ToolRegistry.reload_all()` 后重新导入 `autoresearch.tool` 并恢复注册。旧的 `core/autoresearch_loop.py` 已移除，`core/autoresearch.py` 的小型 Plan/Execute/Conclude 路径不再作为当前 CLI/工具入口。
 
-基本调用参数：
+CLI 使用方式：
 
-- `project_dir`：必填，必须位于当前工作区内。
-- `program_path`：相对 `project_dir` 的研究说明文件，默认 `program.md`。
-- `rounds`：最多执行多少个固定 workflow step。
-- `background=true`：后台非阻塞运行，返回 `run_id`、`progress_path`、`status_path`；之后可用 `auto_research_status` 查看 `.autoresearch/progress.md` 预览。
-- `use_llm_step_agents=true`：为每个固定 workflow step 启用独立 LLM 子 Agent 生成结构化 action；若 JSON 非法、越权或调用失败，会降级到 deterministic fallback。
-- 上下文/实验治理参数：`context_char_budget`、`program_char_budget`、`summary_char_budget`、`bucket_item_char_budget`、`bucket_max_items`、`max_experiments`、`max_active_context_chars`、`max_pareto_items`、`max_useful_failures`。
-- `use_git_versioning`：默认开启；仅在已有 git 仓库中记录 base commit、status、changed files 和 diff artifact。非 git 项目会安全降级，不会自动 `git init`。
-- `versioning_policy`：中间版本生命周期策略，默认 `artifact_only`。R-Agent 默认不频繁自动 commit；建议仅在已有 git 仓库、base 工作区干净，并且实验结果达到 best/Pareto 等值得保留的标准时再提交。可选策略语义：
-  - `artifact_only`：只把 trial 的 diff patch、实验记录/manifest（写入 `.autoresearch/state.json`、`results.tsv`、`active_context.md` 等）和 raw artifact 保存在 `.autoresearch/`，不自动 commit，也不回滚用户工作区。
-  - `commit_pareto`：只对当前 best 或非支配 Pareto 候选等被保留的有效 trial 尝试 commit；失败、无指标、无效或被支配的 trial 保留 patch/manifest，随后仅在 base 工作区干净且可安全归因时回滚 tracked changes。
-  - `commit_all_trials`：对每个有效且可评价的 trial 尝试 commit；失败或无效 trial 仍保留 patch/manifest，并在安全条件满足时回滚。该策略会产生更多中间 commit，一般不建议作为默认日常策略。
-  - `branch_per_trial`：为每个有效 trial 创建/记录 `autoresearch/<experiment_id>` 分支；失败或无效 trial 仍保留 patch/manifest，并在安全条件满足时回滚。
-  - 对所有策略，非 git 项目不会自动初始化仓库；回滚只针对可安全归因的 tracked changes，未跟踪文件会保留，相关 action/status 会写入实验记录，便于人工审阅。
+```text
+/autoresearch run <项目目录>
+/autoresearch show [项目目录]
+/autoresearch debug [on|off|show] [项目目录]
+/autoresearch kill
+```
 
-运行产物主要保存在项目内 `.autoresearch/`：
+工具入口：
 
-- `state.json`：保存 observations、metrics、experiments、best/pareto 等结构化状态。
-- `artifacts/`：保存 shell/file/web/note/apply_patch 等 raw output，父上下文只保留摘要和路径。
-- `progress.md`：文字进度面板，供后台运行时快速查看状态。
-- `active_context.md`：按预算压缩后的工作上下文，汇总当前最佳候选、Pareto front、近期结论和有用失败。
-- `best.json` / `pareto_front.json`：在有可解析实验指标时记录当前最佳实验和多目标 Pareto 候选；若无指标，只会保留空或待补充状态，不虚构结果。
+- `auto_research_run` / `auto_research_status`：legacy workflow，保留固定 workflow、bucket context、artifact/progress 兼容能力。
+- `auto_research_run_v2` / `auto_research_v2_status`：当前 V3 三步循环，执行 `plan -> attempt -> conclude`，通过 `monitor.json`、budget/debug/timeout 和 `.auto`/todo/gate state 跟踪长期运行。
+- `auto_research_stop`：写入或清除 `<project_dir>/.autoresearch/STOP`，用于优雅停止或恢复运行。
+
+当前主要实现位置：
+
+- `autoresearch/tool.py`：真实工具实现和 registry handler。
+- `autoresearch/phases.py`：V3 公共入口 `run_phase_loop`。
+- `autoresearch/controller.py`：`plan -> attempt -> conclude` 控制器。
+- `autoresearch/planner.py`：计划阶段 persona / DAG 生成与压缩。
+- `autoresearch/execution.py`、`run_handler.py`：任务执行、验证、指标读取和行为检查。
+- `autoresearch/state/`：`program.md`、`project.md`、todo、gate、completion、experiment memory。
+- `autoresearch/observability/`：monitor、debug、budget、timeout。
+- `autoresearch/legacy/`：旧 loop 及仍复用的安全执行、metric、versioning 服务。
+
+运行产物主要保存在目标项目内 `.autoresearch/` 和 `.auto/`：
+
+- `.autoresearch/state.json`：实验、best/pareto、bucket context 等结构化状态。
+- `.autoresearch/monitor.json`：后台运行状态、当前 phase、step、预算和心跳。
+- `.autoresearch/debug/`：debug event 与 inflight 状态。
+- `.autoresearch/round_traces/`、`step_traces/`、`delegate_contexts/`：每轮 prompt、上下文、子任务 artifact 和调试信息。
+- `.auto/todo.json`、`.auto/plan.md`、`project.md`：V3 父进程维护的任务和项目状态。
 
 ## 2. 环境配置
 
@@ -455,6 +465,14 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-07-14
+
+#### autoresearch Completion Criteria 默认模板
+
+- **补充官方 solved 标准示例**：`autoresearch` skill 与 `program.md` 模板现在默认包含官方 `metrics.json` solved 标准示例：`metric_name: repair_exact_accuracy`、`higher_is_better: true`、`repair_exact_accuracy >= 1`。
+- **要求指标来源可追溯**：若用户未显式给出指标，模板要求优先从项目 `README`、`eval` 文件或 `metrics.json` 推断；仍无法确定时必须向用户澄清，不得省略或自造评估协议。
+- **区分 solved 与运行预算**：明确 `Completion Criteria` 中的官方指标阈值才表示项目已解决；轮数、时间、资源耗尽或无下一假设只属于预算/停止条件，不能当作 solved。
+
 ### 2026-07-10
 
 #### paper scouting 与论文阅读工作流整理
@@ -466,7 +484,14 @@ pip install PyNaCl>=1.5.0
 - **新增已读论文历史脚本**：新增 `skills/productivity/paper_research_scout/scripts/paper_read_history.py`，支持 `add`、`check`、`import-outputs`、`list`、`filter` 等操作，帮助 paper scouting 过滤已读或重复推荐的论文。
 - **`read_paper` skill 联动更新**：更新 `skills/productivity/read_paper/SKILL.md`，要求确认阅读论文后尽量登记到 `paper_read_history.py`，登记失败不阻塞阅读流程但需在结果中说明。
 
-#### Autoresearch debug trace 与上下文归档
+#### 迁移到顶层 `autoresearch/` 包
+
+- **统一实现位置**：当前 autoresearch runtime 已从 `core/autoresearch_*.py` 分散文件迁移到顶层 `autoresearch/` 包；`tools/autoresearch_tool.py` 仅作为工具注册 shim，真实逻辑位于 `autoresearch/tool.py`。
+- **恢复工具入口**：重新注册 `auto_research_run`、`auto_research_status`、`auto_research_run_v2`、`auto_research_v2_status` 和 `auto_research_stop`，同时保留 legacy workflow 与 V3 phase loop。
+- **CLI 改为后台控制面**：`/autoresearch run <dir>` 后台启动 V3，`/autoresearch show [dir]` 只读 `monitor.json` 查看进度，`/autoresearch debug` 控制 debug flag，`/autoresearch kill` 终止运行中的 autoresearch 进程。
+- **补充回归测试**：恢复源项目 autoresearch 测试集，覆盖 legacy loop、V3 controller、todo/gate/completion、timeout、preflight、tool registry 和 CLI route。
+
+#### Autoresearch debug trace 与上下文归档（历史记录，已被顶层 `autoresearch/` 包替代）
 
 - **新增 `AutoresearchTracer`**：`core/autoresearch.py` 现在会为 Main / Plan / Execute / Conclude 记录结构化 debug trace，包含开始、结束、命令执行、上下文快照等事件。
 - **分类保存 worker 事件**：每个目标项目的 `.autoresearch/traces/` 下新增 `trace.jsonl`、`plan.jsonl`、`execute.jsonl`、`conclude.jsonl`，既能按全局时间线查看，也能只看某个小进程。
@@ -474,7 +499,7 @@ pip install PyNaCl>=1.5.0
 - **终端结果暴露 trace 路径**：`/autoresearch` 完成摘要会显示 Debug Trace、流程归档和上下文快照目录，用户无需翻目录即可定位。
 - **补充回归测试与文档**：扩展 `tests/test_autoresearch_mode.py` 覆盖 trace、分类事件、上下文快照和 flow 生成；同步更新 `autoresearch.md` 的小白说明。
 
-#### 小型 autoresearch mode 最小闭环
+#### 小型 autoresearch mode 最小闭环（历史记录，已被顶层 `autoresearch/` 包替代）
 
 - **新增 `/autoresearch` 本地命令**：CLI 聊天框支持输入 `/autoresearch` 后再填写项目路径，也支持 `/autoresearch /path/to/project` 直接启动小型 autoresearch mode；运行期间复用现有 Rich 状态动画与 `Esc` 中断机制，用户输入锁定，只查看进程。
 - **新增 autoresearch 核心运行器**：新增 `core/autoresearch.py`，实现第一版受控串行闭环 `Plan → Execute → Conclude`；Plan 只生成只读计划，Execute 只执行短时安全只读命令并写日志，Conclude 解析结果并输出 `keep/crash` 决策。
@@ -557,7 +582,7 @@ pip install PyNaCl>=1.5.0
 - **git 版本信息安全降级**：新增 `use_git_versioning` 开关，默认仅在已有 git 仓库中记录 base commit、status、changed files 和 diff artifact；非 git 项目不会自动初始化仓库，相关字段安全留空，自动 commit 仍默认关闭。
 - **新增 auto_research 参数**：工具 schema 补充 `max_experiments`、`max_active_context_chars`、`max_pareto_items`、`max_useful_failures`、`use_git_versioning`、`versioning_policy`，便于限制实验轮次、active context 长度、Pareto 候选数量、失败/丢弃轮次摘要数量以及中间版本生命周期策略。
 - **补充 README 使用说明**：在“1.1 auto_research 使用说明”中记录适用边界、常用参数和 `.autoresearch/` 产物，明确当前是固定 workflow + 可选 step agent + fallback 的实现，不夸大为完全自主科研系统。
-- **补充回归测试**：新增/扩展 `tests/test_autoresearch_loop.py` 与 `tests/test_autoresearch_tool.py`，覆盖 raw output 归档、父上下文预算、项目内 `rm` 不触发全局审批、越界命令拒绝、write action 项目内写入、固定 workflow buckets、工具注册运行、模块化上下文输出、fake LLM step agent 成功覆盖 action、越权 action fallback、JSON fence 提取、metric/progress 解析、progress.md 写入和后台 run/status。
+- **补充回归测试**：当时新增/扩展旧 loop 对应测试，覆盖 raw output 归档、父上下文预算、工具注册运行、模块化上下文输出、step agent fallback、metric/progress 解析、progress.md 写入和后台 run/status；该旧方案后续已移除，当前 `/autoresearch` 以 `tests/test_autoresearch_mode.py` 为准。
 
 ### 2026-07-06
 

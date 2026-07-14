@@ -11,6 +11,16 @@ It must be customized from the user's prompt, paper, code repository, dataset, a
 - Baseline: <unknown until first run>
 - Resource budget: <max rounds/time/GPU/CPU limits>
 
+## Completion Criteria
+
+This project is solved only when the official evaluation in `metrics.json` reports:
+
+- `metric_name`: `repair_exact_accuracy`
+- `higher_is_better`: `true`
+- `repair_exact_accuracy >= 1`
+
+If this project uses a different official metric, replace `metric_name`, direction, and threshold with the official values from the user request, README, eval files, or `metrics.json`. Do not invent or change the evaluation protocol to fit this example.
+
 ## In-scope files
 
 Read before starting:
@@ -103,12 +113,15 @@ Write `reports/autoresearch_report.md` with:
 
 ## Stop conditions
 
+The `Completion Criteria` above define when the project is solved. The limits below are budget/operational stop conditions: if they are reached before the solved criteria are met, stop or ask the user for more budget and report the project as not yet solved.
+
 Stop when any is reached:
 
+- official `metrics.json` values satisfy the `Completion Criteria`;
 - user-approved round limit;
 - user-approved wall-clock limit;
 - resource budget exhausted;
 - repeated infrastructure failure;
 - no valid next hypothesis after documented attempts.
 
-Do not run indefinitely without explicit user approval.
+Do not run indefinitely without explicit user approval. Do not treat budget exhaustion or lack of ideas as a solved result unless the official metric threshold is met.

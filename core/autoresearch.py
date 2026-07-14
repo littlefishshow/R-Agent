@@ -27,6 +27,7 @@ class AutoresearchPaths:
     memory_md: Path
     lessons_md: Path
     results_tsv: Path
+    progress_md: Path
     traces_dir: Path
     trace_jsonl: Path
     flow_md: Path
@@ -83,6 +84,67 @@ def _append_text(path: Path, text: str) -> None:
         f.write(text)
 
 
+def _write_progress(paths: AutoresearchPaths, phase: str, message: str, extra: dict | None = None) -> None:
+    """写一个人能直接看的 autoresearch 进度面板。"""
+    state = _read_json(paths.state_json, default={})
+    lines = [
+        f"# Autoresearch Progress — {paths.project_root.name}",
+        "",
+        f"Updated: {_now_ts()}",
+        f"Phase: **{phase}**",
+        f"Run: `{paths.run_dir.name}`",
+        "",
+        "## 当前状态",
+        f"- {message}",
+        "",
+        "## 关键路径",
+        f"- state: `{paths.state_json}`",
+        f"- plan: `{paths.plan_json}`",
+        f"- execute: `{paths.execute_result_json}`",
+        f"- conclude: `{paths.conclude_result_json}`",
+        f"- run logs: `{paths.run_dir}`",
+        f"- trace: `{paths.flow_md}`",
+    ]
+    if state.get("decision") or state.get("status"):
+        lines.extend(["", "## 最新结论", f"- decision: `{state.get('decision', '')}`", f"- status: `{state.get('status', '')}`"])
+    if extra:
+        lines.extend(["", "## 附加信息"])
+        for key, value in extra.items():
+            lines.append(f"- {key}: `{value}`")
+    paths.progress_md.parent.mkdir(parents=True, exist_ok=True)
+    paths.progress_md.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _read_program(project_root: Path, char_limit: int = 12000) -> str:
+    program = project_root / "program.md"
+    if not program.exists() or not program.is_file():
+        return ""
+    return program.read_text(encoding="utf-8", errors="replace")[:char_limit]
+
+
+def _evaluation_commands(project_root: Path) -> list[list[str]]:
+    """只选择项目内明确存在的短评测入口，不猜测长训练命令。"""
+    if (project_root / "eval.sh").exists():
+        return [["bash", "eval.sh"]]
+    if (project_root / "train" / "train.sh").exists():
+        return [["bash", "train/train.sh"]]
+    return []
+
+
+def _parse_metrics(text: str) -> dict:
+    import re
+
+    metrics = {}
+    for name, value in re.findall(r"\b([A-Za-z][A-Za-z0-9_.-]{1,40})\s*[:=]\s*(-?\d+(?:\.\d+)?)", text or ""):
+        if name.lower() in {"returncode", "pid"}:
+            continue
+        try:
+            metrics[name] = float(value)
+        except ValueError:
+            pass
+    return metrics
+
+
 def resolve_project_root(project_path: str | os.PathLike[str]) -> Path:
     raw = Path(project_path).expanduser()
     root = raw.resolve()
@@ -111,6 +173,7 @@ def build_paths(project_path: str | os.PathLike[str], run_id: str | None = None)
         memory_md=state_dir / "memory.md",
         lessons_md=state_dir / "lessons.md",
         results_tsv=state_dir / "results.tsv",
+        progress_md=state_dir / "progress.md",
         traces_dir=state_dir / "traces",
         trace_jsonl=state_dir / "traces" / "trace.jsonl",
         flow_md=state_dir / "traces" / "flow.md",
@@ -208,7 +271,9 @@ def init_state(paths: AutoresearchPaths, objective: str = "最小 autoresearch �
         paths.results_tsv.write_text("run_id\tstarted_at\tdecision\tstatus\tfailed_commands\tlog_dir\n", encoding="utf-8")
     if not paths.flow_md.exists():
         paths.flow_md.write_text("# Autoresearch Debug Flow\n\n这里按时间记录 Plan / Execute / Conclude 的具体流程。\n", encoding="utf-8")
-    return _update_state(
+    if not paths.progress_md.exists():
+        paths.progress_md.write_text("# Autoresearch Progress\n\n尚未开始。\n", encoding="utf-8")
+    state = _update_state(
         paths,
         version=1,
         mode="autoresearch",
@@ -219,37 +284,68 @@ def init_state(paths: AutoresearchPaths, objective: str = "最小 autoresearch �
         started_at=_now_ts(),
         interrupted=False,
     )
+    _write_progress(paths, "initialized", "状态目录已初始化，准备进入 Plan。")
+    return state
 
 
 def plan_worker(paths: AutoresearchPaths, objective: str, cancel_event=None, on_status: Callable[[str], None] | None = None, tracer: AutoresearchTracer | None = None) -> dict:
     tracer = tracer or _noop_tracer(paths)
     _check_cancel(cancel_event)
-    tracer.emit("Plan", "start", "开始制定只读调研计划", {"objective": objective, "project_root": str(paths.project_root)})
+    tracer.emit("Plan", "start", "开始制定项目感知调研计划", {"objective": objective, "project_root": str(paths.project_root)})
     if on_status:
-        on_status("[bold cyan]🔎 Autoresearch Plan：正在制定只读调研计划...[/bold cyan]")
+        on_status("[bold cyan]🔎 Autoresearch Plan：正在读取 program.md 并制定调研/评测计划...[/bold cyan]")
     _update_state(paths, phase="plan")
+    _write_progress(paths, "plan", "正在读取 program.md 并选择安全评测入口。")
+    program_text = _read_program(paths.project_root)
+    eval_commands = _evaluation_commands(paths.project_root)
+    experiments = [
+        {
+            "id": "baseline_inventory",
+            "description": "读取项目的最小基线信息，确认路径、git 状态和浅层文件结构。",
+            "commands": _safe_inventory_commands(paths.project_root),
+            "success_criteria": "命令可运行，日志完整保存。",
+        }
+    ]
+    if program_text:
+        experiments.append({
+            "id": "read_program",
+            "description": "记录 program.md 的存在与摘要，作为后续研究目标来源。",
+            "commands": [],
+            "program_excerpt": program_text[:2000],
+            "success_criteria": "program.md 已被纳入本轮上下文。",
+        })
+    if eval_commands:
+        experiments.append({
+            "id": "baseline_eval",
+            "description": "运行项目内明确存在的短评测入口，尝试获得 baseline 指标。",
+            "commands": eval_commands,
+            "success_criteria": "评测命令结束，stdout/stderr 被保存；若输出 metric，将在 Conclude 中解析。",
+        })
+    else:
+        experiments.append({
+            "id": "baseline_eval_missing",
+            "description": "未发现 eval.sh 或 train/train.sh，本轮只记录缺少评测入口。",
+            "commands": [],
+            "success_criteria": "明确记录缺少评测入口，等待用户或后续步骤补充。",
+        })
     plan = {
         "role": "Plan",
         "run_id": paths.run_dir.name,
         "created_at": _now_ts(),
         "objective": objective,
+        "program_md_found": bool(program_text),
+        "program_excerpt": program_text[:4000],
         "rules": [
             "Plan 只规划，不改代码。",
-            "第一版只执行安全、只读、短时间命令。",
-            "如果需要进一步拆分或高风险动作，写入 lessons.md，交给用户决定。",
+            "本阶段允许运行项目内明确存在的 eval.sh 或 train/train.sh，并受超时控制。",
+            "如果需要修改代码或高风险动作，写入 lessons.md，交给用户决定。",
         ],
-        "experiments": [
-            {
-                "id": "baseline_inventory",
-                "description": "读取项目的最小基线信息，确认路径、git 状态和浅层文件结构。",
-                "commands": _safe_inventory_commands(paths.project_root),
-                "success_criteria": "命令可运行，日志完整保存。",
-            }
-        ],
+        "experiments": experiments,
     }
     _write_json(paths.plan_json, plan)
     _write_json(paths.run_dir / "plan.json", plan)
-    tracer.snapshot_context("Plan", {"objective": objective, "plan": plan, "safe_commands": plan["experiments"][0]["commands"]}, label="after_plan")
+    tracer.snapshot_context("Plan", {"objective": objective, "plan": plan, "safe_commands": plan["experiments"][0]["commands"], "program_md_found": bool(program_text)}, label="after_plan")
+    _write_progress(paths, "plan", "计划已生成。", {"experiments": len(experiments), "program_md_found": bool(program_text), "eval_commands": len(eval_commands)})
     tracer.emit("Plan", "finish", "计划已生成", {"experiments": len(plan.get("experiments", [])), "plan_json": str(paths.plan_json)})
     return plan
 
@@ -321,8 +417,12 @@ def execute_worker(paths: AutoresearchPaths, plan: dict, cancel_event=None, on_s
     if on_status:
         on_status("[bold cyan]🧪 Autoresearch Execute：正在执行安全只读实验...[/bold cyan]")
     _update_state(paths, phase="execute")
+    _write_progress(paths, "execute", "正在执行计划中的安全命令。")
     command_results = []
+    skipped_experiments = []
     for experiment in plan.get("experiments", []):
+        if not experiment.get("commands"):
+            skipped_experiments.append({"experiment_id": experiment.get("id"), "reason": "no_commands", "description": experiment.get("description", "")})
         for command in experiment.get("commands", []):
             _check_cancel(cancel_event)
             if on_status:
@@ -359,11 +459,13 @@ def execute_worker(paths: AutoresearchPaths, plan: dict, cancel_event=None, on_s
         "created_at": _now_ts(),
         "status": "completed",
         "command_results": command_results,
+        "skipped_experiments": skipped_experiments,
         "log_dir": str(paths.run_dir),
     }
     _write_json(paths.execute_result_json, execute_result)
     _write_json(paths.run_dir / "execute_result.json", execute_result)
     tracer.snapshot_context("Execute", {"plan": plan, "execute_result": execute_result}, label="after_execute")
+    _write_progress(paths, "execute", "执行阶段完成。", {"command_count": len(command_results), "skipped_experiments": len(skipped_experiments)})
     tracer.emit("Execute", "finish", "执行阶段完成", {"command_count": len(command_results), "execute_result_json": str(paths.execute_result_json)})
     return execute_result
 
@@ -378,6 +480,8 @@ def conclude_worker(paths: AutoresearchPaths, plan: dict, execute_result: dict, 
     _update_state(paths, phase="conclude")
     command_results = execute_result.get("command_results", [])
     failed = [r for r in command_results if int(r.get("returncode", -1)) != 0]
+    combined_output = "\n".join((r.get("stdout") or "") + "\n" + (r.get("stderr") or "") for r in command_results)
+    metrics = _parse_metrics(combined_output)
     decision = "keep" if not failed else "crash"
     status = "completed" if not failed else "completed_with_errors"
     conclude_result = {
@@ -386,7 +490,9 @@ def conclude_worker(paths: AutoresearchPaths, plan: dict, execute_result: dict, 
         "created_at": _now_ts(),
         "decision": decision,
         "status": status,
-        "summary": "第一版 autoresearch 已完成一次安全只读闭环。" if not failed else "第一版 autoresearch 完成，但有命令失败，请查看日志。",
+        "summary": "autoresearch 已完成一次项目感知闭环。" if not failed else "autoresearch 完成，但有命令失败，请查看日志。",
+        "metrics": metrics,
+        "skipped_experiments": execute_result.get("skipped_experiments", []),
         "failed_commands": [r.get("command") for r in failed],
         "kept_files": [
             str(paths.state_json),
@@ -395,6 +501,7 @@ def conclude_worker(paths: AutoresearchPaths, plan: dict, execute_result: dict, 
             str(paths.conclude_result_json),
             str(paths.lessons_md),
             str(paths.results_tsv),
+            str(paths.progress_md),
             str(paths.run_dir),
             str(paths.trace_jsonl),
             str(paths.flow_md),
@@ -403,6 +510,7 @@ def conclude_worker(paths: AutoresearchPaths, plan: dict, execute_result: dict, 
         "notes": [
             "本轮没有自动修改项目代码。",
             "本轮没有执行 git reset --hard。",
+            "如果项目提供 eval.sh 或 train/train.sh，本轮会尝试运行并解析指标。",
             "后续可在用户授权后把 Execute 扩展为可控修改与评测。",
         ],
     }
@@ -416,6 +524,7 @@ def conclude_worker(paths: AutoresearchPaths, plan: dict, execute_result: dict, 
             f"- 决策：{decision}\n"
             f"- 状态：{status}\n"
             f"- 失败命令数：{len(failed)}\n"
+            f"- 指标：{json.dumps(metrics, ensure_ascii=False)}\n"
             f"- 日志目录：`{paths.run_dir}`\n"
         ),
     )
@@ -424,6 +533,7 @@ def conclude_worker(paths: AutoresearchPaths, plan: dict, execute_result: dict, 
         f"{paths.run_dir.name}\t{_now_ts()}\t{decision}\t{status}\t{len(failed)}\t{paths.run_dir}\n",
     )
     tracer.snapshot_context("Conclude", {"plan": plan, "execute_result": execute_result, "conclude_result": conclude_result}, label="after_conclude")
+    _write_progress(paths, "completed", "总结阶段完成。", {"decision": decision, "status": status, "metrics": json.dumps(metrics, ensure_ascii=False), "failed_commands": len(failed)})
     tracer.emit("Conclude", "finish", "总结阶段完成", {"decision": decision, "status": status, "failed_commands": len(failed)})
     _update_state(paths, phase="completed", decision=decision, status=status, finished_at=_now_ts())
     return conclude_result
