@@ -523,6 +523,7 @@ def test_run_failure_writes_stderr_note_and_run_report(tmp_path):
     assert "has no attribute" in body
     # The run report also embeds the error output so it is impossible to miss.
     report = (tmp_path / ".auto" / "run_report.md").read_text(encoding="utf-8")
+    assert "## Material Passport" in report
     assert "FAILED" in report and "has no attribute" in report
 
 

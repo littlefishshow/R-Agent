@@ -270,6 +270,8 @@ def _v2_settings_kwargs(
     plan_degrade_personas=1, plan_max_implementation_tasks=0, execute_context_chars=24000,
     execute_max_task_attempts=3, execute_behavior_check=True,
     execute_behavior_check_timeout_seconds=300,
+    best_reproducibility_runs=1, best_reproducibility_determinism="deterministic",
+    best_reproducibility_threshold=0.05,
 ) -> dict:
     return dict(
         project_dir=project_dir,
@@ -300,6 +302,9 @@ def _v2_settings_kwargs(
         execute_max_task_attempts=execute_max_task_attempts,
         execute_behavior_check=execute_behavior_check,
         execute_behavior_check_timeout_seconds=execute_behavior_check_timeout_seconds,
+        best_reproducibility_runs=best_reproducibility_runs,
+        best_reproducibility_determinism=best_reproducibility_determinism,
+        best_reproducibility_threshold=best_reproducibility_threshold,
     )
 
 
@@ -371,6 +376,9 @@ def auto_research_run_v2_tool(
     execute_max_task_attempts: int = 3,
     execute_behavior_check: bool = True,
     execute_behavior_check_timeout_seconds: int = 300,
+    best_reproducibility_runs: int = 1,
+    best_reproducibility_determinism: str = "deterministic",
+    best_reproducibility_threshold: float = 0.05,
     wait_seconds: float = 180.0,
     detach: bool = False,
 ) -> str:
@@ -404,6 +412,8 @@ def auto_research_run_v2_tool(
             llm_request_timeout, plan_max_personas, plan_degrade_personas,
             plan_max_implementation_tasks, execute_context_chars, execute_max_task_attempts,
             execute_behavior_check, execute_behavior_check_timeout_seconds,
+            best_reproducibility_runs, best_reproducibility_determinism,
+            best_reproducibility_threshold,
         )
         settings = AutoResearchSettings(**kwargs)
         preflight = git_preflight(settings.root()) if use_git_versioning else {"warnings": ["git versioning disabled"]}
@@ -505,6 +515,7 @@ def auto_research_v2_status_tool(project_dir: str = ".", monitor_path: str = "")
     """Read the v2 run monitor heartbeat (rounds + token/usd + phase). Pure file read, no LLM."""
     try:
         from autoresearch.observability.monitor import read_monitor, render_monitor_text
+        from autoresearch.state.schema import validate_autoresearch_state
 
         if monitor_path:
             path = Path(monitor_path).expanduser()
@@ -512,7 +523,9 @@ def auto_research_v2_status_tool(project_dir: str = ".", monitor_path: str = "")
             path = Path(project_dir).expanduser().resolve() / ".autoresearch" / "monitor.json"
         data = read_monitor(path)
         data["monitor_text"] = render_monitor_text(data) if data.get("status") not in {"unknown"} else ""
-        return json.dumps({"success": True, "monitor_path": str(path), **data}, ensure_ascii=False, indent=2)
+        root = Path(project_dir).expanduser().resolve() if not monitor_path else Path(path).expanduser().resolve().parent.parent
+        state_check = validate_autoresearch_state(root)
+        return json.dumps({"success": True, "monitor_path": str(path), "state_check": state_check, **data}, ensure_ascii=False, indent=2)
     except Exception as exc:
         return json.dumps({"success": False, "error": str(exc)}, ensure_ascii=False)
 
@@ -622,6 +635,9 @@ def _v2_properties():
         "execute_max_task_attempts": {"type": "integer", "description": "同一个 Execute 任务最多允许多少次未验证尝试；默认 3，三次后才标记 failed 并进入 Evaluate/Replan。", "default": 3},
         "execute_behavior_check": {"type": "boolean", "description": "Execute 写入后是否运行一次训练侧入口进行行为 smoke check，并把 submission/metrics/train_verification 摘要和 artifact 写回 last_result；不调用最终 eval。", "default": True},
         "execute_behavior_check_timeout_seconds": {"type": "integer", "description": "Execute 行为 smoke check 的单次命令超时秒数；默认 300。", "default": 300},
+        "best_reproducibility_runs": {"type": "integer", "description": "Conclude 阶段对当前 best 复跑多少次以确认可复现性；0=跳过。", "default": 1},
+        "best_reproducibility_determinism": {"type": "string", "description": "best 复现比较类型。deterministic 要求精确一致；stochastic/env 使用容差。", "enum": ["deterministic", "stochastic", "environment-sensitive"], "default": "deterministic"},
+        "best_reproducibility_threshold": {"type": "number", "description": "stochastic/env 复现的相对误差容差；0 使用默认。", "default": 0.05},
         "background": {"type": "boolean", "description": "是否在独立子进程运行(存活于慢 LLM 相位)；默认 True。注意：调用默认仍会阻塞并轮询心跳最多 wait_seconds 秒后才返回，返回体带 completed 布尔标志——completed=false 表示仍在运行，禁止当作优化完成，必须继续用 auto_research_v2_status 轮询。", "default": True},
         "wait_seconds": {"type": "number", "description": "background=true 时，调用阻塞轮询心跳的最长秒数(默认 180，安全低于工具超时)。期间跑完则返回真实最终结果(experiments/best/budget)且 completed=true；超时未完成则返回 completed=false 且 status=running，需继续轮询。", "default": 180.0},
         "detach": {"type": "boolean", "description": "是否发射后不管：true 时启动子进程后立即返回(completed=false, status=queued)，不阻塞等待。默认 False(即有界等待)。", "default": False},

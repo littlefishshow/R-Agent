@@ -21,6 +21,14 @@ from autoresearch.state.memory import append_lesson, write_auto_note
 from autoresearch.phases import PhaseContext, PhaseResult
 from autoresearch.state.completion import is_metric_solved, parse_completion_criteria
 from autoresearch.state.todo import load_todo_state, ready_tasks, repair_failed_run_tasks, save_todo_state, task_phase
+from autoresearch.anomalies import (
+    detect_run_anomalies,
+    normalize_run_spec as normalize_monitor_run_spec,
+    render_anomalies_markdown,
+    snapshot_files,
+    write_anomaly_report,
+)
+from autoresearch.state.passport import build_passport, render_passport_markdown
 
 # --------------------------------------------------------------------------- #
 
@@ -107,8 +115,8 @@ def _has_structured_run_work(root: str | Path) -> bool:
     )
 
 
-def _command_from_run_spec(run_spec: dict, *, fallback_command: str, root: str | Path | None = None) -> tuple[str, int, float, str, str, float]:
-    run_spec = dict(run_spec or {})
+def _command_from_run_spec(run_spec: dict, *, fallback_command: str, root: str | Path | None = None) -> tuple[str, int, float, str, str, float, dict]:
+    run_spec = normalize_monitor_run_spec(run_spec or {})
     commands = run_spec.get("commands") or []
     if isinstance(commands, str):
         commands = [commands]
@@ -126,7 +134,7 @@ def _command_from_run_spec(run_spec: dict, *, fallback_command: str, root: str |
     monitor_commands = [str(c).strip() for c in monitor_commands if str(c).strip()]
     monitor_command = " && ".join(monitor_commands)
     poll_interval = float(run_spec.get("poll_interval_seconds") or 0.0)
-    return command, max(1, max_iters), max(0.0, max_seconds), mode, monitor_command, max(0.0, poll_interval)
+    return command, max(1, max_iters), max(0.0, max_seconds), mode, monitor_command, max(0.0, poll_interval), run_spec
 
 
 def _complete_metric_commands(commands: list[str], *, root: str | Path | None = None) -> list[str]:
@@ -387,7 +395,7 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         rationale = "v2 run experiment"
         mode = "single"
     if run_task:
-        command, spec_max_evals, spec_max_seconds, mode, monitor_command, poll_interval = _command_from_run_spec(
+        command, spec_max_evals, spec_max_seconds, mode, monitor_command, poll_interval, monitor_spec = _command_from_run_spec(
             run_task.get("run_spec"),
             fallback_command=fallback_command,
             root=ctx.root,
@@ -399,6 +407,7 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         command = fallback_command
         monitor_command = ""
         poll_interval = 0.0
+        monitor_spec = {}
         max_evals_override = None
         max_seconds_override = None
     from autoresearch.legacy.loop import AutoResearchAction, git_snapshot
@@ -407,6 +416,8 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     base_git = git_snapshot(loop.settings.root(), enabled=loop.settings.use_git_versioning)
     observations = []
     started = time.time()
+    watched_files = sorted(set((monitor_spec.get("expected_outputs") or []) + (monitor_spec.get("monitor_files") or [])))
+    before_files = snapshot_files(ctx.root, watched_files) if watched_files else {}
     start_rows = len(_search_log_rows(ctx.root))
     max_seconds = max(0.0, float(max_seconds_override if max_seconds_override is not None else getattr(loop.settings, "run_max_inner_seconds", 20.0) or 0.0))
     max_evals = max(1, int(max_evals_override if max_evals_override is not None else getattr(loop.settings, "run_max_inner_evals", 100) or 1))
@@ -438,8 +449,6 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
     if callable(recorder):
         recorder(action, obs, base_git, "run_experiment")
     inner_evals = max(len(observations), len(_search_log_rows(ctx.root)) - start_rows)
-    if run_task:
-        _update_run_task_result(ctx.root, run_task, obs, inner_evals=inner_evals)
     status = "ok" if obs.status in {"ok", "ok_metric_recovered"} else "failed"
     stdout = obs.summary
     if len(observations) > 1:
@@ -452,19 +461,39 @@ def _default_run_fn(ctx: PhaseContext) -> dict:
         stderr = art_stderr or art_stdout
         if art_cmd:
             stdout = f"$ {art_cmd}\n{stdout}"
-    return {"status": status, "returncode": 0 if status == "ok" else 1,
-            "stdout": stdout, "stderr": stderr, "artifact_path": obs.artifact_path,
-            "search_driver": driver or "", "inner_evals": inner_evals}
+    after_files = snapshot_files(ctx.root, watched_files) if watched_files else {}
+    result = {"status": status, "returncode": 0 if status == "ok" else 1,
+              "stdout": stdout, "stderr": stderr, "artifact_path": obs.artifact_path,
+              "search_driver": driver or "", "inner_evals": inner_evals}
+    anomalies = detect_run_anomalies(
+        root=ctx.root,
+        run_spec=monitor_spec,
+        result=result,
+        observations=observations,
+        before_files=before_files,
+        after_files=after_files,
+        elapsed_seconds=time.time() - started,
+    )
+    if anomalies:
+        write_anomaly_report(ctx.root, anomalies, run_id=getattr(getattr(loop, "settings", None), "project_id", ""))
+    result["anomalies"] = anomalies
+    result["watched_files"] = {"before": before_files, "after": after_files}
+    result["run_spec"] = monitor_spec
+    if run_task:
+        _update_run_task_result(ctx.root, run_task, obs, inner_evals=inner_evals, anomalies=anomalies)
+    return result
 
 
-def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: int) -> None:
+def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: int, anomalies: list[dict] | None = None) -> None:
     state = load_todo_state(root)
     metric, higher = _metric_from_file(root)
+    anomalies = list(anomalies or [])
+    has_error_anomaly = any(str(item.get("severity")) == "error" for item in anomalies if isinstance(item, dict))
     for existing in state.get("tasks", []):
         if existing.get("task_id") != task.get("task_id"):
             continue
         command_ok = getattr(obs, "status", "") in {"ok", "ok_metric_recovered"}
-        ok = command_ok and _verification_passed(existing.get("verification") or {}, metric, higher)
+        ok = command_ok and _verification_passed(existing.get("verification") or {}, metric, higher) and not has_error_anomaly
         existing["status"] = "verified" if ok else "failed"
         existing["last_result"] = {
             "status": getattr(obs, "status", ""),
@@ -474,6 +503,7 @@ def _update_run_task_result(root: str | Path, task: dict, obs, *, inner_evals: i
             "metric": metric,
             "higher_is_better": higher,
             "updated_at": time.time(),
+            "anomalies": anomalies,
         }
         break
     state = repair_failed_run_tasks(state)
@@ -507,18 +537,28 @@ def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[Autofi
             if not fixed:
                 break
             result = run(ctx)
-        major = result.get("status") == "failed"
+        anomalies = [item for item in (result.get("anomalies") or []) if isinstance(item, dict)]
+        major = result.get("status") == "failed" or any(str(item.get("severity")) == "error" for item in anomalies)
         metric, higher = _metric_from_file(ctx.root)
         write_eval_contract_digest(ctx.root)
         write_failure_digest(ctx.root)
         criteria = parse_completion_criteria(ctx.program_text)
         solved = is_metric_solved(metric, criteria)
         driver = result.get("search_driver") or "(single train+eval)"
+        passport = build_passport(
+            origin_mode="run",
+            project_id=str(getattr(getattr(ctx.loop, "settings", None), "project_id", "")),
+            artifact_type="run_report",
+            verification_status="UNVERIFIED",
+            version_label="autoresearch_run_report_v1",
+        )
         run_report = (
-            f"# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} "
+            render_passport_markdown(passport)
+            + f"\n# Run Report\n\nstatus={result.get('status')} returncode={result.get('returncode')} "
             f"autofix_attempts={attempts} driver={driver} inner_evals={result.get('inner_evals', 1)} "
             f"solved={solved} criteria={criteria}\n"
         )
+        run_report += render_anomalies_markdown(anomalies)
         stderr_tail = str(result.get("stderr") or "").strip()
         if major and stderr_tail:
             # Surface the real root cause (traceback/exception) both in the run
@@ -539,6 +579,13 @@ def make_run_handler(run_fn: Optional[RunFn] = None, autofix_fn: Optional[Autofi
                 f"- returncode: {result.get('returncode')}\n"
                 f"- stdout (tail): {str(result.get('stdout') or '')[-400:]}\n\n"
                 "## stderr / traceback (tail)\n```\n" + tail + "\n```\n",
+            )
+        elif major and anomalies:
+            write_auto_note(
+                ctx.root,
+                "run_failure",
+                "# Run Failure\n\nThe latest run produced blocking anomaly signals.\n\n"
+                + render_anomalies_markdown(anomalies),
             )
         elif not major:
             # A later run succeeded: clear the stale failure note so the next

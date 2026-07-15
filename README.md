@@ -465,6 +465,11 @@ pip install PyNaCl>=1.5.0
 
 ## 更新日志
 
+### 2026-07-16
+
+- 将 `skills/productivity/paper_research_scout/references/read_papers.json` 加入 `.gitignore`，避免本地论文阅读记录进入版本库。
+- 按维护约定补充本次提交前的 README 更新记录。
+
 ### 2026-07-14
 
 #### autoresearch Completion Criteria 默认模板

@@ -2,7 +2,7 @@
 
 这份文档用最直白的话，把 R-Agent 里的 `autoresearch/` 包讲清楚：
 它是什么、怎么一步步跑、每一步能用什么工具、能看到什么、会把结果写到哪、
-以及现在还差什么才算“真正的自动科研”。
+这次新增的几个“检查员”在保护什么，以及现在还差什么才算“真正的自动科研”。
 
 ---
 
@@ -235,6 +235,7 @@ attempt 的几条硬规矩：
 | 文件 | 装什么 | 你什么时候看它 |
 |------|--------|----------------|
 | `monitor.json` | 心跳：状态/阶段/第几步/花了多少钱/pid | 想知道“**现在跑到哪了**”→ `/autoresearch show` |
+| `/autoresearch show` 返回里的 `state_check` | 给 `.autoresearch` 做体检：状态文件是不是坏了、phase 是否合法、todo/gate 能不能读 | 想知道“**这次能不能安全续跑**” |
 | `project.md` | 人类可读的项目态 + **短期结论** | 想知道“**结果咋样、解没解决**”，第一眼看这里 |
 | `state.json` | 所有实验 / best / Pareto / 指标历史 | 想看“**每次实验的数字**” |
 | `todo_state.json` | 任务 DAG（谁依赖谁、做到哪） | 想看“**计划和进度**” |
@@ -242,6 +243,7 @@ attempt 的几条硬规矩：
 | `budget.json` | token / USD 账本 | 想知道“**花了多少钱**” |
 | `lessons.jsonl` | 经验账本（**gitignore，回滚也不丢**） | 想看“**踩过哪些坑**” |
 | `experiment_memory.json/md` | 实验记忆摘要 | 规划下一步的参考 |
+| `anomalies.jsonl` | 运行时发现的异常分类，比如缺输出、输出没变、导入失败、超时 | 想知道“**为什么这次验证不能算通过**” |
 | `regression_cases.json` | 回归用例 / 收尾契约 | 收尾阶段防止改坏 |
 | `debug/inflight.json` | **当前卡在哪个 LLM/shell/phase** | 感觉“卡住了”时看这个 |
 | `debug/debug.jsonl` | debug 事件流 | 详细排查 |
@@ -277,9 +279,148 @@ flowchart LR
 - **预算**：`budget.json` 累计 token/USD，触顶就暂停或降级 persona，保证“可以无限跑”不会变成“无限烧钱”。
 - **心跳**：`monitor.json` 每步一写，即使它在后台独立进程里跑，你也能随时观测。
 
+
 ---
 
-## 7. 安全边界（它绝对不会做的事）
+## 7. 这次新增的“四个检查员”（autoresearch3）
+
+这次改动可以先不用看代码，记成一句话：
+
+> 以前小研究员会做实验、记分数；现在他还会给每份结果贴身份证，给自己的本子做体检，遇到异常会拉警报，最后还会复考一次确认“好成绩不是碰巧来的”。
+
+```mermaid
+flowchart TD
+    RUN[跑一次实验] --> CARD[贴身份证<br/>Material Passport]
+    RUN --> ALARM[报警器<br/>anomalies.jsonl]
+    ALARM --> PASS{有没有严重异常?}
+    PASS -->|有| FAIL[这次不能算 verified<br/>先修问题]
+    PASS -->|没有| SCORE[记录指标到 state.json]
+    SCORE --> BEST[conclude 选 best]
+    BEST --> RETAKE[复考员<br/>重新跑 eval.sh]
+    RETAKE -->|分数对得上| VERIFIED[best 标成 VERIFIED]
+    RETAKE -->|没法复考/对不上| CANNOT[标成 CANNOT_VERIFY]
+    SHOW[/autoresearch show/] --> CHECK[体检表 state_check<br/>检查状态文件能不能安全读]
+```
+
+### 7.1 身份证：Material Passport
+
+`passport` 就像每张试卷右上角贴的一张小卡片，写清楚：
+
+- 这是谁写的：`R-Agent AutoResearch`；
+- 这是哪种东西：run report、experiment record；
+- 什么时候写的；
+- 属于哪个项目、哪个实验；
+- 现在可信度是什么：`UNVERIFIED`、`VERIFIED`、`CANNOT_VERIFY`。
+
+为什么要贴身份证？
+
+以前你看到一个 `best.json` 或 `.auto/run_report.md`，要自己猜“这是哪轮来的、算不算验证过”。现在不用猜，直接看 `passport.verification_status`。
+
+相关文件：
+
+- `autoresearch/state/passport.py`：负责做身份证；
+- `.auto/run_report.md`：现在开头会带 `## Material Passport`；
+- `.autoresearch/state.json` 里的实验记录：现在也会带 `passport` 字段。
+
+### 7.2 体检表：state_check + revision
+
+`state_check` 像每天上课前检查书包：
+
+- `state.json` 是不是能打开；
+- `todo_state.json` 里的任务是不是列表；
+- `gate_signals.json` 里的计数是不是数字；
+- `project.md` 里的 phase 合不合法；
+- 有没有文件坏掉到不能继续。
+
+`revision` 像作业本页码。每次框架保存 `state.json`，页码都会加 1。这样以后要做更强的断点续跑或冲突检测时，就知道“这本子是不是被别人动过”。
+
+你怎么用？
+
+- 跑 `/autoresearch show`；
+- 返回结果里会有 `state_check`；
+- `state_check.ok=true` 表示状态体检通过；
+- `ok=false` 表示状态文件坏了或结构不对，应该先修状态，不要假装能安全续跑。
+
+相关文件：
+
+- `autoresearch/state/schema.py`：负责体检；
+- `autoresearch/legacy/context.py`：每次保存 `state.json` 时自动写 `schema_version/revision/updated_at`；
+- `autoresearch/tool.py`：`auto_research_v2_status` 会返回 `state_check`。
+
+### 7.3 报警器：run_spec 监控 + anomalies
+
+以前 Run 阶段主要看“命令是不是 0 退出”和“有没有指标”。但有些坏情况不能只看 exit code：
+
+- 命令成功了，但应该生成的文件没生成；
+- 日志文件一直没变，像卡住了；
+- 报错是导入失败、schema 错、资源不够、还是超时；
+- eval 其实没拿到新输出，只读到了旧的 `metrics.json`。
+
+所以现在 `run_spec` 可以多写一些“老师额外要求”：
+
+```json
+{
+  "mode": "single",
+  "commands": ["bash train/train.sh", "bash eval.sh"],
+  "expected_outputs": ["outputs/submission.json", "metrics.json"],
+  "monitor_files": ["run.log"],
+  "experiment_type": "training",
+  "determinism": "deterministic"
+}
+```
+
+报警器会把问题分门别类，比如：
+
+| 类型 | 小学生版解释 | 会发生什么 |
+|------|--------------|------------|
+| `MISSING_OUTPUT` | 老师要交两张纸，你少交了一张 | 这次验证不能算稳 |
+| `OUTPUT_STALL` | 本子很久没写新字，可能卡住 | 写入异常记录，提醒下一轮看 |
+| `SCHEMA_ERROR` | 答案格式不对，老师读不懂 | 先修输出格式 |
+| `IMPORT_ERROR` | 代码找不到要用的模块 | 先修环境或 import |
+| `RESOURCE_ANOMALY` | 内存/GPU 之类资源出问题 | 先降规模或改资源策略 |
+| `HARD_TIMEOUT` | 超时没做完 | 停下来，缩小任务或加预算 |
+| `CRASHED` / `RUN_FAILED` | 命令崩了或非 0 退出 | 先修崩溃 |
+
+重点：如果报警器发现“严重异常”，这个 run task **不会被标成 verified**。也就是说，不能只因为命令表面跑完了，就说“作业合格”。
+
+相关文件：
+
+- `autoresearch/anomalies.py`：负责分类报警；
+- `autoresearch/run_handler.py`：执行前后拍快照，写 `.autoresearch/anomalies.jsonl`，并把异常写进 `last_result`；
+- `autoresearch/planner.py`：保留 planner 产出的新 `run_spec` 字段。
+
+### 7.4 复考员：best reproducibility verification
+
+一次考高分不一定代表真的会了，可能是碰巧。所以 conclude 现在会对 best candidate 做“复考”：
+
+1. 先选出当前 best；
+2. 如果能跑 `eval.sh`，就重新跑一次或多次；
+3. 把复跑指标和原来的 best 指标比较；
+4. 如果对得上，就把 best 的 `passport.verification_status` 升级成 `VERIFIED`；
+5. 如果缺 `eval.sh`、复跑失败、或者分数对不上，就标成 `CANNOT_VERIFY`。
+
+复考也分三种题型：
+
+| 类型 | 怎么比较 |
+|------|----------|
+| `deterministic` | 同样代码同样数据，分数必须一样 |
+| `stochastic` | 有随机性，允许一点点误差，默认 5% |
+| `environment-sensitive` | 跟硬件/系统有关，允许更宽一点，默认 10% |
+
+工具参数里可以控制：
+
+- `best_reproducibility_runs`：复考几次；0 表示跳过；
+- `best_reproducibility_determinism`：题型是 deterministic / stochastic / environment-sensitive；
+- `best_reproducibility_threshold`：允许的相对误差。
+
+相关文件：
+
+- `autoresearch/reproducibility.py`：负责比较分数；
+- `autoresearch/legacy/loop.py`：conclude/finalize 时复跑 best，并写回 `best_experiment.reproducibility`。
+
+---
+
+## 8. 安全边界（它绝对不会做的事）
 
 - 不改 `eval.py` / `eval.sh` / `blackbox_oracle.py`，只在 `train/**` 里改；
 - 不做静默的破坏性 git 操作，默认版本策略 `artifact_only`（只存 patch/manifest，不自动 commit）；
@@ -289,7 +430,7 @@ flowchart LR
 
 ---
 
-## 8. 跟着一个真实例子走一遍（black_box）
+## 9. 跟着一个真实例子走一遍（black_box）
 
 题目：最小化黑盒函数 `z`，完成标准 `z <= 0.001`，只能改 `train/`。
 
@@ -302,7 +443,7 @@ flowchart LR
 
 ---
 
-## 9. 现在还差什么？（距离“真正的 AutoResearch”的 TODO）
+## 10. 现在还差什么？（距离“真正的 AutoResearch”的 TODO）
 
 当前框架已经能把**单目标、指标明确、可快速评测**的任务端到端跑通（black_box 已验证）。
 但离“通用自动科研”还有这些可以做：
@@ -343,7 +484,7 @@ flowchart LR
 
 ---
 
-## 10. 一页速记
+## 11. 一页速记
 
 - **入口**：`/autoresearch run <目录>` 后台起；`show` 看进度；`kill` 杀进程。
 - **大脑**：`ThreeStepController` 跑 **plan → attempt → conclude** 循环。
@@ -351,4 +492,5 @@ flowchart LR
 - **分工**：plan 动嘴、attempt 动手（唯一能改代码跑命令）、conclude 算账。
 - **闸门**：完成标准、预算、超时、STOP —— 全是**代码机械判断**，不靠 LLM 自觉。
 - **安全**：只改 `train/**`，不碰 eval/oracle，默认不自动 commit。
-- **状态**：想知道“解没解决”看 `project.md`；想知道“跑到哪”看 `monitor.json`。
+- **状态**：想知道“解没解决”看 `project.md`；想知道“跑到哪”看 `monitor.json`；想知道“能不能安全续跑”看 `state_check`。
+- **新检查员**：passport 贴身份证，state_check 做体检，anomalies 拉警报，reproducibility 给 best 复考。

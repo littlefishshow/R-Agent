@@ -28,6 +28,7 @@ from autoresearch.state.memory import update_belief, split_program, write_auto_n
 from autoresearch.phases import PhaseContext, PhaseResult
 from autoresearch.observability.timeout import call_with_deadline
 from autoresearch.state.todo import load_todo_state, merge_todo_state, render_todo_markdown, save_todo_state
+from autoresearch.anomalies import normalize_run_spec as normalize_run_monitor_spec
 
 
 # --------------------------------------------------------------------------- #
@@ -687,7 +688,7 @@ def _normalize_run_spec(run_spec: dict) -> dict:
         monitor_commands = [monitor_commands]
     if isinstance(monitor_commands, list):
         spec["monitor_commands"] = [_prefer_python3_command(str(command)) for command in monitor_commands]
-    return spec
+    return normalize_run_monitor_spec(spec)
 
 
 def _prefer_python3_command(command: str) -> str:

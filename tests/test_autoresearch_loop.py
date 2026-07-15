@@ -1068,6 +1068,48 @@ def test_baseline_nonzero_exit_does_not_recover_from_stale_metrics_file(tmp_path
     assert obs.status == "failed"
 
 
+
+def test_finalize_verifies_best_when_eval_entrypoint_exists(tmp_path):
+    (tmp_path / "program.md").write_text("# Program\nmaximize score\n", encoding="utf-8")
+    (tmp_path / "solution.py").write_text("VALUE = 0.9\n", encoding="utf-8")
+    (tmp_path / "eval.sh").write_text(
+        "#!/usr/bin/env bash\npython3 - <<'PY'\n"
+        "import json, re\n"
+        "from pathlib import Path\n"
+        "text = Path('solution.py').read_text()\n"
+        "value = float(re.search(r'VALUE = ([0-9.]+)', text).group(1))\n"
+        "Path('metrics.json').write_text(json.dumps({'primary_metric': value, 'primary_metric_name': 'score', 'score': value, 'higher_is_better': True}))\n"
+        "print('primary_metric_name: score')\n"
+        "print(f'primary_metric: {value}')\n"
+        "print('higher_is_better: true')\n"
+        "PY\n",
+        encoding="utf-8",
+    )
+    settings = AutoResearchSettings(
+        project_dir=tmp_path,
+        project_id="verify-best",
+        max_rounds=0,
+        use_git_versioning=False,
+        versioning_policy="artifact_only",
+        defer_experiment_finalization=True,
+        max_experiments=2,
+    )
+    loop = AutoResearchLoop(settings)
+    action = AutoResearchAction(
+        type="run",
+        role="trial",
+        rationale="stable trial",
+        command="python3 - <<'PY'\nfrom pathlib import Path\nPath('solution.py').write_text('VALUE = 0.9\\n')\nPY\nbash eval.sh && cat metrics.json",
+    )
+    obs = loop.execute_action(action)
+    loop._maybe_record_experiment(action, obs, {"git_available": False}, "run_experiment")
+
+    loop.finalize_experiments()
+    state = loop.context.load_state()
+
+    assert state["best_experiment"]["passport"]["verification_status"] == "VERIFIED"
+    assert state["best_experiment"]["reproducibility"]["verdict"] == "REPRODUCIBLE"
+
 def test_search_feedback_digest_surfaces_range_and_best(tmp_path):
     """After a trial, the search summary/history should be digested into experiment_results."""
     (tmp_path / "program.md").write_text("# Program\nminimize z\n", encoding="utf-8")
@@ -1183,3 +1225,5 @@ def test_artifact_only_restores_best_source_snapshot_without_git(tmp_path):
     assert result["best_experiment"]["hypothesis"] == "good trial"
     assert (tmp_path / "solution.py").read_text(encoding="utf-8") == "good"
     assert state["best_restore"]["restored"] == ["solution.py"]
+    assert state["best_experiment"]["passport"]["verification_status"] == "CANNOT_VERIFY"
+    assert state["best_experiment"]["reproducibility"]["verdict"] == "CANNOT_VERIFY"

@@ -92,6 +92,11 @@ class AutoResearchSettings:
     run_max_inner_seconds: float = 20.0
     run_max_inner_evals: int = 100
     run_cheap_eval_threshold_seconds: float = 2.0
+    # Re-run the restored best candidate to upgrade its passport from
+    # UNVERIFIED to VERIFIED/CANNOT_VERIFY. 0 disables this expensive check.
+    best_reproducibility_runs: int = 1
+    best_reproducibility_determinism: str = "deterministic"
+    best_reproducibility_threshold: float = 0.05
     search_driver_globs: tuple[str, ...] = (
         "train/search.py", "train/search_driver.py", "train/*search*.py",
         "train/*driver*.py", "train/*exploration*.py", "search.py",

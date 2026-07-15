@@ -177,6 +177,8 @@ def test_v2_background_run_is_nonblocking_and_status_pure_read(tmp_path):
 
     assert final.get("status") in {"running", "completed", "paused", "queued", "failed"}
     assert "monitor_text" in final
+    assert "state_check" in final
+    assert final["state_check"].get("ok") in {True, False}
     # background run eventually advanced at least one round and finished
     assert final.get("step_index", 0) >= 1
     assert final.get("run_id") == payload["run_id"]

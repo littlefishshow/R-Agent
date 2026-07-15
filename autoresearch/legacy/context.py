@@ -14,6 +14,7 @@ from typing import Iterable
 from autoresearch.legacy.services import ProjectBoundary, _safe_slug, normalize_versioning_policy
 from autoresearch.observability.debug import inflight_finish, inflight_start
 from autoresearch.legacy.types import AutoResearchObservation, AutoResearchSettings, ContextBucket, DEFAULT_CONTEXT_BUCKETS
+from autoresearch.state.schema import stamp_state_revision
 
 class AutoResearchArtifactStore:
     def __init__(self, settings: AutoResearchSettings):
@@ -127,6 +128,9 @@ class AutoResearchContextManager:
 
     def default_state(self) -> dict:
         return {
+            "schema_version": 1,
+            "revision": 0,
+            "updated_at": time.time(),
             "summary": "",
             "observations": [],
             "buckets": {name: [] for name in DEFAULT_CONTEXT_BUCKETS},
@@ -177,6 +181,7 @@ class AutoResearchContextManager:
     def save_state(self, state: dict) -> None:
         import os
 
+        state = stamp_state_revision(state)
         state["versioning_policy"] = normalize_versioning_policy(self.settings.versioning_policy)
         state["use_git_versioning"] = bool(self.settings.use_git_versioning)
         state.setdefault("last_finalized_experiment_count", 0)

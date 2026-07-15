@@ -13,6 +13,8 @@ from typing import Callable, Iterable, Optional
 from autoresearch.observability.debug import inflight_finish, inflight_start
 from autoresearch.state.memory import append_lesson
 from autoresearch.state.experiment_memory import write_experiment_memory
+from autoresearch.state.passport import build_passport, set_passport_status
+from autoresearch.reproducibility import build_reproducibility_report, read_metrics_file
 from autoresearch.observability.timeout import call_with_deadline
 
 from autoresearch.legacy.context import AutoResearchArtifactStore, AutoResearchContextManager, ProjectConfinedCommandRunner
@@ -758,6 +760,67 @@ class AutoResearchLoop:
                 "updated_at": time.time(),
             }
 
+    def _verify_best_reproducibility(self, state: dict) -> None:
+        """Re-run the restored best candidate and stamp its verification status."""
+        best = state.get("best_experiment") if isinstance(state, dict) else None
+        if not isinstance(best, dict) or not best:
+            return
+        if best.get("reproducibility", {}).get("verdict") == "REPRODUCIBLE":
+            best.update(set_passport_status(best, "VERIFIED"))
+            return
+        runs = max(0, int(getattr(self.settings, "best_reproducibility_runs", 1) or 0))
+        if runs <= 0:
+            best.update(set_passport_status(best, "UNVERIFIED"))
+            return
+        if not (self.settings.root() / "eval.sh").exists():
+            report = build_reproducibility_report(
+                best=best,
+                reruns=[],
+                determinism=getattr(self.settings, "best_reproducibility_determinism", "deterministic"),
+                threshold=float(getattr(self.settings, "best_reproducibility_threshold", 0.0) or 0.0),
+            )
+            report["reason"] = "eval.sh missing"
+            best["reproducibility"] = report
+            best.update(set_passport_status(best, report.get("passport_status", "CANNOT_VERIFY")))
+            state["best_experiment"] = best
+            return
+        reruns = []
+        for index in range(runs):
+            try:
+                obs = self.execute_action(AutoResearchAction(
+                    type="run",
+                    rationale=f"verify_best_reproducibility_{index + 1}",
+                    command="bash eval.sh && cat metrics.json",
+                ))
+                reruns.append({
+                    "index": index + 1,
+                    "status": obs.status,
+                    "summary": obs.summary[:1000],
+                    "artifact_path": obs.artifact_path,
+                    "metrics": read_metrics_file(self.settings.root()),
+                })
+            except Exception as exc:
+                reruns.append({
+                    "index": index + 1,
+                    "status": "failed",
+                    "error": str(exc)[:1000],
+                    "metrics": {},
+                })
+                break
+        report = build_reproducibility_report(
+            best=best,
+            reruns=reruns,
+            determinism=getattr(self.settings, "best_reproducibility_determinism", "deterministic"),
+            threshold=float(getattr(self.settings, "best_reproducibility_threshold", 0.0) or 0.0),
+        )
+        best["reproducibility"] = report
+        best.update(set_passport_status(best, report.get("passport_status", "CANNOT_VERIFY")))
+        state["best_experiment"] = best
+        for record in state.get("experiments") or []:
+            if isinstance(record, dict) and record.get("experiment_id") == best.get("experiment_id"):
+                record["reproducibility"] = report
+                record.update(set_passport_status(record, report.get("passport_status", "CANNOT_VERIFY")))
+
     def _maybe_record_experiment(self, action: AutoResearchAction, obs: AutoResearchObservation, base_git: dict, step_name: str) -> None:
         if not self._is_experiment_action(action, step_name):
             return
@@ -796,6 +859,14 @@ class AutoResearchLoop:
         source_snapshot_path = self._save_source_snapshot(experiment_id)
         base_commit = base_git.get("head", "") if isinstance(base_git, dict) else ""
         base_clean = _git_worktree_clean(base_git)
+        passport = build_passport(
+            origin_mode="run",
+            project_id=self.settings.project_id,
+            artifact_type="experiment_record",
+            verification_status="UNVERIFIED",
+            version_label="autoresearch_experiment_v1",
+            record_id=experiment_id,
+        )
         record = {
             "experiment_id": experiment_id,
             "created_at": time.time(),
@@ -822,6 +893,7 @@ class AutoResearchLoop:
             "version_action": "artifact_only",
             "rollback_status": "not_needed",
             "version_error": "",
+            "passport": passport,
         }
         existing.append(record)
         state["experiments"] = existing[-max(1, int(self.settings.max_experiments)) :]
@@ -870,6 +942,7 @@ class AutoResearchLoop:
         if normalize_versioning_policy(self.settings.versioning_policy) == "artifact_only" and not bool(self.settings.use_git_versioning):
             self._restore_best_source_snapshot(state)
             self._refresh_metrics_after_best_restore(state)
+        self._verify_best_reproducibility(state)
         write_experiment_memory(self.settings.root(), state=state)
         self.context.save_state(state)
         self._write_evolution_artifacts(state)
