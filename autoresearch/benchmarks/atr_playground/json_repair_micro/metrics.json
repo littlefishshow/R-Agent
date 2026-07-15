@@ -1,0 +1,106 @@
+{
+  "failures": [
+    {
+      "expected": {
+        "a": 1,
+        "b": 2
+      },
+      "input": "{\"a\":1, \"b\":2,}",
+      "parsed": "ERROR: JSONDecodeError: Expecting ',' delimiter: line 1 column 14 (char 13)",
+      "repaired": "{\"a\":1, \"b\":2\u0001"
+    },
+    {
+      "expected": {
+        "age": 30,
+        "name": "alice"
+      },
+      "input": "{name: \"alice\", age: 30}",
+      "parsed": "ERROR: JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+      "repaired": "{name: \"alice\", age: 30}"
+    },
+    {
+      "expected": {
+        "ok": true,
+        "value": null
+      },
+      "input": "{'ok': True, 'value': None}",
+      "parsed": "ERROR: JSONDecodeError: Expecting value: line 1 column 8 (char 7)",
+      "repaired": "{\"ok\": True, \"value\": None}"
+    },
+    {
+      "expected": [
+        1,
+        2,
+        3
+      ],
+      "input": "[1,2,3,]",
+      "parsed": "ERROR: JSONDecodeError: Expecting ',' delimiter: line 1 column 7 (char 6)",
+      "repaired": "[1,2,3\u0001"
+    },
+    {
+      "expected": {
+        "items": [
+          "a",
+          "b"
+        ],
+        "n": 2
+      },
+      "input": "{\"items\": [\"a\", \"b\",], \"n\": 2}",
+      "parsed": "ERROR: JSONDecodeError: Expecting ',' delimiter: line 1 column 20 (char 19)",
+      "repaired": "{\"items\": [\"a\", \"b\"\u0001, \"n\": 2}"
+    },
+    {
+      "expected": {
+        "x": 5
+      },
+      "input": "// comment\n{\"x\": 5}",
+      "parsed": "ERROR: JSONDecodeError: Expecting value: line 1 column 1 (char 0)",
+      "repaired": "// comment\n{\"x\": 5}"
+    },
+    {
+      "expected": {
+        "a": "unterminated"
+      },
+      "input": "{\"a\": \"unterminated}",
+      "parsed": "ERROR: JSONDecodeError: Unterminated string starting at: line 1 column 7 (char 6)",
+      "repaired": "{\"a\": \"unterminated}"
+    },
+    {
+      "expected": {
+        "a": 1,
+        "b": 2
+      },
+      "input": "{\"a\":1 \"b\":2}",
+      "parsed": "ERROR: JSONDecodeError: Expecting ',' delimiter: line 1 column 8 (char 7)",
+      "repaired": "{\"a\":1 \"b\":2}"
+    },
+    {
+      "expected": {
+        "foo_bar": [
+          true,
+          false,
+          null
+        ]
+      },
+      "input": "{foo_bar: [true, false, null]}",
+      "parsed": "ERROR: JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)",
+      "repaired": "{foo_bar: [true, false, null]}"
+    },
+    {
+      "expected": {
+        "nested": {
+          "inner": "yes"
+        }
+      },
+      "input": "{\"nested\": {inner: \"yes\",},}",
+      "parsed": "ERROR: JSONDecodeError: Expecting property name enclosed in double quotes: line 1 column 13 (char 12)",
+      "repaired": "{\"nested\": {inner: \"yes\"\u0001\u0001"
+    }
+  ],
+  "higher_is_better": true,
+  "metric_name": "repair_exact_accuracy",
+  "num_cases": 12,
+  "num_correct": 1,
+  "primary_metric": 0.08333333333333333,
+  "runtime_seconds": 0.0004
+}

@@ -185,41 +185,36 @@ def skill_curator_run_tool(stale_after_days: int = 30, archive_after_days: int =
     return _json_ok(dry_run=bool(dry_run), checked=checked, actions=actions)
 
 
+def skill_curator_manage_tool(action: str, skill_name: str = "", pinned: bool = True,
+                              stale_after_days: int = 30, archive_after_days: int = 90,
+                              dry_run: bool = True) -> str:
+    """统一 skill 生命周期治理入口，支持 status/run/pin/restore。"""
+    action = (action or "status").strip().lower()
+    if action == "status":
+        return skill_curator_status_tool()
+    if action == "run":
+        return skill_curator_run_tool(stale_after_days=stale_after_days, archive_after_days=archive_after_days, dry_run=dry_run)
+    if action == "pin":
+        return skill_curator_pin_tool(skill_name=skill_name, pinned=pinned)
+    if action == "restore":
+        return skill_curator_restore_tool(skill_name=skill_name)
+    return _json_error("Unsupported action. Use status, run, pin, or restore.")
+
+
 registry.register(
-    name="skill_curator_status",
-    description="查看 Hermes 式 deterministic skill curator 状态：按 usage telemetry 汇总 active/stale/archived/pinned 技能。",
-    parameters={"type": "object", "properties": {}},
-    handler=skill_curator_status_tool,
-)
-registry.register(
-    name="skill_curator_run",
-    description="运行确定性技能生命周期维护：agent-created skill 按未活跃天数 active→stale→archived；默认 dry_run 不改文件。",
+    name="skill_curator_manage",
+    description="统一管理 skill 生命周期治理：action=status|run|pin|restore。status 汇总状态，run 执行 deterministic curator，pin 设置 pinned，restore 从归档恢复。",
     parameters={
         "type": "object",
         "properties": {
-            "stale_after_days": {"type": "integer", "description": "多少天未活跃后标记 stale，默认 30"},
-            "archive_after_days": {"type": "integer", "description": "多少天未活跃后归档到 skills/.archive，默认 90"},
-            "dry_run": {"type": "boolean", "description": "true 时只预览不修改，默认 true"},
+            "action": {"type": "string", "description": "status | run | pin | restore；默认 status"},
+            "skill_name": {"type": "string", "description": "pin/restore 时的技能名称"},
+            "pinned": {"type": "boolean", "description": "pin 时 true=pin，false=unpin；默认 true"},
+            "stale_after_days": {"type": "integer", "description": "run 时多少天未活跃后标记 stale，默认 30"},
+            "archive_after_days": {"type": "integer", "description": "run 时多少天未活跃后归档到 skills/.archive，默认 90"},
+            "dry_run": {"type": "boolean", "description": "run 时 true 只预览不修改，默认 true"},
         },
+        "required": ["action"],
     },
-    handler=skill_curator_run_tool,
-)
-registry.register(
-    name="skill_curator_pin",
-    description="设置技能 pinned 状态；pinned skill 会被 deterministic curator 跳过。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "skill_name": {"type": "string", "description": "技能名称"},
-            "pinned": {"type": "boolean", "description": "true=pin，false=unpin"},
-        },
-        "required": ["skill_name"],
-    },
-    handler=skill_curator_pin_tool,
-)
-registry.register(
-    name="skill_curator_restore",
-    description="从 skills/.archive 恢复已归档技能到 skills/restored/<skill_name>。",
-    parameters={"type": "object", "properties": {"skill_name": {"type": "string", "description": "技能名称"}}, "required": ["skill_name"]},
-    handler=skill_curator_restore_tool,
+    handler=skill_curator_manage_tool,
 )

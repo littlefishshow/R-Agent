@@ -110,12 +110,33 @@ MEMORY_GUIDANCE = (
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Use skills as reusable workflow assets, but keep the skill set compact. "
+    "Prefer patching an existing relevant skill with skill_manage(action='patch') when "
+    "you discover a stable improvement. Create a new skill only when the user asks for "
+    "it or when a broadly reusable workflow cannot fit any existing skill; do not create "
+    "a new skill after every complex task by default.\n"
+    "When using a skill and finding it outdated, incomplete, or wrong, patch it rather "
+    "than creating a duplicate. Skills that aren't maintained become liabilities."
+)
+
+DELEGATED_TODO_GUIDANCE = (
+    "# Delegated todo context policy\n"
+    "When the user presents a problem or task that benefits from tools, tracking, "
+    "or verification, initialize/use todo_manage and delegate executable leaf tasks "
+    "with delegate_task instead of keeping all work in the parent context. The parent "
+    "is the scheduler only: it should create tasks, inspect todo_manage digest/ready/"
+    "status, approve/reject splits, and synthesize from the todo digest. It must not "
+    "pull full child-agent transcripts by default. Child agents should receive only "
+    "task-relevant context, write progress/errors/split proposals into todo_manage, "
+    "and avoid leaking their full internal context back to the parent. If a child fails, "
+    "times out, or leaves its task incomplete, its context may be saved as a bounded "
+    "artifact referenced from todo metadata; the parent may explicitly inspect that "
+    "artifact only when needed. Child context artifacts should be retained until the "
+    "entire todo tree succeeds, then cleaned together; before that, even successful "
+    "leaf-task context may be needed for debugging or sibling/parent synthesis. The "
+    "parent should still retain only the todo digest and its own user-facing conversation "
+    "context unless it explicitly chooses to inspect an artifact.\n"
+    "For trivial conversational replies that require no tools or state, answer directly."
 )
 
 SOUL_MAX_CHARS = 12000
@@ -234,5 +255,8 @@ def build_system_prompt(agent_tools=None) -> str:
 
     # 5. Skills Guidance
     parts.append(SKILLS_GUIDANCE)
+
+    # 6. Delegated todo policy
+    parts.append(DELEGATED_TODO_GUIDANCE)
 
     return "\n\n".join(parts)

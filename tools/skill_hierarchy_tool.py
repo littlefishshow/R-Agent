@@ -23,7 +23,10 @@ def _skill_records() -> List[Dict[str, Any]]:
         else:
             category = "uncategorized"
             skill_name = parts[-2] if len(parts) >= 2 else "unknown"
+        if category.startswith("."):
+            continue
         desc = "无描述"
+        content = ""
         try:
             with open(skill_path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -62,7 +65,7 @@ def _skill_records() -> List[Dict[str, Any]]:
 
 
 def skill_categories(include_counts: bool = True):
-    """列出所有 skill 类目。"""
+    """列出所有 skill 类目。内部兼容函数；默认工具入口请使用 skill_search(action="categories")。"""
     records = _skill_records()
     cats: Dict[str, int] = {}
     for r in records:
@@ -77,7 +80,7 @@ def skill_categories(include_counts: bool = True):
 
 
 def skills_by_category(categories: list = None, include_when_to_use: bool = False, limit_per_category: int = 100):
-    """按一个或多个类目列出 skill 摘要，避免一次展开所有技能。"""
+    """按一个或多个类目列出 skill 摘要。内部兼容函数；默认工具入口请使用 skill_search(action="by_category")。"""
     records = _skill_records()
     if categories is None or categories == []:
         selected = sorted({r["category"] for r in records})
@@ -101,6 +104,57 @@ def skills_by_category(categories: list = None, include_when_to_use: bool = Fals
         }
     missing = [c for c in selected if c not in {r["category"] for r in records}]
     return {"categories": result, "missing_categories": missing}
+
+
+def _search_records(query: str = "", categories: list = None, include_when_to_use: bool = True, limit: int = 50):
+    records = _skill_records()
+    selected_set = set(categories or [])
+    q = (query or "").strip().lower()
+    matches = []
+    for r in records:
+        if selected_set and r["category"] not in selected_set:
+            continue
+        haystack = " ".join([r.get("name", ""), r.get("category", ""), r.get("description", ""), r.get("when_to_use", "")]).lower()
+        if q and q not in haystack:
+            continue
+        item = {
+            "name": r["name"],
+            "category": r["category"],
+            "description": r["description"],
+            "relative_path": r["relative_path"],
+        }
+        if include_when_to_use and r.get("when_to_use"):
+            item["when_to_use"] = r["when_to_use"]
+        matches.append(item)
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+    return {"query": query or "", "matches": matches[:limit], "count": len(matches), "truncated": len(matches) > limit}
+
+
+def skill_search(action: str = "search", query: str = "", categories: list = None,
+                 include_counts: bool = True, include_when_to_use: bool = False,
+                 limit_per_category: int = 100, limit: int = 50):
+    """统一 skill 查询入口：categories/by_category/search。"""
+    action = (action or "search").strip().lower()
+    if action == "categories":
+        return skill_categories(include_counts=include_counts)
+    if action in {"by_category", "category"}:
+        return skills_by_category(
+            categories=categories,
+            include_when_to_use=include_when_to_use,
+            limit_per_category=limit_per_category,
+        )
+    if action == "search":
+        return _search_records(
+            query=query,
+            categories=categories,
+            include_when_to_use=include_when_to_use,
+            limit=limit,
+        )
+    return {"success": False, "error": "Unsupported action. Use categories, by_category, or search."}
 
 
 def skill_relocate(skill_name: str, new_category: str):
@@ -134,29 +188,21 @@ def skill_relocate(skill_name: str, new_category: str):
 
 
 registry.register(
-    name="skill_categories",
-    description="层次化技能查询第一级：只列出 skill 类目及数量，避免一次展开所有技能。",
+    name="skill_search",
+    description="统一查询 skill：action=categories 列类目，by_category 按类目列摘要，search 按关键词检索名称/描述/When to Use。",
     parameters={
         "type": "object",
         "properties": {
-            "include_counts": {"type": "boolean", "description": "是否包含每个类目的技能数量", "default": True}
-        }
-    },
-    handler=skill_categories,
-)
-
-registry.register(
-    name="skills_by_category",
-    description="层次化技能查询第二级：按一个或多个类目列出该类目下的 skill 摘要。",
-    parameters={
-        "type": "object",
-        "properties": {
-            "categories": {"type": "array", "items": {"type": "string"}, "description": "要查询的类目列表；为空则返回所有类目但仍按类目分组"},
+            "action": {"type": "string", "description": "categories | by_category | search；默认 search"},
+            "query": {"type": "string", "description": "search 时的关键词；为空则按过滤条件列出技能摘要"},
+            "categories": {"type": "array", "items": {"type": "string"}, "description": "by_category/search 时限定的类目列表"},
+            "include_counts": {"type": "boolean", "description": "categories 时是否包含每个类目的技能数量", "default": True},
             "include_when_to_use": {"type": "boolean", "description": "是否包含 When to Use 摘要", "default": False},
-            "limit_per_category": {"type": "integer", "description": "每个类目最多返回多少个技能", "default": 100}
+            "limit_per_category": {"type": "integer", "description": "by_category 时每个类目最多返回多少个技能", "default": 100},
+            "limit": {"type": "integer", "description": "search 时最多返回多少个技能", "default": 50},
         }
     },
-    handler=skills_by_category,
+    handler=skill_search,
 )
 
 registry.register(

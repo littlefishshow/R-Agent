@@ -72,6 +72,31 @@ def get_llm_retry_base_delay():
     return max(0.0, d)
 
 
+
+def _env_float(name: str, default: float, *, minimum: float = 0.0) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    return max(minimum, value)
+
+
+def get_llm_request_timeout():
+    """LLM 单次请求超时时间（秒）；防止子 Agent 卡在 provider 请求上。"""
+    return _env_float("LLM_REQUEST_TIMEOUT", 300.0, minimum=1.0)
+
+
+def get_tool_execution_timeout():
+    """隔离工具单次执行超时时间（秒）；<=0 时禁用超时。"""
+    value = _env_float("TOOL_EXECUTION_TIMEOUT", 300.0, minimum=0.0)
+    return None if value <= 0 else value
+
+
+def get_delegate_task_wall_timeout():
+    """单个 delegate 子任务默认墙钟超时时间（秒）；<=0 时禁用。"""
+    value = _env_float("DELEGATE_TASK_WALL_TIMEOUT", 1800.0, minimum=0.0)
+    return None if value <= 0 else value
+
 def get_self_evolution_review_interval():
     """每多少轮用户对话触发一次后台自演进复盘；<=0 表示关闭。"""
     try:
@@ -79,6 +104,52 @@ def get_self_evolution_review_interval():
     except ValueError:
         n = 3
     return max(0, n)
+
+
+def get_llm_context_window():
+    """显式模型最大上下文窗口；0 表示使用本地模型映射。"""
+    raw = (
+        os.environ.get("LLM_CONTEXT_WINDOW")
+        or os.environ.get("MODEL_CONTEXT_WINDOW")
+        or os.environ.get("CONTEXT_WINDOW_TOKENS")
+        or "0"
+    )
+    try:
+        value = int(raw)
+    except ValueError:
+        return 0
+    return max(0, value)
+
+
+def get_context_compression_trigger_ratio():
+    """上下文压缩触发比例；默认达到最大窗口 80% 触发。"""
+    try:
+        ratio = float(os.environ.get("CONTEXT_COMPRESSION_TRIGGER_RATIO", "0.8"))
+    except ValueError:
+        ratio = 0.8
+    if ratio <= 0 or ratio >= 1:
+        ratio = 0.8
+    return ratio
+
+
+def get_context_compression_target_ratio():
+    """上下文压缩后的目标比例。"""
+    try:
+        ratio = float(os.environ.get("CONTEXT_COMPRESSION_TARGET_RATIO", "0.55"))
+    except ValueError:
+        ratio = 0.55
+    if ratio <= 0 or ratio >= 1:
+        ratio = 0.55
+    return ratio
+
+
+def get_context_compression_preserve_recent_messages():
+    """自动压缩时至少尝试保留的最近完整 message 数。"""
+    try:
+        n = int(os.environ.get("CONTEXT_COMPRESSION_PRESERVE_RECENT_MESSAGES", "16"))
+    except ValueError:
+        n = 16
+    return max(4, n)
 
 def create_llm_client(api_key=None):
     """
@@ -95,12 +166,13 @@ def create_llm_client(api_key=None):
             api_key=key,
             api_version=get_azure_api_version(),
             azure_endpoint=get_azure_endpoint(),
-            default_headers={"X-TT-LOGID": uuid.uuid4().hex}
+            default_headers={"X-TT-LOGID": uuid.uuid4().hex},
+            timeout=get_llm_request_timeout(),
         )
     else:
         from openai import OpenAI
         base_url = get_openai_base_url()
-        kwargs = {"api_key": key}
+        kwargs = {"api_key": key, "timeout": get_llm_request_timeout()}
         if base_url:
             kwargs["base_url"] = base_url
         return OpenAI(**kwargs)

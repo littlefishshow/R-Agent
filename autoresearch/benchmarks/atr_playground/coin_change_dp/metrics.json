@@ -1,0 +1,11 @@
+{
+  "primary_metric": 0.9252235576386868,
+  "primary_metric_name": "score",
+  "higher_is_better": true,
+  "accuracy": 1.0,
+  "correct": 137,
+  "total": 137,
+  "runtime_sec": 0.9970280900597572,
+  "speed_score": 0.5014903842579123,
+  "score": 0.9252235576386868
+}

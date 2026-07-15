@@ -1,0 +1,12 @@
+{
+  "primary_metric": 0.2215625,
+  "primary_metric_name": "score",
+  "higher_is_better": true,
+  "row_accuracy": 0.075,
+  "cell_accuracy": 0.49375,
+  "cell_f1": 0.49375,
+  "row_correct": 6,
+  "total_rows": 80,
+  "runtime_sec": 0.009187750518321991,
+  "score": 0.2215625
+}

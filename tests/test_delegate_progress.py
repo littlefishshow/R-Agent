@@ -56,8 +56,10 @@ def test_delegate_task_prints_snapshots_and_blocks_truncated_in_progress_task(mo
     )
 
     payload = json.loads(result)
-    assert payload[0]["status"] == "truncated"
-    assert payload[0]["truncated"] is True
+    tasks = payload["tasks"]
+    assert tasks[0]["status"] == "truncated"
+    assert tasks[0]["truncated"] is True
+    assert "sub_agent_messages" not in tasks[0]
 
     state = todo_tool._load_state()
     task = todo_tool._find_task(state, "t1")
@@ -75,6 +77,17 @@ def test_delegate_task_prints_snapshots_and_blocks_truncated_in_progress_task(mo
 class _CompletingAgent:
     def __init__(self, max_iterations=None):
         self.max_iterations = max_iterations
+
+    def get_token_usage_summary(self, include_children=False):
+        return {
+            "prompt_tokens": 2,
+            "completion_tokens": 3,
+            "total_tokens": 5,
+            "last_prompt_tokens": 2,
+            "last_completion_tokens": 3,
+            "last_total_tokens": 5,
+            "available": True,
+        }
 
     def run_conversation(self, **kwargs):
         task_id = kwargs["user_message"].split("task_id: ", 1)[1].split("\n", 1)[0]
@@ -123,7 +136,18 @@ def test_delegate_task_final_snapshot_reports_completed_progress(monkeypatch, tm
     )
 
     payload = json.loads(result)
-    assert [item["status"] for item in payload] == ["success", "success"]
+    tasks = payload["tasks"]
+    assert [item["status"] for item in tasks] == ["success", "success"]
+    assert all("sub_agent_messages" not in item for item in tasks)
+    assert tasks[0]["token_usage"]["total_tokens"] == 5
+    assert tasks[0]["token_usage"]["available"] is True
+    assert payload["delegated_token_usage"] == {
+        "prompt_tokens": 4,
+        "completion_tokens": 6,
+        "total_tokens": 10,
+        "available": True,
+    }
+    assert payload["todo_digest"]["status_counts"]["completed"] == 2
     state = todo_tool._load_state()
     assert all(task["status"] == "completed" for task in state["tasks"])
     out = capsys.readouterr().out
