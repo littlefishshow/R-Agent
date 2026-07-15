@@ -79,6 +79,7 @@ registry.register(
     name="archive_subtask",
     description=(
         "统一上下文压缩/归档工具：可在阶段性任务完成时归档，也可接收完整 messages/tools 做智能压缩。"
+        "当用户明显更换话题、当前任务已结束或旧上下文会干扰新任务时，应自觉调用本工具先压缩/归档上下文，再进入新话题；"
         "旧用法只传 summary/next_steps，Agent 主流程会压缩当前 self.messages；"
         "新用法传 messages 时会按完整 message 与 assistant+tool 组压缩，保留用户重点、助手决策、tool call/result 要点，"
         "不会从保留的单条 message 中间截断。默认也作为主流程接近上下文窗口时的统一压缩语义。"

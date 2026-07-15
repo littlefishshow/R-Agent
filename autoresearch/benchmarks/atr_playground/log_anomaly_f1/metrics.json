@@ -1,0 +1,51 @@
+{
+  "accuracy": 0.6111111111111112,
+  "failures": [
+    {
+      "expected": true,
+      "line": "INFO request ok status=503 latency_ms=22 service=api",
+      "pred": false
+    },
+    {
+      "expected": true,
+      "line": "INFO request ok status=200 latency_ms=2500 service=checkout",
+      "pred": false
+    },
+    {
+      "expected": true,
+      "line": "WARN disk usage 93 percent on /var",
+      "pred": false
+    },
+    {
+      "expected": true,
+      "line": "WARN retry_count=17 upstream timeout storm",
+      "pred": false
+    },
+    {
+      "expected": true,
+      "line": "INFO memory_mb=8192 oom_kill_risk=true",
+      "pred": false
+    },
+    {
+      "expected": true,
+      "line": "INFO p95_latency_ms=880 endpoint=/search",
+      "pred": false
+    },
+    {
+      "expected": true,
+      "line": "INFO status=500 repeated=6 endpoint=/login",
+      "pred": false
+    }
+  ],
+  "fn": 7,
+  "fp": 0,
+  "higher_is_better": true,
+  "metric_name": "positive_f1",
+  "num_cases": 18,
+  "precision": 1.0,
+  "primary_metric": 0.4615384615384615,
+  "recall": 0.3,
+  "runtime_seconds": 0.0001,
+  "tn": 8,
+  "tp": 3
+}

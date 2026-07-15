@@ -1,0 +1,20 @@
+{
+  "failures": [
+    {
+      "query": "notebook loses power while sleeping",
+      "rank": 4,
+      "target": 3,
+      "top3": [
+        0,
+        1,
+        2
+      ]
+    }
+  ],
+  "higher_is_better": true,
+  "metric_name": "mean_reciprocal_rank",
+  "num_queries": 12,
+  "primary_metric": 0.9375,
+  "runtime_seconds": 0.0006,
+  "top1_accuracy": 0.9166666666666666
+}

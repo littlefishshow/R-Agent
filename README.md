@@ -4,6 +4,8 @@
 
 R-Agent 不是只会聊天的问答壳子。它更像一个“可控的研究助理”：能调用工具、读写文件、检索网页、维护长期记忆、复用技能包，把复杂任务拆成父子 Agent 协作执行，并在需要时启动 autoresearch 循环去尝试改代码、跑验证、总结经验。
 
+它也支持用户按自己的工作流 **DIY tools 和 skills**：你可以直接在终端告诉 Agent“我想加入一个什么样的功能 / 希望以后怎么处理某类任务”，Agent 会在可控范围内交互式地帮你设计、编写、注册和验证新工具，或把稳定流程沉淀成 `skills/**/SKILL.md`。同时，R-Agent 通过 `memories/USER.md` 与 `memories/MEMORY.md` 保存长期偏好和稳定项目事实，会逐渐记住你的使用习惯、目录约定和常用工作流。
+
 <p align="center">
   <b>Research Scout</b> · <b>Paper Reader</b> · <b>Repo Reader</b> · <b>AutoResearch</b> · <b>Tool-using Local Agent</b>
 </p>
@@ -97,13 +99,10 @@ python main.py
 阅读这个论文仓库，告诉我论文核心方法在代码里怎么实现
 ```
 
-```text
-/autoresearch run ../../atr_playground/json_repair_micro
-```
 
 ### 1.4 启动可视化 Cockpit（可选）
 
-R-Agent 也提供浏览器版可视化界面，用于聊天并查看上下文、工具、消息和资源快照：
+R-Agent 也提供浏览器版可视化界面，该界面主要用于测试，目前bug较多正在开发，用于聊天并查看上下文、工具、消息和资源快照：
 
 ```bash
 bash scripts/start_cockpit.sh
@@ -158,8 +157,8 @@ LLM 决策
 
 | 能力 | 说明 | 典型用途 |
 |---|---|---|
-| Tool 系统 | 通过 `tools/registry.py` 动态注册工具，支持文件、Shell、Python、Web、Memory、Skill、Todo、Delegate、语音等 | 让模型不只“说”，还能执行真实操作 |
-| Skill 系统 | `skills/**/SKILL.md` 保存稳定工作流，复杂任务前可读取并复用 | 论文调研、论文阅读、仓库阅读、项目进度恢复 |
+| Tool 系统 | 通过 `tools/registry.py` 动态注册工具，支持文件、Shell、Python、Web、Memory、Skill、Todo、Delegate、语音等，也支持按用户需求新增自定义工具 | 让模型不只“说”，还能执行真实操作 |
+| Skill 系统 | `skills/**/SKILL.md` 保存稳定工作流，用户也可以让 Agent 把反复使用的流程沉淀为自定义 skill | 论文调研、论文阅读、仓库阅读、项目进度恢复、创意生成、GitHub 工作流 |
 | Memory 系统 | `memories/USER.md` 与 `memories/MEMORY.md` 区分用户偏好和项目稳定事实 | 记住长期偏好、项目约定、环境事实 |
 | 上下文控制 | 自动估算上下文、压缩历史、大工具输出外置到 artifact | 避免长任务把模型上下文撑爆 |
 | Todo / Delegate | 父 Agent 维护树状任务与依赖，子 Agent 执行独立叶子任务 | 并行调研、复杂工程维护、降低父上下文压力 |
@@ -302,7 +301,7 @@ R-Agent 通过 `paper_repo_code_research` 等 skill 支持“论文 → 仓库 �
 
 ## 7. AutoResearch：让 Agent 自己做小型实验闭环
 
-`autoresearch/` 是 R-Agent 中正在重点开发的自动研究运行时。它面向的是“小型、可验证、指标明确”的工程/算法实验，不是无限制地让模型乱改大项目。
+`autoresearch/` 是 R-Agent 中正在开发的自动研究运行时。它面向的是“小型、可验证、指标明确”的工程/算法实验，不是无限制地让模型乱改大项目。最终目标是可以用更少的 token 和上下文管理，自动化的进行 research 项目规划、验证和改进。
 
 ### 7.1 基本思路
 
@@ -372,7 +371,7 @@ AutoResearch 目前强调“受控小闭环”：
 
 ## 8. `atr_playground` 测试项目概览
 
-当前 R-Agent 的 AutoResearch 能力正在通过 `../../atr_playground` 下的一组 toy/benchmark 项目持续验证。这些项目都有相似协议：
+当前 R-Agent 的 AutoResearch 能力正在通过仓库内置的 `autoresearch/benchmarks/atr_playground` toy/benchmark 项目持续验证。这些项目都有相似协议：
 
 ```text
 prepare.py → train/train.sh → eval.sh → metrics.json
@@ -418,7 +417,6 @@ R-Agent 做了几层治理：
 - 保留最近完整 message，不从中间截断；
 - 大工具输出落盘为 artifact；
 - 需要时用 `artifact_inspect` / `artifact_search` / `artifact_slice` 二次检索；
-- AutoResearch 内部用 bucket / state / trace 管理长期运行上下文。
 
 ### 9.2 父子进程 / 父子 Agent 管理
 
@@ -457,6 +455,39 @@ R-Agent 不是黑盒：
 - AutoResearch 产物保存在目标项目目录；
 - 大输出、trace、debug 都有 artifact；
 - 高风险命令、工作区外访问、危险 Python 代码都有审批边界。
+
+
+### 9.5 整体 Skill 系统
+
+R-Agent 当前内置的 skill 已经比较多，README 不逐个展开每个 `SKILL.md` 的完整内容，而是按用途给出整体地图。Skill 可以理解为“可复用工作流说明书”：当某类任务经常重复出现时，就把步骤、注意事项、输出格式和验证方法写成 skill，让 Agent 下次不用从零规划。
+
+当前 skill 大致分为几类：
+
+- **Agent 运维类（`skills/agent_ops/`）**：用于维护 Agent 自身能力，例如上下文控制、动态 todo 委派、项目进度保存、代码库巡检、工具面审计、autoresearch 工作流等。
+- **论文与研究生产力类（`skills/productivity/`）**：包括 `paper_research_scout`、`read_paper`、`paper_repo_code_research`、`paper_note_targeted_correction`、`research_explainer_md` 等，覆盖论文发现、精读、笔记修正、论文代码定位和研究材料解释。
+- **文档/办公/知识库类（`skills/productivity/`）**：包括 OCR 与文档处理、PDF、Notion、Airtable、Google Workspace、PowerPoint、地图、会议流水线等工作流。
+- **GitHub 工程协作类（`skills/github/`）**：支持仓库检查、代码审查、issue、PR workflow、仓库管理和认证相关流程。
+- **创意与可视化类（`skills/creative/`）**：覆盖架构图、ASCII art/video、漫画、信息图、网页设计、Manim、p5.js、像素画、音乐创作、TouchDesigner 等创意任务。
+
+常用查看方式：
+
+```text
+/skill
+```
+
+也可以直接对 Agent 说：
+
+```text
+以后我做某类任务时，希望你按这个流程处理，请帮我沉淀成 skill
+```
+
+或者：
+
+```text
+我想新增一个工具，用来读取/转换/检查某类文件，请你帮我设计并注册
+```
+
+这也是 R-Agent 与普通一次性聊天工具的重要区别：它不仅能完成当前任务，还能把稳定经验逐渐变成可复用的工具、skill 和长期记忆。
 
 ---
 
@@ -516,6 +547,7 @@ R-Agent/
 ├── tools/                          # 全局工具注册与实现
 ├── skills/                         # 可复用工作流：论文调研、论文阅读、仓库阅读等
 ├── autoresearch/                   # AutoResearch runtime package
+│   └── benchmarks/atr_playground/   # 内置 AutoResearch 示例 benchmark
 ├── app_gui/                        # Cockpit 后端 runtime / event / snapshot
 ├── app_gui_frontend/               # Cockpit 前端
 ├── gateway/                        # HTTP/Gateway/外部平台接入
@@ -562,5 +594,8 @@ pip install -r requirements.txt
 
 最近一次文档维护：
 
+- 将 `atr_playground` 移入 `autoresearch/benchmarks/atr_playground`，作为内置 AutoResearch 示例 benchmark；
 - 将 README 改为项目入口文档，重点介绍环境配置、论文调研、论文阅读、仓库阅读、AutoResearch 与 atr_playground 测试项目；
+- 补充 tools / skills DIY、长期记忆与整体 Skill 系统说明；
+- 记录上下文主动压缩规则与 delegate 子 Agent timeout 默认值/提示文案优化；
 - 历史更新记录迁移到 `CHANGELOG.md`，避免 README 过长。

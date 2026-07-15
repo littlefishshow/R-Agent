@@ -1,0 +1,60 @@
+{
+  "failures": [
+    {
+      "expected": "caf\u00e9",
+      "input": "caf\u00e9",
+      "pred": "caf\u00c3\u00a9"
+    },
+    {
+      "expected": "price \u20ac10",
+      "input": "price &euro;10",
+      "pred": "price \u00e2\u0082\u00ac10"
+    },
+    {
+      "expected": "It\u2019s fine",
+      "input": "It\u00e2\u20ac\u2122s fine",
+      "pred": "It\u00c3\u00a2\u00e2\u0082\u00ac\u00e2\u0084\u00a2s fine"
+    },
+    {
+      "expected": "\u201cquoted\u201d",
+      "input": "\u00e2\u20ac\u0153quoted\u00e2\u20ac\u009d",
+      "pred": "\u00c3\u00a2\u00e2\u0082\u00ac\u00c5\u0093quoted\u00c3\u00a2\u00e2\u0082\u00ac\u00c2\u009d"
+    },
+    {
+      "expected": "M\u00fcnchen",
+      "input": "M\u00c3\u00bcnchen",
+      "pred": "M\u00c3\u0083\u00c2\u00bcnchen"
+    },
+    {
+      "expected": "na\u00efve approach",
+      "input": "na\u00c3\u00afve approach",
+      "pred": "na\u00c3\u0083\u00c2\u00afve approach"
+    },
+    {
+      "expected": "Fran\u00e7ois",
+      "input": "Fran\u00c3\u00a7ois",
+      "pred": "Fran\u00c3\u0083\u00c2\u00a7ois"
+    },
+    {
+      "expected": "\u00a35",
+      "input": "\u00c2\u00a35",
+      "pred": "\u00c3\u0082\u00c2\u00a35"
+    },
+    {
+      "expected": "\u4f60\u597d",
+      "input": "\u4f60\u597d",
+      "pred": "\u00e4\u00bd\u00a0\u00e5\u00a5\u00bd"
+    },
+    {
+      "expected": "smile \ud83d\ude03",
+      "input": "smile \ud83d\ude03",
+      "pred": "smile \ud83d\ude03"
+    }
+  ],
+  "higher_is_better": true,
+  "metric_name": "decoded_exact_accuracy",
+  "num_cases": 14,
+  "num_correct": 2,
+  "primary_metric": 0.14285714285714285,
+  "runtime_seconds": 0.002
+}

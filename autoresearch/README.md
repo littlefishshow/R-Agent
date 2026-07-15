@@ -55,3 +55,29 @@ importing modules from `tools/`, so the shim imports and reloads
 
 New AutoResearch runtime code should be added under this package unless it is
 shared general R-Agent infrastructure.
+
+## Built-in benchmark examples
+
+This package also contains small deterministic benchmark projects under:
+
+```text
+autoresearch/benchmarks/atr_playground/
+```
+
+These projects are used as local smoke tests and examples for the AutoResearch
+loop. They are intentionally CPU-only, network-free, and metric-driven. A typical
+project contains `program.md`, `prepare.py`, `train/train.sh`, `eval.sh`, and
+`metrics.json`.
+
+Example:
+
+```bash
+python main.py
+# then in the R-Agent CLI:
+/autoresearch run autoresearch/benchmarks/atr_playground/json_repair_micro
+```
+
+The benchmark directory is part of the R-Agent repository, not a nested git
+repository. Runtime artifacts such as `.auto/`, `.autoresearch/`, `__pycache__/`,
+and logs should remain untracked.
+

@@ -674,9 +674,9 @@ def delegate_task(
             if _is_model_failure_result(result):
                 blocked_update = _mark_task_blocked(
                     task_id,
-                    "子 Agent 模型请求失败，任务自动标记为 blocked。\n\n" + str(result),
+                    "Agent 思考过程中的模型请求超时/失败，本轮任务已暂停并交回父 Agent 重新思考；任务暂标记为 blocked。\n\n" + str(result),
                     session_id=session_id,
-                    metadata={"blocked_reason": "subagent_model_request_failed", "max_iterations": max_iters},
+                    metadata={"blocked_reason": "subagent_model_request_interrupted", "max_iterations": max_iters},
                 )
                 status = "error"
             else:
@@ -706,7 +706,7 @@ def delegate_task(
                 if todo_status_after_run == "in_progress":
                     _mark_task_blocked(
                         task_id,
-                        f"子 Agent 未可靠完成；上下文已保存到 {context_artifact_path}",
+                        f"Agent 思考过程未可靠完成，已保存上下文供父 Agent 重新思考：{context_artifact_path}",
                         session_id=session_id,
                         metadata={"context_artifact_path": context_artifact_path, "context_saved_reason": context_reason},
                     )
@@ -865,7 +865,7 @@ def delegate_task(
                 context_artifact_path = _save_subagent_context(task_id, timed_sub_agent, "timeout", session_id=session_id, run_id=f"delegate-{i}-{task_id or 'adhoc'}")
                 blocked_update = _mark_task_blocked(
                     task_id,
-                    f"子 Agent 超过墙钟超时 {timeout_value:g}s，任务自动标记为 blocked；后台请求如仍在运行会被取消信号要求停止。" + (f" 上下文已保存到 {context_artifact_path}" if context_artifact_path else ""),
+                    f"Agent 思考时间超过本轮预算 {timeout_value:g}s；这不代表任务失败，已暂停本轮委托并交回父 Agent 重新思考/拆分/延长预算。后台请求如仍在运行会被取消信号要求停止。" + (f" 上下文已保存到 {context_artifact_path}" if context_artifact_path else ""),
                     session_id=session_id,
                     metadata={"blocked_reason": "subagent_wall_timeout", "wall_timeout_seconds": timeout_value, **({"context_artifact_path": context_artifact_path, "context_saved_reason": "timeout"} if context_artifact_path else {})},
                 )
@@ -883,7 +883,7 @@ def delegate_task(
                 results.append(item)
                 pending.remove(future)
                 _print_after_status(
-                    f"[bold red]⏱️ Delegate 子任务超时：{task_id or i} -> timeout[/bold red]"
+                    f"[bold yellow]⏳ Delegate 子任务思考时间较长：{task_id or i} 已暂停本轮委托，交回父 Agent 重新思考[/bold yellow]"
                 )
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -938,7 +938,7 @@ registry.register(
     name="delegate_task",
     description=(
         "生成一个或多个具有隔离上下文的子智能体来并行处理任务。\n"
-        "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考。\n"
+        "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考；默认墙钟预算来自 DELEGATE_TASK_WALL_TIMEOUT（当前默认 1800 秒）。\n"
         "支持动态 todo list 协议：传入 task_id/id 时，子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
         "默认 return_mode=compact：返回 tasks 中每项仅含 task_index/task_id/status/truncated/max_iterations、简表 token_usage、可选 context_artifact_path，并可附 todo_digest；不返回 goal/note。return_mode=full 保留旧完整结构。\n"
@@ -971,7 +971,7 @@ registry.register(
             },
             "default_wall_timeout_seconds": {
                 "type": "number",
-                "description": "单个子任务默认墙钟超时时间；超时后标记 blocked 并让 delegate_task 返回。"
+                "description": "单个子任务默认墙钟超时时间；超时后会暂停本轮委托、标记 blocked 并交回父 Agent 重新思考/拆分/延长预算。默认 1800 秒，可用 DELEGATE_TASK_WALL_TIMEOUT 调整；<=0 禁用。"
             },
             "event_sink": {
                 "type": "object",

@@ -1,0 +1,70 @@
+{
+  "failures": [
+    {
+      "expected": "acme widget extra large",
+      "input": "  ACME   Widget XL!! ",
+      "ok": false,
+      "pred": "acme widget xl!!"
+    },
+    {
+      "expected": "acme widget extra large",
+      "input": "acme widgit xl",
+      "ok": false,
+      "pred": "acme widgit xl"
+    },
+    {
+      "expected": "acme widget extra large",
+      "input": "ACME widget extra-large",
+      "ok": false,
+      "pred": "acme widget extra-large"
+    },
+    {
+      "expected": "mega phone pro version 2",
+      "input": "Mega Phone Pro v2",
+      "ok": false,
+      "pred": "mega phone pro v2"
+    },
+    {
+      "expected": "mega phone pro version 2",
+      "input": "mega-phone profesional version II",
+      "ok": false,
+      "pred": "mega-phone profesional version ii"
+    },
+    {
+      "expected": "budget usb c cable",
+      "input": "budget USB C cabel",
+      "ok": false,
+      "pred": "budget usb c cabel"
+    },
+    {
+      "expected": "budget usb c cable",
+      "input": "Budget usb-c cable",
+      "ok": false,
+      "pred": "budget usb-c cable"
+    },
+    {
+      "expected": "noise canceling headphones",
+      "input": "Noise Cancelling Headphones",
+      "ok": false,
+      "pred": "noise cancelling headphones"
+    },
+    {
+      "expected": "noise canceling headphones",
+      "input": "noise-canceling headphone",
+      "ok": false,
+      "pred": "noise-canceling headphone"
+    },
+    {
+      "expected": "4k ultra hd monitor",
+      "input": "Ultra-HD 4K monitor",
+      "ok": false,
+      "pred": "ultra-hd 4k monitor"
+    }
+  ],
+  "higher_is_better": true,
+  "metric_name": "exact_match_accuracy",
+  "num_cases": 18,
+  "num_correct": 2,
+  "primary_metric": 0.1111111111111111,
+  "runtime_seconds": 0.0002
+}

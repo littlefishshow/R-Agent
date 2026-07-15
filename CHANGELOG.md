@@ -4,9 +4,14 @@
 
 ### 2026-07-16
 
+- README 开头补充 tools/skills DIY 与长期记忆说明，并新增整体 Skill 系统概览，说明 agent_ops、productivity、github、creative 等 skill 类目。
+- 将 `../../atr_playground` 回退到干净状态后迁入 `autoresearch/benchmarks/atr_playground`，作为内置 AutoResearch 示例 benchmark；迁入后移除其内部 `.git`，避免嵌套仓库。
 - 将 README 与更新日志拆分：README 聚焦项目介绍、环境配置、核心能力、论文/仓库阅读与 autoresearch；历史更新记录迁移到独立 `CHANGELOG.md`，避免入口文档过于臃肿。
 - 将 `skills/productivity/paper_research_scout/references/read_papers.json` 加入 `.gitignore`，避免本地论文阅读记录进入版本库。
-- 按维护约定补充本次提交前的 README 更新记录。
+- 更新 `archive_subtask` 工具描述：当用户明显更换话题、当前任务结束或旧上下文会干扰新任务时，Agent 应主动先压缩/归档上下文。
+- 放宽父子 Agent 委托超时：`LLM_REQUEST_TIMEOUT` 默认从 120 秒提升到 300 秒，`DELEGATE_TASK_WALL_TIMEOUT` 默认从 900 秒提升到 1800 秒。
+- 优化 delegate 子任务超时文案：不再直接提示“子任务失败/超时”，改为“Agent 思考时间较长，暂停本轮委托并交回父 Agent 重新思考/拆分/延长预算”。
+- 按维护约定补充本次提交前的 README 与更新日志记录。
 
 ### 2026-07-14
 
