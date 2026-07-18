@@ -632,6 +632,78 @@ def _rect_area(rect) -> float:
     return max(0.0, float(rect.width)) * max(0.0, float(rect.height))
 
 
+def _crop_quality(rect, page_rect, max_area_ratio: float = 0.45, *, full_page_snapshot: bool = False) -> Dict[str, Any]:
+    """Return note-facing quality metadata for a crop/page snapshot.
+
+    A suspicious crop is one that covers too much of the page or is effectively a
+    full-page rectangle.  The field names are intentionally explicit so callers
+    can decide whether to insert the image into final notes or rerun with
+    --mode crops / --crops-json.
+    """
+    page_area = max(1.0, _rect_area(page_rect))
+    crop_area_ratio = _rect_area(rect) / page_area
+    width_ratio = max(0.0, float(rect.width)) / max(1.0, float(page_rect.width))
+    height_ratio = max(0.0, float(rect.height)) / max(1.0, float(page_rect.height))
+    reasons = []
+    if crop_area_ratio > float(max_area_ratio):
+        reasons.append(f"crop_area_ratio>{float(max_area_ratio):.2f}")
+    if width_ratio >= 0.92 and height_ratio >= 0.85:
+        reasons.append("crop_width_height_close_to_full_page")
+    if full_page_snapshot:
+        reasons.append("full_page_snapshot")
+    suspicious = bool(reasons)
+    quality: Dict[str, Any] = {
+        "crop_area_ratio": round(crop_area_ratio, 4),
+        "crop_width_ratio": round(width_ratio, 4),
+        "crop_height_ratio": round(height_ratio, 4),
+        "max_area_ratio": float(max_area_ratio),
+        "is_suspicious_large_crop": suspicious,
+        "recommended_for_notes": not suspicious,
+        "warning": "; ".join(reasons) if suspicious else "",
+        "recommended_manual_crop": (
+            "Rerun pdf_snapshot.py with --mode crops --crops-json using a tighter bbox_points crop."
+            if suspicious else ""
+        ),
+    }
+    if full_page_snapshot:
+        quality["full_page_snapshot"] = True
+        quality["recommended_for_notes"] = False
+        if "full_page_snapshot" not in quality["warning"]:
+            quality["warning"] = (quality["warning"] + "; full_page_snapshot").strip("; ")
+    return quality
+
+
+def _relative_markdown_path(out: Path) -> str:
+    """Best-effort Markdown image path relative to the note's output directory.
+
+    read_paper stores images under outputs/papers_output/<category>/assets/<stem>/
+    and notes in outputs/papers_output/<category>/.  In that common layout this
+    returns assets/<stem>/<file>.  For custom output directories, fall back to the
+    workspace-relative path to preserve compatibility.
+    """
+    try:
+        rel = out.resolve().relative_to(WORKSPACE)
+    except ValueError:
+        return out.as_posix()
+    parts = rel.parts
+    if "assets" in parts:
+        idx = parts.index("assets")
+        return Path(*parts[idx:]).as_posix()
+    return rel.as_posix()
+
+
+def _result_paths(label_text: str, out: Path) -> Dict[str, str]:
+    workspace_path = out.relative_to(WORKSPACE).as_posix()
+    rel_md_path = _relative_markdown_path(out)
+    return {
+        "path": workspace_path,
+        "markdown": f"![{label_text}]({workspace_path})",
+        "markdown_workspace": f"![{label_text}]({workspace_path})",
+        "relative_markdown": f"![{label_text}]({rel_md_path})",
+        "relative_path": rel_md_path,
+    }
+
+
 def _smart_caption_rect(fitz, page, cap, all_caps=None, margin: float = 8.0, content_refine: bool = True):
     """Estimate tight Figure/Table crop from caption anchor + row-projection content bands.
 
@@ -703,6 +775,8 @@ def pdf_snapshot_tool(
     smart_crop: bool = True,
     content_refine: bool = True,
     crop_margin: float = 8.0,
+    max_area_ratio: float = 0.45,
+    reject_large_crops: bool = False,
 ) -> str:
     """Render PDF pages/regions to PNG screenshots for paper notes."""
     try:
@@ -734,6 +808,8 @@ def pdf_snapshot_tool(
 
         if dpi < 72 or dpi > 600:
             raise ValueError("dpi must be between 72 and 600")
+        if max_area_ratio <= 0 or max_area_ratio > 1:
+            raise ValueError("max_area_ratio must be in (0, 1]")
         if mode not in {"auto", "smart", "pages", "crops"}:
             raise ValueError("mode must be one of: auto, smart, pages, crops")
 
@@ -748,12 +824,17 @@ def pdf_snapshot_tool(
                 fn = f"{pdf.stem}_{label}.png"
                 out = out_dir / fn
                 size = _render_rect(page, page.rect, out, dpi)
+                quality = _crop_quality(page.rect, page.rect, max_area_ratio, full_page_snapshot=True)
                 results.append({
                     "type": "page",
                     "page": pi + 1,
                     "label": label,
-                    "path": str(out.relative_to(WORKSPACE)),
-                    "markdown": f"![{label}]({out.relative_to(WORKSPACE).as_posix()})",
+                    "warning": "full_page_snapshot",
+                    "full_page_snapshot": True,
+                    "crop_area_ratio": 1,
+                    "recommended_for_notes": False,
+                    "quality": quality,
+                    **_result_paths(label, out),
                     **size,
                 })
 
@@ -769,14 +850,15 @@ def pdf_snapshot_tool(
                 label = _safe_slug(crop.get("label") or f"p{pi+1:03d}_crop_{idx:02d}")
                 fn = f"{pdf.stem}_{label}.png"
                 out = out_dir / fn
+                quality = _crop_quality(rect, page.rect, max_area_ratio)
                 size = _render_rect(page, rect, out, dpi)
                 results.append({
                     "type": "crop",
                     "page": pi + 1,
                     "label": label,
                     "bbox_points": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
-                    "path": str(out.relative_to(WORKSPACE)),
-                    "markdown": f"![{label}]({out.relative_to(WORKSPACE).as_posix()})",
+                    "quality": quality,
+                    **_result_paths(label, out),
                     **size,
                 })
 
@@ -806,18 +888,30 @@ def pdf_snapshot_tool(
                     label = _safe_slug(f"{base}_{ci:02d}")
                     fn = f"{pdf.stem}_{label}.png"
                     out = out_dir / fn
-                    size = _render_rect(page, rect, out, dpi)
-                    results.append({
+                    quality = _crop_quality(rect, page.rect, max_area_ratio)
+                    item = {
                         "type": "smart_caption_crop" if (mode == "smart" or smart_crop) else "auto_caption_crop",
                         "page": pi + 1,
                         "label": label,
                         "caption": cap["text"],
                         "caption_bbox_points": [round(x0, 2), round(y0, 2), round(x1, 2), round(y1, 2)],
                         "crop_bbox_points": [round(rect.x0, 2), round(rect.y0, 2), round(rect.x1, 2), round(rect.y1, 2)],
-                        "path": str(out.relative_to(WORKSPACE)),
-                        "markdown": f"![{label_text}]({out.relative_to(WORKSPACE).as_posix()})",
-                        **size,
-                    })
+                        "quality": quality,
+                    }
+                    if reject_large_crops and quality["is_suspicious_large_crop"]:
+                        item.update({
+                            "status": "skipped",
+                            "skipped": True,
+                            "skip_reason": quality["warning"] or "suspicious_large_crop",
+                        })
+                    else:
+                        size = _render_rect(page, rect, out, dpi)
+                        item.update({
+                            "status": "rendered",
+                            **_result_paths(label_text, out),
+                            **size,
+                        })
+                    results.append(item)
 
         return json.dumps({
             "success": True,
@@ -826,6 +920,8 @@ def pdf_snapshot_tool(
             "page_count": doc.page_count,
             "mode": mode,
             "dpi": dpi,
+            "max_area_ratio": max_area_ratio,
+            "reject_large_crops": reject_large_crops,
             "count": len(results),
             "results": results,
             "note": "Use the returned markdown links in paper reading notes. Smart/auto mode estimates tighter regions from Figure/Table captions plus neighboring text and pixel content; for imperfect crops, rerun mode='crops' with bbox_points adjusted.",
@@ -878,6 +974,8 @@ def _main() -> int:
     parser.add_argument("--smart-crop", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--content-refine", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--crop-margin", type=float, default=8.0)
+    parser.add_argument("--max-area-ratio", type=float, default=0.45, help="Mark smart/auto/crops suspicious when crop/page area exceeds this ratio.")
+    parser.add_argument("--reject-large-crops", action="store_true", default=False, help="In smart/auto mode, skip rendering suspiciously large crops.")
     args = parser.parse_args()
     print(pdf_snapshot_tool(
         pdf_path=args.pdf_path,
@@ -893,6 +991,8 @@ def _main() -> int:
         smart_crop=args.smart_crop,
         content_refine=args.content_refine,
         crop_margin=args.crop_margin,
+        max_area_ratio=args.max_area_ratio,
+        reject_large_crops=args.reject_large_crops,
     ))
     return 0
 

@@ -1,18 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from app_gui.runtime import AgentRuntimeService
+from app_gui.file_workspace import FileWorkspace
+from app_gui.runtime import AgentRuntimeService, LearningRuntimeService
 
 runtime = AgentRuntimeService()
+learning_runtime = LearningRuntimeService()
+file_workspace = FileWorkspace()
 
 
-def create_app(runtime_service: Optional[AgentRuntimeService] = None):
+def create_app(
+    runtime_service: Optional[AgentRuntimeService] = None,
+    learning_service: Optional[LearningRuntimeService] = None,
+    workspace_service: Optional[FileWorkspace] = None,
+):
     try:
         from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
         from fastapi.middleware.cors import CORSMiddleware
+        from fastapi.responses import FileResponse
+        from fastapi.responses import StreamingResponse
         from fastapi.staticfiles import StaticFiles
         # Avoid endpoint-local Pydantic models: with postponed annotations they can be
         # resolved as query parameters by FastAPI in some environments. Use Body dicts.
@@ -20,6 +30,8 @@ def create_app(runtime_service: Optional[AgentRuntimeService] = None):
         raise RuntimeError("R-Agent Cockpit server requires optional dependencies: fastapi, uvicorn, pydantic") from exc
 
     service = runtime_service or runtime
+    learning = learning_service or learning_runtime
+    workspace = workspace_service or file_workspace
     app = FastAPI(title="R-Agent Cockpit API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -106,6 +118,316 @@ def create_app(runtime_service: Optional[AgentRuntimeService] = None):
             return service.resources(session_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions")
+    def create_learning_session(request: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        try:
+            session = learning.create_session(
+                session_id=request.get("session_id"),
+                title=str(request.get("title") or ""),
+                root_question=str(request.get("root_question") or ""),
+                parent_session_id=request.get("parent_session_id"),
+                account_id=str(request.get("account_id") or "default"),
+                tools_enabled=bool(request.get("tools_enabled", True)),
+            )
+            initial_question = str(request.get("initial_question") or request.get("root_question") or "")
+            if initial_question.strip():
+                send_result = session.send_message(initial_question, background=bool(request.get("background", True)))
+                state = session.state()
+                state["send"] = send_result
+                return state
+            return session.state()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions")
+    def list_learning_sessions(account_id: Optional[str] = None) -> Dict[str, Any]:
+        return learning.list_sessions(account_id=account_id)
+
+    @app.post("/learning/file-root")
+    def get_learning_file_root(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            session = learning.get_or_create_file_root(
+                account_id=str(request.get("account_id") or "default"),
+                file_path=str(request.get("file_path") or ""),
+            )
+            return session.state()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/learning/accounts/{account_id}/roots")
+    def get_learning_account_roots(account_id: str) -> Dict[str, Any]:
+        try:
+            return learning.account_roots(account_id)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions/{session_id}/children")
+    def get_learning_session_children(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.child_nodes(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions/{session_id}")
+    def get_learning_session(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.get_session(session_id).state()
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/send")
+    def send_learning_message(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            text = str(request.get("text") or "")
+            background = bool(request.get("background", True))
+            return learning.send_message(session_id, text, background=background)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/tools")
+    def set_learning_tools_enabled(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return learning.set_tools_enabled(session_id, bool(request.get("enabled")))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/branch")
+    def branch_learning_session(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            question = str(request.get("question") or request.get("text") or "")
+            return learning.branch_session(
+                session_id,
+                question=question,
+                title=str(request.get("title") or ""),
+                background=bool(request.get("background", True)),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/setback")
+    def setback_learning_session(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return learning.setback_to_message(session_id, int(request.get("message_index")))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/fork-from-message")
+    def fork_learning_session_from_message(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return learning.fork_from_message(session_id, int(request.get("message_index")))
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/selection-branch")
+    def branch_learning_selection(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return learning.branch_from_selection(
+                session_id,
+                selected_text=str(request.get("selected_text") or ""),
+                action=str(request.get("action") or "question"),
+                custom_question=str(request.get("custom_question") or ""),
+                target_language=str(request.get("target_language") or ""),
+                title=str(request.get("title") or ""),
+                source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
+                background=bool(request.get("background", True)),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/learning/sessions/{session_id}")
+    def delete_learning_session(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.delete_subtree(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/interrupt")
+    def interrupt_learning(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.interrupt(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions/{session_id}/events")
+    def get_learning_events(session_id: str, event_type: Optional[str] = None) -> Dict[str, Any]:
+        try:
+            session = learning.get_session(session_id)
+            return {"session_id": session_id, "events": session.store.list_events(event_type=event_type)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions/{session_id}/current-context")
+    def get_learning_current_context(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.current_model_context(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions/{session_id}/resources")
+    def get_learning_resources(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.resources(session_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/learning/sessions/{session_id}/payloads/{payload_id}")
+    def get_learning_payload(session_id: str, payload_id: str) -> Dict[str, Any]:
+        try:
+            session = learning.get_session(session_id)
+            return {"session_id": session_id, "payload_id": payload_id, "content": session.store.get_payload(payload_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"payload not found: {payload_id}") from exc
+
+    @app.get("/workspace/files")
+    def list_workspace_files(path: str = "") -> Dict[str, Any]:
+        try:
+            return workspace.list_dir(path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except NotADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=f"not a directory: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/workspace/tree")
+    def get_workspace_tree(expanded: str = "") -> Dict[str, Any]:
+        try:
+            expanded_paths = [item for item in str(expanded or "").split(",") if item or item == ""]
+            return workspace.tree(expanded_paths)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/workspace/folders")
+    def create_workspace_folder(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return workspace.create_folder(str(request.get("path") or ""), str(request.get("name") or ""))
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=f"folder exists: {exc}") from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/workspace/files")
+    def upload_workspace_file(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return workspace.write_base64_file(
+                str(request.get("path") or ""),
+                str(request.get("name") or ""),
+                str(request.get("content_base64") or ""),
+            )
+        except FileExistsError as exc:
+            raise HTTPException(status_code=409, detail=f"file exists: {exc}") from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/workspace/text")
+    def read_workspace_text(path: str) -> Dict[str, Any]:
+        try:
+            return workspace.read_text_file(path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=f"not a file: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.put("/workspace/text")
+    def write_workspace_text(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return workspace.write_text_file(str(request.get("path") or ""), str(request.get("content") or ""))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=f"not a file: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/workspace/copy")
+    def copy_workspace_item(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return workspace.copy(
+                str(request.get("source") or ""),
+                str(request.get("target_dir") or ""),
+                str(request.get("name") or "") or None,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/workspace/files")
+    def delete_workspace_item(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return workspace.delete(str(request.get("path") or ""))
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/workspace/open")
+    def open_workspace_file(path: str, download: bool = False):
+        try:
+            file_path = workspace.get_file(path)
+            media_type = "application/pdf" if file_path.suffix.lower() == ".pdf" else None
+            return FileResponse(
+                str(file_path),
+                media_type=media_type,
+                filename=file_path.name if download else None,
+                headers={"Content-Disposition": f"{'attachment' if download else 'inline'}; filename=\"{file_path.name}\""},
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=f"not a file: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/workspace/pdf-text")
+    def get_workspace_pdf_text(path: str) -> Dict[str, Any]:
+        try:
+            return workspace.extract_pdf_text(path)
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=f"not a file: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/workspace/pdf-page-image")
+    def get_workspace_pdf_page_image(path: str, page: int, zoom: float = 1.6):
+        try:
+            png = workspace.render_pdf_page_png(path, page, zoom=zoom)
+            return StreamingResponse(
+                BytesIO(png),
+                media_type="image/png",
+                headers={"Cache-Control": "public, max-age=86400"},
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
+        except IsADirectoryError as exc:
+            raise HTTPException(status_code=400, detail=f"not a file: {exc}") from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/sessions/{session_id}/payloads/{payload_id}")
     def get_payload(session_id: str, payload_id: str) -> Dict[str, Any]:

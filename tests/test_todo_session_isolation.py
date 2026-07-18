@@ -169,6 +169,7 @@ def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
         max_workers=1,
         default_max_iterations=1,
         default_wall_timeout_seconds=5,
+        allowed_tools=["web_search", "delegate_task", "read_file"],
     ))
 
     assert payload["tasks"][0]["status"] == "success"
@@ -180,4 +181,5 @@ def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
         "text_to_speech",
         "self_evolution_review",
     }.issubset(excluded)
+    assert _CapturingExcludeAgent.captured_kwargs["allowed_tools"] == {"web_search", "read_file"}
 

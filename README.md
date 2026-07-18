@@ -102,7 +102,7 @@ python main.py
 
 ### 1.4 启动可视化 Cockpit（可选）
 
-R-Agent 也提供浏览器版可视化界面，该界面主要用于测试，目前bug较多正在开发，用于聊天并查看上下文、工具、消息和资源快照：
+R-Agent 也提供浏览器版可视化 Cockpit，用于在本地管理学习型对话、论文文件、Markdown 笔记和上下文分支：
 
 ```bash
 bash scripts/start_cockpit.sh
@@ -118,6 +118,17 @@ bash scripts/start_cockpit.sh
 ```bash
 R_AGENT_COCKPIT_PORT=8765 R_AGENT_COCKPIT_FRONTEND_PORT=5173 bash scripts/start_cockpit.sh
 ```
+
+当前 Cockpit 支持：
+
+- 左侧树状问题链：普通对话、文件对话和选中文本产生的子对话都以树状上下文保存；
+- 中间聊天/文件双模式：点击左侧进入纯聊天模式，点击右侧文件进入文件浏览模式；
+- VSCode 风格文件系统：右侧直接映射项目 `outputs/`，默认包含 `outputs/papers`，可上传、复制、粘贴、下载和删除文件；
+- PDF 阅读：使用后端 PyMuPDF 渲染页面图片并叠加文本选择层，保留公式、图片和版面，同时支持选中文本提问、高亮和子窗口唤回；
+- Markdown 笔记：支持 Markdown 预览/编辑、表格、图片链接、数学公式和选中文本提问；
+- 子窗口分支：用户消息和选中文本都可以 fork / setback / 打开分支窗口，分支上下文写入独立 `context.json`；
+- Agent Tools 开关：每个会话可控制下一次请求是否携带 tools schema；关闭后模型不会获得工具上下文，也不能实际执行工具调用；
+- 可调三栏布局：左右栏宽度可拖拽调整，子窗口全屏会跟随中间栏尺寸。
 
 ---
 
@@ -166,7 +177,7 @@ LLM 决策
 | Paper Reading | `read_paper` 负责 PDF 精读、图表截图、中文研究笔记 | 读懂方法、实验、局限与后续研究价值 |
 | Repo Reading | `paper_repo_code_research` 等 skill 负责源码定位 | 把论文方法映射到代码实现 |
 | AutoResearch | `autoresearch/` 提供 plan → attempt → conclude 小型研究闭环 | 自动改进小项目、跑 eval、记录指标和经验 |
-| Cockpit GUI | 浏览器可视化界面，查看聊天、事件、上下文资源 | 非终端使用与上下文审计 |
+| Cockpit GUI | 浏览器可视化界面，管理树状对话、文件系统、PDF/Markdown 阅读、选中文本分支和工具上下文开关 | 非终端学习、论文阅读与上下文审计 |
 
 ---
 

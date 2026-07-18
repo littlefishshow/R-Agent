@@ -26,12 +26,17 @@ def test_cockpit_frontend_contains_three_panel_context_ui():
     styles = Path("app_gui_frontend/src/styles.css").read_text(encoding="utf-8")
     api = Path("app_gui_frontend/src/api.ts").read_text(encoding="utf-8")
 
-    assert "ContextTree" in app
-    assert "ChatPane" in app
-    assert "Inspector" in app
-    assert "Timeline" not in app
-    assert "grid-template-columns: 310px minmax(420px, 1fr) 420px" in styles
+    assert "learning-sidebar" in app
+    assert "search-row" in app
+    assert "learning-detail" in app
+    assert "FileBrowser" in app
+    assert "文件系统" in app
+    assert "read_paper 会在阅读笔记产生或手动新建后显示" in app
+    assert "ChatPane" not in app
+    assert "ContextTree" not in app
+    assert "grid-template-columns: var(--sidebar-width, 296px) minmax(420px, 1fr) var(--detail-width, 340px)" in styles
     assert "/sessions" in api
+    assert "/learning/sessions" in api
     assert "/current-context" in api
     assert "/payloads/" in api
 
@@ -45,37 +50,241 @@ def test_server_source_exposes_frontend_status_and_cors():
     assert "frontend_dist_exists" in server
     assert "/sessions/{session_id}/current-context" in server
     assert "/sessions/{session_id}/resources" in server
+    assert "/learning/sessions" in server
+    assert "/learning/sessions/{session_id}/branch" in server
+    assert "/learning/sessions/{session_id}/selection-branch" in server
+    assert "/learning/file-root" in server
+    assert "@app.delete(\"/learning/sessions/{session_id}\")" in server
+    assert "/workspace/files" in server
+    assert "/workspace/folders" in server
+    assert "/workspace/copy" in server
+    assert "/workspace/open" in server
+    assert "/workspace/pdf-text" in server
+    assert "/workspace/pdf-page-image" in server
+    assert "/workspace/tree" in server
+    assert "/workspace/text" in server
+    assert "FileWorkspace" in server
 
 
-def test_cockpit_frontend_current_context_nodes_present():
-    tree = Path("app_gui_frontend/src/components/ContextTree.tsx").read_text(encoding="utf-8")
+def test_learning_frontend_current_context_nodes_present():
     app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
+    api = Path("app_gui_frontend/src/api.ts").read_text(encoding="utf-8")
 
-    assert "Current Model Context" in tree
-    assert "LLM Visible" in tree
-    assert "Available by Tool" in tree
-    assert "fetchCurrentContext" in app
+    assert "FileBrowser" in app
+    assert "WorkspaceListing" in app
+    assert "WorkspaceItem" in app
+    assert "WorkspaceTreeNode" in app
+    assert "OpenFileTab" in app
+    assert "sourceContext" in app
+    assert "source_context" in api
+    assert "getLearningFileRoot" in app
+    assert "/learning/file-root" in api
+    assert "accountId" in app
+    assert "fetchLearningAccountRoots" in app
+    assert "visibleFileRoots" in app
+    assert "setLearningToolsEnabled" in app
+    assert "Tools" in app
+    assert "tools_enabled" in api
+    assert "/tools" in api
+    assert "文件对话" in app
+    assert "对话" in app
+    assert "child_count" in app
+    assert "activeMode" in app
+    assert "openFiles" in app
+    assert "activeFilePath" in app
+    assert "uploadWorkspaceFile" in app
+    assert "copyWorkspaceItem" in app
+    assert "deleteWorkspaceItem" in app
+    assert "fetchWorkspacePdfText" in app
+    assert "workspacePdfPageImageUrl" in app
+    assert "fetchWorkspaceTree" in app
+    assert "expanded.join(',')" in api
+    assert "toggleWorkspaceFolder" in app
+    assert "fetchWorkspaceText" in app
+    assert "saveWorkspaceText" in app
+    assert "workspaceOpenUrl" in app
 
 
-def test_cockpit_frontend_new_chat_and_slash_commands_present():
+def test_learning_frontend_new_chain_and_branch_controls_present():
     app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
     styles = Path("app_gui_frontend/src/styles.css").read_text(encoding="utf-8")
 
-    assert "New Chat" in app
-    assert "async function newChat" in app
-    for command in ["/new", "/help", "/context", "/messages", "/tools", "/skills", "/memory", "/bbb"]:
-        assert command in app
-    assert "slash-menu" in styles
-    assert "notice-banner" in styles
+    assert "async function newQuestionChain" in app
+    assert "forkFromUserMessage" in app
+    assert "setbackToUserMessage" in app
+    assert "message-branch-menu" in app
+    assert "chain-list" in styles
+    assert "account-tree-section" in styles
+    assert "search-row" in styles
+    assert "chain-delete" in styles
+    assert "onOpenSessionWindow" in app
+    assert "deleteRootSession" in app
 
 
-def test_cockpit_chat_pane_renders_user_and_assistant_events():
-    chat = Path("app_gui_frontend/src/components/ChatPane.tsx").read_text(encoding="utf-8")
+def test_learning_chat_renders_user_and_assistant_events():
     app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
 
-    assert "user_input_received" in chat
-    assert "user 输入" in chat
-    assert "assistant 回复" in chat
-    assert "buildChatItems" in chat
-    assert "<ChatPane events={events}" in app
+    assert "buildChatItems" in app
+    assert "return items.map(item" in app
+    assert "lastAssistant" not in app
+    assert "messageIndex" in app
+    assert "UserMessageActions" in app
+    assert "forkFromUserMessage" in app
+    assert "setbackToUserMessage" in app
+    assert "forkLearningSessionFromMessage" in app
+    assert "setbackLearningSession" in app
+    assert "MessageContent" in app
+    assert "MarkdownText" in app
+    assert "MarkdownIt" in app
+    assert "renderMarkdownToHtml" in app
+    assert "rewriteMarkdownAssetUrls" in app
+    assert "renderToString" in app
+    assert "katex/dist/katex.min.css" in app
+    assert "MathFormula" in app
+    assert "dangerouslySetInnerHTML" in app
+    assert "throwOnError: false" in app
+    assert "折叠到 10 行" in app
+    assert "展开全部" in app
+    assert "math-block" in app
+    assert "math-inline" in app
+    assert "math-fallback" in app
+    assert "shouldSubmitFromKey" in app
+    assert "isComposing" in app
+    assert "user_input_received" in app
+    assert "你的问题" in app
+    assert "学习助手" in app
+    assert "message?.role === 'tool'" not in app
     assert "assistantEvents" not in app
+
+
+def test_learning_selection_menu_and_floating_windows_present():
+    app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
+    styles = Path("app_gui_frontend/src/styles.css").read_text(encoding="utf-8")
+    api = Path("app_gui_frontend/src/api.ts").read_text(encoding="utf-8")
+
+    for label in ["提问", "翻译", "解释", "总结"]:
+        assert label in app
+    assert "selectionBranchLearningSession" in app
+    assert "deleteLearningSession" in app
+    assert "pdf-frame" in app
+    assert "FileWorkspacePanel" in app
+    assert "MarkdownFileEditor" in app
+    assert "markdown-preview" in app
+    assert "markdown-editor" in app
+    assert "selected markdown text" in app
+    assert "kind: 'markdown'" in app
+    assert "kind: 'pdf'" in app
+    assert "read_paper" in app
+    assert "column-resizer" in app
+    assert "PdfTextReader" in app
+    assert "PdfPageView" in app
+    assert "pdf-word-layer" in app
+    assert "pdf-page-image" in app
+    assert "pdf-highlight-layer" in app
+    assert "pdf-highlight-rect" in app
+    assert "buildPdfHighlightRects" in app
+    assert "findPdfHighlightForRect" in app
+    assert "pdfRectsIntersect" in app
+    assert "collectPdfDragSelection" in app
+    assert "normalizeDragRect" in app
+    assert "rectsOverlap" in app
+    assert "onOpenHighlight={onOpenHighlight}" in app
+    assert "page.words && page.words.length ? page.words : page.lines" in app
+    assert "pdfZoom" in app
+    assert "pdf-zoom-controls" in app
+    assert "ZoomIn" in app
+    assert "ZoomOut" in app
+    assert "file-workspace-panel" in styles
+    assert "file-tabs" in app
+    assert "file-tab active" in app
+    assert "activeMode === 'chat'" in app
+    assert "setActiveMode('chat')" in app
+    assert "setActiveMode('files')" in app
+    assert "setAccountRootIds([created.session_id])" in app
+    assert "正在抽取 PDF 文本" in app
+    assert "没有抽取到可选择文本" in app
+    assert "文件系统" in app
+    assert "Upload..." in app
+    assert "粘贴" in app
+    assert "Download" in app
+    assert "FloatingWindows" in app
+    assert "nextWindowPlacement" in app
+    assert "QuestionDialog" in app
+    assert "TranslateDialog" in app
+    assert "selection-highlight" in app
+    assert "buildCleanSelectionDisplay" in app
+    assert "buildBranchColors" in app
+    assert "makeBranchColor" in app
+    assert "thinkingLabel" in app
+    assert "llm_request_snapshot" in app
+    assert "onMove" in app
+    assert "onResize" in app
+    assert "mousemove" in app
+    assert "思考过程中" in app
+    assert "delete-window" in app
+    assert "floating-window" in styles
+    assert "file-browser" in styles
+    assert "file-row" in styles
+    assert "file-context-menu" in styles
+    assert "hidden-file-input" in styles
+    assert "EXPLORER" in app
+    assert "requestAnimationFrame" in app
+    assert "cancelAnimationFrame" in app
+    assert "file-workspace-panel" in styles
+    assert "markdown-file-panel" in styles
+    assert "markdown-preview" in styles
+    assert "markdown-editor" in styles
+    assert "column-resizer" in styles
+    assert "file-tabs" in styles
+    assert "file-tab.active" in styles
+    assert "learning-main.file-mode" in styles
+    assert "pdf-text-reader" in styles
+    assert "pdf-image-page" in styles
+    assert "pdf-word-layer" in styles
+    assert "pdf-word" in styles
+    assert "pdf-line" in styles
+    assert "pdf-drag-selection" in styles
+    assert "pdf-highlight-layer" in styles
+    assert "pdf-highlight-rect" in styles
+    assert "cursor: text" in styles
+    assert "pdf-zoom-controls" in styles
+    assert "window-dock" in styles
+    assert "dock-item" in styles
+    assert "pdf-page-image" in styles
+    assert "pdf-text-status" in styles
+    assert "pdf-frame" in styles
+    assert "left: var(--sidebar-width, 296px)" in styles
+    assert "right: var(--detail-width, 340px)" in styles
+    assert "window-resize-handle" in styles
+    assert "nwse-resize" in styles
+    assert "selection-menu" in styles
+    assert "message-actions" in styles
+    assert "message-branch-menu" in styles
+    assert "tools-toggle" in app
+    assert "tools-toggle" in styles
+    assert "action-dialog" in styles
+    assert "language-options" in styles
+    assert "resize: both" in styles
+    assert "cursor: move" in styles
+    assert "--branch-bg" in styles
+    assert "color-mix" in styles
+    assert "markdown-body" in styles
+    assert "markdown-body table" in styles
+    assert "markdown-body img" in styles
+    assert "markdown-body blockquote" in styles
+    assert "md-code" in styles
+    assert "collapse-toggle" in styles
+    assert "math-block" in styles
+    assert "math-inline" in styles
+    assert "math-block .katex-display" in styles
+    assert "math-fallback" in styles
+    assert "/selection-branch" in api
+    assert "/workspace/files" in api
+    assert "/workspace/folders" in api
+    assert "/workspace/copy" in api
+    assert "/workspace/open" in api
+    assert "/workspace/pdf-text" in api
+    assert "/workspace/pdf-page-image" in api
+    assert "/workspace/tree" in api
+    assert "/workspace/text" in api
+    assert "DELETE" in api

@@ -694,11 +694,11 @@ class RAgent:
         if system_message and not any(m.get("role") == "system" for m in self.messages):
             system_msg = {"role": "system", "content": system_message}
             self.messages.append(system_msg)
-            _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(system_msg)})
+            _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(system_msg), "message_index": len(self.messages) - 1})
 
         user_msg = {"role": "user", "content": user_message}
         self.messages.append(user_msg)
-        _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(user_msg)})
+        _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(user_msg), "message_index": len(self.messages) - 1})
         rollback_index = len(self.messages)
 
         # 新一轮 run，复位截断/软提醒标记，并恢复默认预算。
@@ -755,7 +755,7 @@ class RAgent:
             ),
         }
         self.messages.append(resume_msg)
-        _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(resume_msg)})
+        _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(resume_msg), "message_index": len(self.messages) - 1})
         self.max_iterations += extra_iterations
         setattr(self, _TRUNCATED_FLAG, False)
         self._soft_warned = False
@@ -788,7 +788,7 @@ class RAgent:
         soft_threshold = max(1, int(self.max_iterations * config.get_soft_warn_ratio()))
         iteration = start_iteration
         excluded = set(exclude_tools or [])
-        allowed = set(allowed_tools or [])
+        allowed = set(allowed_tools or []) if allowed_tools is not None else None
 
         while iteration < self.max_iterations:
             if _is_cancelled(cancel_event):
@@ -800,7 +800,7 @@ class RAgent:
                 self._soft_warned = True
 
             tools = registry.get_all_schemas()
-            if allowed:
+            if allowed is not None:
                 tools = [
                     schema for schema in tools
                     if schema.get("function", {}).get("name") in allowed
@@ -849,7 +849,7 @@ class RAgent:
             message = response.choices[0].message
             _emit_event(event_sink, EVENT_LLM_RESPONSE_RECEIVED, {"message": normalize_message(message)})
             self.messages.append(message)
-            _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(message)})
+            _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(message), "message_index": len(self.messages) - 1})
 
             if message.tool_calls:
                 pending_tool_events = []
@@ -886,6 +886,8 @@ class RAgent:
 
                     if guard_denial:
                         result = guard_denial
+                    elif allowed is not None and func_name not in allowed:
+                        result = f'工具 {func_name} 未在当前上下文中启用，未执行。'
                     elif func_name in excluded:
                         result = f'工具 {func_name} 已在当前上下文中被禁用，未执行。'
                     elif func_name == "delegate_task":
@@ -899,6 +901,8 @@ class RAgent:
                                 delegate_args = json.loads(func_args or "{}")
                                 if isinstance(delegate_args, dict):
                                     delegate_args["event_sink"] = event_sink
+                                    if allowed:
+                                        delegate_args["allowed_tools"] = sorted(allowed)
                                     if self.session_id and not delegate_args.get("session_id"):
                                         delegate_args["session_id"] = self.session_id
                                     result = registry._tools[func_name]["handler"](**delegate_args)
@@ -907,14 +911,16 @@ class RAgent:
                             except Exception as exc:
                                 result = json.dumps({"error": str(exc)}, ensure_ascii=False)
                         else:
-                            if self.session_id:
-                                try:
-                                    delegate_args = json.loads(func_args or "{}")
-                                    if isinstance(delegate_args, dict) and not delegate_args.get("session_id"):
+                            try:
+                                delegate_args = json.loads(func_args or "{}")
+                                if isinstance(delegate_args, dict):
+                                    if self.session_id and not delegate_args.get("session_id"):
                                         delegate_args["session_id"] = self.session_id
-                                        func_args = json.dumps(delegate_args, ensure_ascii=False)
-                                except Exception:
-                                    pass
+                                    if allowed:
+                                        delegate_args["allowed_tools"] = sorted(allowed)
+                                    func_args = json.dumps(delegate_args, ensure_ascii=False)
+                            except Exception:
+                                pass
                             result = registry.execute_tool(func_name, func_args)
                     else:
                         result = registry.execute_tool_isolated(
@@ -963,7 +969,7 @@ class RAgent:
                     self.messages.append(tool_msg)
                     normalized_tool_msg = normalize_message(tool_msg)
                     _emit_event(event_sink, EVENT_TOOL_RESULT_APPENDED, {"message": normalized_tool_msg})
-                    _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalized_tool_msg})
+                    _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalized_tool_msg, "message_index": len(self.messages) - 1})
                     if tool_event["name"] == "archive_subtask":
                         try:
                             outer = json.loads(result)

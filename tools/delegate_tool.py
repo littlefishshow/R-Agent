@@ -525,6 +525,7 @@ def delegate_task(
     include_goal: bool = False,
     include_token_detail: bool = False,
     include_context_artifacts: bool = True,
+    allowed_tools=None,
 ) -> str:
     """生成隔离上下文子智能体并行处理任务。
 
@@ -551,6 +552,9 @@ def delegate_task(
     include_goal = bool(include_goal)
     include_token_detail = bool(include_token_detail)
     include_context_artifacts = bool(include_context_artifacts)
+    child_allowed_tools = set(allowed_tools or []) if allowed_tools else None
+    if child_allowed_tools is not None:
+        child_allowed_tools.discard("delegate_task")
     if default_wall_timeout_seconds is None:
         default_wall_timeout_seconds = config.get_delegate_task_wall_timeout()
     try:
@@ -667,6 +671,7 @@ def delegate_task(
                 on_tool_start=on_tool_start,
                 on_tool_end=on_tool_end,
                 exclude_tools=DELEGATE_CHILD_EXCLUDED_TOOLS,
+                allowed_tools=child_allowed_tools,
                 cancel_event=cancel_event,
             )
             truncated = _is_truncated_result(result, sub_agent)
@@ -997,6 +1002,11 @@ registry.register(
             "include_context_artifacts": {
                 "type": "boolean",
                 "description": "compact 模式是否包含 context_artifact_path；默认 true。"
+            },
+            "allowed_tools": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "内部参数：父 Agent 注入给子 Agent 的工具白名单，模型不应手动设置。"
             }
         },
         "required": ["tasks"]

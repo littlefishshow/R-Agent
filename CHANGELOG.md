@@ -2,6 +2,63 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-07-18
+
+#### R-Agent Cockpit 可视化学习工作台大更新
+
+- **重做学习型三栏界面**：Cockpit 前端从旧的上下文审计界面升级为学习工作台，左侧为树状问题链，中间在聊天模式与文件模式之间切换，右侧为映射 `outputs/` 的 VSCode 风格文件系统。
+- **接入真实 `outputs/` 文件系统**：新增 `app_gui/file_workspace.py` 与 `/workspace/*` API，支持 `outputs/papers` 下上传 PDF、复制/粘贴、下载、删除和懒加载目录树；不再自动创建 `outputs/read_paper`，避免和实际 skill 产物混淆。
+- **PDF 阅读与选中文本分支**：后端使用 PyMuPDF 抽取文字坐标并渲染高分辨率页面图片，前端叠加文本/高亮层，保留论文图片、公式和版面；选中文本后可提问、解释、总结、翻译，并创建可最小化/唤回的子对话窗口。
+- **Markdown 预览与编辑**：前端引入 `markdown-it` 与 KaTeX 渲染，支持表格、图片链接、代码块、数学公式、Markdown 预览/编辑/保存，以及选中文本提问和高亮唤回。
+- **树状上下文与单文件存储**：`ContextSnapshotStore` 改为单个 `context.json` 存储 metadata、modules、events 和 payloads；学习会话支持 chat/file_root/selection 节点、文件根节点、fork、setback、删除子树和按需加载子节点。
+- **用户消息级分支操作**：每条用户消息旁提供 fork、setback 和分支菜单；fork 会复制目标消息之前的上下文到子窗口，setback 会确认后回退当前会话上下文并把该用户消息放回输入框。
+- **Agent Tools 会话开关**：学习会话新增 `tools_enabled`，前端在输入区提供 `Tools On/Off` 控件；关闭后下一次请求不携带 tools schema，即使模型返回 tool call，后端也会拒绝执行。
+- **性能与交互优化**：文件树、会话树改为懒加载，PDF 页面图片加入缓存，窗口拖拽/缩放使用 `requestAnimationFrame` 节流；子窗口支持 Windows 风格调整大小、最小化、全屏并跟随中间栏宽度。
+- **普通文本选择修复**：Markdown/聊天文本改为 token 化选择，避免浏览器原生选区把起点吸到全文开头；选区菜单出现时保留蓝色选区，点击外部立即关闭菜单。
+- **补充测试覆盖**：更新 GUI runtime、context events、frontend structure 和 todo/delegate 相关测试，覆盖工具开关、文件系统、PDF/Markdown API、树状上下文、fork/setback、单文件 context 和前端结构。
+
+#### read_paper SKILL.md 章节模板重构
+
+- **重构第 1 章模板职责**：`skills/productivity/read_paper/SKILL.md` 将旧“一句话结论”和旧“全局扫描”的职责合并为 `## 1. 小白友好版论文解释`，并强制包含 `### 1.1`-`### 1.6` 六个小节，面向不熟悉方向的读者解释研究问题、核心方法、方法细节、实验结果、相对优势和代价局限。
+- **前移主线串读章节**：原第 4 章职责前移为新 `## 3. 论文主线串读`，要求按论文实际行文顺序做完整叙事式串读，并覆盖 Appendix、Limitations、关键图表、公式、实验和材料缺口。
+- **更新验收约束**：模板和质量清单明确不再保留独立扫描式概览章节，关键图片/表格/公式/代码解释需在第 1 章或第 3 章就地服务理解，避免拆成割裂索引。
+
+#### read_paper 截图工具升级与 TOP-D 图片重插
+
+- **升级 `read_paper` 截图逻辑**：维护 `skills/productivity/read_paper/scripts/pdf_snapshot.py` 的图表/表格截图流程，强化 caption 定位、smart crop 与手动 crops 精裁能力，便于为阅读笔记生成非整页的图表级资产。
+- **重插 TOP-D 阅读笔记图片**：更新 `outputs/papers_output/OPD/2026-07-06_TOP-D_Trust_Region_Policy_Distillation_阅读笔记.md`，将 10 张关键 Figure/Table 图片改为相对路径引用的精裁截图，并移除正文中旧 `pXX` 整页截图引用。
+- **最终验证记录**：对 TOP-D 笔记执行图片存在性、旧整页引用、数学分隔符、代码围栏与新图尺寸检查；`pdf_snapshot.py` 通过 Python 语法检查。
+
+#### 移除 read_paper2 Skill
+
+- **删除不可用实验 Skill**：按用户反馈，已删除 `skills/productivity/read_paper2/`，停止维护该实验性论文阅读工作流。
+- **保留原有论文阅读能力**：未删除 `skills/productivity/read_paper/`、`paper_research_scout`、已有论文 PDF、`outputs/papers_output/` 阅读笔记或 `sandbox/read_paper2/` 历史运行产物。
+- **原因记录**：`read_paper2` 的实际使用体验未达到预期，增强流程复杂但对阅读效果提升不足，因此移除，后续论文阅读默认回到稳定的 `read_paper` skill。
+
+#### read_paper2 v2 阅读骨架与增强截图工作流
+
+- **新增 v2 阅读规划与笔记骨架工具**：`skills/productivity/read_paper2/scripts/reading_plan_builder.py` 可从 `paper_structure_jsonl.py` 的 manifest/chunks 与 inspect 结果生成 `reading_plan.json`，`readpaper2_note_builder.py` 可基于 reading plan、enhanced snapshot manifest 与人工 notes 生成 readpaper2 Markdown scaffold/draft，避免直接回退到旧 `read_paper` 模板。
+- **新增增强版 PDF 图表截图工具**：`enhanced_pdf_snapshot.py` 根据 `reading_plan.visual_targets` 与 layout caption bbox 生成 Figure/Table enhanced snapshots，并输出 `enhanced_snapshot_manifest.json`；MemGPT 端到端验证已生成 11 张 enhanced snapshots。
+- **同步更新 read_paper2 文档**：更新 `skills/productivity/read_paper2/SKILL.md` 与 `references/tooling.md`，补充 v2 reading plan、enhanced snapshot、note scaffold/draft、asset inspection 和中间产物路径说明。
+- **修复截图兼容性**：修复 `pdf_snapshot.py` 中 `_caption_window_x` 兼容问题，保留 smart crop/auto crop 与增强截图流程的兼容入口。
+- **端到端试读验证**：在 MemGPT 论文上完成 read_paper2 v2 阅读骨架生成、增强截图生成与 `asset_inspector.py --fail-on-missing` 检查；阅读笔记资产引用检查通过。
+- **依赖与语法验证**：`requirements.txt` 已声明 `pymupdf>=1.26.0` 与 `pillow>=10.0.0`；本轮使用 `python3 -m py_compile` 验证 read_paper2 关键脚本无语法错误，并逐一确认新增/相关脚本 `--help` 可正常展示。
+
+#### read_paper2 论文精读 Skill 验证与日志记录
+
+- **新增 `read_paper2` skill 维护记录**：确认 `skills/productivity/read_paper2/` 已包含 `SKILL.md`、`references/tooling.md` 以及 `paper_locator.py`、`pdf_snapshot.py`、`pdf_layout_inspect.py`、`paper_structure_jsonl.py`、`asset_inspector.py` 五个 skill-local 脚本入口。
+- **验证脚本 CLI 入口**：逐一运行五个脚本的 `--help`，确认 `paper_locator` 论文定位、`pdf_snapshot` 图表截图、`pdf_layout_inspect` PDF/OCR 决策、`paper_structure_jsonl` layout-aware JSONL 抽取和 `asset_inspector` Markdown 资产检查入口均可正常展示用法。
+- **确认对外兼容目标**：`read_paper2` 保持 `read_paper` 的默认输入输出目录约定，并增强 PDF inspect、JSONL/manifest、截图资产检查、OCR 决策和失败报告流程；最终阅读笔记仍输出到 `outputs/papers_output/`，中间产物放入 `sandbox/read_paper2/`。
+- **提交前差异检查**：当前 `skills/productivity/read_paper2/` 为新增未跟踪目录，`CHANGELOG.md` 在本条记录写入后进入待提交修改；未删除任何文件。
+
+#### read_paper2 依赖安装与试读完成记录
+
+- **确认 PDF 处理依赖可用**：再次验证 `import fitz` 与 `from PIL import Image` 可正常执行，当前环境报告 PyMuPDF/fitz `1.26.5`、Pillow `10.2.0`。
+- **更新 requirements 依赖声明**：确认 `requirements.txt` 已追加 `pymupdf>=1.26.0` 与 `pillow>=10.0.0`，用于支撑 read_paper2 的 PDF 解析、版面检查与截图资产流程。
+- **完成 read_paper2 实际试读**：此前按当前目录状态复核时发现 `outputs/paper` 不存在，且 `outputs/papers/agent_RL_memory/` 下 5 篇 PDF（Reflexion、MemGPT、MemAgent、ExpeL、Memento）均已有对应阅读笔记；随后按用户授权改为重读已有 PDF，使用 `read_paper2` 流程完成 MemGPT 试读，产物为 `outputs/papers_output/agent_RL_memory/2026-07-16_MemGPT_readpaper2_阅读笔记.md`。
+- **验证试读资产与已读标记**：2026-07-18 复核确认该阅读笔记存在；`asset_inspector.py --fail-on-missing` 通过，`image_reference_count=9`、`missing_count=0`，且无未闭合代码围栏/未配对 display math；`skills/productivity/paper_research_scout/references/read_papers.json` 中 MemGPT 记录已标记 `source=readpaper2`，`notes` 指向 readpaper2 笔记与 sandbox。
+- **非破坏性验证范围**：本轮仅执行 `date`、文件存在/内容读取、`asset_inspector.py` 只读检查、输出资产目录只读枚举和已读记录复核；未删除任何文件。
+
 ### 2026-07-16
 
 - README 开头补充 tools/skills DIY 与长期记忆说明，并新增整体 Skill 系统概览，说明 agent_ops、productivity、github、creative 等 skill 类目。

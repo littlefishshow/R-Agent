@@ -59,7 +59,7 @@ def test_normalize_message_supports_dict_and_sdk_like_tool_calls():
     assert tool_msg["tool_call_id"] == "call1"
 
 
-def test_snapshot_store_payload_ref_and_event_jsonl(tmp_path):
+def test_snapshot_store_payload_ref_and_single_context_file(tmp_path):
     store = ContextSnapshotStore(tmp_path, preview_chars=5)
     ref = store.put_payload("abcdefghijklmnopqrstuvwxyz")
 
@@ -70,7 +70,9 @@ def test_snapshot_store_payload_ref_and_event_jsonl(tmp_path):
     event = store.append_event({"event_type": "demo", "payload": {"payload_ref": ref.to_dict()}})
     assert event["event_type"] == "demo"
     assert store.list_events(event_type="demo")
-    assert (tmp_path / "events.jsonl").read_text(encoding="utf-8").strip()
+    bundle = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
+    assert bundle["payloads"][ref.id]["content"] == "abcdefghijklmnopqrstuvwxyz"
+    assert bundle["events"][0]["event_type"] == "demo"
 
 
 def test_build_llm_request_snapshot_contains_messages_and_tool_schemas():
@@ -121,3 +123,31 @@ def test_agent_event_sink_captures_llm_tool_context(monkeypatch):
 
     appended = [event["payload"]["message"] for event in bus.events if event["event_type"] == EVENT_MESSAGE_APPENDED]
     assert any(message["role"] == "tool" and "tool-result:abc" in message["content"] for message in appended)
+
+
+def test_agent_empty_allowed_tools_disables_tool_schemas(monkeypatch):
+    called = {"count": 0}
+
+    def disabled_tool():
+        called["count"] += 1
+        return "should-not-run"
+
+    registry.register("gui_disabled_tool", "demo", {"type": "object"}, disabled_tool)
+    monkeypatch.setattr(registry, "get_all_schemas", lambda: [registry._tools["gui_disabled_tool"]["schema"]])
+    monkeypatch.setattr(registry, "execute_tool_isolated", lambda name, args, **kwargs: registry.execute_tool(name, args))
+
+    agent = RAgent(model="test-model", max_iterations=2, enable_self_review=False)
+    agent.client = _FakeClient([
+        _response(_message(tool_calls=[_tool_call("gui_disabled_tool", {})])),
+        _response(_message(content="plain answer", tool_calls=None)),
+    ])
+    bus = ContextEventBus(session_id="test-session")
+
+    result = agent.run_conversation("no tools", system_message="system prompt", event_sink=bus, allowed_tools=set())
+
+    request = next(event for event in bus.events if event["event_type"] == EVENT_LLM_REQUEST_SNAPSHOT)
+    tool_finished = next(event for event in bus.events if event["event_type"] == EVENT_TOOL_CALL_FINISHED)
+    assert result == "plain answer"
+    assert "未在当前上下文中启用" in tool_finished["payload"]["result"]
+    assert request["payload"]["tools"] == []
+    assert called["count"] == 0
