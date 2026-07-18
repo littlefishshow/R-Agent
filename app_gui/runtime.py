@@ -11,6 +11,7 @@ from app_gui.event_bus import ContextEventBus
 from app_gui.schemas import (
     EVENT_ERROR,
     EVENT_MEMORY_SNAPSHOT_LOADED,
+    EVENT_MESSAGE_APPENDED,
     EVENT_SESSION_STARTED,
     EVENT_SYSTEM_PROMPT_BUILT,
     EVENT_USER_INPUT_RECEIVED,
@@ -76,14 +77,17 @@ SELECTION_ACTIONS = {
     "translate": ("翻译", "只翻译选中文本，不要引入父对话上下文，不要解释无关内容。"),
     "explain": ("解释", "请解释选中文本本身的含义、背景、关键概念和常见误区。"),
     "summarize": ("总结", "请总结选中文本本身的核心要点。"),
+    "note": ("笔记", "请结合选中文本和用户手写笔记回答，优先围绕笔记中的想法、疑问或判断展开。"),
 }
 
 
 class GuiSession:
-    def __init__(self, session_id: str, *, store_root: str | Path = "outputs/gui_context", agent: Optional[RAgent] = None):
+    def __init__(self, session_id: str, *, store_root: str | Path = "outputs/gui_context", agent: Optional[RAgent] = None, restore: bool = False):
         self.session_id = session_id
         self.store = ContextSnapshotStore(Path(store_root) / session_id)
         self.event_bus = ContextEventBus(store=self.store, session_id=session_id)
+        if restore:
+            self.event_bus.events = list(self.store.events)
         self.agent = agent or RAgent(session_id=session_id)
         self.agent.session_id = session_id
         self.cancel_event = threading.Event()
@@ -93,8 +97,57 @@ class GuiSession:
         self._active_run_baseline = []
         self.last_response: Optional[str] = None
         self.last_error: Optional[str] = None
-        self.system_prompt = self._build_and_emit_system_prompt()
-        self.event_bus.emit(EVENT_SESSION_STARTED, {"session_id": session_id, "model": self.agent.model})
+        if restore:
+            self.system_prompt = self._restore_system_prompt()
+            self.agent.messages = self._restore_agent_messages()
+        else:
+            self.system_prompt = self._build_and_emit_system_prompt()
+            self.event_bus.emit(EVENT_SESSION_STARTED, {"session_id": session_id, "model": self.agent.model})
+
+    def _restore_system_prompt(self) -> str:
+        for event in reversed(self.store.events):
+            if event.get("event_type") != EVENT_SYSTEM_PROMPT_BUILT:
+                continue
+            payload = event.get("payload") or {}
+            ref = payload.get("payload_ref") or {}
+            payload_id = ref.get("id") if isinstance(ref, dict) else None
+            if payload_id:
+                try:
+                    return self.store.get_payload(payload_id)
+                except Exception:
+                    break
+        return self._build_system_prompt_text()
+
+    def _build_system_prompt_text(self) -> str:
+        return build_system_prompt() + SELF_EVOLUTION_PROMPT + memory_manager.load_snapshot()
+
+    def _restore_agent_messages(self) -> list:
+        messages = []
+        indexed = []
+        for event in self.store.events:
+            if event.get("event_type") != EVENT_MESSAGE_APPENDED:
+                continue
+            payload = event.get("payload") or {}
+            message = self._expand_restored_message(payload.get("message") or {})
+            indexed.append((payload.get("message_index"), len(indexed), message))
+        indexed.sort(key=lambda item: (item[0] if isinstance(item[0], int) else item[1], item[1]))
+        for _, _, message in indexed:
+            if message.get("role"):
+                messages.append(message)
+        return messages
+
+    def _expand_restored_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
+        restored = dict(message or {})
+        content = restored.get("content")
+        if isinstance(content, dict):
+            ref = content.get("payload_ref") or {}
+            payload_id = ref.get("id") if isinstance(ref, dict) else None
+            if payload_id:
+                try:
+                    restored["content"] = self.store.get_payload(payload_id)
+                except Exception:
+                    restored["content"] = ref.get("preview", "")
+        return restored
 
     def _build_and_emit_system_prompt(self) -> str:
         base_prompt = build_system_prompt() + SELF_EVOLUTION_PROMPT
@@ -351,6 +404,7 @@ class LearningSession(GuiSession):
         file_path: str = "",
         source_message_index: Optional[int] = None,
         tools_enabled: bool = True,
+        restore: bool = False,
     ):
         self.title = title or _make_learning_title(root_question)
         self.root_question = root_question
@@ -361,7 +415,7 @@ class LearningSession(GuiSession):
         self.file_path = str(file_path or "")
         self.source_message_index = source_message_index
         self.tools_enabled = bool(tools_enabled)
-        super().__init__(session_id, store_root=store_root, agent=agent)
+        super().__init__(session_id, store_root=store_root, agent=agent, restore=restore)
         self.store.update_metadata({
             "title": self.title,
             "root_question": self.root_question,
@@ -380,6 +434,9 @@ class LearningSession(GuiSession):
         system_prompt = base_prompt + memory_snapshot
         self.event_bus.emit(EVENT_SYSTEM_PROMPT_BUILT, {"payload_ref": self.store.put_payload(system_prompt).to_dict()})
         return system_prompt
+
+    def _build_system_prompt_text(self) -> str:
+        return build_system_prompt() + LEARNING_AGENT_PROMPT + memory_manager.load_snapshot()
 
     def send_message(self, text: str, *, background: bool = True) -> Dict[str, Any]:
         cleaned = str(text or "").strip()
@@ -539,11 +596,72 @@ class AgentRuntimeService:
 
 
 class LearningRuntimeService(AgentRuntimeService):
-    def __init__(self, *, store_root: str | Path = "outputs/learning_context", max_saved_sessions: int = 12, max_session_age_hours: float = 24.0):
+    def __init__(self, *, store_root: str | Path = "outputs/learning_context", max_saved_sessions: int = 200, max_session_age_hours: float = 0.0):
         super().__init__(store_root=store_root)
         self.max_saved_sessions = max(1, int(max_saved_sessions))
         self.max_session_age_hours = max(0.0, float(max_session_age_hours))
         self.cleanup_saved_sessions()
+        self.restore_saved_sessions()
+
+    def restore_saved_sessions(self) -> Dict[str, Any]:
+        root = Path(self.store_root)
+        if not root.exists():
+            return {"restored": []}
+        restored = []
+        errors = []
+        for context_path in sorted(root.glob("*/context.json"), key=lambda item: item.stat().st_mtime if item.exists() else 0):
+            session_dir = context_path.parent
+            sid = session_dir.name
+            if sid in self.sessions:
+                continue
+            try:
+                store = ContextSnapshotStore(session_dir)
+                metadata = dict(store.metadata or {})
+                session = LearningSession(
+                    sid,
+                    store_root=self.store_root,
+                    title=str(metadata.get("title") or ""),
+                    root_question=str(metadata.get("root_question") or ""),
+                    parent_session_id=metadata.get("parent_session_id"),
+                    account_id=str(metadata.get("account_id") or "default"),
+                    node_kind=str(metadata.get("node_kind") or "chat"),
+                    file_path=str(metadata.get("file_path") or ""),
+                    source_message_index=metadata.get("source_message_index"),
+                    tools_enabled=bool(metadata.get("tools_enabled", True)),
+                    restore=True,
+                )
+                self._hydrate_learning_session_from_events(session)
+                self.sessions[sid] = session
+                restored.append(sid)
+            except Exception as exc:
+                errors.append({"session_id": sid, "error": str(exc)})
+                continue
+        return {"restored": restored, "errors": errors}
+
+    def _hydrate_learning_session_from_events(self, session: LearningSession) -> None:
+        user_inputs = [
+            str((event.get("payload") or {}).get("content") or "").strip()
+            for event in session.store.events
+            if event.get("event_type") == EVENT_USER_INPUT_RECEIVED
+        ]
+        meaningful_inputs = [item for item in user_inputs if item]
+        if meaningful_inputs:
+            if not session.root_question:
+                session.root_question = meaningful_inputs[0]
+            session.last_question = meaningful_inputs[-1]
+        if not session.title or session.title == "新的学习问题":
+            session.title = _make_learning_title(session.root_question or session.last_question)
+        session.store.update_metadata({
+            "title": session.title,
+            "root_question": session.root_question,
+            "last_question": session.last_question,
+            "parent_session_id": session.parent_session_id,
+            "account_id": session.account_id,
+            "node_kind": session.node_kind,
+            "file_path": session.file_path,
+            "source_message_index": session.source_message_index,
+            "tools_enabled": session.tools_enabled,
+        })
 
     def cleanup_saved_sessions(self) -> Dict[str, Any]:
         root = Path(self.store_root)
@@ -582,6 +700,7 @@ class LearningRuntimeService(AgentRuntimeService):
         file_path: str = "",
         source_message_index: Optional[int] = None,
         tools_enabled: bool = True,
+        restore: bool = False,
     ) -> LearningSession:
         sid = session_id or new_id("learn")
         with self._lock:
@@ -599,6 +718,7 @@ class LearningRuntimeService(AgentRuntimeService):
                 file_path=file_path,
                 source_message_index=source_message_index,
                 tools_enabled=tools_enabled,
+                restore=restore,
             )
             self.sessions[sid] = session
             return session
@@ -805,6 +925,7 @@ class LearningRuntimeService(AgentRuntimeService):
         action: str,
         custom_question: str = "",
         target_language: str = "",
+        note_text: str = "",
         title: str = "",
         source_context: Optional[Dict[str, Any]] = None,
         background: bool = True,
@@ -816,10 +937,13 @@ class LearningRuntimeService(AgentRuntimeService):
         action_label, action_instruction = SELECTION_ACTIONS.get(action_key, SELECTION_ACTIONS["question"])
         question = str(custom_question or "").strip()
         target_language = str(target_language or "").strip()
+        note_text = str(note_text or "").strip()
         if action_key == "question" and not question:
             raise ValueError("custom_question is required for question action")
         if action_key == "translate" and not target_language:
             raise ValueError("target_language is required for translate action")
+        if action_key == "note" and not note_text:
+            raise ValueError("note_text is required for note action")
         source = self.get_session(source_session_id)
         source_context = source_context or {}
         context_lines = []
@@ -848,6 +972,13 @@ class LearningRuntimeService(AgentRuntimeService):
                 f"【选中文本】\n{selected_text}\n\n"
                 f"【我的问题】\n{question}"
             )
+        elif action_key == "note":
+            initial_question = (
+                f"{action_instruction}\n\n"
+                f"{context_block}"
+                f"【选中文本】\n{selected_text}\n\n"
+                f"【我的手写笔记】\n{note_text}"
+            )
         else:
             initial_question = (
                 f"{action_instruction}\n\n"
@@ -864,7 +995,7 @@ class LearningRuntimeService(AgentRuntimeService):
             file_path=getattr(source, "file_path", ""),
             tools_enabled=getattr(source, "tools_enabled", True),
         )
-        if action_key in {"question", "explain", "summarize"}:
+        if action_key in {"question", "explain", "summarize", "note"}:
             session.agent.messages = self._copy_parent_context(source_session_id, system_prompt=session.system_prompt)
         send_result = session.send_message(initial_question, background=background)
         state = session.state()
@@ -876,6 +1007,57 @@ class LearningRuntimeService(AgentRuntimeService):
             "action_label": action_label,
             "custom_question": question,
             "target_language": target_language,
+            "note_text": note_text,
+            "source_context": source_context,
+        }
+        return state
+
+    def save_selection_note(
+        self,
+        source_session_id: str,
+        *,
+        selected_text: str,
+        note_text: str,
+        title: str = "",
+        source_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        selected_text = str(selected_text or "").strip()
+        note_text = str(note_text or "").strip()
+        if not selected_text:
+            raise ValueError("selected_text is empty")
+        if not note_text:
+            raise ValueError("note_text is empty")
+        source = self.get_session(source_session_id)
+        session = self.create_session(
+            title=title or f"笔记: {_make_learning_title(note_text, limit=18)}",
+            root_question=note_text,
+            parent_session_id=source_session_id,
+            account_id=getattr(source, "account_id", "default"),
+            node_kind="note",
+            file_path=getattr(source, "file_path", ""),
+            tools_enabled=getattr(source, "tools_enabled", True),
+        )
+        note_message = (
+            "【手写笔记】\n"
+            f"{note_text}\n\n"
+            "【关联选中文本】\n"
+            f"{selected_text}"
+        )
+        source_context = source_context or {}
+        if source_context:
+            note_message += "\n\n【来源】\n" + "\n".join(
+                f"{key}: {value}" for key, value in source_context.items() if value
+            )
+        session.agent.messages = [{"role": "user", "content": note_message}]
+        session.store.replace_message_events(normalize_messages(session.agent.messages), session_id=session.session_id)
+        session.event_bus.events = list(session.store.events)
+        state = session.state()
+        state["selection"] = {
+            "source_session_id": source_session_id,
+            "selected_text": selected_text,
+            "action": "note",
+            "action_label": "笔记",
+            "note_text": note_text,
             "source_context": source_context,
         }
         return state

@@ -26,6 +26,7 @@ import {
   selectionBranchLearningSession,
   sendLearningMessage,
   saveWorkspaceText,
+  saveSelectionNoteLearningSession,
   setLearningToolsEnabled,
   uploadWorkspaceFile,
   workspacePdfPageImageUrl,
@@ -46,7 +47,7 @@ type ChatItem = {
   messageIndex?: number
 }
 
-type SelectionAction = 'question' | 'translate' | 'explain' | 'summarize'
+type SelectionAction = 'question' | 'translate' | 'explain' | 'summarize' | 'note'
 
 type SelectionMenuState = {
   sourceSessionId: string
@@ -114,6 +115,7 @@ type FloatingWindowState = {
   selectedText?: string
   displayQuestion?: string
   targetLanguage?: string
+  noteText?: string
   x: number
   y: number
   width: number
@@ -163,6 +165,7 @@ const SELECTION_ACTIONS: Array<{ action: SelectionAction, label: string, icon: a
   { action: 'translate', label: '翻译', icon: Languages },
   { action: 'explain', label: '解释', icon: Lightbulb },
   { action: 'summarize', label: '总结', icon: FileText },
+  { action: 'note', label: '笔记', icon: Edit3 },
 ]
 
 const ROOT_BRANCH_COLOR = makeBranchColor(212, 0)
@@ -187,6 +190,7 @@ export function App() {
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenuState | null>(null)
   const [pendingAction, setPendingAction] = useState<PendingSelectionAction | null>(null)
   const [questionDraft, setQuestionDraft] = useState('')
+  const [noteDraft, setNoteDraft] = useState('')
   const [translationChoice, setTranslationChoice] = useState<'英语' | '中文' | '其他'>('英语')
   const [customLanguage, setCustomLanguage] = useState('')
   const [highlights, setHighlights] = useState<Record<string, HighlightRecord>>({})
@@ -218,7 +222,7 @@ export function App() {
       .map(id => sessions[id])
       .filter(Boolean)
       .filter(item => item.node_kind !== 'file_root')
-      .sort((a, b) => Number(isBlankRoot(b)) - Number(isBlankRoot(a)) || Number(!!b.running) - Number(!!a.running) || (b.event_count || 0) - (a.event_count || 0))
+      .sort((a, b) => Number(isBlankRoot(a)) - Number(isBlankRoot(b)) || Number(!!b.running) - Number(!!a.running) || (b.event_count || 0) - (a.event_count || 0))
       .filter(item => !q || `${item.title || ''} ${item.root_question || ''} ${item.last_question || ''}`.toLowerCase().includes(q))
   }, [sessions, accountRootIds, filter])
   const visibleFileRoots = useMemo(() => {
@@ -571,6 +575,11 @@ export function App() {
       setPendingAction({ ...menu, action })
       return
     }
+    if (action === 'note') {
+      setNoteDraft('')
+      setPendingAction({ ...menu, action })
+      return
+    }
     createSelectionBranch({ ...menu, action })
   }
 
@@ -582,6 +591,7 @@ export function App() {
     selectedText?: string
     displayQuestion?: string
     targetLanguage?: string
+    noteText?: string
     color?: BranchColor
     fullscreen?: boolean
   }) {
@@ -604,6 +614,7 @@ export function App() {
         selectedText: options.selectedText,
         displayQuestion: options.displayQuestion,
         targetLanguage: options.targetLanguage,
+        noteText: options.noteText,
         x: placement.x,
         y: placement.y,
         width: placement.width,
@@ -618,7 +629,7 @@ export function App() {
     setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
   }
 
-  async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string } = {}) {
+  async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string, noteText?: string } = {}) {
     const menu = actionState
     try {
       const actionMeta = SELECTION_ACTIONS.find(item => item.action === menu.action)
@@ -635,6 +646,7 @@ export function App() {
         action: menu.action,
         custom_question: options.customQuestion,
         target_language: options.targetLanguage,
+        note_text: options.noteText,
         source_context: menu.sourceContext,
       })
       const highlightId = `hl_${Date.now()}_${Math.random().toString(16).slice(2)}`
@@ -677,6 +689,7 @@ export function App() {
         selectedText: menu.text,
         displayQuestion: options.customQuestion,
         targetLanguage: options.targetLanguage,
+        noteText: options.noteText,
         color,
       })
     } catch (err: any) {
@@ -698,6 +711,82 @@ export function App() {
     const action = pendingAction
     setPendingAction(null)
     createSelectionBranch(action, { targetLanguage: language })
+  }
+
+  async function saveNoteDialog(sendToModel: boolean) {
+    if (!pendingAction || !noteDraft.trim()) return
+    const action = pendingAction
+    const note = noteDraft.trim()
+    setPendingAction(null)
+    setNoteDraft('')
+    if (sendToModel) {
+      createSelectionBranch(action, { noteText: note })
+      return
+    }
+    try {
+      let sourceSessionId = action.sourceSessionId
+      const filePath = typeof action.sourceContext?.path === 'string' ? action.sourceContext.path : ''
+      if (filePath) {
+        const fileRoot = await getLearningFileRoot(accountId, filePath)
+        sourceSessionId = fileRoot.session_id
+        setSessions(prev => ({ ...prev, [fileRoot.session_id]: fileRoot }))
+        setAccountRootIds(prev => prev.includes(fileRoot.session_id) ? prev : [...prev, fileRoot.session_id])
+      }
+      const branch = await saveSelectionNoteLearningSession(sourceSessionId, {
+        selected_text: action.text,
+        note_text: note,
+        source_context: action.sourceContext,
+      })
+      const highlightId = `hl_${Date.now()}_${Math.random().toString(16).slice(2)}`
+      const color = branchColors[branch.session_id] || deriveChildColor(sourceSessionId, Object.values(sessions), branchColors)
+      if (action.pdfContext) {
+        setPdfHighlights(prev => ({
+          ...prev,
+          [highlightId]: {
+            id: highlightId,
+            sessionId: branch.session_id,
+            path: action.pdfContext?.path || '',
+            page: action.pdfContext?.page || 1,
+            text: action.text,
+            rects: action.pdfContext?.rects || [],
+            color,
+          },
+        }))
+      }
+      setHighlights(prev => ({
+        ...prev,
+        [highlightId]: {
+          id: highlightId,
+          sessionId: branch.session_id,
+          sourceSessionId,
+          chatId: action.chatId,
+          text: action.text,
+          action: 'note',
+          label: '笔记',
+          color,
+        },
+      }))
+      setSessions(prev => ({ ...prev, [branch.session_id]: branch }))
+      setConversationChildren(prev => ({
+        ...prev,
+        [sourceSessionId]: [branch.session_id, ...(prev[sourceSessionId] || [])],
+      }))
+      await openFloatingSession(branch, {
+        sourceSessionId,
+        title: branch.title || '笔记',
+        highlightId,
+        action: 'note',
+        selectedText: action.text,
+        noteText: note,
+        color,
+      })
+      setWindows(prev => {
+        const id = `win_${branch.session_id}`
+        return prev[id] ? { ...prev, [id]: { ...prev[id], minimized: true } } : prev
+      })
+    } catch (err: any) {
+      setError(err.message || String(err))
+    }
   }
 
   async function sendWindowMessage(windowId: string) {
@@ -1160,13 +1249,14 @@ export function App() {
           }
         }}
         onMarkdownSelection={(text, rect, path, range) => {
+          const location = describeMarkdownSelectionLocation(openFiles[path]?.textContent || '', text)
           showSelectionMenu({
             sourceSessionId: session?.session_id || '',
             chatId: `markdown:${path}`,
             text,
             x: Math.min(rect.left + rect.width / 2, window.innerWidth - 220),
             y: Math.max(12, rect.top - 46),
-            sourceContext: { kind: 'markdown', path, location: 'selected markdown text' },
+            sourceContext: { kind: 'markdown', path, location },
           }, range)
         }}
         onPdfSelection={(text, page, rect, rects) => {
@@ -1289,6 +1379,14 @@ export function App() {
       onCancel={() => setPendingAction(null)}
       onSubmit={submitTranslationDialog}
     />}
+    {pendingAction?.action === 'note' && <NoteDialog
+      selectedText={pendingAction.text}
+      value={noteDraft}
+      onChange={setNoteDraft}
+      onCancel={() => setPendingAction(null)}
+      onSave={() => saveNoteDialog(false)}
+      onSend={() => saveNoteDialog(true)}
+    />}
     <FloatingWindows
       windows={windows}
       sessions={sessions}
@@ -1394,6 +1492,9 @@ function thinkingLabel(events: ContextEvent[], running?: boolean): string {
 
 function buildCleanSelectionDisplay(win: FloatingWindowState): string {
   const selected = win.selectedText || ''
+  if (win.action === 'note') {
+    return `笔记：\n${win.noteText || ''}\n\n关联文本：\n${selected}`
+  }
   if (win.action === 'question') {
     return win.displayQuestion || ''
   }
@@ -1428,6 +1529,21 @@ function formatFileSize(size: number): string {
     unit += 1
   }
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
+}
+
+function describeMarkdownSelectionLocation(content: string, selectedText: string): string {
+  const source = String(content || '')
+  const selected = String(selectedText || '').trim()
+  if (!source || !selected) return 'selected markdown text'
+  const exactIndex = source.indexOf(selected)
+  const normalizedIndex = exactIndex >= 0 ? exactIndex : source.replace(/\s+/g, ' ').indexOf(selected.replace(/\s+/g, ' '))
+  if (exactIndex < 0 && normalizedIndex < 0) return 'selected markdown text'
+  const index = Math.max(0, exactIndex >= 0 ? exactIndex : normalizedIndex)
+  const before = source.slice(0, index)
+  const startLine = before.split('\n').length
+  const lineCount = Math.max(1, selected.split('\n').length)
+  const endLine = startLine + lineCount - 1
+  return startLine === endLine ? `line ${startLine}` : `lines ${startLine}-${endLine}`
 }
 
 function parentPath(path: string): string {
@@ -1507,6 +1623,28 @@ function TranslateDialog({ selectedText, choice, customLanguage, onChoice, onCus
       <footer>
         <button className="secondary" onClick={onCancel}>取消</button>
         <button className="primary" onClick={onSubmit}>翻译</button>
+      </footer>
+    </section>
+  </div>
+}
+
+function NoteDialog({ selectedText, value, onChange, onCancel, onSave, onSend }: {
+  selectedText: string
+  value: string
+  onChange: (value: string) => void
+  onCancel: () => void
+  onSave: () => void
+  onSend: () => void
+}) {
+  return <div className="modal-backdrop">
+    <section className="action-dialog">
+      <header>写手写笔记</header>
+      <div className="selected-preview">{selectedText}</div>
+      <textarea value={value} onChange={event => onChange(event.target.value)} placeholder="写下你的理解、疑问或备注..."/>
+      <footer>
+        <button className="secondary" onClick={onCancel}>取消</button>
+        <button className="secondary" disabled={!value.trim()} onClick={onSave}>保存笔记</button>
+        <button className="primary" disabled={!value.trim()} onClick={onSend}>发送给模型</button>
       </footer>
     </section>
   </div>

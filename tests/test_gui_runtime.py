@@ -171,6 +171,37 @@ def test_learning_runtime_uses_restricted_tools(monkeypatch, tmp_path):
     assert state["tools_enabled"] is True
 
 
+def test_learning_runtime_restores_saved_sessions(monkeypatch, tmp_path):
+    def fake_run(self, user_message, **kwargs):
+        event_sink = kwargs.get("event_sink")
+        for message in [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": "restored answer"},
+        ]:
+            self.messages.append(message)
+            if event_sink is not None:
+                event_sink.emit("message_appended", {"message": message, "message_index": len(self.messages) - 1})
+        return "restored answer"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path)
+    session = service.create_session(session_id="saved-learn", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    session.send_message("需要恢复的问题", background=False)
+    before_events = len(session.store.events)
+
+    restored_service = LearningRuntimeService(store_root=tmp_path)
+    restored = restored_service.get_session("saved-learn")
+
+    assert "saved-learn" in restored_service.list_sessions(account_id="default")
+    assert restored.root_question == "需要恢复的问题"
+    assert restored.last_question == "需要恢复的问题"
+    assert any(message.get("content") == "需要恢复的问题" for message in restored.agent.messages)
+    assert any(message.get("content") == "restored answer" for message in restored.agent.messages)
+    assert len(restored.store.events) == before_events
+    assert restored.event_bus.events == restored.store.events
+
+
 def test_learning_runtime_can_disable_tool_context(monkeypatch, tmp_path):
     seen = {}
 
@@ -300,6 +331,66 @@ def test_learning_translate_branch_uses_only_selected_text(monkeypatch, tmp_path
     assert "目标语言" in seen[-1]
     assert "这段父上下文不应进入翻译" not in seen[-1]
     assert not any(message.get("content") == "这段父上下文不应进入翻译" for message in child.agent.messages)
+
+
+def test_learning_selection_note_can_save_without_model(monkeypatch, tmp_path):
+    calls = []
+
+    def fake_run(self, user_message, **kwargs):
+        calls.append(user_message)
+        return "should not run"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path)
+    parent = service.create_session(session_id="note-parent", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+
+    result = service.save_selection_note(
+        "note-parent",
+        selected_text="important paragraph",
+        note_text="my handwritten note",
+        source_context={"kind": "markdown", "path": "read_paper/a.md", "location": "lines 3-5"},
+    )
+    child = service.get_session(result["session_id"])
+
+    assert calls == []
+    assert result["node_kind"] == "note"
+    assert result["selection"]["action"] == "note"
+    assert result["selection"]["note_text"] == "my handwritten note"
+    assert "my handwritten note" in child.agent.messages[0]["content"]
+    assert "important paragraph" in child.agent.messages[0]["content"]
+    assert "lines 3-5" in child.agent.messages[0]["content"]
+
+
+def test_learning_selection_note_can_send_to_model(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run(self, user_message, **kwargs):
+        seen.append(user_message)
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "note answer"})
+        return "note answer"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path)
+    parent = service.create_session(session_id="note-model-parent", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    parent.send_message("父上下文", background=False)
+
+    result = service.branch_from_selection(
+        "note-model-parent",
+        selected_text="selected claim",
+        action="note",
+        note_text="check this claim later",
+        source_context={"kind": "pdf", "path": "papers/a.pdf", "location": "page 2"},
+        background=False,
+    )
+
+    assert result["selection"]["action"] == "note"
+    assert result["selection"]["note_text"] == "check this claim later"
+    assert "【我的手写笔记】" in seen[-1]
+    assert "check this claim later" in seen[-1]
+    assert "【来源文件】papers/a.pdf" in seen[-1]
 
 
 def test_learning_branch_session_copies_parent_context(monkeypatch, tmp_path):

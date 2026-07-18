@@ -164,6 +164,12 @@ def test_learning_selection_menu_and_floating_windows_present():
 
     for label in ["提问", "翻译", "解释", "总结"]:
         assert label in app
+    assert "笔记" in app
+    assert "NoteDialog" in app
+    assert "saveSelectionNoteLearningSession" in app
+    assert "保存笔记" in app
+    assert "发送给模型" in app
+    assert "describeMarkdownSelectionLocation" in app
     assert "selectionBranchLearningSession" in app
     assert "deleteLearningSession" in app
     assert "pdf-frame" in app
@@ -279,6 +285,7 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "math-block .katex-display" in styles
     assert "math-fallback" in styles
     assert "/selection-branch" in api
+    assert "/selection-note" in api
     assert "/workspace/files" in api
     assert "/workspace/folders" in api
     assert "/workspace/copy" in api

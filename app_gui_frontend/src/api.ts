@@ -247,9 +247,10 @@ export async function forkLearningSessionFromMessage(sessionId: string, messageI
 
 export async function selectionBranchLearningSession(sessionId: string, payload: {
   selected_text: string
-  action: 'question' | 'translate' | 'explain' | 'summarize'
+  action: 'question' | 'translate' | 'explain' | 'summarize' | 'note'
   custom_question?: string
   target_language?: string
+  note_text?: string
   title?: string
   source_context?: Record<string, any>
   background?: boolean
@@ -258,6 +259,21 @@ export async function selectionBranchLearningSession(sessionId: string, payload:
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ background: true, ...payload }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function saveSelectionNoteLearningSession(sessionId: string, payload: {
+  selected_text: string
+  note_text: string
+  title?: string
+  source_context?: Record<string, any>
+}): Promise<LearningSessionState> {
+  const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/selection-note`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()

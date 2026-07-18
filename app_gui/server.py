@@ -238,9 +238,25 @@ def create_app(
                 action=str(request.get("action") or "question"),
                 custom_question=str(request.get("custom_question") or ""),
                 target_language=str(request.get("target_language") or ""),
+                note_text=str(request.get("note_text") or ""),
                 title=str(request.get("title") or ""),
                 source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
                 background=bool(request.get("background", True)),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/selection-note")
+    def save_learning_selection_note(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
+        try:
+            return learning.save_selection_note(
+                session_id,
+                selected_text=str(request.get("selected_text") or ""),
+                note_text=str(request.get("note_text") or ""),
+                title=str(request.get("title") or ""),
+                source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
