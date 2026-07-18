@@ -185,6 +185,7 @@ export function App() {
   const [accountId] = useState('default')
   const [events, setEvents] = useState<ContextEvent[]>([])
   const [input, setInput] = useState('')
+  const inputDraftRef = useRef('')
   const [filter, setFilter] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenuState | null>(null)
@@ -198,6 +199,7 @@ export function App() {
   const [windows, setWindows] = useState<Record<string, FloatingWindowState>>({})
   const [windowEvents, setWindowEvents] = useState<Record<string, ContextEvent[]>>({})
   const [windowInputs, setWindowInputs] = useState<Record<string, string>>({})
+  const windowInputDraftsRef = useRef<Record<string, string>>({})
   const [messageBranchMenus, setMessageBranchMenus] = useState<Record<string, boolean>>({})
   const [collapsedMessages, setCollapsedMessages] = useState<Record<string, boolean>>({})
   const [workspace, setWorkspace] = useState<WorkspaceListing | null>(null)
@@ -455,9 +457,11 @@ export function App() {
     }
   }
 
-  async function submit() {
-    if (!session || !input.trim()) return
-    const text = input
+  async function submit(textOverride?: string) {
+    const draft = textOverride ?? inputDraftRef.current ?? input
+    if (!session || !draft.trim()) return
+    const text = draft
+    inputDraftRef.current = ''
     setInput('')
     setError(null)
     try {
@@ -789,10 +793,11 @@ export function App() {
     }
   }
 
-  async function sendWindowMessage(windowId: string) {
+  async function sendWindowMessage(windowId: string, textOverride?: string) {
     const win = windows[windowId]
-    const text = (windowInputs[windowId] || '').trim()
+    const text = (textOverride ?? windowInputDraftsRef.current[windowId] ?? windowInputs[windowId] ?? '').trim()
     if (!win || !text) return
+    windowInputDraftsRef.current[windowId] = ''
     setWindowInputs(prev => ({ ...prev, [windowId]: '' }))
     try {
       await sendLearningMessage(win.sessionId, text)
@@ -811,7 +816,11 @@ export function App() {
     const win = windows[windowId]
     if (!win) return
     await interruptLearning(win.sessionId)
-    const ev = await fetchLearningEvents(win.sessionId)
+    const [state, ev] = await Promise.all([
+      fetchLearningSession(win.sessionId),
+      fetchLearningEvents(win.sessionId),
+    ])
+    setSessions(prev => ({ ...prev, [state.session_id]: state }))
     setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
   }
 
@@ -964,10 +973,77 @@ export function App() {
     })
   }
 
-  function openHighlight(highlightId: string) {
+  async function openHighlight(highlightId: string) {
     const win = Object.values(windows).find(item => item.highlightId === highlightId)
-    if (!win) return
-    raiseWindow(win.id)
+    if (win) {
+      raiseWindow(win.id)
+      return
+    }
+    const highlight = highlights[highlightId] || pdfHighlights[highlightId]
+    if (!highlight?.sessionId) return
+    try {
+      const branch = await fetchLearningSession(highlight.sessionId)
+      await openFloatingSession(branch, {
+        sourceSessionId: (highlight as any).sourceSessionId || branch.parent_session_id || '',
+        title: branch.title || (highlight as any).label || '子问题',
+        highlightId,
+        action: (branch.selection?.action as SelectionAction) || (highlight as any).action,
+        selectedText: branch.selection?.selected_text || highlight.text,
+        displayQuestion: branch.selection?.custom_question,
+        targetLanguage: branch.selection?.target_language,
+        noteText: branch.selection?.note_text,
+      })
+    } catch (err: any) {
+      setError(err.message || String(err))
+    }
+  }
+
+  async function restoreFileHighlights(path: string) {
+    try {
+      const fileRoot = await getLearningFileRoot(accountId, path)
+      const children = await fetchLearningChildren(fileRoot.session_id)
+      setSessions(prev => ({
+        ...prev,
+        [fileRoot.session_id]: fileRoot,
+        ...Object.fromEntries(children.nodes.map(item => [item.session_id, item])),
+      }))
+      setAccountRootIds(prev => prev.includes(fileRoot.session_id) ? prev : [...prev, fileRoot.session_id])
+      setConversationChildren(prev => ({ ...prev, [fileRoot.session_id]: children.nodes.map(item => item.session_id) }))
+      const nextTextHighlights: Record<string, HighlightRecord> = {}
+      const nextPdfHighlights: Record<string, PdfHighlightRecord> = {}
+      for (const child of children.nodes) {
+        const selection = child.selection || {}
+        const source = selection.source_context || {}
+        if (source.path !== path || !selection.selected_text) continue
+        const highlightId = `persist_${child.session_id}`
+        const color = branchColors[child.session_id] || deriveChildColor(fileRoot.session_id, [...Object.values(sessions), fileRoot, ...children.nodes], branchColors)
+        nextTextHighlights[highlightId] = {
+          id: highlightId,
+          sessionId: child.session_id,
+          sourceSessionId: fileRoot.session_id,
+          chatId: source.kind === 'markdown' ? `markdown:${path}` : `pdf:${path}:p${source.page || 1}`,
+          text: selection.selected_text || '',
+          action: (selection.action as SelectionAction) || 'question',
+          label: selection.action_label || '提问',
+          color,
+        }
+        if (source.kind === 'pdf' && Array.isArray(source.rects)) {
+          nextPdfHighlights[highlightId] = {
+            id: highlightId,
+            sessionId: child.session_id,
+            path,
+            page: Number(source.page || String(source.location || '').match(/page (\d+)/)?.[1] || 1),
+            text: selection.selected_text || '',
+            rects: source.rects,
+            color,
+          }
+        }
+      }
+      setHighlights(prev => ({ ...prev, ...nextTextHighlights }))
+      setPdfHighlights(prev => ({ ...prev, ...nextPdfHighlights }))
+    } catch {
+      // File highlights are opportunistic; opening the file should still work.
+    }
   }
 
   async function openWorkspaceItem(item: WorkspaceItem) {
@@ -980,6 +1056,7 @@ export function App() {
       setOpenFiles(prev => ({ ...prev, [item.path]: tab }))
       setActiveFilePath(item.path)
       setActiveMode('files')
+      await restoreFileHighlights(item.path)
       try {
         const pdfText = await fetchWorkspacePdfText(item.path)
         setOpenFiles(prev => ({
@@ -1008,6 +1085,7 @@ export function App() {
       setOpenFiles(prev => ({ ...prev, [item.path]: markdownTab }))
       setActiveFilePath(item.path)
       setActiveMode('files')
+      await restoreFileHighlights(item.path)
       try {
         const text = await fetchWorkspaceText(item.path)
         setOpenFiles(prev => ({
@@ -1167,20 +1245,6 @@ export function App() {
             onActivate={activateSession}
             onDelete={deleteRootSession}
           />)}
-          {visibleFileRoots.length > 0 && <div className="account-tree-section">文件对话</div>}
-          {visibleFileRoots.map(item => <ConversationTreeNode
-            key={item.session_id}
-            item={item}
-            depth={0}
-            activeSessionId={session?.session_id || ''}
-            childrenById={conversationChildren}
-            sessions={sessions}
-            expanded={expandedConversationNodes}
-            colors={branchColors}
-            onToggle={toggleConversationNode}
-            onActivate={activateSession}
-            onDelete={deleteRootSession}
-          />)}
         </div>
       </div>
     </aside>
@@ -1268,7 +1332,7 @@ export function App() {
             x: Math.min(rect.left + rect.width / 2, window.innerWidth - 220),
             y: Math.max(12, rect.top - 46),
             pdfContext: filePath ? { path: filePath, page, rects } : undefined,
-            sourceContext: filePath ? { kind: 'pdf', path: filePath, location: `page ${page}` } : undefined,
+            sourceContext: filePath ? { kind: 'pdf', path: filePath, location: `page ${page}`, page, rects } : undefined,
           })
         }}
         onOpenHighlight={openHighlight}
@@ -1314,10 +1378,13 @@ export function App() {
 
       {activeMode === 'chat' && <section className="learning-composer">
         <div className="composer-row">
-          <textarea value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => {
-            if (shouldSubmitFromKey(e)) { e.preventDefault(); submit() }
-          }}/>
-          <button className="primary" onClick={submit}><Send size={18}/>发送</button>
+          <ComposerInput
+            value={input}
+            onChange={setInput}
+            onDraftChange={value => { inputDraftRef.current = value }}
+            onSubmit={submit}
+          />
+          <button className="primary" onClick={() => submit()}><Send size={18}/>发送</button>
           <div className="composer-side-actions">
             <button className="secondary icon-only" onClick={stop} title="停止当前回答"><Square size={16}/></button>
             <ToolsToggleButton
@@ -1395,6 +1462,7 @@ export function App() {
       collapsedMessages={collapsedMessages}
       highlights={highlights}
       onInputChange={(windowId, value) => setWindowInputs(prev => ({ ...prev, [windowId]: value }))}
+      onInputDraftChange={(windowId, value) => { windowInputDraftsRef.current[windowId] = value }}
       onToggleCollapse={(messageId) => setCollapsedMessages(prev => ({ ...prev, [messageId]: !prev[messageId] }))}
       onSend={sendWindowMessage}
       onStop={stopWindow}
@@ -1476,8 +1544,15 @@ function thinkingStats(events: ContextEvent[], running?: boolean): { elapsedSeco
   if (!running) return null
   const lastInputIndex = Math.max(...events.map((event, index) => event.event_type === 'user_input_received' ? index : -1))
   if (lastInputIndex < 0) return { elapsedSeconds: 0, rounds: 0 }
-  const start = events[lastInputIndex]?.created_at || Date.now() / 1000
   const afterInput = events.slice(lastInputIndex)
+  const hasTerminalEvent = afterInput.some(event => {
+    if (event.event_type === 'error') return true
+    if (event.event_type !== 'message_appended') return false
+    const message = event.payload?.message || {}
+    return message.role === 'assistant' && isMeaningfulContent(message.content)
+  })
+  if (hasTerminalEvent) return null
+  const start = events[lastInputIndex]?.created_at || Date.now() / 1000
   return {
     elapsedSeconds: Math.max(0, Math.floor(Date.now() / 1000 - start)),
     rounds: afterInput.filter(event => event.event_type === 'llm_request_snapshot').length,
@@ -1581,6 +1656,38 @@ function ToolsToggleButton({ enabled, disabled, onToggle }: {
     <span>Tools</span>
     <strong>{enabled ? 'On' : 'Off'}</strong>
   </button>
+}
+
+function ComposerInput({ value, onChange, onDraftChange, onSubmit, className }: {
+  value: string
+  onChange: (value: string) => void
+  onDraftChange?: (value: string) => void
+  onSubmit: (value: string) => void
+  className?: string
+}) {
+  const [draft, setDraft] = useState(value)
+  useEffect(() => {
+    setDraft(value)
+    onDraftChange?.(value)
+  }, [value])
+  return <textarea
+    className={className}
+    value={draft}
+    onChange={event => {
+      const next = event.target.value
+      setDraft(next)
+      onDraftChange?.(next)
+    }}
+    onBlur={() => onChange(draft)}
+    onKeyDown={event => {
+      if (shouldSubmitFromKey(event)) {
+        event.preventDefault()
+        const text = draft
+        onChange(text)
+        onSubmit(text)
+      }
+    }}
+  />
 }
 
 function QuestionDialog({ selectedText, value, onChange, onCancel, onSubmit }: {
@@ -2391,6 +2498,7 @@ function FloatingWindows({
   collapsedMessages,
   highlights,
   onInputChange,
+  onInputDraftChange,
   onToggleCollapse,
   onSend,
   onStop,
@@ -2416,8 +2524,9 @@ function FloatingWindows({
   collapsedMessages: Record<string, boolean>
   highlights: Record<string, HighlightRecord>
   onInputChange: (windowId: string, value: string) => void
+  onInputDraftChange: (windowId: string, value: string) => void
   onToggleCollapse: (messageId: string) => void
-  onSend: (windowId: string) => void
+  onSend: (windowId: string, text?: string) => void
   onStop: (windowId: string) => void
   onMinimize: (windowId: string) => void
   onMaximize: (windowId: string) => void
@@ -2470,6 +2579,7 @@ function FloatingWindows({
           if (target.closest('button')) return
           event.preventDefault()
           onRaise(win.id)
+          const windowElement = target.closest<HTMLElement>('.floating-window')
           const startX = event.clientX
           const startY = event.clientY
           const originX = win.x
@@ -2483,11 +2593,15 @@ function FloatingWindows({
             if (frame) return
             frame = window.requestAnimationFrame(() => {
               frame = 0
-              onMove(win.id, latestX, latestY)
+              if (windowElement) {
+                windowElement.style.left = `${latestX}px`
+                windowElement.style.top = `${latestY}px`
+              }
             })
           }
           const handleUp = () => {
             if (frame) window.cancelAnimationFrame(frame)
+            onMove(win.id, latestX, latestY)
             window.removeEventListener('mousemove', handleMove)
             window.removeEventListener('mouseup', handleUp)
           }
@@ -2531,15 +2645,11 @@ function FloatingWindows({
           {session?.running && <div className="thinking-state">{thinkingLabel(eventsByWindow[win.id] || [], session.running)}</div>}
         </div>
         <footer className="window-composer">
-          <textarea
+          <ComposerInput
             value={inputs[win.id] || ''}
-            onChange={e => onInputChange(win.id, e.target.value)}
-            onKeyDown={e => {
-              if (shouldSubmitFromKey(e)) {
-                e.preventDefault()
-                onSend(win.id)
-              }
-            }}
+            onChange={value => onInputChange(win.id, value)}
+            onDraftChange={value => onInputDraftChange(win.id, value)}
+            onSubmit={value => onSend(win.id, value)}
           />
           <button className="primary" onClick={() => onSend(win.id)}><Send size={16}/></button>
           <div className="composer-side-actions">
@@ -2555,6 +2665,7 @@ function FloatingWindows({
           event.preventDefault()
           event.stopPropagation()
           onRaise(win.id)
+          const windowElement = (event.currentTarget as HTMLElement).closest<HTMLElement>('.floating-window')
           const startX = event.clientX
           const startY = event.clientY
           const startWidth = win.width
@@ -2568,11 +2679,15 @@ function FloatingWindows({
             if (frame) return
             frame = window.requestAnimationFrame(() => {
               frame = 0
-              onResize(win.id, latestWidth, latestHeight)
+              if (windowElement) {
+                windowElement.style.width = `${Math.max(360, latestWidth)}px`
+                windowElement.style.height = `${Math.max(330, latestHeight)}px`
+              }
             })
           }
           const handleUp = () => {
             if (frame) window.cancelAnimationFrame(frame)
+            onResize(win.id, latestWidth, latestHeight)
             window.removeEventListener('mousemove', handleMove)
             window.removeEventListener('mouseup', handleUp)
           }
@@ -2582,6 +2697,27 @@ function FloatingWindows({
       </section>
     })}
   </>
+}
+
+function copyTextToClipboard(text: string): void {
+  const value = String(text || '')
+  if (!value) return
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(value).catch(() => fallbackCopyText(value))
+    return
+  }
+  fallbackCopyText(value)
+}
+
+function fallbackCopyText(text: string): void {
+  const textarea = document.createElement('textarea')
+  textarea.value = text
+  textarea.style.position = 'fixed'
+  textarea.style.opacity = '0'
+  document.body.appendChild(textarea)
+  textarea.select()
+  try { document.execCommand('copy') } catch { /* ignore */ }
+  textarea.remove()
 }
 
 function renderContent(value: any): string {
@@ -2651,6 +2787,14 @@ function MessageContent({ sessionId, item, collapsed, highlights, onToggleCollap
       selectionAnchorRef.current = null
     }}
   >
+    {(item.role === 'user' || item.role === 'assistant') && <button
+      className="message-copy-button"
+      title="复制这条消息"
+      onClick={event => {
+        event.stopPropagation()
+        copyTextToClipboard(text)
+      }}
+    ><Copy size={13}/></button>}
     <MarkdownText text={visibleText} chatId={item.id} highlights={highlights} onOpenHighlight={onOpenHighlight}/>
     {canCollapse && <button className="collapse-toggle" onClick={onToggleCollapse}>{collapsed ? `展开全部 ${lines.length} 行` : '折叠到 10 行'}</button>}
   </div>
@@ -2693,8 +2837,9 @@ function renderMarkdownToHtml(text: string, options: {
     html = html.split(`@@RAGENT_MATH_${index}@@`).join(value)
   })
   html = rewriteMarkdownAssetUrls(html, options.basePath || '')
+  html = applyMarkdownHighlights(html, options.chatId, options.highlights)
   html = wrapMarkdownTextTokens(html)
-  return applyMarkdownHighlights(html, options.chatId, options.highlights)
+  return html
 }
 
 function stashMath(items: string[], tex: string, displayMode: boolean): string {

@@ -297,6 +297,10 @@ def test_learning_selection_branch_includes_file_source_context(monkeypatch, tmp
     )
 
     assert result["selection"]["source_context"]["path"] == "outputs/papers/a.pdf"
+    child = service.get_session(result["session_id"])
+    assert child.selection["selected_text"] == "a selected paragraph"
+    assert child.state()["selection"]["source_context"]["location"] == "page 3"
+    assert child.store.metadata["selection"]["source_context"]["path"] == "outputs/papers/a.pdf"
     assert "【来源类型】pdf" in seen[-1]
     assert "【来源文件】outputs/papers/a.pdf" in seen[-1]
     assert "【来源位置】page 3" in seen[-1]
@@ -443,7 +447,9 @@ def test_learning_file_roots_are_account_scoped(monkeypatch, tmp_path):
     assert service.account_roots("a")["nodes"][0]["child_count"] == 1
     assert "last_response" not in service.account_roots("a")["nodes"][0]
     assert "token_usage_breakdown" not in service.account_roots("a")["nodes"][0]
-    assert service.child_nodes(a1.session_id)["nodes"][0]["session_id"] == child["session_id"]
+    child_node = service.child_nodes(a1.session_id)["nodes"][0]
+    assert child_node["session_id"] == child["session_id"]
+    assert child_node["selection"]["selected_text"] == "selection"
 
 
 def test_learning_setback_and_fork_rewrite_context_file(monkeypatch, tmp_path):

@@ -541,9 +541,34 @@ pre {
 }
 
 .message-content {
+  position: relative;
   white-space: normal;
   word-break: break-word;
   user-select: text;
+}
+
+.message-copy-button {
+  position: absolute;
+  top: 0;
+  right: 0;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  color: #516177;
+  background: #f8fafc;
+  border: 1px solid #dce3ec;
+  border-radius: 6px;
+  opacity: .72;
+}
+
+.message-copy-button:hover {
+  opacity: 1;
+  color: #172033;
+  background: #eef2f7;
+}
+
+.message-content .markdown-body {
+  padding-right: 30px;
 }
 
 .message-content.collapsed {

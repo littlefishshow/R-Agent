@@ -17,6 +17,17 @@ export type SessionState = {
   token_usage?: string | number
 }
 
+export type LearningSelectionState = {
+  source_session_id?: string
+  selected_text?: string
+  action?: 'question' | 'translate' | 'explain' | 'summarize' | 'note'
+  action_label?: string
+  custom_question?: string
+  target_language?: string
+  note_text?: string
+  source_context?: Record<string, any>
+}
+
 export type LearningSessionState = SessionState & {
   mode?: 'learning'
   title?: string
@@ -30,6 +41,7 @@ export type LearningSessionState = SessionState & {
   source_message_index?: number | null
   allowed_tools?: string[]
   tools_enabled?: boolean
+  selection?: LearningSelectionState
   send?: any
 }
 

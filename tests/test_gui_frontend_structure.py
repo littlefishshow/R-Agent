@@ -86,8 +86,8 @@ def test_learning_frontend_current_context_nodes_present():
     assert "Tools" in app
     assert "tools_enabled" in api
     assert "/tools" in api
-    assert "文件对话" in app
-    assert "对话" in app
+    assert "文件对话" not in app
+    assert "visibleSessions.map" in app
     assert "child_count" in app
     assert "activeMode" in app
     assert "openFiles" in app
@@ -134,6 +134,8 @@ def test_learning_chat_renders_user_and_assistant_events():
     assert "forkLearningSessionFromMessage" in app
     assert "setbackLearningSession" in app
     assert "MessageContent" in app
+    assert "message-copy-button" in app
+    assert "copyTextToClipboard" in app
     assert "MarkdownText" in app
     assert "MarkdownIt" in app
     assert "renderMarkdownToHtml" in app
@@ -195,6 +197,9 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "normalizeDragRect" in app
     assert "rectsOverlap" in app
     assert "onOpenHighlight={onOpenHighlight}" in app
+    assert "restoreFileHighlights" in app
+    assert "persist_${child.session_id}" in app
+    assert "fetchLearningSession(highlight.sessionId)" in app
     assert "page.words && page.words.length ? page.words : page.lines" in app
     assert "pdfZoom" in app
     assert "pdf-zoom-controls" in app
@@ -265,6 +270,7 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "nwse-resize" in styles
     assert "selection-menu" in styles
     assert "message-actions" in styles
+    assert "message-copy-button" in styles
     assert "message-branch-menu" in styles
     assert "tools-toggle" in app
     assert "tools-toggle" in styles

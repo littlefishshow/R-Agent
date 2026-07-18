@@ -404,6 +404,7 @@ class LearningSession(GuiSession):
         file_path: str = "",
         source_message_index: Optional[int] = None,
         tools_enabled: bool = True,
+        selection: Optional[Dict[str, Any]] = None,
         restore: bool = False,
     ):
         self.title = title or _make_learning_title(root_question)
@@ -415,7 +416,10 @@ class LearningSession(GuiSession):
         self.file_path = str(file_path or "")
         self.source_message_index = source_message_index
         self.tools_enabled = bool(tools_enabled)
+        self.selection = dict(selection or {})
         super().__init__(session_id, store_root=store_root, agent=agent, restore=restore)
+        if not self.selection and isinstance(self.store.metadata.get("selection"), dict):
+            self.selection = dict(self.store.metadata.get("selection") or {})
         self.store.update_metadata({
             "title": self.title,
             "root_question": self.root_question,
@@ -425,6 +429,7 @@ class LearningSession(GuiSession):
             "file_path": self.file_path,
             "source_message_index": self.source_message_index,
             "tools_enabled": self.tools_enabled,
+            "selection": self.selection,
         })
 
     def _build_and_emit_system_prompt(self) -> str:
@@ -551,6 +556,7 @@ class LearningSession(GuiSession):
             "context_path": str(self.store.context_path),
             "allowed_tools": sorted(LEARNING_ALLOWED_TOOLS) if self.tools_enabled else [],
             "tools_enabled": self.tools_enabled,
+            "selection": self.selection,
         })
         return state
 
@@ -628,6 +634,7 @@ class LearningRuntimeService(AgentRuntimeService):
                     file_path=str(metadata.get("file_path") or ""),
                     source_message_index=metadata.get("source_message_index"),
                     tools_enabled=bool(metadata.get("tools_enabled", True)),
+                    selection=metadata.get("selection") if isinstance(metadata.get("selection"), dict) else None,
                     restore=True,
                 )
                 self._hydrate_learning_session_from_events(session)
@@ -661,6 +668,7 @@ class LearningRuntimeService(AgentRuntimeService):
             "file_path": session.file_path,
             "source_message_index": session.source_message_index,
             "tools_enabled": session.tools_enabled,
+            "selection": session.selection,
         })
 
     def cleanup_saved_sessions(self) -> Dict[str, Any]:
@@ -700,6 +708,7 @@ class LearningRuntimeService(AgentRuntimeService):
         file_path: str = "",
         source_message_index: Optional[int] = None,
         tools_enabled: bool = True,
+        selection: Optional[Dict[str, Any]] = None,
         restore: bool = False,
     ) -> LearningSession:
         sid = session_id or new_id("learn")
@@ -718,6 +727,7 @@ class LearningRuntimeService(AgentRuntimeService):
                 file_path=file_path,
                 source_message_index=source_message_index,
                 tools_enabled=tools_enabled,
+                selection=selection,
                 restore=restore,
             )
             self.sessions[sid] = session
@@ -796,6 +806,7 @@ class LearningRuntimeService(AgentRuntimeService):
             "source_message_index": session.source_message_index,
             "context_path": str(session.store.context_path),
             "tools_enabled": session.tools_enabled,
+            "selection": session.selection,
             "child_count": sum(
                 1 for item in self.sessions.values()
                 if getattr(item, "parent_session_id", None) == session.session_id
@@ -985,22 +996,7 @@ class LearningRuntimeService(AgentRuntimeService):
                 f"{context_block}"
                 f"【选中文本】\n{selected_text}"
             )
-        display_title = title or f"{action_label}: {_make_learning_title(selected_text, limit=24)}"
-        session = self.create_session(
-            title=display_title,
-            root_question=selected_text,
-            parent_session_id=source_session_id,
-            account_id=getattr(source, "account_id", "default"),
-            node_kind="selection",
-            file_path=getattr(source, "file_path", ""),
-            tools_enabled=getattr(source, "tools_enabled", True),
-        )
-        if action_key in {"question", "explain", "summarize", "note"}:
-            session.agent.messages = self._copy_parent_context(source_session_id, system_prompt=session.system_prompt)
-        send_result = session.send_message(initial_question, background=background)
-        state = session.state()
-        state["send"] = send_result
-        state["selection"] = {
+        selection_meta = {
             "source_session_id": source_session_id,
             "selected_text": selected_text,
             "action": action_key,
@@ -1010,6 +1006,23 @@ class LearningRuntimeService(AgentRuntimeService):
             "note_text": note_text,
             "source_context": source_context,
         }
+        display_title = title or f"{action_label}: {_make_learning_title(selected_text, limit=24)}"
+        session = self.create_session(
+            title=display_title,
+            root_question=selected_text,
+            parent_session_id=source_session_id,
+            account_id=getattr(source, "account_id", "default"),
+            node_kind="selection",
+            file_path=getattr(source, "file_path", ""),
+            tools_enabled=getattr(source, "tools_enabled", True),
+            selection=selection_meta,
+        )
+        if action_key in {"question", "explain", "summarize", "note"}:
+            session.agent.messages = self._copy_parent_context(source_session_id, system_prompt=session.system_prompt)
+        send_result = session.send_message(initial_question, background=background)
+        state = session.state()
+        state["send"] = send_result
+        state["selection"] = selection_meta
         return state
 
     def save_selection_note(
@@ -1028,6 +1041,15 @@ class LearningRuntimeService(AgentRuntimeService):
         if not note_text:
             raise ValueError("note_text is empty")
         source = self.get_session(source_session_id)
+        source_context = source_context or {}
+        selection_meta = {
+            "source_session_id": source_session_id,
+            "selected_text": selected_text,
+            "action": "note",
+            "action_label": "笔记",
+            "note_text": note_text,
+            "source_context": source_context,
+        }
         session = self.create_session(
             title=title or f"笔记: {_make_learning_title(note_text, limit=18)}",
             root_question=note_text,
@@ -1036,6 +1058,7 @@ class LearningRuntimeService(AgentRuntimeService):
             node_kind="note",
             file_path=getattr(source, "file_path", ""),
             tools_enabled=getattr(source, "tools_enabled", True),
+            selection=selection_meta,
         )
         note_message = (
             "【手写笔记】\n"
@@ -1043,7 +1066,6 @@ class LearningRuntimeService(AgentRuntimeService):
             "【关联选中文本】\n"
             f"{selected_text}"
         )
-        source_context = source_context or {}
         if source_context:
             note_message += "\n\n【来源】\n" + "\n".join(
                 f"{key}: {value}" for key, value in source_context.items() if value
@@ -1052,14 +1074,7 @@ class LearningRuntimeService(AgentRuntimeService):
         session.store.replace_message_events(normalize_messages(session.agent.messages), session_id=session.session_id)
         session.event_bus.events = list(session.store.events)
         state = session.state()
-        state["selection"] = {
-            "source_session_id": source_session_id,
-            "selected_text": selected_text,
-            "action": "note",
-            "action_label": "笔记",
-            "note_text": note_text,
-            "source_context": source_context,
-        }
+        state["selection"] = selection_meta
         return state
 
     def set_tools_enabled(self, session_id: str, enabled: bool) -> Dict[str, Any]:
