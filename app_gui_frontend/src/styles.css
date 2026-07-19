@@ -912,6 +912,13 @@ textarea:focus {
   font-weight: 500;
 }
 
+.file-open svg {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 14px;
+  stroke-width: 2;
+}
+
 .markdown-file-panel {
   min-width: 0;
   min-height: 0;
@@ -1183,6 +1190,7 @@ textarea:focus {
   box-shadow: 0 18px 50px rgba(15, 23, 42, .24);
   overflow: hidden;
   resize: both;
+  will-change: transform, width, height;
 }
 
 .window-dock {

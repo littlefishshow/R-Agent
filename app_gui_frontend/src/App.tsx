@@ -53,6 +53,8 @@ type SelectionMenuState = {
   sourceSessionId: string
   chatId: string
   text: string
+  textOffset?: number
+  occurrence?: number
   x: number
   y: number
   pdfContext?: {
@@ -73,6 +75,8 @@ type HighlightRecord = {
   sourceSessionId: string
   chatId: string
   text: string
+  textOffset?: number
+  occurrence?: number
   action: SelectionAction
   label: string
   color: BranchColor
@@ -149,6 +153,8 @@ type FileContextMenuState = {
 
 type TextSelectionResult = {
   text: string
+  textOffset?: number
+  occurrence?: number
   rect: DOMRect
   range: Range
 }
@@ -186,6 +192,7 @@ export function App() {
   const [events, setEvents] = useState<ContextEvent[]>([])
   const [input, setInput] = useState('')
   const inputDraftRef = useRef('')
+  const [inputResetToken, setInputResetToken] = useState(0)
   const [filter, setFilter] = useState('')
   const [error, setError] = useState<string | null>(null)
   const [selectionMenu, setSelectionMenu] = useState<SelectionMenuState | null>(null)
@@ -200,6 +207,7 @@ export function App() {
   const [windowEvents, setWindowEvents] = useState<Record<string, ContextEvent[]>>({})
   const [windowInputs, setWindowInputs] = useState<Record<string, string>>({})
   const windowInputDraftsRef = useRef<Record<string, string>>({})
+  const [windowInputResetTokens, setWindowInputResetTokens] = useState<Record<string, number>>({})
   const [messageBranchMenus, setMessageBranchMenus] = useState<Record<string, boolean>>({})
   const [collapsedMessages, setCollapsedMessages] = useState<Record<string, boolean>>({})
   const [workspace, setWorkspace] = useState<WorkspaceListing | null>(null)
@@ -240,6 +248,15 @@ export function App() {
   const branchColors = useMemo(() => buildBranchColors(Object.values(sessions)), [sessions])
   const activeFile = activeFilePath ? openFiles[activeFilePath] || null : null
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
+  const openWindowPollKey = useMemo(() => Object.values(windows)
+    .map(win => `${win.id}:${win.sessionId}:${win.minimized ? 'min' : 'open'}`)
+    .sort()
+    .join('|'), [windows])
+  const runningSessionPollKey = useMemo(() => Object.values(sessions)
+    .filter(item => item.running)
+    .map(item => item.session_id)
+    .sort()
+    .join('|'), [sessions])
 
   async function boot() {
     setError(null)
@@ -262,12 +279,14 @@ export function App() {
     if (!session) return
     const timer = window.setInterval(async () => {
       try {
-        await refreshActive(session.session_id)
-        await refreshOpenWindows()
+        if (session.running) await refreshActive(session.session_id)
+        if (Object.values(windows).some(win => !win.minimized && sessions[win.sessionId]?.running)) {
+          await refreshOpenWindows()
+        }
       } catch { /* ignore */ }
     }, 1000)
     return () => window.clearInterval(timer)
-  }, [session?.session_id, Object.keys(windows).join('|')])
+  }, [session?.session_id, session?.running, openWindowPollKey, runningSessionPollKey])
 
   useEffect(() => {
     function clearMenu(event: PointerEvent) {
@@ -304,9 +323,9 @@ export function App() {
         fetchLearningSession(sessionId),
         fetchLearningEvents(sessionId),
       ])
-      setSession(state)
-      setEvents(ev)
-      setSessions(prev => ({ ...prev, [state.session_id]: state }))
+      setSession(prev => prev && sameLearningSession(prev, state) ? prev : state)
+      setEvents(prev => sameEventList(prev, ev) ? prev : ev)
+      setSessions(prev => sameLearningSession(prev[state.session_id], state) ? prev : ({ ...prev, [state.session_id]: state }))
     } catch (err: any) {
       await recoverActiveSession()
     }
@@ -360,14 +379,26 @@ export function App() {
     const valid = updates.filter(item => item && !item.missing && item.state) as Array<{ win: FloatingWindowState, state: LearningSessionState, ev: ContextEvent[] }>
     if (!valid.length) return
     setSessions(prev => {
+      let changed = false
       const next = { ...prev }
-      for (const item of valid) next[item.state.session_id] = item.state
-      return next
+      for (const item of valid) {
+        if (!sameLearningSession(prev[item.state.session_id], item.state)) {
+          next[item.state.session_id] = item.state
+          changed = true
+        }
+      }
+      return changed ? next : prev
     })
     setWindowEvents(prev => {
+      let changed = false
       const next = { ...prev }
-      for (const item of valid) next[item.win.id] = item.ev
-      return next
+      for (const item of valid) {
+        if (!sameEventList(prev[item.win.id] || [], item.ev)) {
+          next[item.win.id] = item.ev
+          changed = true
+        }
+      }
+      return changed ? next : prev
     })
   }
 
@@ -463,6 +494,7 @@ export function App() {
     const text = draft
     inputDraftRef.current = ''
     setInput('')
+    setInputResetToken(prev => prev + 1)
     setError(null)
     try {
       await sendLearningMessage(session.session_id, text)
@@ -558,6 +590,8 @@ export function App() {
       sourceSessionId,
       chatId,
       text: result.text,
+      textOffset: result.textOffset,
+      occurrence: result.occurrence,
       x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
       y: Math.max(12, result.rect.top - 46),
     }, result.range)
@@ -675,6 +709,8 @@ export function App() {
         sourceSessionId,
         chatId: menu.chatId,
         text: menu.text,
+        textOffset: menu.textOffset,
+        occurrence: menu.occurrence,
         action: menu.action,
         label: actionMeta?.label || '提问',
         color,
@@ -765,6 +801,8 @@ export function App() {
           sourceSessionId,
           chatId: action.chatId,
           text: action.text,
+          textOffset: action.textOffset,
+          occurrence: action.occurrence,
           action: 'note',
           label: '笔记',
           color,
@@ -799,6 +837,7 @@ export function App() {
     if (!win || !text) return
     windowInputDraftsRef.current[windowId] = ''
     setWindowInputs(prev => ({ ...prev, [windowId]: '' }))
+    setWindowInputResetTokens(prev => ({ ...prev, [windowId]: (prev[windowId] || 0) + 1 }))
     try {
       await sendLearningMessage(win.sessionId, text)
       const [state, ev] = await Promise.all([
@@ -1023,6 +1062,8 @@ export function App() {
           sourceSessionId: fileRoot.session_id,
           chatId: source.kind === 'markdown' ? `markdown:${path}` : `pdf:${path}:p${source.page || 1}`,
           text: selection.selected_text || '',
+          textOffset: typeof source.text_offset === 'number' ? source.text_offset : undefined,
+          occurrence: typeof source.occurrence === 'number' ? source.occurrence : undefined,
           action: (selection.action as SelectionAction) || 'question',
           label: selection.action_label || '提问',
           color,
@@ -1312,16 +1353,18 @@ export function App() {
             setError(err.message || String(err))
           }
         }}
-        onMarkdownSelection={(text, rect, path, range) => {
-          const location = describeMarkdownSelectionLocation(openFiles[path]?.textContent || '', text)
+        onMarkdownSelection={(result, path) => {
+          const location = describeMarkdownSelectionLocation(openFiles[path]?.textContent || '', result.text)
           showSelectionMenu({
             sourceSessionId: session?.session_id || '',
             chatId: `markdown:${path}`,
-            text,
-            x: Math.min(rect.left + rect.width / 2, window.innerWidth - 220),
-            y: Math.max(12, rect.top - 46),
-            sourceContext: { kind: 'markdown', path, location },
-          }, range)
+            text: result.text,
+            textOffset: result.textOffset,
+            occurrence: result.occurrence,
+            x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
+            y: Math.max(12, result.rect.top - 46),
+            sourceContext: { kind: 'markdown', path, location, text_offset: result.textOffset, occurrence: result.occurrence },
+          }, result.range)
         }}
         onPdfSelection={(text, page, rect, rects) => {
           const filePath = activeFile?.path || ''
@@ -1382,6 +1425,7 @@ export function App() {
             value={input}
             onChange={setInput}
             onDraftChange={value => { inputDraftRef.current = value }}
+            resetSignal={inputResetToken}
             onSubmit={submit}
           />
           <button className="primary" onClick={() => submit()}><Send size={18}/>发送</button>
@@ -1459,6 +1503,7 @@ export function App() {
       sessions={sessions}
       eventsByWindow={windowEvents}
       inputs={windowInputs}
+      inputResetTokens={windowInputResetTokens}
       collapsedMessages={collapsedMessages}
       highlights={highlights}
       onInputChange={(windowId, value) => setWindowInputs(prev => ({ ...prev, [windowId]: value }))}
@@ -1503,6 +1548,66 @@ export function App() {
       }}
     />
   </div>
+}
+
+function sameLearningSession(a?: LearningSessionState, b?: LearningSessionState): boolean {
+  if (!a || !b) return false
+  return a.session_id === b.session_id &&
+    a.model === b.model &&
+    a.running === b.running &&
+    a.event_count === b.event_count &&
+    a.last_error === b.last_error &&
+    a.last_response === b.last_response &&
+    a.token_usage === b.token_usage &&
+    (a as any).last_token_usage === (b as any).last_token_usage &&
+    (a as any).parent_session_token_usage === (b as any).parent_session_token_usage &&
+    (a as any).children_token_usage === (b as any).children_token_usage &&
+    (a as any).total_token_usage_including_children === (b as any).total_token_usage_including_children &&
+    a.title === b.title &&
+    a.root_question === b.root_question &&
+    a.last_question === b.last_question &&
+    a.parent_session_id === b.parent_session_id &&
+    a.account_id === b.account_id &&
+    a.node_kind === b.node_kind &&
+    a.file_path === b.file_path &&
+    a.child_count === b.child_count &&
+    a.source_message_index === b.source_message_index &&
+    a.tools_enabled === b.tools_enabled &&
+    sameStringList(a.allowed_tools, b.allowed_tools) &&
+    sameJsonValue(a.selection, b.selection) &&
+    sameJsonValue((a as any).token_usage_breakdown, (b as any).token_usage_breakdown)
+}
+
+function sameEventList(a: ContextEvent[] = [], b: ContextEvent[] = []): boolean {
+  if (a === b) return true
+  if (a.length !== b.length) return false
+  for (let index = 0; index < a.length; index += 1) {
+    const left = a[index]
+    const right = b[index]
+    if (left.event_id !== right.event_id ||
+      left.event_type !== right.event_type ||
+      left.created_at !== right.created_at ||
+      left.session_id !== right.session_id) {
+      return false
+    }
+  }
+  return true
+}
+
+function sameStringList(a?: string[], b?: string[]): boolean {
+  const left = a || []
+  const right = b || []
+  if (left.length !== right.length) return false
+  return left.every((value, index) => value === right[index])
+}
+
+function sameJsonValue(a: any, b: any): boolean {
+  if (a === b) return true
+  try {
+    return JSON.stringify(a ?? null) === JSON.stringify(b ?? null)
+  } catch {
+    return false
+  }
 }
 
 function buildChatItems(events: ContextEvent[]): ChatItem[] {
@@ -1658,18 +1763,27 @@ function ToolsToggleButton({ enabled, disabled, onToggle }: {
   </button>
 }
 
-function ComposerInput({ value, onChange, onDraftChange, onSubmit, className }: {
+function ComposerInput({ value, onChange, onDraftChange, onSubmit, className, resetSignal = 0 }: {
   value: string
   onChange: (value: string) => void
   onDraftChange?: (value: string) => void
   onSubmit: (value: string) => void
   className?: string
+  resetSignal?: number
 }) {
   const [draft, setDraft] = useState(value)
+  const resetSignalRef = useRef(resetSignal)
   useEffect(() => {
     setDraft(value)
     onDraftChange?.(value)
   }, [value])
+  useEffect(() => {
+    if (resetSignalRef.current === resetSignal) return
+    resetSignalRef.current = resetSignal
+    setDraft('')
+    onDraftChange?.('')
+    onChange('')
+  }, [resetSignal])
   return <textarea
     className={className}
     value={draft}
@@ -1928,7 +2042,7 @@ function MarkdownFileEditor({ tab, highlights, onUpdate, onToggleMode, onSave, o
   onUpdate: (content: string) => void
   onToggleMode: (mode: 'preview' | 'edit') => void
   onSave: () => void
-  onSelection: (text: string, rect: DOMRect, range: Range) => void
+  onSelection: (result: TextSelectionResult) => void
   onOpenHighlight: (highlightId: string) => void
 }) {
   const mode = tab.viewMode || 'preview'
@@ -1962,7 +2076,7 @@ function MarkdownFileEditor({ tab, highlights, onUpdate, onToggleMode, onSave, o
           const selection = window.getSelection()
           selection?.removeAllRanges()
           selection?.addRange(result.range)
-          onSelection(result.text, result.rect, result.range)
+          onSelection(result)
         }}>
           <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
         </div>}
@@ -1983,7 +2097,7 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
   onUpdateMarkdown: (path: string, content: string) => void
   onToggleMarkdownMode: (path: string, mode: 'preview' | 'edit') => void
   onSaveMarkdown: (path: string) => void
-  onMarkdownSelection: (text: string, rect: DOMRect, path: string, range: Range) => void
+  onMarkdownSelection: (result: TextSelectionResult, path: string) => void
   onPdfSelection: (text: string, page: number, rect: DOMRect, rects: PdfSelectionRect[]) => void
   onOpenHighlight: (highlightId: string) => void
 }) {
@@ -2019,7 +2133,7 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
               onUpdate={content => onUpdateMarkdown(activeFile.path, content)}
               onToggleMode={mode => onToggleMarkdownMode(activeFile.path, mode)}
               onSave={() => onSaveMarkdown(activeFile.path)}
-              onSelection={(text, rect, range) => onMarkdownSelection(text, rect, activeFile.path, range)}
+              onSelection={result => onMarkdownSelection(result, activeFile.path)}
               onOpenHighlight={onOpenHighlight}
             />
         : <iframe className="pdf-frame" title={activeFile.name} src={activeFile.url}/>}
@@ -2355,11 +2469,13 @@ function readTextSelectionWithin(container: HTMLElement, anchor?: TextSelectionA
 
 function textSelectionResultFromRange(container: HTMLElement, range: Range): TextSelectionResult | null {
   if (!rangeInsideContainer(container, range)) return null
-  const text = range.toString().trim()
+  const rawText = range.toString()
+  const leadingTrim = rawText.length - rawText.trimStart().length
+  const text = rawText.trim()
   if (text.length < 2) return null
   const rect = range.getBoundingClientRect()
   if (!rect || (rect.width === 0 && rect.height === 0)) return null
-  return { text, rect, range }
+  return { text, rect, range, ...locateSelectionInContainer(container, range, text, leadingTrim) }
 }
 
 function makeTextSelectionAnchor(container: HTMLElement, event: any): TextSelectionAnchor | null {
@@ -2495,6 +2611,7 @@ function FloatingWindows({
   sessions,
   eventsByWindow,
   inputs,
+  inputResetTokens,
   collapsedMessages,
   highlights,
   onInputChange,
@@ -2521,6 +2638,7 @@ function FloatingWindows({
   sessions: Record<string, LearningSessionState>
   eventsByWindow: Record<string, ContextEvent[]>
   inputs: Record<string, string>
+  inputResetTokens: Record<string, number>
   collapsedMessages: Record<string, boolean>
   highlights: Record<string, HighlightRecord>
   onInputChange: (windowId: string, value: string) => void
@@ -2594,13 +2712,13 @@ function FloatingWindows({
             frame = window.requestAnimationFrame(() => {
               frame = 0
               if (windowElement) {
-                windowElement.style.left = `${latestX}px`
-                windowElement.style.top = `${latestY}px`
+                windowElement.style.transform = `translate3d(${latestX - originX}px, ${latestY - originY}px, 0)`
               }
             })
           }
           const handleUp = () => {
             if (frame) window.cancelAnimationFrame(frame)
+            if (windowElement) windowElement.style.transform = ''
             onMove(win.id, latestX, latestY)
             window.removeEventListener('mousemove', handleMove)
             window.removeEventListener('mouseup', handleUp)
@@ -2649,6 +2767,7 @@ function FloatingWindows({
             value={inputs[win.id] || ''}
             onChange={value => onInputChange(win.id, value)}
             onDraftChange={value => onInputDraftChange(win.id, value)}
+            resetSignal={inputResetTokens[win.id] || 0}
             onSubmit={value => onSend(win.id, value)}
           />
           <button className="primary" onClick={() => onSend(win.id)}><Send size={16}/></button>
@@ -2687,6 +2806,10 @@ function FloatingWindows({
           }
           const handleUp = () => {
             if (frame) window.cancelAnimationFrame(frame)
+            if (windowElement) {
+              windowElement.style.width = ''
+              windowElement.style.height = ''
+            }
             onResize(win.id, latestWidth, latestHeight)
             window.removeEventListener('mousemove', handleMove)
             window.removeEventListener('mouseup', handleUp)
@@ -2842,6 +2965,21 @@ function renderMarkdownToHtml(text: string, options: {
   return html
 }
 
+function locateSelectionInContainer(container: HTMLElement, range: Range, selectedText: string, trimOffset = 0): { textOffset?: number, occurrence?: number } {
+  const textNodes = selectableTextNodes(container)
+  const selected = String(selectedText || '').trim()
+  let offset = 0
+  for (const node of textNodes) {
+    if (node === range.startContainer) {
+      const startOffset = Math.max(0, Math.min(range.startOffset, node.textContent?.length || 0))
+      const textOffset = offset + startOffset + trimOffset
+      return { textOffset, occurrence: occurrenceBeforeOffset(textNodes.map(item => item.textContent || '').join(''), selected, textOffset) }
+    }
+    offset += node.textContent?.length || 0
+  }
+  return {}
+}
+
 function stashMath(items: string[], tex: string, displayMode: boolean): string {
   const index = items.length
   try {
@@ -2891,7 +3029,7 @@ function wrapMarkdownTextTokens(html: string): string {
   function visit(node: Node) {
     if (node.nodeType === Node.ELEMENT_NODE) {
       const element = node as HTMLElement
-      if (skipTags.has(element.tagName) || element.classList.contains('katex') || element.closest('.selection-highlight')) return
+      if (skipTags.has(element.tagName) || element.classList.contains('katex')) return
       Array.from(element.childNodes).forEach(visit)
       return
     }
@@ -2918,22 +3056,109 @@ function wrapMarkdownTextTokens(html: string): string {
 }
 
 function applyMarkdownHighlights(html: string, chatId: string, highlights: Record<string, HighlightRecord>): string {
-  let output = html
-  for (const item of Object.values(highlights).filter(entry => entry.chatId === chatId)) {
-    const escapedText = markdownRenderer.utils.escapeHtml(item.text)
-    if (!escapedText || !output.includes(escapedText)) continue
-    const style = [
-      `--branch-bg:${item.color.bg}`,
-      `--branch-border:${item.color.border}`,
-      `--branch-strong:${item.color.strong}`,
-      `--branch-text:${item.color.text}`,
-    ].join(';')
-    output = output.replace(
-      escapedText,
-      `<span class="selection-highlight" data-highlight-id="${markdownRenderer.utils.escapeHtml(item.id)}" style="${style}">${escapedText}</span>`,
-    )
+  const items = Object.values(highlights).filter(entry => entry.chatId === chatId && String(entry.text || '').trim())
+  if (!items.length) return html
+  const parser = new DOMParser()
+  const doc = parser.parseFromString(`<div>${html}</div>`, 'text/html')
+  const root = doc.body.firstElementChild as HTMLElement | null
+  if (!root) return html
+  for (const item of items) {
+    applyHighlightToTextNodes(doc, selectableTextNodes(root), item)
   }
-  return output
+  return root.innerHTML
+}
+
+function selectableTextNodes(root: Node): Text[] {
+  const nodes: Text[] = []
+  const skipTags = new Set(['SCRIPT', 'STYLE', 'CODE', 'PRE', 'KBD', 'SAMP', 'IMG', 'SVG', 'MATH'])
+  function visit(node: Node) {
+    if (node.nodeType === Node.ELEMENT_NODE) {
+      const element = node as HTMLElement
+      if (skipTags.has(element.tagName) || element.classList.contains('katex')) return
+      Array.from(element.childNodes).forEach(visit)
+      return
+    }
+    if (node.nodeType !== Node.TEXT_NODE) return
+    if (node.textContent) nodes.push(node as Text)
+  }
+  visit(root)
+  return nodes
+}
+
+function applyHighlightToTextNodes(doc: Document, textNodes: Text[], item: HighlightRecord): void {
+  const text = String(item.text || '').trim()
+  if (!text) return
+  const fullText = textNodes.map(node => node.textContent || '').join('')
+  let start = typeof item.textOffset === 'number' && item.textOffset >= 0 ? item.textOffset : -1
+  if (start < 0 || fullText.slice(start, start + text.length) !== text) {
+    start = nthIndexOf(fullText, text, item.occurrence || 0)
+  }
+  if (start < 0) start = fullText.indexOf(text)
+  if (start < 0) return
+  wrapTextNodeRange(doc, textNodes, start, start + text.length, item)
+}
+
+function wrapTextNodeRange(doc: Document, textNodes: Text[], start: number, end: number, item: HighlightRecord): void {
+  let cursor = 0
+  const nodes = [...textNodes]
+  for (const node of nodes) {
+    if (!node.parentElement) {
+      cursor += node.textContent?.length || 0
+      continue
+    }
+    const value = node.textContent || ''
+    const nodeStart = cursor
+    const nodeEnd = cursor + value.length
+    cursor = nodeEnd
+    if (end <= nodeStart || start >= nodeEnd) continue
+    if (node.parentElement.closest('.selection-highlight')) continue
+    const from = Math.max(0, start - nodeStart)
+    const to = Math.min(value.length, end - nodeStart)
+    if (from >= to) continue
+    const fragment = doc.createDocumentFragment()
+    if (from > 0) fragment.appendChild(doc.createTextNode(value.slice(0, from)))
+    const span = doc.createElement('span')
+    span.className = 'selection-highlight'
+    span.dataset.highlightId = item.id
+    span.setAttribute('style', highlightStyle(item))
+    span.textContent = value.slice(from, to)
+    fragment.appendChild(span)
+    if (to < value.length) fragment.appendChild(doc.createTextNode(value.slice(to)))
+    node.parentElement.replaceChild(fragment, node)
+  }
+}
+
+function highlightStyle(item: HighlightRecord): string {
+  return [
+    `--branch-bg:${item.color.bg}`,
+    `--branch-border:${item.color.border}`,
+    `--branch-strong:${item.color.strong}`,
+    `--branch-text:${item.color.text}`,
+  ].join(';')
+}
+
+function nthIndexOf(source: string, needle: string, occurrence: number): number {
+  let from = 0
+  let index = -1
+  for (let count = 0; count <= Math.max(0, occurrence); count += 1) {
+    index = source.indexOf(needle, from)
+    if (index < 0) return -1
+    from = index + needle.length
+  }
+  return index
+}
+
+function occurrenceBeforeOffset(source: string, needle: string, offset: number): number {
+  if (!needle || offset <= 0) return 0
+  let count = 0
+  let from = 0
+  while (from < offset) {
+    const index = source.indexOf(needle, from)
+    if (index < 0 || index >= offset) break
+    count += 1
+    from = index + needle.length
+  }
+  return count
 }
 
 function MathFormula({ tex, displayMode = false }: { tex: string, displayMode?: boolean }) {
