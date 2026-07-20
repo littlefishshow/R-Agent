@@ -42,7 +42,7 @@ sleep 1
 echo "🧭 启动 R-Agent Cockpit 前端 http://127.0.0.1:$FRONTEND_PORT"
 (
   cd "$FRONTEND_DIR"
-  VITE_R_AGENT_API_BASE="http://$BACKEND_HOST:$BACKEND_PORT" npm run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT"
+  npm run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT"
 ) &
 FRONTEND_PID=$!
 

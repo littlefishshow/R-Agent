@@ -82,9 +82,9 @@ SELECTION_ACTIONS = {
 
 
 class GuiSession:
-    def __init__(self, session_id: str, *, store_root: str | Path = "outputs/gui_context", agent: Optional[RAgent] = None, restore: bool = False):
+    def __init__(self, session_id: str, *, store_root: str | Path = "outputs/gui_context", agent: Optional[RAgent] = None, restore: bool = False, base_dir: Optional[str | Path] = None):
         self.session_id = session_id
-        self.store = ContextSnapshotStore(Path(store_root) / session_id)
+        self.store = ContextSnapshotStore(Path(base_dir) if base_dir is not None else Path(store_root) / session_id)
         self.event_bus = ContextEventBus(store=self.store, session_id=session_id)
         if restore:
             self.event_bus.events = list(self.store.events)
@@ -137,17 +137,29 @@ class GuiSession:
         return messages
 
     def _expand_restored_message(self, message: Dict[str, Any]) -> Dict[str, Any]:
-        restored = dict(message or {})
-        content = restored.get("content")
-        if isinstance(content, dict):
-            ref = content.get("payload_ref") or {}
+        restored = self._expand_payload_refs(dict(message or {}))
+        for tool_call in restored.get("tool_calls") or []:
+            function = tool_call.get("function") if isinstance(tool_call, dict) else None
+            if not isinstance(function, dict):
+                continue
+            arguments = function.get("arguments")
+            if not isinstance(arguments, str):
+                function["arguments"] = json.dumps(arguments, ensure_ascii=False, default=str)
+        return restored
+
+    def _expand_payload_refs(self, value: Any) -> Any:
+        if isinstance(value, dict):
+            ref = value.get("payload_ref")
             payload_id = ref.get("id") if isinstance(ref, dict) else None
             if payload_id:
                 try:
-                    restored["content"] = self.store.get_payload(payload_id)
+                    return self.store.get_payload(payload_id)
                 except Exception:
-                    restored["content"] = ref.get("preview", "")
-        return restored
+                    return ref.get("preview", "")
+            return {key: self._expand_payload_refs(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._expand_payload_refs(item) for item in value]
+        return value
 
     def _build_and_emit_system_prompt(self) -> str:
         base_prompt = build_system_prompt() + SELF_EVOLUTION_PROMPT
@@ -375,7 +387,7 @@ class GuiSession:
             "session_id": self.session_id,
             "model": self.agent.model,
             "running": self.running,
-            "event_count": len(self.event_bus.events),
+            "event_count": self.store.event_count(),
             "last_response": self.last_response,
             "last_error": self.last_error,
             # Backward compatible fields: token_usage remains the parent Agent session total.
@@ -406,6 +418,7 @@ class LearningSession(GuiSession):
         tools_enabled: bool = True,
         selection: Optional[Dict[str, Any]] = None,
         restore: bool = False,
+        base_dir: Optional[str | Path] = None,
     ):
         self.title = title or _make_learning_title(root_question)
         self.root_question = root_question
@@ -417,7 +430,7 @@ class LearningSession(GuiSession):
         self.source_message_index = source_message_index
         self.tools_enabled = bool(tools_enabled)
         self.selection = dict(selection or {})
-        super().__init__(session_id, store_root=store_root, agent=agent, restore=restore)
+        super().__init__(session_id, store_root=store_root, agent=agent, restore=restore, base_dir=base_dir)
         if not self.selection and isinstance(self.store.metadata.get("selection"), dict):
             self.selection = dict(self.store.metadata.get("selection") or {})
         self.store.update_metadata({
@@ -602,12 +615,63 @@ class AgentRuntimeService:
 
 
 class LearningRuntimeService(AgentRuntimeService):
+    # Children live physically under their parent so on-disk layout mirrors the
+    # conversation tree: <root>/<id>/children/<child_id>/children/<grandchild>/...
+    CHILDREN_DIRNAME = "children"
+
     def __init__(self, *, store_root: str | Path = "outputs/learning_context", max_saved_sessions: int = 200, max_session_age_hours: float = 0.0):
         super().__init__(store_root=store_root)
         self.max_saved_sessions = max(1, int(max_saved_sessions))
         self.max_session_age_hours = max(0.0, float(max_session_age_hours))
+        # session_id -> on-disk directory (Path). Authoritative location map so
+        # children can be created/deleted relative to their parent's folder.
+        self._dirs: Dict[str, Path] = {}
+        self._archive_legacy_flat_store()
         self.cleanup_saved_sessions()
         self.restore_saved_sessions()
+
+    def _archive_legacy_flat_store(self) -> None:
+        """One-time: move a pre-nesting flat store aside so we start fresh.
+
+        Legacy layout kept every session as a flat sibling under store_root with
+        parent/child only in metadata. The nested layout is incompatible, so we
+        rename the old tree to a timestamped ``.flat.bak-*`` sibling instead of
+        deleting it (data is preserved, just not shown).
+        """
+        root = Path(self.store_root)
+        if not root.exists():
+            return
+        session_dirs = [p for p in root.iterdir() if p.is_dir() and (p / "context.json").exists()]
+        if not session_dirs:
+            return
+        # A dir is a "child" in the new layout only if it sits under a
+        # ``children/`` folder. If none do but parent_session_id links exist,
+        # this is the legacy flat store.
+        looks_nested = any(p.parent.name == self.CHILDREN_DIRNAME for p in root.rglob("context.json"))
+        if looks_nested:
+            return
+        has_parent_links = False
+        for p in session_dirs:
+            try:
+                data = json.loads((p / "context.json").read_text(encoding="utf-8"))
+                if (data.get("metadata") or {}).get("parent_session_id"):
+                    has_parent_links = True
+                    break
+            except Exception:
+                continue
+        if not has_parent_links:
+            return
+        backup = root.with_name(f"{root.name}.flat.bak-{int(time.time())}")
+        try:
+            root.rename(backup)
+        except OSError:
+            return
+
+    def _session_dir(self, session_id: str, parent_session_id: Optional[str]) -> Path:
+        """Resolve the on-disk directory for a session given its parent."""
+        if parent_session_id and parent_session_id in self._dirs:
+            return self._dirs[parent_session_id] / self.CHILDREN_DIRNAME / session_id
+        return Path(self.store_root) / session_id
 
     def restore_saved_sessions(self) -> Dict[str, Any]:
         root = Path(self.store_root)
@@ -615,20 +679,39 @@ class LearningRuntimeService(AgentRuntimeService):
             return {"restored": []}
         restored = []
         errors = []
-        for context_path in sorted(root.glob("*/context.json"), key=lambda item: item.stat().st_mtime if item.exists() else 0):
+        # Read every context.json (at any depth), then instantiate parents
+        # before children so nested base_dirs resolve through self._dirs.
+        discovered = []
+        for context_path in root.rglob("context.json"):
             session_dir = context_path.parent
-            sid = session_dir.name
-            if sid in self.sessions:
+            if session_dir.name == self.CHILDREN_DIRNAME:
                 continue
+            sid = session_dir.name
             try:
-                store = ContextSnapshotStore(session_dir)
-                metadata = dict(store.metadata or {})
+                data = json.loads(context_path.read_text(encoding="utf-8"))
+                metadata = dict(data.get("metadata") or {})
+            except Exception as exc:
+                errors.append({"session_id": sid, "error": str(exc)})
+                continue
+            discovered.append((sid, session_dir, metadata))
+
+        pending = {sid: (session_dir, metadata) for sid, session_dir, metadata in discovered}
+
+        def _restore_one(sid: str) -> None:
+            if sid in self.sessions or sid not in pending:
+                return
+            session_dir, metadata = pending[sid]
+            parent_id = metadata.get("parent_session_id")
+            if parent_id and parent_id in pending and parent_id not in self.sessions:
+                _restore_one(parent_id)
+            try:
                 session = LearningSession(
                     sid,
                     store_root=self.store_root,
+                    base_dir=session_dir,
                     title=str(metadata.get("title") or ""),
                     root_question=str(metadata.get("root_question") or ""),
-                    parent_session_id=metadata.get("parent_session_id"),
+                    parent_session_id=parent_id,
                     account_id=str(metadata.get("account_id") or "default"),
                     node_kind=str(metadata.get("node_kind") or "chat"),
                     file_path=str(metadata.get("file_path") or ""),
@@ -639,10 +722,16 @@ class LearningRuntimeService(AgentRuntimeService):
                 )
                 self._hydrate_learning_session_from_events(session)
                 self.sessions[sid] = session
+                self._dirs[sid] = Path(session_dir)
                 restored.append(sid)
             except Exception as exc:
                 errors.append({"session_id": sid, "error": str(exc)})
-                continue
+
+        for sid, _dir, _meta in sorted(
+            discovered,
+            key=lambda item: item[1].stat().st_mtime if item[1].exists() else 0,
+        ):
+            _restore_one(sid)
         return {"restored": restored, "errors": errors}
 
     def _hydrate_learning_session_from_events(self, session: LearningSession) -> None:
@@ -672,14 +761,22 @@ class LearningRuntimeService(AgentRuntimeService):
         })
 
     def cleanup_saved_sessions(self) -> Dict[str, Any]:
+        """Age/count-based cleanup that only ever removes whole root subtrees.
+
+        Operating on top-level root dirs keeps nested children with their parent
+        (removing a root removes its whole subtree folder in one rmtree).
+        """
         root = Path(self.store_root)
         if not root.exists():
             return {"deleted": []}
         now = time.time()
-        dirs = [path for path in root.iterdir() if path.is_dir()]
+        root_dirs = [
+            path for path in root.iterdir()
+            if path.is_dir() and path.name != self.CHILDREN_DIRNAME and (path / "context.json").exists()
+        ]
         deleted = []
         retained = []
-        for path in dirs:
+        for path in root_dirs:
             try:
                 age_hours = (now - path.stat().st_mtime) / 3600.0
             except OSError:
@@ -715,9 +812,11 @@ class LearningRuntimeService(AgentRuntimeService):
         with self._lock:
             if sid in self.sessions:
                 raise ValueError(f"session already exists: {sid}")
+            base_dir = self._session_dir(sid, parent_session_id)
             session = LearningSession(
                 sid,
                 store_root=self.store_root,
+                base_dir=base_dir,
                 agent=agent,
                 title=title,
                 root_question=root_question,
@@ -731,6 +830,7 @@ class LearningRuntimeService(AgentRuntimeService):
                 restore=restore,
             )
             self.sessions[sid] = session
+            self._dirs[sid] = Path(base_dir)
             return session
 
     def list_sessions(self, account_id: Optional[str] = None) -> Dict[str, Any]:
@@ -794,7 +894,7 @@ class LearningRuntimeService(AgentRuntimeService):
             "session_id": session.session_id,
             "model": session.agent.model,
             "running": session.running,
-            "event_count": len(session.event_bus.events),
+            "event_count": session.store.event_count(),
             "mode": "learning",
             "title": session.title,
             "root_question": session.root_question,
@@ -830,13 +930,30 @@ class LearningRuntimeService(AgentRuntimeService):
         if normalized.get("role") != "user":
             raise ValueError("setback target must be a user message")
         draft = normalized.get("content") or ""
+        # Any branch/fork/selection/note child anchored at or after the
+        # truncation point loses its anchor; delete those subtrees so the tree
+        # and on-disk folders stay consistent with the shortened context.
+        orphaned = [
+            child.session_id
+            for child in list(self.sessions.values())
+            if getattr(child, "parent_session_id", None) == session_id
+            and isinstance(getattr(child, "source_message_index", None), int)
+            and child.source_message_index >= index
+        ]
+        deleted: list[str] = []
+        for child_id in orphaned:
+            if child_id in self.sessions:
+                try:
+                    deleted.extend(self.delete_subtree(child_id).get("deleted", []))
+                except KeyError:
+                    pass
         session.agent.messages = list(session.agent.messages[:index])
         self._truncate_store_from_message_index(session, index)
         session.store.replace_message_events(normalize_messages(session.agent.messages), session_id=session.session_id)
         session.event_bus.events = list(session.store.events)
         session.last_response = None
         session.last_question = ""
-        return {"session": session.state(), "draft": draft}
+        return {"session": session.state(), "draft": draft, "deleted": deleted}
 
     def fork_from_message(self, session_id: str, message_index: int) -> Dict[str, Any]:
         parent = self.get_session(session_id)
@@ -1014,6 +1131,7 @@ class LearningRuntimeService(AgentRuntimeService):
             account_id=getattr(source, "account_id", "default"),
             node_kind="selection",
             file_path=getattr(source, "file_path", ""),
+            source_message_index=len(source.agent.messages),
             tools_enabled=getattr(source, "tools_enabled", True),
             selection=selection_meta,
         )
@@ -1057,6 +1175,7 @@ class LearningRuntimeService(AgentRuntimeService):
             account_id=getattr(source, "account_id", "default"),
             node_kind="note",
             file_path=getattr(source, "file_path", ""),
+            source_message_index=len(source.agent.messages),
             tools_enabled=getattr(source, "tools_enabled", True),
             selection=selection_meta,
         )
@@ -1098,20 +1217,26 @@ class LearningRuntimeService(AgentRuntimeService):
     def delete_subtree(self, session_id: str) -> Dict[str, Any]:
         ids = [session_id] + self.descendant_session_ids(session_id)
         deleted = []
+        # Children are nested under the root's folder, so removing the root
+        # directory removes the whole subtree in one shot; capture it first.
+        root_session = self.sessions.get(session_id)
+        root_dir = root_session.store.base_dir if root_session is not None else self._dirs.get(session_id)
         with self._lock:
             for sid in ids:
                 session = self.sessions.pop(sid, None)
+                self._dirs.pop(sid, None)
                 if session is None:
                     continue
                 try:
                     session.shutdown(join_timeout=0.2)
                 except Exception:
                     pass
+                deleted.append(sid)
+            if root_dir is not None:
                 try:
-                    shutil.rmtree(session.store.base_dir, ignore_errors=True)
+                    shutil.rmtree(root_dir, ignore_errors=True)
                 except Exception:
                     pass
-                deleted.append(sid)
         if not deleted:
             raise KeyError(f"session not found: {session_id}")
         return {"deleted": deleted}

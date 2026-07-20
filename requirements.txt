@@ -6,7 +6,9 @@ PyNaCl>=1.5.0
 # /bbb 终端语音输入录音后端；系统也可用 sox/rec/arecord/ffmpeg 替代
 sounddevice>=0.4.6
 
+# 可视化 Cockpit（app_gui + scripts/start_cockpit.sh）：FastAPI 后端、PDF 渲染、图片处理
 fastapi>=0.110.0
 uvicorn>=0.29.0
+websockets>=12.0
 pymupdf>=1.26.0
 pillow>=10.0.0

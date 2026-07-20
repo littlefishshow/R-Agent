@@ -10,6 +10,8 @@ R-Agent 不是只会聊天的问答壳子。它更像一个“可控的研究助
   <b>Research Scout</b> · <b>Paper Reader</b> · <b>Repo Reader</b> · <b>AutoResearch</b> · <b>Tool-using Local Agent</b>
 </p>
 
+> **想直接用可视化界面？** 装好依赖并配置 `.env` 后，在项目根目录运行 `bash scripts/start_cockpit.sh`，浏览器打开 **http://127.0.0.1:5173** 即可使用可视化 Cockpit（学习型对话 / 论文与 Markdown 阅读 / 上下文分支）。停止用 `bash scripts/stop_cockpit.sh`。详见 [1.4 启动可视化 Cockpit](#14-启动可视化-cockpit可选)。
+
 ---
 
 ## 目录
@@ -44,7 +46,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> `requirements.txt` 当前包含 OpenAI SDK、Rich、python-dotenv、pytest、FastAPI/Uvicorn、语音输入相关依赖等。
+> `requirements.txt` 当前包含 OpenAI SDK、Rich、python-dotenv、pytest、语音输入相关依赖，以及可视化 Cockpit 所需的 FastAPI / Uvicorn / websockets / PyMuPDF / Pillow。
 
 ### 1.2 配置 `.env`
 
@@ -102,7 +104,15 @@ python main.py
 
 ### 1.4 启动可视化 Cockpit（可选）
 
-R-Agent 也提供浏览器版可视化 Cockpit，用于在本地管理学习型对话、论文文件、Markdown 笔记和上下文分支：
+R-Agent 也提供浏览器版可视化 Cockpit，用于在本地管理学习型对话、论文文件、Markdown 笔记和上下文分支。
+
+前置条件：
+
+- 已执行 `pip install -r requirements.txt`（含 FastAPI / Uvicorn / websockets / PyMuPDF / Pillow）；
+- 已安装 Node.js 18+ 与 npm（前端基于 Vite，首次启动脚本会自动执行 `npm install`）；
+- 已按 [1.2](#12-配置-env) 配置好 `.env`。
+
+启动：
 
 ```bash
 bash scripts/start_cockpit.sh
@@ -110,8 +120,14 @@ bash scripts/start_cockpit.sh
 
 默认入口：
 
+- 前端页面：`http://127.0.0.1:5173`（在浏览器打开这个即可）
 - 后端 API：`http://127.0.0.1:8765`
-- 前端页面：`http://127.0.0.1:5173`
+
+停止（关闭前后端并释放端口）：
+
+```bash
+bash scripts/stop_cockpit.sh
+```
 
 可选端口：
 

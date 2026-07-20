@@ -63,10 +63,17 @@ def _render_rect(page, rect, output_path: Path, dpi: int):
 
 
 def _is_caption_text(text: str, include_tables: bool = True) -> bool:
-    pattern = r"^\s*(Figure|Fig\.?|Table)\s*\d+\s*(?:[:.|]|—|-)"
-    if not include_tables:
-        pattern = r"^\s*(Figure|Fig\.?)\s*\d+\s*(?:[:.|]|—|-)"
-    return bool(re.search(pattern, text or "", re.IGNORECASE))
+    txt = text or ""
+    # Figure/Table captions in papers normally have a delimiter after the number
+    # (":", ".", "|", dash).  Keep that requirement to avoid false positives
+    # such as body prose beginning with "Table 4 summarizes ...".  Algorithm
+    # captions, however, often appear as title lines like "Algorithm 1 SWITCH"
+    # without a delimiter; accept those compact title lines explicitly.
+    visual = r"^\s*(Figure|Fig\.?|Table)\s*\d+\s*(?:[:.|]|—|-)"
+    figure_only = r"^\s*(Figure|Fig\.?)\s*\d+\s*(?:[:.|]|—|-)"
+    algorithm = r"^\s*Algorithm\s*\d+\b(?:\s*[:.|—-]|\s+[A-Z][A-Za-z0-9_-]*(?:\s+[A-Z][A-Za-z0-9_-]*){0,8})?\s*$"
+    pattern = visual if include_tables else figure_only
+    return bool(re.search(pattern, txt, re.IGNORECASE) or re.search(algorithm, txt))
 
 
 def _looks_like_body_paragraph(text: str, bbox) -> bool:
@@ -179,6 +186,88 @@ def _candidate_table_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, directi
 
 
 
+
+
+def _candidate_algorithm_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction: str, margin: float = 8.0):
+    """Crop Algorithm/pseudocode blocks anchored by an Algorithm caption/title.
+
+    Algorithm captions commonly appear above the pseudocode (e.g. "Algorithm 1
+    SWITCH") and are exposed as text, not raster images.  Treat the following
+    compact text blocks as algorithm content until the next caption, section
+    heading, normal prose block, or a large vertical gap.
+    """
+    cx0, cy0, cx1, cy1 = map(float, cap_bbox)
+    cap_rect = fitz.Rect(cx0, cy0, cx1, cy1)
+    # If the global caption window failed to infer two columns, restrict
+    # algorithms to the caption side of the page; otherwise right-column prose
+    # at the same vertical band can be swallowed before the left-column section
+    # heading is reached.
+    page_mid = float(page.rect.width) / 2.0
+    cap_center = (cx0 + cx1) / 2.0
+    local_wx0, local_wx1 = wx0, wx1
+    if (wx1 - wx0) > float(page.rect.width) * 0.72:
+        if cap_center < page_mid:
+            local_wx1 = page_mid - margin
+        else:
+            local_wx0 = page_mid + margin
+    blocks = []
+    for b in _text_blocks(page):
+        bx0, by0, bx1, by1 = map(float, b["bbox"])
+        center = (bx0 + bx1) / 2.0
+        if center < local_wx0 - margin or center > local_wx1 + margin:
+            continue
+        if _horizontal_overlap_ratio((bx0, by0, bx1, by1), (local_wx0, 0, local_wx1, page.rect.height)) < 0.15:
+            continue
+        blocks.append(b)
+    blocks.sort(key=lambda b: (float(b["bbox"][1]), float(b["bbox"][0])))
+
+    selected = []
+    if direction == "below":
+        last_y = cy1
+        for b in blocks:
+            bx0, by0, bx1, by1 = map(float, b["bbox"])
+            if by1 <= cy1 + 1:
+                continue
+            gap = by0 - last_y
+            if gap > 36:
+                break
+            txt = b["text"].strip()
+            if _is_caption_text(txt, include_tables=True):
+                break
+            # Stop at numbered section headings such as "3 Experiments".
+            if re.match(r"^\d+\.?\s+[A-Z][A-Za-z]", txt):
+                break
+            # Stop at long normal prose, but allow compact pseudocode lines with
+            # assignment arrows, variables, math symbols, or indentation.
+            algorithmish = bool(re.search(r"←|∼|∥|∇|θ|τ|λ|EOS|Input:|Output:|for |while |if |else|end ", txt))
+            if _looks_like_body_paragraph(txt, b["bbox"]) and not algorithmish:
+                break
+            selected.append(b)
+            last_y = max(last_y, by1)
+    else:
+        last_y = cy0
+        for b in reversed(blocks):
+            bx0, by0, bx1, by1 = map(float, b["bbox"])
+            if by0 >= cy0 - 1:
+                continue
+            gap = last_y - by1
+            if gap > 36:
+                break
+            txt = b["text"].strip()
+            if _is_caption_text(txt, include_tables=True) or re.match(r"^\d+\.?\s+[A-Z][A-Za-z]", txt):
+                break
+            algorithmish = bool(re.search(r"←|∼|∥|∇|θ|τ|λ|EOS|Input:|Output:|for |while |if |else|end ", txt))
+            if _looks_like_body_paragraph(txt, b["bbox"]) and not algorithmish:
+                break
+            selected.append(b)
+            last_y = min(last_y, by0)
+    if not selected:
+        return None
+    rect = cap_rect
+    for b in selected:
+        rect = rect | fitz.Rect(*map(float, b["bbox"]))
+    return (rect + (-margin, -margin, margin, margin)) & page.rect
+
 def _candidate_figure_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction: str, margin: float = 8.0):
     """Tight crop for vector/text figures adjacent to a caption.
 
@@ -218,8 +307,14 @@ def _candidate_figure_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direct
             if gap > 52:
                 break
             txt = b["text"]
-            if _is_caption_text(txt, include_tables=True) or _looks_like_body_paragraph(txt, b["bbox"]):
+            if _is_caption_text(txt, include_tables=True):
                 break
+            if _looks_like_body_paragraph(txt, b["bbox"]):
+                # Vector figures may contain long example sentences inside the
+                # diagram. If nearby labels have already been attached and the
+                # gap is small, keep walking to avoid cutting off the top half.
+                if not selected or gap > 28:
+                    break
             selected.append(b)
             last_y = min(last_y, by0)
     else:
@@ -232,8 +327,11 @@ def _candidate_figure_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direct
             if gap > 52:
                 break
             txt = b["text"]
-            if _is_caption_text(txt, include_tables=True) or _looks_like_body_paragraph(txt, b["bbox"]):
+            if _is_caption_text(txt, include_tables=True):
                 break
+            if _looks_like_body_paragraph(txt, b["bbox"]):
+                if not selected or gap > 28:
+                    break
             selected.append(b)
             last_y = max(last_y, by1)
     if not selected:
@@ -262,7 +360,11 @@ def _caption_blocks(page, include_tables: bool = True):
 
 
 def _caption_kind(text: str) -> str:
-    return "table" if re.search(r"^\s*Table\b", text, re.I) else "figure"
+    if re.search(r"^\s*Table\b", text, re.I):
+        return "table"
+    if re.search(r"^\s*Algorithm\b", text, re.I):
+        return "algorithm"
+    return "figure"
 
 
 
@@ -389,6 +491,15 @@ def _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, direction: str,
                 rect = rect | fitz.Rect(*ib)
             return (rect + (-margin, -margin, margin, margin)) & page.rect
         text_rect = _candidate_figure_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction, margin=margin)
+        if text_rect is not None:
+            # Some vector figures contain prose-like labels (e.g. long example
+            # sentences) that _looks_like_body_paragraph may treat as a separator,
+            # producing only the lower half.  If the semantic candidate is short,
+            # compare it with row-projection below instead of returning early.
+            if float(text_rect.height) >= 150:
+                return text_rect
+    if kind == "algorithm":
+        text_rect = _candidate_algorithm_rect_by_text_blocks(fitz, page, cap_bbox, wx0, wx1, direction, margin=margin)
         if text_rect is not None:
             return text_rect
     if kind == "table":
@@ -716,8 +827,9 @@ def _smart_caption_rect(fitz, page, cap, all_caps=None, margin: float = 8.0, con
     x0, y0, x1, y1 = map(float, cap["bbox"])
     wx0, wx1 = _caption_window_x(page, cap, all_caps, margin=margin)
     kind = _caption_kind(cap.get("text", ""))
-    # Default conventions: figures usually have captions below; tables often captions above.
-    preferred = "below" if kind == "table" else "above"
+    # Default conventions: figures usually have captions below; tables and
+    # algorithms often have captions/titles above.
+    preferred = "below" if kind in {"table", "algorithm"} else "above"
     alternate = "above" if preferred == "below" else "below"
     cap_bbox = (x0, y0, x1, y1)
     pref_rect = _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, preferred, margin=margin, kind=kind)
@@ -725,6 +837,9 @@ def _smart_caption_rect(fitz, page, cap, all_caps=None, margin: float = 8.0, con
 
     # Direction sanity check: if preferred side contains almost no object besides caption,
     # try the other side and choose it when it has much more plausible adjacent content.
+    if kind == "algorithm":
+        return pref_rect
+
     alt_rect = _candidate_rect_by_direction(fitz, page, cap_bbox, wx0, wx1, alternate, margin=margin, kind=kind)
     alt_rect = _clip_rect_to_caption_column(fitz, page, alt_rect, cap, margin=margin, kind=kind)
     cap_h = max(1.0, y1 - y0)
@@ -883,7 +998,7 @@ def pdf_snapshot_tool(
                             min(h, y1 + h * float(caption_below_ratio)),
                         ) & page.rect
                     label_text = cap["text"][:60]
-                    m = re.search(r"(Figure|Fig\.?|Table)\s*(\d+)", cap["text"], re.IGNORECASE)
+                    m = re.search(r"(Figure|Fig\.?|Table|Algorithm)\s*(\d+)", cap["text"], re.IGNORECASE)
                     base = f"p{pi+1:03d}_{m.group(1).lower().replace('.', '')}_{m.group(2)}" if m else f"p{pi+1:03d}_visual_{ci:02d}"
                     label = _safe_slug(f"{base}_{ci:02d}")
                     fn = f"{pdf.stem}_{label}.png"

@@ -1,6 +1,7 @@
 import json
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -200,6 +201,125 @@ def test_learning_runtime_restores_saved_sessions(monkeypatch, tmp_path):
     assert any(message.get("content") == "restored answer" for message in restored.agent.messages)
     assert len(restored.store.events) == before_events
     assert restored.event_bus.events == restored.store.events
+
+
+def test_learning_runtime_restores_payload_refs_inside_tool_calls(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path)
+    session = service.create_session(session_id="saved-tool-call", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    ref = session.store.put_payload(json.dumps({"path": "README.md"}, ensure_ascii=False))
+    message = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call_read_file",
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "arguments": {"payload_ref": ref.to_dict()},
+            },
+        }],
+    }
+    session.store.append_event({
+        "event_type": "message_appended",
+        "payload": {"message": message, "message_index": 0},
+    })
+
+    restored_service = LearningRuntimeService(store_root=tmp_path)
+    restored = restored_service.get_session("saved-tool-call")
+    arguments = restored.agent.messages[0]["tool_calls"][0]["function"]["arguments"]
+
+    assert isinstance(arguments, str)
+    assert json.loads(arguments) == {"path": "README.md"}
+
+
+def test_learning_runtime_nests_children_on_disk(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path)
+    root = service.create_session(session_id="root1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    child = service.create_session(
+        session_id="child1",
+        parent_session_id="root1",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+    grandchild = service.create_session(
+        session_id="grand1",
+        parent_session_id="child1",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+
+    assert Path(root.store.base_dir) == Path(tmp_path) / "root1"
+    assert Path(child.store.base_dir) == Path(tmp_path) / "root1" / "children" / "child1"
+    assert Path(grandchild.store.base_dir) == Path(tmp_path) / "root1" / "children" / "child1" / "children" / "grand1"
+    assert (Path(grandchild.store.base_dir) / "context.json").exists()
+
+
+def test_learning_runtime_restores_nested_tree(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path)
+    service.create_session(session_id="root1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    service.create_session(session_id="child1", parent_session_id="root1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    service.create_session(session_id="grand1", parent_session_id="child1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+
+    restored = LearningRuntimeService(store_root=tmp_path)
+    assert set(["root1", "child1", "grand1"]).issubset(set(restored.sessions))
+    assert restored.get_session("child1").parent_session_id == "root1"
+    assert restored.get_session("grand1").parent_session_id == "child1"
+    # Nested base_dir must be reconstructed under the parent, not flattened.
+    assert Path(restored.get_session("grand1").store.base_dir) == Path(tmp_path) / "root1" / "children" / "child1" / "children" / "grand1"
+
+
+def test_delete_subtree_removes_nested_folders(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path)
+    root = service.create_session(session_id="root1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    service.create_session(session_id="child1", parent_session_id="root1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    root_dir = Path(root.store.base_dir)
+    assert root_dir.exists()
+
+    result = service.delete_subtree("root1")
+    assert set(result["deleted"]) == {"root1", "child1"}
+    assert not root_dir.exists()
+    assert "child1" not in service.sessions
+
+
+def test_setback_prunes_children_anchored_after_index(monkeypatch, tmp_path):
+    def fake_run(self, user_message, **kwargs):
+        event_sink = kwargs.get("event_sink")
+        for message in [
+            {"role": "user", "content": user_message},
+            {"role": "assistant", "content": "answer"},
+        ]:
+            self.messages.append(message)
+            if event_sink is not None:
+                event_sink.emit("message_appended", {"message": message, "message_index": len(self.messages) - 1})
+        return "answer"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path)
+    parent = service.create_session(session_id="parent1", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    parent.send_message("第一个问题", background=False)  # messages: system, user, assistant
+    # A selection branch created now anchors at the current message count.
+    branch = service.branch_from_selection(
+        "parent1",
+        selected_text="重点",
+        action="explain",
+        source_context={"kind": "chat"},
+        background=False,
+    )
+    branch_id = branch["session_id"]
+    assert branch_id in service.sessions
+    branch_dir = Path(service.get_session(branch_id).store.base_dir)
+    assert branch_dir.exists()
+
+    # Find the first user message index and set back to it (before the branch anchor).
+    user_index = next(i for i, m in enumerate(parent.agent.messages) if m.get("role") == "user")
+    result = service.setback_to_message("parent1", user_index)
+
+    assert branch_id in result["deleted"]
+    assert branch_id not in service.sessions
+    assert not branch_dir.exists()
 
 
 def test_learning_runtime_can_disable_tool_context(monkeypatch, tmp_path):
@@ -468,14 +588,19 @@ def test_learning_setback_and_fork_rewrite_context_file(monkeypatch, tmp_path):
     )
 
     forked = service.fork_from_message("rewrite", 3)
-    setback = service.setback_to_message("rewrite", 3)
-
     child = service.get_session(forked["session"]["session_id"])
     assert forked["draft"] == "second"
     assert [m["content"] for m in child.agent.messages] == ["sys", "first", "answer"]
+
+    setback = service.setback_to_message("rewrite", 3)
     assert setback["draft"] == "second"
     assert [m["content"] for m in session.agent.messages] == ["sys", "first", "answer"]
     assert "second" not in session.store.context_path.read_text(encoding="utf-8")
+    # The fork was anchored at message index 3; setting the parent back to
+    # index 3 removes that anchor, so the orphaned branch is pruned.
+    assert forked["session"]["session_id"] in setback["deleted"]
+    with pytest.raises(KeyError):
+        service.get_session(forked["session"]["session_id"])
 
 
 def test_learning_branch_validates_before_creating_child(monkeypatch, tmp_path):
@@ -517,11 +642,17 @@ def test_learning_delete_subtree_removes_descendants(monkeypatch, tmp_path):
 def test_learning_runtime_cleanup_saved_sessions(monkeypatch, tmp_path):
     monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
     root = tmp_path / "learn"
+    import os
     for index in range(4):
         session_dir = root / f"old-{index}"
         session_dir.mkdir(parents=True)
+        # A real session dir must carry a context.json to be counted/cleaned.
+        (session_dir / "context.json").write_text(
+            json.dumps({"version": 1, "metadata": {}, "events": [], "payloads": {}}),
+            encoding="utf-8",
+        )
         mtime = time.time() - (index + 1) * 100
-        import os
+        os.utime(session_dir / "context.json", (mtime, mtime))
         os.utime(session_dir, (mtime, mtime))
 
     service = LearningRuntimeService(store_root=root, max_saved_sessions=2, max_session_age_hours=0)

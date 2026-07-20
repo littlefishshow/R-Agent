@@ -95,7 +95,7 @@ export type PdfTextDocument = {
   pages: PdfTextPage[]
 }
 
-const API_BASE = import.meta.env.VITE_R_AGENT_API_BASE || 'http://127.0.0.1:8765'
+const API_BASE = import.meta.env.VITE_R_AGENT_API_BASE || ''
 
 export async function createSession(sessionId?: string): Promise<SessionState> {
   const res = await fetch(`${API_BASE}/sessions`, {
@@ -130,6 +130,13 @@ export async function fetchEvents(sessionId: string): Promise<ContextEvent[]> {
   return data.events || []
 }
 
+export async function fetchEventsSince(sessionId: string, since = 0): Promise<{ events: ContextEvent[], event_count: number }> {
+  const res = await fetch(`${API_BASE}/sessions/${sessionId}/events?since=${Math.max(0, since)}`)
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  return { events: data.events || [], event_count: data.event_count ?? since }
+}
+
 export async function fetchPayload(sessionId: string, payloadId: string): Promise<string> {
   const res = await fetch(`${API_BASE}/sessions/${sessionId}/payloads/${payloadId}`)
   if (!res.ok) throw new Error(await res.text())
@@ -150,7 +157,9 @@ export async function fetchResources(sessionId: string): Promise<Record<string, 
 }
 
 export function openEventSocket(sessionId: string): WebSocket {
-  const wsBase = API_BASE.replace(/^http/, 'ws')
+  const wsBase = API_BASE
+    ? API_BASE.replace(/^http/, 'ws')
+    : `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`
   return new WebSocket(`${wsBase}/sessions/${sessionId}/ws`)
 }
 
@@ -237,7 +246,7 @@ export async function branchLearningSession(sessionId: string, question: string)
   return res.json()
 }
 
-export async function setbackLearningSession(sessionId: string, messageIndex: number): Promise<{ session: LearningSessionState, draft: string }> {
+export async function setbackLearningSession(sessionId: string, messageIndex: number): Promise<{ session: LearningSessionState, draft: string, deleted?: string[] }> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/setback`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -308,6 +317,13 @@ export async function fetchLearningEvents(sessionId: string): Promise<ContextEve
   if (!res.ok) throw new Error(await res.text())
   const data = await res.json()
   return data.events || []
+}
+
+export async function fetchLearningEventsSince(sessionId: string, since = 0): Promise<{ events: ContextEvent[], event_count: number }> {
+  const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/events?since=${Math.max(0, since)}`)
+  if (!res.ok) throw new Error(await res.text())
+  const data = await res.json()
+  return { events: data.events || [], event_count: data.event_count ?? since }
 }
 
 export async function fetchLearningPayload(sessionId: string, payloadId: string): Promise<string> {

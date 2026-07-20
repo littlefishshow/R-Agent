@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MarkdownIt from 'markdown-it'
 import { renderToString } from 'katex'
 import { BookOpen, Check, Copy, Edit3, Ellipsis, Eye, File, FileText, Folder, Languages, Lightbulb, ListTree, Maximize2, MessageCircle, Minimize2, Plus, Search, Save, Send, Square, Trash2, Workflow, X, ZoomIn, ZoomOut } from 'lucide-react'
@@ -17,6 +17,7 @@ import {
   fetchWorkspaceTree,
   getLearningFileRoot,
   fetchLearningEvents,
+  fetchLearningEventsSince,
   fetchLearningPayload,
   fetchLearningSession,
   interruptLearning,
@@ -190,6 +191,7 @@ export function App() {
   const [session, setSession] = useState<LearningSessionState | null>(null)
   const [accountId] = useState('default')
   const [events, setEvents] = useState<ContextEvent[]>([])
+  const eventsRef = useRef<ContextEvent[]>([])
   const [input, setInput] = useState('')
   const inputDraftRef = useRef('')
   const [inputResetToken, setInputResetToken] = useState(0)
@@ -205,6 +207,7 @@ export function App() {
   const [pdfHighlights, setPdfHighlights] = useState<Record<string, PdfHighlightRecord>>({})
   const [windows, setWindows] = useState<Record<string, FloatingWindowState>>({})
   const [windowEvents, setWindowEvents] = useState<Record<string, ContextEvent[]>>({})
+  const windowEventsRef = useRef<Record<string, ContextEvent[]>>({})
   const [windowInputs, setWindowInputs] = useState<Record<string, string>>({})
   const windowInputDraftsRef = useRef<Record<string, string>>({})
   const [windowInputResetTokens, setWindowInputResetTokens] = useState<Record<string, number>>({})
@@ -224,6 +227,17 @@ export function App() {
   const [detailWidth, setDetailWidth] = useState(340)
   const [topZ, setTopZ] = useState(30)
   const activeTextSelectionRangeRef = useRef<Range | null>(null)
+  // Sessions with a just-sent message whose background run may not yet report
+  // running=true. The poller keeps reconciling these so a reply can't get stuck.
+  const pendingRunsRef = useRef<Record<string, number>>({})
+  // Latest-closure refs so the sidebar tree can receive stable callback
+  // identities (memoized ConversationTreeNode skips re-render on poll ticks).
+  const activateSessionRef = useRef<(id: string) => void>(() => {})
+  const toggleConversationNodeRef = useRef<(id: string) => void>(() => {})
+  const deleteRootSessionRef = useRef<(id: string) => void>(() => {})
+  const stableActivateSession = useCallback((id: string) => activateSessionRef.current(id), [])
+  const stableToggleNode = useCallback((id: string) => toggleConversationNodeRef.current(id), [])
+  const stableDeleteRoot = useCallback((id: string) => deleteRootSessionRef.current(id), [])
 
   const chatItems = useMemo(() => buildChatItems(events), [events])
   const visibleSessions = useMemo(() => {
@@ -247,6 +261,9 @@ export function App() {
   const sessionTree = useMemo(() => buildSessionTree(Object.values(sessions)), [sessions])
   const branchColors = useMemo(() => buildBranchColors(Object.values(sessions)), [sessions])
   const activeFile = activeFilePath ? openFiles[activeFilePath] || null : null
+  activateSessionRef.current = activateSession
+  toggleConversationNodeRef.current = toggleConversationNode
+  deleteRootSessionRef.current = deleteRootSession
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const openWindowPollKey = useMemo(() => Object.values(windows)
     .map(win => `${win.id}:${win.sessionId}:${win.minimized ? 'min' : 'open'}`)
@@ -276,11 +293,20 @@ export function App() {
   useEffect(() => { boot() }, [])
 
   useEffect(() => {
+    eventsRef.current = events
+  }, [events])
+
+  useEffect(() => {
+    windowEventsRef.current = windowEvents
+  }, [windowEvents])
+
+  useEffect(() => {
     if (!session) return
     const timer = window.setInterval(async () => {
       try {
-        if (session.running) await refreshActive(session.session_id)
-        if (Object.values(windows).some(win => !win.minimized && sessions[win.sessionId]?.running)) {
+        const activePending = isPendingRun(session.session_id)
+        if (session.running || activePending) await refreshActive(session.session_id)
+        if (Object.values(windows).some(win => !win.minimized && (sessions[win.sessionId]?.running || isPendingRun(win.sessionId)))) {
           await refreshOpenWindows()
         }
       } catch { /* ignore */ }
@@ -316,18 +342,79 @@ export function App() {
     setSelectionMenu(menu)
   }
 
+  function markPendingRun(sessionId: string) {
+    if (!sessionId) return
+    // Keep polling this session for up to 90s even if running never flips true.
+    pendingRunsRef.current[sessionId] = Date.now() + 90_000
+  }
+
+  function isPendingRun(sessionId: string): boolean {
+    const deadline = pendingRunsRef.current[sessionId]
+    if (!deadline) return false
+    if (Date.now() > deadline) {
+      delete pendingRunsRef.current[sessionId]
+      return false
+    }
+    return true
+  }
+
+  function resolvePendingRun(sessionId: string, state?: LearningSessionState | null) {
+    if (!sessionId || !pendingRunsRef.current[sessionId]) return
+    // Once the backend has actually started (running) we no longer need the
+    // pending flag — the normal running-based poll takes over. If it already
+    // finished with a response/error, clear it too.
+    if (state?.running || state?.last_response || state?.last_error) {
+      delete pendingRunsRef.current[sessionId]
+    }
+  }
+
   async function refreshActive(sessionId = session?.session_id || '') {
     if (!sessionId) return
     try {
+      const forceFullEvents = session?.session_id !== sessionId
       const [state, ev] = await Promise.all([
         fetchLearningSession(sessionId),
-        fetchLearningEvents(sessionId),
+        forceFullEvents ? fetchLearningEvents(sessionId) : Promise.resolve(null),
       ])
+      resolvePendingRun(sessionId, state)
       setSession(prev => prev && sameLearningSession(prev, state) ? prev : state)
-      setEvents(prev => sameEventList(prev, ev) ? prev : ev)
       setSessions(prev => sameLearningSession(prev[state.session_id], state) ? prev : ({ ...prev, [state.session_id]: state }))
+      if (ev) {
+        setEvents(prev => sameEventList(prev, ev) ? prev : ev)
+      } else {
+        await syncActiveEvents(sessionId, state, false)
+      }
     } catch (err: any) {
       await recoverActiveSession()
+    }
+  }
+
+  async function syncActiveEvents(sessionId: string, state: LearningSessionState, forceFull = false) {
+    const expected = state.event_count || 0
+    const current = eventsRef.current
+    if (forceFull || expected < current.length) {
+      const ev = await fetchLearningEvents(sessionId)
+      setEvents(prev => sameEventList(prev, ev) ? prev : ev)
+      return
+    }
+    // Nothing new and not mid-run: safe to skip. While running we keep
+    // reconciling so a raced/dropped batch cannot leave the UI stuck.
+    if (expected === current.length && !state.running) return
+    const since = current.length
+    const result = await fetchLearningEventsSince(sessionId, since)
+    if (!result.events.length) return
+    let applied = false
+    setEvents(prev => {
+      if (prev.length !== since) return prev
+      applied = true
+      return [...prev, ...result.events]
+    })
+    if (!applied) {
+      // Raced with another sync (eventsRef lags a render): the incremental
+      // batch no longer lines up. Self-heal with a full fetch instead of
+      // silently dropping events (root cause of "no reply until setback").
+      const ev = await fetchLearningEvents(sessionId)
+      setEvents(prev => sameEventList(prev, ev) ? prev : ev)
     }
   }
 
@@ -349,17 +436,14 @@ export function App() {
   }
 
   async function refreshOpenWindows() {
-    const entries = Object.values(windows).filter(win => !win.minimized)
+    const entries = Object.values(windows).filter(win => !win.minimized && sessions[win.sessionId]?.running)
     if (!entries.length) return
     const updates = await Promise.all(entries.map(async win => {
       try {
-        const [state, ev] = await Promise.all([
-          fetchLearningSession(win.sessionId),
-          fetchLearningEvents(win.sessionId),
-        ])
-        return { win, state, ev, missing: false }
+        const state = await fetchLearningSession(win.sessionId)
+        return { win, state, missing: false }
       } catch {
-        return { win, state: null, ev: [], missing: true }
+        return { win, state: null, missing: true }
       }
     }))
     const missing = updates.filter(item => item?.missing).map(item => item!.win.id)
@@ -376,7 +460,7 @@ export function App() {
         return next
       })
     }
-    const valid = updates.filter(item => item && !item.missing && item.state) as Array<{ win: FloatingWindowState, state: LearningSessionState, ev: ContextEvent[] }>
+    const valid = updates.filter(item => item && !item.missing && item.state) as Array<{ win: FloatingWindowState, state: LearningSessionState }>
     if (!valid.length) return
     setSessions(prev => {
       let changed = false
@@ -389,17 +473,32 @@ export function App() {
       }
       return changed ? next : prev
     })
+    await Promise.all(valid.map(item => syncWindowEvents(item.win, item.state)))
+  }
+
+  async function syncWindowEvents(win: FloatingWindowState, state: LearningSessionState) {
+    const expected = state.event_count || 0
+    const current = windowEventsRef.current[win.id] || []
+    if (expected < current.length) {
+      const ev = await fetchLearningEvents(win.sessionId)
+      setWindowEvents(prev => sameEventList(prev[win.id] || [], ev) ? prev : ({ ...prev, [win.id]: ev }))
+      return
+    }
+    if (expected === current.length && !state.running) return
+    const since = current.length
+    const result = await fetchLearningEventsSince(win.sessionId, since)
+    if (!result.events.length) return
+    let applied = false
     setWindowEvents(prev => {
-      let changed = false
-      const next = { ...prev }
-      for (const item of valid) {
-        if (!sameEventList(prev[item.win.id] || [], item.ev)) {
-          next[item.win.id] = item.ev
-          changed = true
-        }
-      }
-      return changed ? next : prev
+      const existing = prev[win.id] || []
+      if (existing.length !== since) return prev
+      applied = true
+      return { ...prev, [win.id]: [...existing, ...result.events] }
     })
+    if (!applied) {
+      const ev = await fetchLearningEvents(win.sessionId)
+      setWindowEvents(prev => sameEventList(prev[win.id] || [], ev) ? prev : ({ ...prev, [win.id]: ev }))
+    }
   }
 
   async function refreshWorkspace(path = workspace?.cwd || '') {
@@ -449,6 +548,8 @@ export function App() {
     const nextOpen = !expandedConversationNodes[sessionId]
     setExpandedConversationNodes(prev => ({ ...prev, [sessionId]: nextOpen }))
     if (!nextOpen) return
+    // If children are already cached, the subtree renders immediately; the
+    // fetch below just refreshes counts in the background.
     try {
       const result = await fetchLearningChildren(sessionId)
       setSessions(prev => ({
@@ -467,6 +568,14 @@ export function App() {
   async function activateSession(sessionId: string) {
     setError(null)
     setActiveMode('chat')
+    // Optimistic switch: show the target conversation immediately from the
+    // sidebar cache and clear stale bubbles so switching feels instant, then
+    // reconcile against the server.
+    const known = sessions[sessionId]
+    if (known && known.session_id !== session?.session_id) {
+      setSession(known)
+      setEvents([])
+    }
     await refreshActive(sessionId)
   }
 
@@ -492,13 +601,19 @@ export function App() {
     const draft = textOverride ?? inputDraftRef.current ?? input
     if (!session || !draft.trim()) return
     const text = draft
+    const sessionId = session.session_id
     inputDraftRef.current = ''
     setInput('')
     setInputResetToken(prev => prev + 1)
     setError(null)
     try {
-      await sendLearningMessage(session.session_id, text)
-      await refreshActive(session.session_id)
+      await sendLearningMessage(sessionId, text)
+      // Keep the poller reconciling even if the background run hasn't flipped
+      // running=true yet, and show the thinking indicator immediately.
+      markPendingRun(sessionId)
+      setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: true } : prev)
+      setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: true } } : prev)
+      await refreshActive(sessionId)
     } catch (err: any) {
       const message = err.message || String(err)
       if (message.includes('session is already running')) {
@@ -550,10 +665,13 @@ export function App() {
 
   async function setbackToUserMessage(sessionId: string, messageIndex?: number, windowId?: string) {
     if (messageIndex == null) return
-    if (!window.confirm('确认回退到这条用户消息之前？该消息及其之后的上下文会被删除。')) return
+    if (!window.confirm('确认回退到这条用户消息之前？该消息及其之后的上下文会被删除，其后创建的分支/高亮子对话也会一并删除。')) return
     try {
       const result = await setbackLearningSession(sessionId, messageIndex)
       setSessions(prev => ({ ...prev, [result.session.session_id]: result.session }))
+      if (result.deleted?.length) {
+        removeDeletedSessions(new Set(result.deleted))
+      }
       if (windowId) {
         setWindowInputs(prev => ({ ...prev, [windowId]: result.draft }))
         const ev = await fetchLearningEvents(sessionId)
@@ -594,6 +712,15 @@ export function App() {
       occurrence: result.occurrence,
       x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
       y: Math.max(12, result.rect.top - 46),
+      // Unify with file/PDF selections: always describe where the text came
+      // from so the backend prompt gets kind/location/selected text.
+      sourceContext: {
+        kind: 'chat',
+        session_id: sourceSessionId,
+        location: `对话消息 ${chatId}`,
+        text_offset: result.textOffset,
+        occurrence: result.occurrence,
+      },
     }, result.range)
   }
 
@@ -840,10 +967,12 @@ export function App() {
     setWindowInputResetTokens(prev => ({ ...prev, [windowId]: (prev[windowId] || 0) + 1 }))
     try {
       await sendLearningMessage(win.sessionId, text)
+      markPendingRun(win.sessionId)
       const [state, ev] = await Promise.all([
         fetchLearningSession(win.sessionId),
         fetchLearningEvents(win.sessionId),
       ])
+      resolvePendingRun(win.sessionId, state)
       setSessions(prev => ({ ...prev, [state.session_id]: state }))
       setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
     } catch (err: any) {
@@ -1282,9 +1411,9 @@ export function App() {
             sessions={sessions}
             expanded={expandedConversationNodes}
             colors={branchColors}
-            onToggle={toggleConversationNode}
-            onActivate={activateSession}
-            onDelete={deleteRootSession}
+            onToggle={stableToggleNode}
+            onActivate={stableActivateSession}
+            onDelete={stableDeleteRoot}
           />)}
         </div>
       </div>
@@ -1380,7 +1509,11 @@ export function App() {
         }}
         onOpenHighlight={openHighlight}
       /> : <section className="conversation-panel">
-          {!chatItems.length && <div className="learning-empty">
+          {!chatItems.length && (session?.event_count || 0) > 0 && <div className="learning-empty">
+            <BookOpen size={28}/>
+            <div>正在载入对话上下文...</div>
+          </div>}
+          {!chatItems.length && !(session?.event_count || 0) && <div className="learning-empty">
             <BookOpen size={28}/>
             <div>输入一个问题开始学习。当前问题链会独立保存上下文；遇到旁支问题时切换到“新分支”发送。</div>
           </div>}
@@ -1896,7 +2029,7 @@ function UserMessageActions({ sessionId, item, sessions, menuKey, openMenus, onT
   </div>
 }
 
-function ConversationTreeNode({ item, depth, activeSessionId, childrenById, sessions, expanded, colors, onToggle, onActivate, onDelete }: {
+const ConversationTreeNode = memo(function ConversationTreeNode({ item, depth, activeSessionId, childrenById, sessions, expanded, colors, onToggle, onActivate, onDelete }: {
   item: LearningSessionState
   depth: number
   activeSessionId: string
@@ -1938,7 +2071,7 @@ function ConversationTreeNode({ item, depth, activeSessionId, childrenById, sess
       onDelete={onDelete}
     /> : null)}
   </div>
-}
+})
 
 function FileBrowser({
   listing,

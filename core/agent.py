@@ -56,6 +56,70 @@ def _is_cancelled(cancel_event=None) -> bool:
     return bool(cancel_event is not None and getattr(cancel_event, "is_set", lambda: False)())
 
 
+def _msg_get(message, key, default=None):
+    """Read a field from a message that may be a dict or an SDK object."""
+    if isinstance(message, dict):
+        return message.get(key, default)
+    return getattr(message, key, default)
+
+
+def _tool_call_ids(message) -> list:
+    """Return the tool_call ids declared on an assistant message (if any)."""
+    tool_calls = _msg_get(message, "tool_calls", None) or []
+    ids = []
+    for tc in tool_calls:
+        tc_id = _msg_get(tc, "id", None)
+        if tc_id:
+            ids.append(tc_id)
+    return ids
+
+
+def sanitize_tool_call_messages(messages: list) -> list:
+    """Drop dangling tool-call artifacts that make the chat API reject a request.
+
+    The OpenAI-compatible API requires that every assistant message with
+    ``tool_calls`` is immediately followed by one ``tool`` message per
+    ``tool_call_id``. A run that dies mid tool-call (interrupt, crash, restart)
+    can leave an assistant ``tool_calls`` message with no matching tool result,
+    or an orphan ``tool`` message. Either shape makes every subsequent turn
+    fail with "must be followed by tool messages responding to each
+    tool_call_id". This repairs the list by:
+
+    - dropping assistant messages whose declared tool_call_ids are not all
+      answered by following tool messages before the next assistant/user turn;
+    - dropping ``tool`` messages whose tool_call_id was never declared.
+    """
+    if not messages:
+        return messages
+
+    # Which tool_call_ids actually have a tool response somewhere later.
+    answered = set()
+    for message in messages:
+        if _msg_get(message, "role") == "tool":
+            tcid = _msg_get(message, "tool_call_id")
+            if tcid:
+                answered.add(tcid)
+
+    cleaned = []
+    valid_ids = set()
+    for message in messages:
+        role = _msg_get(message, "role")
+        if role == "assistant" and _tool_call_ids(message):
+            ids = _tool_call_ids(message)
+            if all(tc_id in answered for tc_id in ids):
+                cleaned.append(message)
+                valid_ids.update(ids)
+            # else: dangling assistant tool_calls -> drop it entirely.
+            continue
+        if role == "tool":
+            tcid = _msg_get(message, "tool_call_id")
+            if tcid and tcid not in valid_ids:
+                # Orphan tool result (its assistant call was dropped/never existed).
+                continue
+        cleaned.append(message)
+    return cleaned
+
+
 def _is_transient_error(exc: Exception) -> bool:
     """
     判断异常是否属于"瞬时错误"，值得重试。
@@ -699,6 +763,12 @@ class RAgent:
         user_msg = {"role": "user", "content": user_message}
         self.messages.append(user_msg)
         _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(user_msg), "message_index": len(self.messages) - 1})
+        # Repair any dangling tool-call state left by a previous run that died
+        # mid tool-call (interrupt/crash/restart). Otherwise the chat API rejects
+        # every turn with "assistant message with 'tool_calls' must be followed
+        # by tool messages...". Done before rollback_index so a later interrupt
+        # rolls back to the repaired baseline.
+        self.messages = sanitize_tool_call_messages(self.messages)
         rollback_index = len(self.messages)
 
         # 新一轮 run，复位截断/软提醒标记，并恢复默认预算。

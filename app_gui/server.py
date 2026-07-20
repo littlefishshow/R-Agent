@@ -96,10 +96,14 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/sessions/{session_id}/events")
-    def get_events(session_id: str, event_type: Optional[str] = None) -> Dict[str, Any]:
+    def get_events(session_id: str, event_type: Optional[str] = None, since: int = 0) -> Dict[str, Any]:
         try:
             session = service.get_session(session_id)
-            return {"session_id": session_id, "events": session.store.list_events(event_type=event_type)}
+            return {
+                "session_id": session_id,
+                "events": session.store.list_events(event_type=event_type, since=since),
+                "event_count": session.store.event_count(),
+            }
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -280,10 +284,14 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/learning/sessions/{session_id}/events")
-    def get_learning_events(session_id: str, event_type: Optional[str] = None) -> Dict[str, Any]:
+    def get_learning_events(session_id: str, event_type: Optional[str] = None, since: int = 0) -> Dict[str, Any]:
         try:
             session = learning.get_session(session_id)
-            return {"session_id": session_id, "events": session.store.list_events(event_type=event_type)}
+            return {
+                "session_id": session_id,
+                "events": session.store.list_events(event_type=event_type, since=since),
+                "event_count": session.store.event_count(),
+            }
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

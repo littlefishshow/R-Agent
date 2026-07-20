@@ -5,6 +5,7 @@ import importlib
 import sys
 import time
 import multiprocessing
+import threading
 from typing import Callable, Dict, Any, List, Optional, Type
 
 
@@ -94,28 +95,51 @@ class ToolRegistry:
     """
     def __init__(self):
         self._tools: Dict[str, Dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._tools_signature = None
 
     def register(self, name: str, description: str, parameters: Dict[str, Any], handler: Callable):
         """注册一个工具"""
-        self._tools[name] = {
-            "schema": {
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters,
-                }
-            },
-            "handler": handler
-        }
+        with self._lock:
+            self._tools[name] = {
+                "schema": {
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                },
+                "handler": handler
+            }
 
-    def reload_all(self):
-        """重新扫描并加载所有工具模块"""
-        self._tools.clear()
+    def _iter_tool_files(self):
         current_dir = os.path.dirname(os.path.abspath(__file__))
         for file_path in glob.glob(os.path.join(current_dir, "*.py")):
             module_name = os.path.basename(file_path)[:-3]
             if module_name not in ["__init__", "registry"]:
+                yield file_path, module_name
+
+    def _compute_tools_signature(self):
+        signature = []
+        for file_path, module_name in self._iter_tool_files():
+            try:
+                stat = os.stat(file_path)
+            except OSError:
+                continue
+            signature.append((module_name, stat.st_mtime_ns, stat.st_size))
+        return tuple(sorted(signature))
+
+    def reload_all(self, *, force: bool = True):
+        """重新扫描并加载所有工具模块"""
+        with self._lock:
+            signature = self._compute_tools_signature()
+            if not force and self._tools and signature == self._tools_signature:
+                return
+
+            self._tools.clear()
+            self._tools_signature = signature
+            for _file_path, module_name in self._iter_tool_files():
                 full_module_name = f"tools.{module_name}"
                 try:
                     if full_module_name in sys.modules:
@@ -126,13 +150,16 @@ class ToolRegistry:
                     print(f"⚠️ Warning: Failed to load tool module {module_name}: {e}")
 
     def get_all_schemas(self) -> List[Dict[str, Any]]:
-        """获取所有已注册工具的 schema 列表，每次获取前自动热更新"""
-        self.reload_all()
-        return [tool["schema"] for tool in self._tools.values()]
+        """获取所有已注册工具的 schema 列表，并在工具文件变化时热更新。"""
+        self.reload_all(force=False)
+        with self._lock:
+            return [tool["schema"] for tool in self._tools.values()]
 
     def execute_tool(self, name: str, args_json: str) -> str:
         """执行工具，返回结果的 JSON 字符串"""
-        return _execute_tool_from_mapping(self._tools, name, args_json)
+        with self._lock:
+            tools_snapshot = dict(self._tools)
+        return _execute_tool_from_mapping(tools_snapshot, name, args_json)
 
     def execute_tool_isolated(
         self,
@@ -152,8 +179,10 @@ class ToolRegistry:
         Timeout and child failures are reported as JSON error strings to match
         the forgiving behavior of ``execute_tool``.
         """
-        if name not in self._tools:
-            return json.dumps({"error": f"Tool '{name}' not found."})
+        with self._lock:
+            if name not in self._tools:
+                return json.dumps({"error": f"Tool '{name}' not found."})
+            tools_snapshot = dict(self._tools)
 
         # Prefer fork where available: it preserves dynamically registered or
         # otherwise unpickleable handlers while still isolating execution in a
@@ -168,7 +197,7 @@ class ToolRegistry:
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
             target=_tool_process_entry,
-            args=(child_conn, self._tools, name, args_json),
+            args=(child_conn, tools_snapshot, name, args_json),
             daemon=True,
         )
 
