@@ -2,6 +2,92 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-07-28
+
+#### Cockpit 启动、会话与 Todo 可观测性维护
+
+- **后端运行时惰性初始化**：`app_gui.server` 改为按需创建 Agent、Learning runtime 与文件工作区，`/health` 可先快速就绪；学习会话恢复会跳过超过阈值的超大 `context.json`，避免历史上下文拖慢 Cockpit 启动。
+- **统一 GUI/Agent Todo 会话作用域**：GUI 会话、学习分支、`todo_manage` 与 `delegate_task` 统一规整 `session_id`，把空值或 `default` 视为旧版空 session 并继承当前会话，避免父窗口、子窗口和子 Agent 写到不同 todo 看板。
+- **前后端透传 Todo 看板状态**：GUI state 返回当前/父级 todo board 摘要，前端思考态与 Todo preview 可持续展示 session、ready/completed/failed 等进度，便于诊断长任务和委派执行。
+- **启动脚本按真实健康检查编排**：`scripts/start_cockpit.sh` 会补齐前端依赖、等待后端 `/health` 就绪后再启动 Vite，并遵循 Cockpit host/port/ready-timeout 环境变量，减少启动期 proxy 连接失败噪声。
+
+#### Cockpit 前端分支、高亮与 Markdown 交互修复
+
+- **稳定学习分支 session 与乐观窗口**：前端为主会话、fork、选区分支和本地笔记生成稳定 session id，创建分支时先显示 pending/loading 子窗口与高亮，再由后端结果回填，失败时自动清理乐观 UI。
+- **修复并发子窗口与刷新竞态**：窗口打开改为函数式状态更新，pending 子窗口不会被刷新误删；发送消息前即标记 pending/running，保证思考态、窗口层级和子会话状态及时反馈。
+- **改进 Markdown/KaTeX 选区高亮**：继续完善公式原始 TeX 锚点、相邻/重叠高亮批量解析、点击高亮恢复窗口和跨 token 选区定位，提升论文 Markdown 预览中的提问/解释/总结交互稳定性。
+- **补齐前端类型与 Vite 兼容**：新增 `markdown-it` 类型声明，并将 KaTeX 字体目录加入 Vite 受限 allow list；README 明确前端 Markdown/数学公式依赖需在 `app_gui_frontend` 安装。
+
+#### AutoResearch 与 read_paper 维护
+
+- **整理 AutoResearch debug 日志路径**：AutoResearch v2 debug 输出统一写入 `.autoresearch/debug_logs/`，monitor trace 和工具 schema 同步展示新路径，同时 debug summary 保留读取旧 `.autoresearch/debug/` 的兼容逻辑。
+- **强化 read_paper 图表截图标准**：`read_paper` 文档与 `pdf_snapshot.py` CLI/help 明确默认只交付 Figure/Table/Algorithm/案例图表主体区域截图；整页截图仅作为诊断降级，并要求在笔记和复核记录中显式标注。
+
+#### 测试与项目进度记录
+
+- **补充回归测试覆盖**：更新 GUI runtime/frontend 结构、AutoResearch monitor、Todo session isolation 等测试，覆盖 lazy runtime、session 继承、父子看板返回、pending 子窗口与 debug 路径等维护点。
+- **沉淀历史问题上下文**：新增 project progress context，记录 todo/delegate 中断与文件锁问题的定位和后续修复方向，便于后续继续治理长任务取消与看板锁竞争。
+
+### 2026-07-23
+
+#### Cockpit Markdown 公式选区高亮修复
+
+- **保留公式原始 TeX 高亮锚点**：Markdown 数学公式渲染为 KaTeX HTML 时同步写入隐藏的原始 TeX 文本，并让 `selectableTextNodes`、选区文本提取和 offset 计算统一使用该源文本，避免 KaTeX DOM/annotation 文本与用户选中文本不一致导致 range 无法匹配。
+- **公式作为可选 Markdown token 参与托管选区**：`wrapMarkdownTextTokens` 会把 `.math-inline` / `.math-block` 标记为可选 token，拖拽起止点落在公式或公式附近时可稳定形成范围；高亮命中公式源文本时包裹整个公式节点，保证视觉高亮可见且可点击恢复子窗口。
+
+#### Cockpit 相邻高亮渲染修复
+
+- **批量解析并应用 Markdown 高亮 range**：`applyMarkdownHighlights` 先基于未修改的 textNodes/fullText 一次性解析所有 `HighlightRecord` 的 `textOffset` / `occurrence` / 归一化匹配结果，再按文档顺序统一包裹文本节点，避免逐条插入 `<span>` 后导致后续相邻高亮使用失效快照或 offset 被前一条 DOM 修改影响。
+- **稳定处理相邻与重叠 range**：新增 range 归一化与批量切分逻辑，连续相邻两句分别提问时可分别生成高亮 span；重叠高亮按文档顺序裁剪，防止后续 wrap 失败或重复包裹。
+
+#### Cockpit 后端启动修复
+
+- **惰性初始化后端运行时**：`app_gui.server` 不再在模块导入时立即构造 Agent/Learning/FileWorkspace 运行时，FastAPI app 与 `/health` 可快速建立监听，避免历史学习上下文恢复阻塞 Cockpit 启动。
+- **跳过超大 learning context**：`LearningRuntimeService.restore_saved_sessions` 会按 `R_AGENT_COCKPIT_RESTORE_MAX_CONTEXT_MB` 阈值跳过 GB 级 `context.json`，防止读取超大 `outputs/learning_context` 文件导致后端长期卡死。
+- **遵循 Cockpit Host/Port 环境变量**：后端入口读取 `R_AGENT_COCKPIT_HOST` / `R_AGENT_COCKPIT_PORT` 启动 uvicorn，`scripts/start_cockpit.sh` 同步传入对应环境变量，避免脚本等待端口与实际监听端口不一致。
+- **启动脚本等待真实健康检查**：`start_cockpit.sh` 从固定 sleep 改为轮询真实 `/health`，并在后端进程提前退出时立即报告崩溃日志，减少 30 秒后才发现 `connection refused` 的误导性等待。
+
+#### Cockpit 选择分支与子窗口并发修复
+
+- **高亮和 loading 子窗口乐观显示**：选中文本分支与本地笔记保存会先生成前端 provisional session/highlight/window，立即显示高亮与 pending/loading 子窗口，再用后端返回状态回填，失败时清理乐观 UI。
+- **修复多子窗口并发竞态**：`openFloatingSession` 改为函数式 `setTopZ` / `setWindows` 状态更新，并基于当前窗口集合计算 placement，避免 stale closure 导致并发打开时窗口覆盖、层级冲突或状态丢失。
+- **刷新逻辑保留 pending 窗口**：`refreshOpenWindows` 纳入 pending run 状态，后端暂未创建好的窗口不会在刷新时被误删，获取到真实状态后再解除 pending。
+- **发送前标记 pending/running**：`sendWindowMessage` 和主会话提交在请求发出前即标记 pending 并乐观置为 running，失败后再回滚，保证 Todo/思考态与子窗口状态即时反馈。
+
+#### GUI Todo/Delegate 会话继承修复
+
+- **修复 `session_id=default` 误路由到旧看板**：`RAgent` 工具调用注入层现在会把空值、`default` 等 legacy 空 session 视为未提供，在当前 Agent 存在有效 `session_id` 时自动继承当前会话，避免 GUI/Learning 会话下 `todo_manage` 或 `delegate_task` 读写 `sandbox/todo_list.json` 而看不到 `learn_*` 看板。
+- **规范化委派会话参数**：`delegate_task` 入口会复用 todo session 规范化逻辑，防止 `default` 继续传播给子 Agent；工具 schema 说明同步强调模型通常不应手动传 session，`default` 仅代表旧版空 session。
+- **补充回归测试**：新增覆盖 `RAgent(session_id="learn_x")` 在模型显式传 `session_id="default"` 调用 `todo_manage` 与 `delegate_task` 时，最终仍使用 `learn_x` 看板。
+
+#### GUI 父子进程 Todo 会话对齐修复
+
+- **修复 GUI 父子进程看板错位**：GUI 场景下空值或 `default` session 不再落到旧版 default 看板，而是按入口规整为稳定的 `gui_*` / `learn_*` 会话，避免父进程、子窗口和 todo list 读写不同文件。
+- **补齐前后端会话透传**：GUI state 现在返回当前 `todo_board`，`LearningSession.state` 返回 `parent_todo_board`；后端学习分支接口支持显式传入 child `session_id`，前端为 GUI 主窗口和子窗口生成稳定 session id。
+- **提升 Todo Preview 可诊断性**：前端 todo preview 展示当前 `session_id`，便于确认主窗口、子窗口和 Agent 工具调用使用同一会话作用域。
+- **补充会话一致性测试**：新增/更新测试覆盖 GUI default scope、window-scoped child session、parent todo board 返回，以及 Agent session 与 todo/delegate 工具调用的一致性。
+
+### 2026-07-21
+
+#### read_paper 默认图表区域截图要求
+
+- **默认改为图表主体区域截图**：`skills/productivity/read_paper/SKILL.md` 明确关键 Figure/Table/Algorithm/案例图表截图默认只截取图表主体区域（含必要标题/图注），不得用整页截图冒充图表截图。
+- **明确裁剪失败降级规则**：自动裁剪明显过大、包含整页或脚本返回 suspicious/full-page 警告时，必须使用 `--mode crops --crops-json` 精裁；暂时无法精裁时，需在 Markdown 图片说明和重检查记录中显式标注降级整页/大区域截图。
+- **同步脚本说明**：`pdf_snapshot.py` 保持 crop-based 默认工作流，并补充 CLI/help 与返回 note，说明 `pages` 仅为显式全页诊断降级，不推荐作为笔记图表资产。
+
+#### Cockpit 前端依赖、公式样式与启动稳定性修复
+
+- **补充并纠正 README 安装说明**：在 Cockpit 前置条件中明确 `markdown-it` 与 `katex` 是前端 Markdown / 数学公式渲染依赖，并要求在 `app_gui_frontend` 目录执行 `npm install`，避免只在项目根目录安装导致 Vite 回退解析到根目录 `node_modules`。
+- **优化 Markdown 数学公式观感**：将 Cockpit 前端 `.math-block` 从卡片式边框背景调整为透明论文风格，放大 KaTeX 字号并让行内公式回归 baseline 对齐，减少“网页组件感”。
+- **修复 KaTeX 字体 Vite allow list 报错**：`app_gui_frontend/vite.config.ts` 额外允许访问根目录 KaTeX 字体目录作为兼容兜底，避免依赖暂时被解析到根 `node_modules` 时字体加载失败。
+- **修复 Cockpit 启动时序抖动**：`scripts/start_cockpit.sh` 不再固定 `sleep 1`，改为等待后端 `/health` 就绪后再启动 Vite 前端，减少启动早期 proxy `ECONNREFUSED` 噪声；同时在前端 `node_modules` 已存在但新增依赖缺失时自动补齐前端依赖。
+- **修复选中文本高亮恢复问题**：优化 Markdown 文本高亮匹配，在跨 token/换行或空白归一化不一致时仍能定位原文；点击高亮文本会阻止父级选择逻辑吞掉事件，并可恢复已最小化的子对话窗口。
+- **思考状态展示 Todo 看板**：Cockpit 在模型运行中除显示思考秒数和轮数外，会同步展示当前 session 的 todo 看板；看板尚未生成时提示“agent 正在规划”，看板文件更新后随轮询自动刷新主界面/子窗口进度。
+- **独立思考计时器**：`ThinkingState` 内部增加独立 1 秒 tick，不再依赖 session/event/todo 轮询触发重渲染，避免模型长时间思考或看板未变化时计时器卡住。
+- **修复 Markdown 数学公式拖拽选区终点问题**：当鼠标拖拽选中文本的终点落在 KaTeX/数学公式上时，Cockpit 会把终点回退到同一行最近的可选 Markdown 文本 token，避免选区丢失导致提问/总结/解释菜单不弹出。
+- **修复左侧对话栏顺序跳动**：Cockpit 左侧根对话列表不再按运行状态或 `event_count` 动态重排，点击/轮询不会让条目乱跑；子分支列表改按来源消息位置与标题稳定排序，避免打开分支后因事件数变化改变顺序。
+- **修复思考中 Todo 看板不显示**：`ThinkingState` 不再因为运行中已有 assistant/tool-call 消息就提前隐藏；只要后端仍标记会话 `running=true`，主界面和子窗口都会继续显示思考状态、规划提示和实时 todo 看板。
+
 ### 2026-07-18
 
 #### R-Agent Cockpit 可视化学习工作台大更新

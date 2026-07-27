@@ -110,6 +110,7 @@ R-Agent 也提供浏览器版可视化 Cockpit，用于在本地管理学习型�
 
 - 已执行 `pip install -r requirements.txt`（含 FastAPI / Uvicorn / websockets / PyMuPDF / Pillow）；
 - 已安装 Node.js 18+ 与 npm（前端基于 Vite，首次启动脚本会自动执行 `npm install`）；
+- 已安装前端 Markdown / 数学公式渲染依赖：`markdown-it` 与 `katex`。如果启动时提示缺少这两个包，请在前端目录执行 `cd app_gui_frontend && npm install`（或精确执行 `cd app_gui_frontend && npm install markdown-it katex && npm install -D @types/markdown-it @types/katex`）；不要只在项目根目录安装，否则 Vite 可能回退解析到根目录 `node_modules` 并触发字体 allow list 报错；
 - 已按 [1.2](#12-配置-env) 配置好 `.env`。
 
 启动：

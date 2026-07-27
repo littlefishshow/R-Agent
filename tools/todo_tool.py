@@ -712,7 +712,7 @@ registry.register(
             },
             "session_id": {
                 "type": "string",
-                "description": "可选会话编号；提供后 todo list 隔离到 sandbox/todo_lists/todo_list_<session_id>.json"
+                "description": "可选会话编号；通常不要手动传，CLI/GUI/父 Agent 会自动注入。提供后 todo list 隔离到 sandbox/todo_lists/todo_list_<session_id>.json；'default' 是旧版空 session，不代表当前会话。"
             }
         },
         "required": ["action"]

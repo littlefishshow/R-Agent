@@ -893,7 +893,11 @@ def pdf_snapshot_tool(
     max_area_ratio: float = 0.45,
     reject_large_crops: bool = False,
 ) -> str:
-    """Render PDF pages/regions to PNG screenshots for paper notes."""
+    """Render PDF Figure/Table/Algorithm regions to PNG screenshots for paper notes.
+
+    Default note-facing modes are crop-based; mode=pages is an explicit full-page
+    diagnostic fallback and is marked as not recommended for notes.
+    """
     try:
         import fitz  # PyMuPDF
     except Exception as e:
@@ -1039,7 +1043,7 @@ def pdf_snapshot_tool(
             "reject_large_crops": reject_large_crops,
             "count": len(results),
             "results": results,
-            "note": "Use the returned markdown links in paper reading notes. Smart/auto mode estimates tighter regions from Figure/Table captions plus neighboring text and pixel content; for imperfect crops, rerun mode='crops' with bbox_points adjusted.",
+            "note": "Use returned markdown links only when the crop covers the Figure/Table/Algorithm/case visual body, not a full page. Smart/auto mode estimates tighter regions from captions plus neighboring text and pixel content; for imperfect or suspicious/full-page crops, rerun mode='crops' with bbox_points adjusted, or explicitly label the asset as a degraded full-page/large-area fallback.",
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"success": False, "error": str(e)}, ensure_ascii=False)
@@ -1075,12 +1079,12 @@ def _load_json_arg(value: str):
 def _main() -> int:
     import argparse
 
-    parser = argparse.ArgumentParser(description="Render PDF pages/figures/tables to PNG screenshots for read_paper notes.")
+    parser = argparse.ArgumentParser(description="Render PDF Figure/Table/Algorithm region crops to PNG screenshots for read_paper notes; full pages are explicit diagnostic fallbacks.")
     parser.add_argument("pdf_path", help="Workspace-local PDF path.")
     parser.add_argument("--output-dir", default="", help="Workspace-relative output directory.")
     parser.add_argument("--pages", default="", help="1-based pages, e.g. '1,3,5-7'. Empty means all pages.")
     parser.add_argument("--crops-json", default="", help="JSON string or JSON file for crops; required for mode=crops.")
-    parser.add_argument("--mode", default="auto", choices=["auto", "smart", "pages", "crops"])
+    parser.add_argument("--mode", default="auto", choices=["auto", "smart", "pages", "crops"], help="auto/smart/crops generate note-facing region crops; pages is explicit full-page diagnostic fallback.")
     parser.add_argument("--dpi", type=int, default=200)
     parser.add_argument("--include-tables", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--caption-above-ratio", type=float, default=0.48)

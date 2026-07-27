@@ -34,6 +34,7 @@ import {
   workspaceOpenUrl,
   type ContextEvent,
   type LearningSessionState,
+  type TodoBoardState,
   type PdfTextDocument,
   type WorkspaceItem,
   type WorkspaceListing,
@@ -134,6 +135,19 @@ type PdfViewerState = {
   path: string
   name: string
   url: string
+}
+
+
+function makeGuiSessionId(prefix = 'gui'): string {
+  const randomPart = (globalThis.crypto?.randomUUID?.() || `${Date.now().toString(36)}_${Math.random().toString(16).slice(2)}`)
+    .replace(/[^A-Za-z0-9_.-]+/g, '_')
+    .slice(0, 32)
+  return `${prefix}_${randomPart}`
+}
+
+function makeChildSessionId(parentSessionId: string, prefix = 'learn'): string {
+  const parent = (parentSessionId || 'root').replace(/[^A-Za-z0-9_.-]+/g, '_').slice(0, 40)
+  return `${prefix}_${parent}_${makeGuiSessionId('win').slice(4)}`
 }
 
 type OpenFileTab = PdfViewerState & {
@@ -246,7 +260,6 @@ export function App() {
       .map(id => sessions[id])
       .filter(Boolean)
       .filter(item => item.node_kind !== 'file_root')
-      .sort((a, b) => Number(isBlankRoot(a)) - Number(isBlankRoot(b)) || Number(!!b.running) - Number(!!a.running) || (b.event_count || 0) - (a.event_count || 0))
       .filter(item => !q || `${item.title || ''} ${item.root_question || ''} ${item.last_question || ''}`.toLowerCase().includes(q))
   }, [sessions, accountRootIds, filter])
   const visibleFileRoots = useMemo(() => {
@@ -280,7 +293,7 @@ export function App() {
     try {
       const roots = await fetchLearningAccountRoots(accountId)
       const first = roots.nodes.find(item => item.node_kind !== 'file_root') || roots.nodes[0]
-      const s = first || await createLearningSession({ title: '新的学习问题', account_id: accountId })
+      const s = first || await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
       setSessions(Object.fromEntries((first ? roots.nodes : [s]).map(item => [item.session_id, item])))
       setAccountRootIds(first ? roots.nodes.map(item => item.session_id) : [s.session_id])
       await activateSession(s.session_id)
@@ -368,6 +381,39 @@ export function App() {
     }
   }
 
+
+  function makeOptimisticBranch(sessionId: string, sourceSessionId: string, data: {
+    title: string
+    action?: SelectionAction
+    selectedText?: string
+    customQuestion?: string
+    targetLanguage?: string
+    noteText?: string
+    sourceContext?: Record<string, any>
+  }): LearningSessionState {
+    return {
+      session_id: sessionId,
+      mode: 'learning',
+      model: '',
+      running: true,
+      event_count: 0,
+      title: data.title,
+      root_question: data.customQuestion || data.noteText || data.selectedText || data.title,
+      last_question: data.customQuestion || data.noteText || data.selectedText || data.title,
+      parent_session_id: sourceSessionId,
+      account_id: accountId,
+      selection: data.selectedText ? {
+        source_session_id: sourceSessionId,
+        selected_text: data.selectedText,
+        action: data.action,
+        custom_question: data.customQuestion,
+        target_language: data.targetLanguage,
+        note_text: data.noteText,
+        source_context: data.sourceContext,
+      } : undefined,
+    }
+  }
+
   async function refreshActive(sessionId = session?.session_id || '') {
     if (!sessionId) return
     try {
@@ -379,6 +425,7 @@ export function App() {
       resolvePendingRun(sessionId, state)
       setSession(prev => prev && sameLearningSession(prev, state) ? prev : state)
       setSessions(prev => sameLearningSession(prev[state.session_id], state) ? prev : ({ ...prev, [state.session_id]: state }))
+      restoreChatHighlights(state.session_id).catch(() => {})
       if (ev) {
         setEvents(prev => sameEventList(prev, ev) ? prev : ev)
       } else {
@@ -428,7 +475,7 @@ export function App() {
       setEvents(await fetchLearningEvents(next.session_id))
       return
     }
-    const created = await createLearningSession({ title: '新的学习问题', account_id: accountId })
+    const created = await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
     setSessions({ [created.session_id]: created })
     setAccountRootIds([created.session_id])
     setSession(created)
@@ -436,7 +483,7 @@ export function App() {
   }
 
   async function refreshOpenWindows() {
-    const entries = Object.values(windows).filter(win => !win.minimized && sessions[win.sessionId]?.running)
+    const entries = Object.values(windows).filter(win => !win.minimized && (sessions[win.sessionId]?.running || isPendingRun(win.sessionId)))
     if (!entries.length) return
     const updates = await Promise.all(entries.map(async win => {
       try {
@@ -446,7 +493,9 @@ export function App() {
         return { win, state: null, missing: true }
       }
     }))
-    const missing = updates.filter(item => item?.missing).map(item => item!.win.id)
+    const missing = updates
+      .filter(item => item?.missing && !isPendingRun(item.win.sessionId))
+      .map(item => item!.win.id)
     if (missing.length) {
       const missingSet = new Set(missing)
       setWindows(prev => {
@@ -466,6 +515,7 @@ export function App() {
       let changed = false
       const next = { ...prev }
       for (const item of valid) {
+        resolvePendingRun(item.state.session_id, item.state)
         if (!sameLearningSession(prev[item.state.session_id], item.state)) {
           next[item.state.session_id] = item.state
           changed = true
@@ -588,7 +638,7 @@ export function App() {
         await activateSession(existingBlank.session_id)
         return
       }
-      const s = await createLearningSession({ title: '新的学习问题', account_id: accountId })
+      const s = await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
       setSessions(prev => ({ ...prev, [s.session_id]: s }))
       setAccountRootIds(prev => [s.session_id, ...prev])
       await activateSession(s.session_id)
@@ -606,15 +656,18 @@ export function App() {
     setInput('')
     setInputResetToken(prev => prev + 1)
     setError(null)
+    // Keep the poller reconciling immediately; send can return before the
+    // backend run flips running=true, and failures clear the optimistic state.
+    markPendingRun(sessionId)
+    setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: true } : prev)
+    setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: true } } : prev)
     try {
       await sendLearningMessage(sessionId, text)
-      // Keep the poller reconciling even if the background run hasn't flipped
-      // running=true yet, and show the thinking indicator immediately.
-      markPendingRun(sessionId)
-      setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: true } : prev)
-      setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: true } } : prev)
       await refreshActive(sessionId)
     } catch (err: any) {
+      delete pendingRunsRef.current[sessionId]
+      setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: false } : prev)
+      setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: false } } : prev)
       const message = err.message || String(err)
       if (message.includes('session is already running')) {
         setError('Agent 正在运行，请稍候或点击 Stop。')
@@ -644,7 +697,7 @@ export function App() {
   async function forkFromUserMessage(sessionId: string, messageIndex?: number, windowId?: string) {
     if (messageIndex == null) return
     try {
-      const result = await forkLearningSessionFromMessage(sessionId, messageIndex)
+      const result = await forkLearningSessionFromMessage(sessionId, messageIndex, makeChildSessionId(sessionId, 'fork'))
       const branch = result.session
       setSessions(prev => ({ ...prev, [branch.session_id]: branch }))
       setConversationChildren(prev => ({
@@ -718,6 +771,7 @@ export function App() {
         kind: 'chat',
         session_id: sourceSessionId,
         location: `对话消息 ${chatId}`,
+        chat_id: chatId,
         text_offset: result.textOffset,
         occurrence: result.occurrence,
       },
@@ -759,46 +813,116 @@ export function App() {
     noteText?: string
     color?: BranchColor
     fullscreen?: boolean
+    initialEvents?: ContextEvent[]
+    skipInitialFetch?: boolean
   }) {
     const windowId = `win_${branch.session_id}`
-    const nextZ = topZ + 1
     const color = options.color || branchColors[branch.session_id] || deriveChildColor(options.sourceSessionId, Object.values(sessions), branchColors)
-    const placement = nextWindowPlacement(Object.values(windows), options.sourceSessionId)
-    setTopZ(nextZ)
     setSessions(prev => ({ ...prev, [branch.session_id]: branch }))
-    setWindows(prev => ({
-      ...prev,
-      [windowId]: {
-        id: windowId,
-        sessionId: branch.session_id,
-        sourceSessionId: options.sourceSessionId,
-        title: options.title || branch.title || '新分支',
-        highlightId: options.highlightId,
-        color,
-        action: options.action,
-        selectedText: options.selectedText,
-        displayQuestion: options.displayQuestion,
-        targetLanguage: options.targetLanguage,
-        noteText: options.noteText,
-        x: placement.x,
-        y: placement.y,
-        width: placement.width,
-        height: placement.height,
-        fullscreen: !!options.fullscreen,
-        minimized: false,
-        zIndex: nextZ,
-      },
-    }))
-    setWindowEvents(prev => ({ ...prev, [windowId]: [] }))
-    const ev = await fetchLearningEvents(branch.session_id)
-    setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
+    setTopZ(prevZ => {
+      const nextZ = prevZ + 1
+      setWindows(current => {
+        const placement = nextWindowPlacement(Object.values(current), options.sourceSessionId)
+        return {
+          ...current,
+          [windowId]: {
+            id: windowId,
+            sessionId: branch.session_id,
+            sourceSessionId: options.sourceSessionId,
+            title: options.title || branch.title || '新分支',
+            highlightId: options.highlightId,
+            color,
+            action: options.action,
+            selectedText: options.selectedText,
+            displayQuestion: options.displayQuestion,
+            targetLanguage: options.targetLanguage,
+            noteText: options.noteText,
+            x: placement.x,
+            y: placement.y,
+            width: placement.width,
+            height: placement.height,
+            fullscreen: !!options.fullscreen,
+            minimized: false,
+            zIndex: nextZ,
+          },
+        }
+      })
+      return nextZ
+    })
+    if (options.initialEvents) {
+      setWindowEvents(prev => ({ ...prev, [windowId]: options.initialEvents || [] }))
+    } else if (!options.skipInitialFetch) {
+      setWindowEvents(prev => ({ ...prev, [windowId]: prev[windowId] || [] }))
+      try {
+        const ev = await fetchLearningEvents(branch.session_id)
+        setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
+      } catch {
+        // Optimistic windows may be visible before the backend creates the
+        // session. The poller will reconcile events as soon as the session exists.
+      }
+    } else {
+      setWindowEvents(prev => ({ ...prev, [windowId]: prev[windowId] || [] }))
+    }
   }
 
   async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string, noteText?: string } = {}) {
     const menu = actionState
+    const actionMeta = SELECTION_ACTIONS.find(item => item.action === menu.action)
+    const requestedSourceSessionId = menu.sourceSessionId
+    const provisionalSessionId = makeChildSessionId(requestedSourceSessionId, menu.action === 'note' ? 'note' : 'learn')
+    const highlightId = `hl_${Date.now()}_${Math.random().toString(16).slice(2)}`
+    const provisionalColor = branchColors[provisionalSessionId] || deriveChildColor(requestedSourceSessionId, Object.values(sessions), branchColors)
+    const highlight: HighlightRecord = {
+      id: highlightId,
+      sessionId: provisionalSessionId,
+      sourceSessionId: requestedSourceSessionId,
+      chatId: menu.chatId,
+      text: menu.text,
+      textOffset: menu.textOffset,
+      occurrence: menu.occurrence,
+      action: menu.action,
+      label: actionMeta?.label || '提问',
+      color: provisionalColor,
+    }
+    if (menu.pdfContext) {
+      setPdfHighlights(prev => ({
+        ...prev,
+        [highlightId]: {
+          id: highlightId,
+          sessionId: provisionalSessionId,
+          path: menu.pdfContext?.path || '',
+          page: menu.pdfContext?.page || 1,
+          text: menu.text,
+          rects: menu.pdfContext?.rects || [],
+          color: provisionalColor,
+        },
+      }))
+    }
+    setHighlights(prev => ({ ...prev, [highlightId]: highlight }))
+    markPendingRun(provisionalSessionId)
+    const optimisticBranch = makeOptimisticBranch(provisionalSessionId, requestedSourceSessionId, {
+      title: options.customQuestion || options.noteText || actionMeta?.label || '新分支',
+      action: menu.action,
+      selectedText: menu.text,
+      customQuestion: options.customQuestion,
+      targetLanguage: options.targetLanguage,
+      noteText: options.noteText,
+      sourceContext: menu.sourceContext,
+    })
+    await openFloatingSession(optimisticBranch, {
+      sourceSessionId: requestedSourceSessionId,
+      title: optimisticBranch.title || highlight.label,
+      highlightId,
+      action: menu.action,
+      selectedText: menu.text,
+      displayQuestion: options.customQuestion,
+      targetLanguage: options.targetLanguage,
+      noteText: options.noteText,
+      color: provisionalColor,
+      skipInitialFetch: true,
+    })
     try {
-      const actionMeta = SELECTION_ACTIONS.find(item => item.action === menu.action)
-      let sourceSessionId = menu.sourceSessionId
+      let sourceSessionId = requestedSourceSessionId
       const filePath = typeof menu.sourceContext?.path === 'string' ? menu.sourceContext.path : ''
       if (filePath) {
         const fileRoot = await getLearningFileRoot(accountId, filePath)
@@ -806,7 +930,14 @@ export function App() {
         setSessions(prev => ({ ...prev, [fileRoot.session_id]: fileRoot }))
         setAccountRootIds(prev => prev.includes(fileRoot.session_id) ? prev : [...prev, fileRoot.session_id])
       }
+      if (sourceSessionId !== requestedSourceSessionId) {
+        setHighlights(prev => prev[highlightId] ? ({
+          ...prev,
+          [highlightId]: { ...prev[highlightId], sourceSessionId },
+        }) : prev)
+      }
       const branch = await selectionBranchLearningSession(sourceSessionId, {
+        session_id: provisionalSessionId,
         selected_text: menu.text,
         action: menu.action,
         custom_question: options.customQuestion,
@@ -814,39 +945,23 @@ export function App() {
         note_text: options.noteText,
         source_context: menu.sourceContext,
       })
-      const highlightId = `hl_${Date.now()}_${Math.random().toString(16).slice(2)}`
-      const color = branchColors[branch.session_id] || deriveChildColor(menu.sourceSessionId, Object.values(sessions), branchColors)
+      const color = branchColors[branch.session_id] || provisionalColor
       if (menu.pdfContext) {
-        setPdfHighlights(prev => ({
+        setPdfHighlights(prev => prev[highlightId] ? ({
           ...prev,
-          [highlightId]: {
-            id: highlightId,
-            sessionId: branch.session_id,
-            path: menu.pdfContext?.path || '',
-            page: menu.pdfContext?.page || 1,
-            text: menu.text,
-            rects: menu.pdfContext?.rects || [],
-            color,
-          },
-        }))
+          [highlightId]: { ...prev[highlightId], sessionId: branch.session_id, color },
+        }) : prev)
       }
-      const highlight: HighlightRecord = {
-        id: highlightId,
-        sessionId: branch.session_id,
-        sourceSessionId,
-        chatId: menu.chatId,
-        text: menu.text,
-        textOffset: menu.textOffset,
-        occurrence: menu.occurrence,
-        action: menu.action,
-        label: actionMeta?.label || '提问',
-        color,
-      }
-      setHighlights(prev => ({ ...prev, [highlightId]: highlight }))
+      setHighlights(prev => prev[highlightId] ? ({
+        ...prev,
+        [highlightId]: { ...prev[highlightId], sessionId: branch.session_id, sourceSessionId, color },
+      }) : prev)
       setSessions(prev => ({ ...prev, [branch.session_id]: branch }))
       setConversationChildren(prev => ({
         ...prev,
-        [sourceSessionId]: [branch.session_id, ...(prev[sourceSessionId] || [])],
+        [sourceSessionId]: prev[sourceSessionId]?.includes(branch.session_id)
+          ? prev[sourceSessionId]
+          : [branch.session_id, ...(prev[sourceSessionId] || [])],
       }))
       await openFloatingSession(branch, {
         sourceSessionId,
@@ -858,8 +973,31 @@ export function App() {
         targetLanguage: options.targetLanguage,
         noteText: options.noteText,
         color,
+        skipInitialFetch: true,
       })
+      await refreshOpenWindows()
     } catch (err: any) {
+      delete pendingRunsRef.current[provisionalSessionId]
+      setWindows(prev => {
+        const next = { ...prev }
+        delete next[`win_${provisionalSessionId}`]
+        return next
+      })
+      setWindowEvents(prev => {
+        const next = { ...prev }
+        delete next[`win_${provisionalSessionId}`]
+        return next
+      })
+      setHighlights(prev => {
+        const next = { ...prev }
+        delete next[highlightId]
+        return next
+      })
+      setPdfHighlights(prev => {
+        const next = { ...prev }
+        delete next[highlightId]
+        return next
+      })
       setError(err.message || String(err))
     }
   }
@@ -890,6 +1028,59 @@ export function App() {
       createSelectionBranch(action, { noteText: note })
       return
     }
+    const provisionalSessionId = makeChildSessionId(action.sourceSessionId, 'note')
+    const highlightId = `hl_${Date.now()}_${Math.random().toString(16).slice(2)}`
+    const provisionalColor = branchColors[provisionalSessionId] || deriveChildColor(action.sourceSessionId, Object.values(sessions), branchColors)
+    if (action.pdfContext) {
+      setPdfHighlights(prev => ({
+        ...prev,
+        [highlightId]: {
+          id: highlightId,
+          sessionId: provisionalSessionId,
+          path: action.pdfContext?.path || '',
+          page: action.pdfContext?.page || 1,
+          text: action.text,
+          rects: action.pdfContext?.rects || [],
+          color: provisionalColor,
+        },
+      }))
+    }
+    setHighlights(prev => ({
+      ...prev,
+      [highlightId]: {
+        id: highlightId,
+        sessionId: provisionalSessionId,
+        sourceSessionId: action.sourceSessionId,
+        chatId: action.chatId,
+        text: action.text,
+        textOffset: action.textOffset,
+        occurrence: action.occurrence,
+        action: 'note',
+        label: '笔记',
+        color: provisionalColor,
+      },
+    }))
+    const optimisticBranch = makeOptimisticBranch(provisionalSessionId, action.sourceSessionId, {
+      title: '笔记',
+      action: 'note',
+      selectedText: action.text,
+      noteText: note,
+      sourceContext: action.sourceContext,
+    })
+    await openFloatingSession(optimisticBranch, {
+      sourceSessionId: action.sourceSessionId,
+      title: '笔记',
+      highlightId,
+      action: 'note',
+      selectedText: action.text,
+      noteText: note,
+      color: provisionalColor,
+      skipInitialFetch: true,
+    })
+    setWindows(prev => {
+      const id = `win_${provisionalSessionId}`
+      return prev[id] ? { ...prev, [id]: { ...prev[id], minimized: true } } : prev
+    })
     try {
       let sourceSessionId = action.sourceSessionId
       const filePath = typeof action.sourceContext?.path === 'string' ? action.sourceContext.path : ''
@@ -900,45 +1091,28 @@ export function App() {
         setAccountRootIds(prev => prev.includes(fileRoot.session_id) ? prev : [...prev, fileRoot.session_id])
       }
       const branch = await saveSelectionNoteLearningSession(sourceSessionId, {
+        session_id: provisionalSessionId,
         selected_text: action.text,
         note_text: note,
         source_context: action.sourceContext,
       })
-      const highlightId = `hl_${Date.now()}_${Math.random().toString(16).slice(2)}`
-      const color = branchColors[branch.session_id] || deriveChildColor(sourceSessionId, Object.values(sessions), branchColors)
+      const color = branchColors[branch.session_id] || provisionalColor
       if (action.pdfContext) {
-        setPdfHighlights(prev => ({
+        setPdfHighlights(prev => prev[highlightId] ? ({
           ...prev,
-          [highlightId]: {
-            id: highlightId,
-            sessionId: branch.session_id,
-            path: action.pdfContext?.path || '',
-            page: action.pdfContext?.page || 1,
-            text: action.text,
-            rects: action.pdfContext?.rects || [],
-            color,
-          },
-        }))
+          [highlightId]: { ...prev[highlightId], sessionId: branch.session_id, color },
+        }) : prev)
       }
-      setHighlights(prev => ({
+      setHighlights(prev => prev[highlightId] ? ({
         ...prev,
-        [highlightId]: {
-          id: highlightId,
-          sessionId: branch.session_id,
-          sourceSessionId,
-          chatId: action.chatId,
-          text: action.text,
-          textOffset: action.textOffset,
-          occurrence: action.occurrence,
-          action: 'note',
-          label: '笔记',
-          color,
-        },
-      }))
+        [highlightId]: { ...prev[highlightId], sessionId: branch.session_id, sourceSessionId, color },
+      }) : prev)
       setSessions(prev => ({ ...prev, [branch.session_id]: branch }))
       setConversationChildren(prev => ({
         ...prev,
-        [sourceSessionId]: [branch.session_id, ...(prev[sourceSessionId] || [])],
+        [sourceSessionId]: prev[sourceSessionId]?.includes(branch.session_id)
+          ? prev[sourceSessionId]
+          : [branch.session_id, ...(prev[sourceSessionId] || [])],
       }))
       await openFloatingSession(branch, {
         sourceSessionId,
@@ -948,12 +1122,33 @@ export function App() {
         selectedText: action.text,
         noteText: note,
         color,
+        skipInitialFetch: true,
       })
       setWindows(prev => {
         const id = `win_${branch.session_id}`
         return prev[id] ? { ...prev, [id]: { ...prev[id], minimized: true } } : prev
       })
     } catch (err: any) {
+      setWindows(prev => {
+        const next = { ...prev }
+        delete next[`win_${provisionalSessionId}`]
+        return next
+      })
+      setWindowEvents(prev => {
+        const next = { ...prev }
+        delete next[`win_${provisionalSessionId}`]
+        return next
+      })
+      setHighlights(prev => {
+        const next = { ...prev }
+        delete next[highlightId]
+        return next
+      })
+      setPdfHighlights(prev => {
+        const next = { ...prev }
+        delete next[highlightId]
+        return next
+      })
       setError(err.message || String(err))
     }
   }
@@ -965,9 +1160,10 @@ export function App() {
     windowInputDraftsRef.current[windowId] = ''
     setWindowInputs(prev => ({ ...prev, [windowId]: '' }))
     setWindowInputResetTokens(prev => ({ ...prev, [windowId]: (prev[windowId] || 0) + 1 }))
+    markPendingRun(win.sessionId)
+    setSessions(prev => prev[win.sessionId] ? { ...prev, [win.sessionId]: { ...prev[win.sessionId], running: true } } : prev)
     try {
       await sendLearningMessage(win.sessionId, text)
-      markPendingRun(win.sessionId)
       const [state, ev] = await Promise.all([
         fetchLearningSession(win.sessionId),
         fetchLearningEvents(win.sessionId),
@@ -976,6 +1172,8 @@ export function App() {
       setSessions(prev => ({ ...prev, [state.session_id]: state }))
       setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
     } catch (err: any) {
+      delete pendingRunsRef.current[win.sessionId]
+      setSessions(prev => prev[win.sessionId] ? { ...prev, [win.sessionId]: { ...prev[win.sessionId], running: false } } : prev)
       setError(err.message || String(err))
     }
   }
@@ -1080,7 +1278,7 @@ export function App() {
         if (nextRoot) {
           await activateSession(nextRoot.session_id)
         } else {
-          const created = await createLearningSession({ title: '新的学习问题', account_id: accountId })
+          const created = await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
           setSessions({ [created.session_id]: created })
           setAccountRootIds([created.session_id])
           await activateSession(created.session_id)
@@ -1163,6 +1361,42 @@ export function App() {
       })
     } catch (err: any) {
       setError(err.message || String(err))
+    }
+  }
+
+  async function restoreChatHighlights(sessionId: string) {
+    if (!sessionId) return
+    try {
+      const children = await fetchLearningChildren(sessionId)
+      const nextTextHighlights: Record<string, HighlightRecord> = {}
+      for (const child of children.nodes) {
+        const selection = child.selection || {}
+        const source = selection.source_context || {}
+        if (source.kind !== 'chat' || !selection.selected_text) continue
+        const chatId = typeof source.chat_id === 'string'
+          ? source.chat_id
+          : String(source.location || '').replace(/^对话消息\s*/, '')
+        if (!chatId) continue
+        const highlightId = `persist_${child.session_id}`
+        const color = branchColors[child.session_id] || deriveChildColor(sessionId, [...Object.values(sessions), ...children.nodes], branchColors)
+        nextTextHighlights[highlightId] = {
+          id: highlightId,
+          sessionId: child.session_id,
+          sourceSessionId: sessionId,
+          chatId,
+          text: selection.selected_text || '',
+          textOffset: typeof source.text_offset === 'number' ? source.text_offset : undefined,
+          occurrence: typeof source.occurrence === 'number' ? source.occurrence : undefined,
+          action: (selection.action as SelectionAction) || 'question',
+          label: selection.action_label || '提问',
+          color,
+        }
+      }
+      if (Object.keys(nextTextHighlights).length) {
+        setHighlights(prev => ({ ...prev, ...nextTextHighlights }))
+      }
+    } catch {
+      // Chat highlights are opportunistic; the conversation should still render.
     }
   }
 
@@ -1549,7 +1783,7 @@ export function App() {
               onOpenHighlight={openHighlight}
             />
           </article>)}
-          {session?.running && <div className="thinking-state main-thinking">{thinkingLabel(events, session.running)}</div>}
+          {session?.running && <ThinkingState events={events} running={session.running} todoBoard={session.todo_board}/>}
         </section>}
 
       {activeMode === 'chat' && <section className="learning-composer">
@@ -1708,7 +1942,8 @@ function sameLearningSession(a?: LearningSessionState, b?: LearningSessionState)
     a.tools_enabled === b.tools_enabled &&
     sameStringList(a.allowed_tools, b.allowed_tools) &&
     sameJsonValue(a.selection, b.selection) &&
-    sameJsonValue((a as any).token_usage_breakdown, (b as any).token_usage_breakdown)
+    sameJsonValue((a as any).token_usage_breakdown, (b as any).token_usage_breakdown) &&
+    sameJsonValue(a.todo_board, b.todo_board)
 }
 
 function sameEventList(a: ContextEvent[] = [], b: ContextEvent[] = []): boolean {
@@ -1778,29 +2013,91 @@ function visibleWindowItems(items: ChatItem[], win: FloatingWindowState): ChatIt
   })
 }
 
-function thinkingStats(events: ContextEvent[], running?: boolean): { elapsedSeconds: number, rounds: number } | null {
+function thinkingStats(events: ContextEvent[], running?: boolean, nowSeconds = Date.now() / 1000, fallbackStartSeconds = nowSeconds): { elapsedSeconds: number, rounds: number } | null {
   if (!running) return null
   const lastInputIndex = Math.max(...events.map((event, index) => event.event_type === 'user_input_received' ? index : -1))
-  if (lastInputIndex < 0) return { elapsedSeconds: 0, rounds: 0 }
-  const afterInput = events.slice(lastInputIndex)
-  const hasTerminalEvent = afterInput.some(event => {
-    if (event.event_type === 'error') return true
-    if (event.event_type !== 'message_appended') return false
-    const message = event.payload?.message || {}
-    return message.role === 'assistant' && isMeaningfulContent(message.content)
-  })
-  if (hasTerminalEvent) return null
-  const start = events[lastInputIndex]?.created_at || Date.now() / 1000
+  const afterInput = lastInputIndex >= 0 ? events.slice(lastInputIndex) : []
+  // ThinkingState is only rendered while the backend still reports running=true.
+  // Do not hide it just because an assistant/tool-call message has already been
+  // appended: during long tool calls the assistant may emit a partial message
+  // before todo_manage updates the board, and hiding here makes the GUI lose the
+  // live todo progress panel.
+  const start = lastInputIndex >= 0 ? (events[lastInputIndex]?.created_at || fallbackStartSeconds) : fallbackStartSeconds
   return {
-    elapsedSeconds: Math.max(0, Math.floor(Date.now() / 1000 - start)),
+    elapsedSeconds: Math.max(0, Math.floor(nowSeconds - start)),
     rounds: afterInput.filter(event => event.event_type === 'llm_request_snapshot').length,
   }
 }
 
-function thinkingLabel(events: ContextEvent[], running?: boolean): string {
-  const stats = thinkingStats(events, running)
+function thinkingLabel(events: ContextEvent[], running?: boolean, nowSeconds = Date.now() / 1000, fallbackStartSeconds = nowSeconds): string {
+  const stats = thinkingStats(events, running, nowSeconds, fallbackStartSeconds)
   if (!stats) return ''
   return `思考过程中 · ${stats.elapsedSeconds}s · ${stats.rounds} 轮`
+}
+
+function ThinkingState({ events, running, todoBoard }: { events: ContextEvent[], running?: boolean, todoBoard?: TodoBoardState | null }) {
+  const startedAtRef = useRef(Date.now() / 1000)
+  const [timerTick, setTimerTick] = useState(0)
+  useEffect(() => {
+    if (!running) return
+    startedAtRef.current = Date.now() / 1000
+    setTimerTick(tick => tick + 1)
+    const timer = window.setInterval(() => setTimerTick(tick => tick + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [running])
+  const nowSeconds = Date.now() / 1000
+  const label = thinkingLabel(events, running, nowSeconds, startedAtRef.current)
+  void timerTick
+  if (!label) return null
+  return <div className="thinking-state">
+    <div className="thinking-state-header">{label}</div>
+    <TodoBoardPreview board={todoBoard}/>
+  </div>
+}
+
+function TodoBoardPreview({ board }: { board?: TodoBoardState | null }) {
+  if (!board?.exists || !Array.isArray(board.tasks) || board.tasks.length === 0) {
+    return <div className="thinking-planning">agent 正在规划，todo 看板生成后会自动显示。</div>
+  }
+  const counts = board.status_counts || {}
+  const total = board.total ?? board.tasks.length
+  const completed = board.completed ?? counts.completed ?? 0
+  const progress = total ? Math.round(completed / total * 100) : 0
+  const visibleTasks = board.tasks.slice(0, 8)
+  return <div className="thinking-todo-board">
+    <div className="todo-board-summary">
+      <span>Todo 看板{board.session_id ? ` · ${board.session_id}` : ''}</span>
+      <strong>{completed}/{total}</strong>
+      <span>{progress}%</span>
+    </div>
+    <div className="todo-board-counts">
+      <span>🚧 {counts.in_progress || 0}</span>
+      <span>🕓 {counts.pending || 0}</span>
+      <span>🧩 {counts.needs_split || 0}</span>
+      <span>🧱 {counts.blocked || 0}</span>
+      <span>✅ {counts.completed || 0}</span>
+      <span>❌ {counts.failed || 0}</span>
+    </div>
+    <ul className="todo-board-list">
+      {visibleTasks.map(task => <li key={task.id} className={`todo-board-item ${task.status}`}>
+        <span className="todo-board-status">{todoStatusIcon(task.status)}</span>
+        <span className="todo-board-text"><b>{task.id}</b> {task.description}</span>
+        {task.assigned_to && <span className="todo-board-owner">{task.assigned_to}</span>}
+      </li>)}
+    </ul>
+    {(board.truncated || board.tasks.length > visibleTasks.length) && <div className="todo-board-more">还有更多任务，已折叠显示。</div>}
+    {!!board.ready_to_execute?.length && <div className="todo-board-ready">Ready: {board.ready_to_execute.slice(0, 6).join(', ')}</div>}
+  </div>
+}
+
+function todoStatusIcon(status: string): string {
+  if (status === 'completed') return '✅'
+  if (status === 'in_progress') return '🚧'
+  if (status === 'needs_split') return '🧩'
+  if (status === 'blocked') return '🧱'
+  if (status === 'failed') return '❌'
+  if (status === 'cancelled') return '🚫'
+  return '🕓'
 }
 
 function buildCleanSelectionDisplay(win: FloatingWindowState): string {
@@ -2602,8 +2899,9 @@ function readTextSelectionWithin(container: HTMLElement, anchor?: TextSelectionA
 
 function textSelectionResultFromRange(container: HTMLElement, range: Range): TextSelectionResult | null {
   if (!rangeInsideContainer(container, range)) return null
-  const rawText = range.toString()
-  const leadingTrim = rawText.length - rawText.trimStart().length
+  const extracted = selectableTextFromRange(container, range)
+  const rawText = extracted?.text || range.toString()
+  const leadingTrim = extracted?.leadingTrim ?? (rawText.length - rawText.trimStart().length)
   const text = rawText.trim()
   if (text.length < 2) return null
   const rect = range.getBoundingClientRect()
@@ -2632,15 +2930,25 @@ function updateManagedTextSelection(container: HTMLElement, anchor: TextSelectio
 
 function rangeFromAnchorToEvent(container: HTMLElement, anchor: TextSelectionAnchor | null, event: any): Range | null {
   if (!anchor) return null
-  const end = textSelectionPointFromEvent(container, event)
+  const end = textSelectionPointFromEvent(container, event, anchor)
   if (!end) return null
   return rangeFromTextSelectionPoints(container, anchor, end)
 }
 
-function textSelectionPointFromEvent(container: HTMLElement, event: any): TextSelectionPoint | null {
+function textSelectionPointFromEvent(container: HTMLElement, event: any, anchor?: TextSelectionAnchor | null): TextSelectionPoint | null {
   const target = event.target as HTMLElement
-  const token = target.closest<HTMLElement>('[data-md-token]') || nearestMarkdownToken(container, event.clientX, event.clientY)
-  if (!token || !container.contains(token)) return null
+  const token = target.closest<HTMLElement>('[data-md-token]')
+  if (token && container.contains(token)) return textSelectionPointFromToken(token, event.clientX, event.clientY)
+  const mathBoundary = target.closest<HTMLElement>('.katex, .math-inline, .math-block')
+  if (mathBoundary && container.contains(mathBoundary)) {
+    const mathPoint = textSelectionPointAroundMath(container, mathBoundary, anchor || null)
+    if (mathPoint) return mathPoint
+  }
+  const nearest = nearestMarkdownToken(container, event.clientX, event.clientY)
+  return nearest ? textSelectionPointFromToken(nearest, event.clientX, event.clientY) : null
+}
+
+function textSelectionPointFromToken(token: HTMLElement, x: number, y: number): TextSelectionPoint | null {
   if (token.dataset.mdSelectable !== '1') return null
   const textNode = firstTextNode(token)
   if (!textNode) return null
@@ -2648,8 +2956,42 @@ function textSelectionPointFromEvent(container: HTMLElement, event: any): TextSe
   if (!Number.isFinite(tokenIndex) || tokenIndex < 0) return null
   return {
     tokenIndex,
-    offset: offsetFromPointInTextNode(textNode, event.clientX, event.clientY),
+    offset: token.dataset.mdMath === '1'
+      ? offsetFromPointInMathToken(token, textNode, x)
+      : offsetFromPointInTextNode(textNode, x, y),
   }
+}
+
+function textSelectionPointAroundMath(container: HTMLElement, mathElement: HTMLElement, anchor: TextSelectionAnchor | null): TextSelectionPoint | null {
+  const mathRect = mathElement.getBoundingClientRect()
+  const tokens = markdownTokens(container).filter(token => token.dataset.mdSelectable === '1')
+  const before: HTMLElement[] = []
+  const after: HTMLElement[] = []
+  for (const token of tokens) {
+    const rect = firstUsableRect(token)
+    if (!rect) continue
+    const sameLine = rect.bottom >= mathRect.top - 10 && rect.top <= mathRect.bottom + 10
+    if (!sameLine) continue
+    const tokenIndex = Number(token.dataset.mdToken || -1)
+    if (!Number.isFinite(tokenIndex) || tokenIndex < 0) continue
+    if (rect.right <= mathRect.left + 2) before.push(token)
+    if (rect.left >= mathRect.right - 2) after.push(token)
+  }
+  before.sort((a, b) => Number(a.dataset.mdToken || 0) - Number(b.dataset.mdToken || 0))
+  after.sort((a, b) => Number(a.dataset.mdToken || 0) - Number(b.dataset.mdToken || 0))
+  const previous = before[before.length - 1]
+  const next = after[0]
+  const anchorIndex = anchor?.tokenIndex ?? -1
+  if (next && (anchorIndex < 0 || anchorIndex <= Number(next.dataset.mdToken || 0))) {
+    return { tokenIndex: Number(next.dataset.mdToken || 0), offset: 0 }
+  }
+  if (previous) {
+    const textNode = firstTextNode(previous)
+    return { tokenIndex: Number(previous.dataset.mdToken || 0), offset: textNode?.textContent?.length || 0 }
+  }
+  if (next) return { tokenIndex: Number(next.dataset.mdToken || 0), offset: 0 }
+  const nearest = nearestMarkdownToken(container, mathRect.left + mathRect.width / 2, mathRect.top + mathRect.height / 2, 220)
+  return nearest ? textSelectionPointFromToken(nearest, mathRect.left + mathRect.width / 2, mathRect.top + mathRect.height / 2) : null
 }
 
 function rangeFromTextSelectionPoints(container: HTMLElement, a: TextSelectionPoint, b: TextSelectionPoint): Range | null {
@@ -2677,7 +3019,7 @@ function markdownTokens(container: HTMLElement): HTMLElement[] {
   return Array.from(container.querySelectorAll<HTMLElement>('[data-md-token]'))
 }
 
-function nearestMarkdownToken(container: HTMLElement, x: number, y: number): HTMLElement | null {
+function nearestMarkdownToken(container: HTMLElement, x: number, y: number, maxScore = 72): HTMLElement | null {
   let best: HTMLElement | null = null
   let bestScore = Infinity
   for (const token of markdownTokens(container)) {
@@ -2695,12 +3037,32 @@ function nearestMarkdownToken(container: HTMLElement, x: number, y: number): HTM
       }
     }
   }
-  return bestScore <= 72 ? best : null
+  return bestScore <= maxScore ? best : null
+}
+
+function firstUsableRect(element: HTMLElement): DOMRect | null {
+  return Array.from(element.getClientRects()).find(rect => rect.width || rect.height) || null
 }
 
 function firstTextNode(element: HTMLElement): Text | null {
+  const mathSource = element.dataset.mdMath === '1'
+    ? element.querySelector<HTMLElement>('[data-md-math-source]')
+    : null
+  if (mathSource) {
+    const mathWalker = document.createTreeWalker(mathSource, NodeFilter.SHOW_TEXT)
+    const mathText = mathWalker.nextNode() as Text | null
+    if (mathText) return mathText
+  }
   const walker = document.createTreeWalker(element, NodeFilter.SHOW_TEXT)
   return walker.nextNode() as Text | null
+}
+
+function offsetFromPointInMathToken(token: HTMLElement, node: Text, x: number): number {
+  const textLength = (node.textContent || '').length
+  if (!textLength) return 0
+  const rect = token.getBoundingClientRect()
+  if (!rect || (!rect.width && !rect.height)) return textLength
+  return x <= rect.left + rect.width / 2 ? 0 : textLength
 }
 
 function offsetFromPointInTextNode(node: Text, x: number, y: number): number {
@@ -2893,7 +3255,7 @@ function FloatingWindows({
               onOpenHighlight={onOpenHighlight}
             />
           </article>)}
-          {session?.running && <div className="thinking-state">{thinkingLabel(eventsByWindow[win.id] || [], session.running)}</div>}
+          {session?.running && <ThinkingState events={eventsByWindow[win.id] || []} running={session.running} todoBoard={session.todo_board}/>}
         </div>
         <footer className="window-composer">
           <ComposerInput
@@ -3051,25 +3413,36 @@ function MessageContent({ sessionId, item, collapsed, highlights, onToggleCollap
         copyTextToClipboard(text)
       }}
     ><Copy size={13}/></button>}
-    <MarkdownText text={visibleText} chatId={item.id} highlights={highlights} onOpenHighlight={onOpenHighlight}/>
+    <MarkdownText text={visibleText} chatId={item.id} sourceSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight}/>
     {canCollapse && <button className="collapse-toggle" onClick={onToggleCollapse}>{collapsed ? `展开全部 ${lines.length} 行` : '折叠到 10 行'}</button>}
   </div>
 }
 
-function MarkdownText({ text, chatId, highlights, onOpenHighlight, basePath = '' }: {
+function MarkdownText({ text, chatId, sourceSessionId, highlights, onOpenHighlight, basePath = '' }: {
   text: string
   chatId: string
+  sourceSessionId?: string
   highlights: Record<string, HighlightRecord>
   onOpenHighlight: (highlightId: string) => void
   basePath?: string
 }) {
-  const html = useMemo(() => renderMarkdownToHtml(text || '', { basePath, chatId, highlights }), [text, basePath, chatId, highlights])
+  const html = useMemo(() => renderMarkdownToHtml(text || '', { basePath, chatId, sourceSessionId, highlights }), [text, basePath, chatId, sourceSessionId, highlights])
   return <div
     className="markdown-body"
+    onMouseDown={event => {
+      const target = event.target as HTMLElement
+      if (target.closest('[data-highlight-id]')) event.stopPropagation()
+    }}
+    onMouseUp={event => {
+      const target = event.target as HTMLElement
+      if (target.closest('[data-highlight-id]')) event.stopPropagation()
+    }}
     onClick={event => {
       const target = event.target as HTMLElement
       const highlight = target.closest<HTMLElement>('[data-highlight-id]')
       if (highlight?.dataset.highlightId) {
+        event.preventDefault()
+        event.stopPropagation()
         onOpenHighlight(highlight.dataset.highlightId)
       }
     }}
@@ -3077,23 +3450,30 @@ function MarkdownText({ text, chatId, highlights, onOpenHighlight, basePath = ''
   />
 }
 
+type MathRenderPlaceholder = {
+  html: string
+  source: string
+  displayMode: boolean
+}
+
 function renderMarkdownToHtml(text: string, options: {
   basePath?: string
   chatId: string
+  sourceSessionId?: string
   highlights: Record<string, HighlightRecord>
 }): string {
-  const mathHtml: string[] = []
+  const mathItems: MathRenderPlaceholder[] = []
   const withMath = text
-    .replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_, body) => stashMath(mathHtml, body, true))
-    .replace(/\$\$\s*([\s\S]*?)\s*\$\$/g, (_, body) => stashMath(mathHtml, body, true))
-    .replace(/\\\(([\s\S]*?)\\\)/g, (_, body) => stashMath(mathHtml, body, false))
-    .replace(/\$([^$\n]+)\$/g, (_, body) => stashMath(mathHtml, body, false))
+    .replace(/\\\[\s*([\s\S]*?)\s*\\\]/g, (_, body) => stashMath(mathItems, body, true))
+    .replace(/\$\$\s*([\s\S]*?)\s*\$\$/g, (_, body) => stashMath(mathItems, body, true))
+    .replace(/\\\(([\s\S]*?)\\\)/g, (_, body) => stashMath(mathItems, body, false))
+    .replace(/\$([^$\n]+)\$/g, (_, body) => stashMath(mathItems, body, false))
   let html = markdownRenderer.render(withMath)
-  mathHtml.forEach((value, index) => {
-    html = html.split(`@@RAGENT_MATH_${index}@@`).join(value)
+  mathItems.forEach((item, index) => {
+    html = html.split(`@@RAGENT_MATH_${index}@@`).join(renderMathPlaceholder(item))
   })
   html = rewriteMarkdownAssetUrls(html, options.basePath || '')
-  html = applyMarkdownHighlights(html, options.chatId, options.highlights)
+  html = applyMarkdownHighlights(html, options.chatId, options.sourceSessionId, options.highlights)
   html = wrapMarkdownTextTokens(html)
   return html
 }
@@ -3113,19 +3493,30 @@ function locateSelectionInContainer(container: HTMLElement, range: Range, select
   return {}
 }
 
-function stashMath(items: string[], tex: string, displayMode: boolean): string {
+function stashMath(items: MathRenderPlaceholder[], tex: string, displayMode: boolean): string {
   const index = items.length
+  const source = String(tex || '').trim()
+  let html = ''
   try {
-    items.push(renderToString(String(tex || '').trim(), {
+    html = renderToString(source, {
       displayMode,
       throwOnError: false,
       strict: 'ignore',
       trust: false,
-    }))
+    })
   } catch {
-    items.push(markdownRenderer.utils.escapeHtml(String(tex || '')))
+    html = markdownRenderer.utils.escapeHtml(source)
   }
+  items.push({ html, source, displayMode })
   return `@@RAGENT_MATH_${index}@@`
+}
+
+function renderMathPlaceholder(item: MathRenderPlaceholder): string {
+  const className = item.displayMode ? 'math-block' : 'math-inline'
+  const tag = item.displayMode ? 'div' : 'span'
+  const escapedSource = markdownRenderer.utils.escapeHtml(item.source)
+  const source = `<span class="md-math-source" data-md-math-source="1" aria-hidden="true">${escapedSource}</span>`
+  return `<${tag} class="${className}" data-md-math="1">${item.html}${source}</${tag}>`
 }
 
 function rewriteMarkdownAssetUrls(html: string, basePath: string): string {
@@ -3162,7 +3553,12 @@ function wrapMarkdownTextTokens(html: string): string {
   function visit(node: Node) {
     if (node.nodeType === Node.ELEMENT_NODE) {
       const element = node as HTMLElement
-      if (skipTags.has(element.tagName) || element.classList.contains('katex')) return
+      if (skipTags.has(element.tagName)) return
+      if (element.dataset.mdMath === '1') {
+        index = makeMathToken(doc, element, index)
+        return
+      }
+      if (element.classList.contains('katex')) return
       Array.from(element.childNodes).forEach(visit)
       return
     }
@@ -3170,7 +3566,7 @@ function wrapMarkdownTextTokens(html: string): string {
     const value = node.textContent || ''
     if (!value.trim()) return
     const parent = node.parentElement
-    if (!parent || parent.closest('pre, code, .katex, .selection-highlight')) return
+    if (!parent || parent.closest('pre, code, .katex, .selection-highlight, [data-md-math]')) return
     const fragment = doc.createDocumentFragment()
     const parts = value.match(/\S+|\s+/g) || [value]
     for (const part of parts) {
@@ -3188,17 +3584,69 @@ function wrapMarkdownTextTokens(html: string): string {
   return root.innerHTML
 }
 
-function applyMarkdownHighlights(html: string, chatId: string, highlights: Record<string, HighlightRecord>): string {
-  const items = Object.values(highlights).filter(entry => entry.chatId === chatId && String(entry.text || '').trim())
+function makeMathToken(doc: Document, element: HTMLElement, index: number): number {
+  element.classList.add('md-token', 'md-math-token')
+  element.dataset.mdToken = String(index)
+  element.dataset.mdSelectable = '1'
+  const source = element.querySelector<HTMLElement>('[data-md-math-source]')
+  if (!source) {
+    const fallback = doc.createElement('span')
+    fallback.className = 'md-math-source'
+    fallback.dataset.mdMathSource = '1'
+    fallback.setAttribute('aria-hidden', 'true')
+    fallback.textContent = element.textContent || ''
+    element.appendChild(fallback)
+  }
+  return index + 1
+}
+
+type ResolvedHighlightRange = {
+  item: HighlightRecord
+  start: number
+  end: number
+  order: number
+}
+
+function applyMarkdownHighlights(html: string, chatId: string, sourceSessionId: string | undefined, highlights: Record<string, HighlightRecord>): string {
+  const items = Object.values(highlights).filter(entry =>
+    entry.chatId === chatId &&
+    (!sourceSessionId || !entry.sourceSessionId || entry.sourceSessionId === sourceSessionId) &&
+    String(entry.text || '').trim()
+  )
   if (!items.length) return html
   const parser = new DOMParser()
   const doc = parser.parseFromString(`<div>${html}</div>`, 'text/html')
   const root = doc.body.firstElementChild as HTMLElement | null
   if (!root) return html
-  for (const item of items) {
-    applyHighlightToTextNodes(doc, selectableTextNodes(root), item)
-  }
+  applyMathOnlyHighlights(doc, root, items)
+  const textNodes = selectableTextNodes(root)
+  const fullText = textNodes.map(node => node.textContent || '').join('')
+  const ranges = items
+    .map((item, order) => {
+      const range = resolveHighlightRange(fullText, item)
+      return range ? { ...range, item, order } : null
+    })
+    .filter((range): range is ResolvedHighlightRange => !!range)
+  applyHighlightRangesToTextNodes(doc, textNodes, ranges)
   return root.innerHTML
+}
+
+
+function applyMathOnlyHighlights(doc: Document, root: HTMLElement, items: HighlightRecord[]): void {
+  const mathElements = Array.from(root.querySelectorAll<HTMLElement>('[data-md-math]'))
+  if (!mathElements.length) return
+  for (const element of mathElements) {
+    if (element.closest('[data-highlight-id]')) continue
+    const source = element.querySelector<HTMLElement>('[data-md-math-source]')?.textContent || ''
+    if (!source) continue
+    const match = items.find(item => normalizeComparableText(item.text) === normalizeComparableText(source))
+    if (!match) continue
+    highlightMathElement(doc, element, match)
+  }
+}
+
+function normalizeComparableText(value: string): string {
+  return normalizeTextWithMap(String(value || '').replace(/^\s*(?:\$\$|\\\[|\\\()\s*/, '').replace(/\s*(?:\$\$|\\\]|\\\))\s*$/, '')).text
 }
 
 function selectableTextNodes(root: Node): Text[] {
@@ -3207,7 +3655,14 @@ function selectableTextNodes(root: Node): Text[] {
   function visit(node: Node) {
     if (node.nodeType === Node.ELEMENT_NODE) {
       const element = node as HTMLElement
-      if (skipTags.has(element.tagName) || element.classList.contains('katex')) return
+      if (skipTags.has(element.tagName)) return
+      if (element.dataset.mdMath === '1') {
+        const source = element.querySelector<HTMLElement>('[data-md-math-source]')
+        const text = source ? firstTextNode(source) : null
+        if (text?.textContent) nodes.push(text)
+        return
+      }
+      if (element.classList.contains('katex') || element.closest('[data-md-math]')) return
       Array.from(element.childNodes).forEach(visit)
       return
     }
@@ -3218,47 +3673,179 @@ function selectableTextNodes(root: Node): Text[] {
   return nodes
 }
 
-function applyHighlightToTextNodes(doc: Document, textNodes: Text[], item: HighlightRecord): void {
-  const text = String(item.text || '').trim()
-  if (!text) return
-  const fullText = textNodes.map(node => node.textContent || '').join('')
-  let start = typeof item.textOffset === 'number' && item.textOffset >= 0 ? item.textOffset : -1
-  if (start < 0 || fullText.slice(start, start + text.length) !== text) {
-    start = nthIndexOf(fullText, text, item.occurrence || 0)
-  }
-  if (start < 0) start = fullText.indexOf(text)
-  if (start < 0) return
-  wrapTextNodeRange(doc, textNodes, start, start + text.length, item)
-}
-
-function wrapTextNodeRange(doc: Document, textNodes: Text[], start: number, end: number, item: HighlightRecord): void {
-  let cursor = 0
-  const nodes = [...textNodes]
-  for (const node of nodes) {
-    if (!node.parentElement) {
-      cursor += node.textContent?.length || 0
+function selectableTextFromRange(container: HTMLElement, range: Range): { text: string, leadingTrim: number } | null {
+  const textNodes = selectableTextNodes(container)
+  if (!textNodes.length) return null
+  let text = ''
+  let started = false
+  for (const node of textNodes) {
+    const value = node.textContent || ''
+    if (node === range.startContainer && node === range.endContainer) {
+      const start = clampOffset(range.startOffset, node)
+      const end = clampOffset(range.endOffset, node)
+      text += value.slice(Math.min(start, end), Math.max(start, end))
+      break
+    }
+    if (node === range.startContainer) {
+      started = true
+      text += value.slice(clampOffset(range.startOffset, node))
       continue
     }
+    if (node === range.endContainer) {
+      if (started) text += value.slice(0, clampOffset(range.endOffset, node))
+      break
+    }
+    if (started) text += value
+  }
+  if (!text && range.intersectsNode) {
+    for (const node of textNodes) {
+      const parent = node.parentElement
+      if (!parent || !range.intersectsNode(parent)) continue
+      text += node.textContent || ''
+    }
+  }
+  return text ? { text, leadingTrim: text.length - text.trimStart().length } : null
+}
+
+function applyHighlightToTextNodes(doc: Document, textNodes: Text[], item: HighlightRecord): void {
+  const fullText = textNodes.map(node => node.textContent || '').join('')
+  const range = resolveHighlightRange(fullText, item)
+  if (!range) return
+  applyHighlightRangesToTextNodes(doc, textNodes, [{ ...range, item, order: 0 }])
+}
+
+function resolveHighlightRange(fullText: string, item: HighlightRecord): { start: number, end: number } | null {
+  const text = String(item.text || '').trim()
+  if (!text) return null
+  let start = typeof item.textOffset === 'number' && item.textOffset >= 0 ? item.textOffset : -1
+  let end = start >= 0 ? start + text.length : -1
+  if (start < 0 || fullText.slice(start, end) !== text) {
+    start = nthIndexOf(fullText, text, item.occurrence || 0)
+    end = start >= 0 ? start + text.length : -1
+  }
+  if (start < 0) {
+    start = fullText.indexOf(text)
+    end = start >= 0 ? start + text.length : -1
+  }
+  if (start < 0) {
+    const normalized = findNormalizedTextRange(fullText, text, item.occurrence || 0)
+    if (!normalized) return null
+    start = normalized.start
+    end = normalized.end
+  }
+  if (start < 0 || end <= start) return null
+  return { start, end }
+}
+
+function findNormalizedTextRange(source: string, needle: string, occurrence: number): { start: number, end: number } | null {
+  const sourceMap = normalizeTextWithMap(source)
+  const needleText = normalizeTextWithMap(needle).text
+  if (!sourceMap.text || !needleText) return null
+  const normalizedStart = nthIndexOf(sourceMap.text, needleText, occurrence)
+  if (normalizedStart < 0) return null
+  const normalizedEnd = normalizedStart + needleText.length
+  const start = sourceMap.map[normalizedStart]
+  const end = (sourceMap.map[normalizedEnd - 1] ?? start) + 1
+  return { start, end }
+}
+
+function normalizeTextWithMap(value: string): { text: string, map: number[] } {
+  let text = ''
+  const map: number[] = []
+  let pendingSpace = false
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]
+    if (/\s/.test(char)) {
+      pendingSpace = text.length > 0
+      continue
+    }
+    if (pendingSpace) {
+      text += ' '
+      map.push(index)
+      pendingSpace = false
+    }
+    text += char
+    map.push(index)
+  }
+  return { text, map }
+}
+
+function applyHighlightRangesToTextNodes(doc: Document, textNodes: Text[], ranges: ResolvedHighlightRange[]): void {
+  const normalizedRanges = normalizeHighlightRanges(ranges)
+  if (!normalizedRanges.length) return
+  let cursor = 0
+  let rangeIndex = 0
+  const nodes = [...textNodes]
+  for (const node of nodes) {
     const value = node.textContent || ''
     const nodeStart = cursor
     const nodeEnd = cursor + value.length
     cursor = nodeEnd
-    if (end <= nodeStart || start >= nodeEnd) continue
-    if (node.parentElement.closest('.selection-highlight')) continue
-    const from = Math.max(0, start - nodeStart)
-    const to = Math.min(value.length, end - nodeStart)
-    if (from >= to) continue
+    if (!node.parentElement || !value) continue
+    while (rangeIndex < normalizedRanges.length && normalizedRanges[rangeIndex].end <= nodeStart) rangeIndex += 1
+    const nodeRanges: ResolvedHighlightRange[] = []
+    for (let index = rangeIndex; index < normalizedRanges.length && normalizedRanges[index].start < nodeEnd; index += 1) {
+      const range = normalizedRanges[index]
+      if (range.end > nodeStart) nodeRanges.push(range)
+    }
+    if (!nodeRanges.length) continue
+    const mathElement = node.parentElement.closest<HTMLElement>('[data-md-math]')
+    if (mathElement) {
+      highlightMathElement(doc, mathElement, nodeRanges[0].item)
+      continue
+    }
     const fragment = doc.createDocumentFragment()
-    if (from > 0) fragment.appendChild(doc.createTextNode(value.slice(0, from)))
-    const span = doc.createElement('span')
-    span.className = 'selection-highlight'
-    span.dataset.highlightId = item.id
-    span.setAttribute('style', highlightStyle(item))
-    span.textContent = value.slice(from, to)
-    fragment.appendChild(span)
-    if (to < value.length) fragment.appendChild(doc.createTextNode(value.slice(to)))
+    let localOffset = 0
+    for (const range of nodeRanges) {
+      const from = Math.max(localOffset, Math.max(0, range.start - nodeStart))
+      const to = Math.min(value.length, range.end - nodeStart)
+      if (from > localOffset) fragment.appendChild(doc.createTextNode(value.slice(localOffset, from)))
+      if (from < to) {
+        fragment.appendChild(createHighlightSpan(doc, range.item, value.slice(from, to)))
+        localOffset = to
+      }
+    }
+    if (localOffset < value.length) fragment.appendChild(doc.createTextNode(value.slice(localOffset)))
     node.parentElement.replaceChild(fragment, node)
   }
+}
+
+
+function highlightMathElement(doc: Document, element: HTMLElement, item: HighlightRecord): void {
+  const existingWrapper = element.parentElement?.closest<HTMLElement>('[data-highlight-id]')
+  if (existingWrapper) return
+  const wrapper = createHighlightSpan(doc, item, '')
+  wrapper.classList.add('math-selection-highlight')
+  element.parentNode?.insertBefore(wrapper, element)
+  wrapper.appendChild(element)
+}
+
+function normalizeHighlightRanges(ranges: ResolvedHighlightRange[]): ResolvedHighlightRange[] {
+  const sorted = [...ranges]
+    .filter(range => range.end > range.start)
+    .sort((a, b) => a.start - b.start || a.end - b.end || a.order - b.order)
+  const result: ResolvedHighlightRange[] = []
+  let coveredUntil = -1
+  for (const range of sorted) {
+    const start = Math.max(range.start, coveredUntil)
+    if (start >= range.end) continue
+    result.push({ ...range, start })
+    coveredUntil = range.end
+  }
+  return result
+}
+
+function createHighlightSpan(doc: Document, item: HighlightRecord, text: string): HTMLElement {
+  const span = doc.createElement('span')
+  span.className = 'selection-highlight'
+  span.dataset.highlightId = item.id
+  span.setAttribute('style', highlightStyle(item))
+  span.textContent = text
+  return span
+}
+
+function wrapTextNodeRange(doc: Document, textNodes: Text[], start: number, end: number, item: HighlightRecord): void {
+  applyHighlightRangesToTextNodes(doc, textNodes, [{ item, start, end, order: 0 }])
 }
 
 function highlightStyle(item: HighlightRecord): string {

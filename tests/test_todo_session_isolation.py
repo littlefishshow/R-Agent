@@ -1,8 +1,11 @@
 import json
+from types import SimpleNamespace
 
+import core.agent
+from core.agent import RAgent
 from tools import todo_tool
 from tools import delegate_tool
-import core.agent
+from tools.registry import registry
 
 
 def test_todo_manage_session_id_isolates_files(monkeypatch, tmp_path):
@@ -182,4 +185,86 @@ def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
         "self_evolution_review",
     }.issubset(excluded)
     assert _CapturingExcludeAgent.captured_kwargs["allowed_tools"] == {"web_search", "read_file"}
+
+
+class _FakeCompletions:
+    def __init__(self, responses):
+        self._responses = list(responses)
+
+    def create(self, **kwargs):
+        if not self._responses:
+            raise AssertionError("unexpected extra LLM call")
+        return self._responses.pop(0)
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self.chat = SimpleNamespace(completions=_FakeCompletions(responses))
+
+
+def _tool_call(name, arguments):
+    return SimpleNamespace(
+        id=f"call_{name}",
+        function=SimpleNamespace(name=name, arguments=json.dumps(arguments, ensure_ascii=False)),
+    )
+
+
+def _message(content="", tool_calls=None):
+    return SimpleNamespace(content=content, tool_calls=tool_calls)
+
+
+def _response(message):
+    return SimpleNamespace(usage={"total_tokens": 1}, choices=[SimpleNamespace(message=message)])
+
+
+def test_agent_inherits_current_session_when_todo_manage_gets_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    monkeypatch.setattr(todo_tool, "TODO_LIST_DIR", str(tmp_path / "todo_lists"))
+    monkeypatch.setattr(registry, "execute_tool_isolated", lambda name, args, **kwargs: registry.execute_tool(name, args))
+
+    agent = RAgent(model="test-model", max_iterations=3, enable_self_review=False, session_id="learn_x")
+    agent.client = _FakeClient([
+        _response(_message(tool_calls=[_tool_call("todo_manage", {
+            "action": "init",
+            "payload": json.dumps({"tasks": [{"id": "learn-task", "description": "Learn"}]}),
+            "session_id": "default",
+        })])),
+        _response(_message(content="done", tool_calls=None)),
+    ])
+
+    assert agent.run_conversation("init todo") == "done"
+    state = json.loads(todo_tool.todo_manage("view", "{}", session_id="learn_x"))
+    assert [t["id"] for t in state["todo_list"]] == ["learn-task"]
+    legacy = json.loads(todo_tool.todo_manage("view", "{}", session_id="default"))
+    assert legacy["todo_list"] == []
+
+
+def test_agent_inherits_current_session_when_delegate_task_gets_default(monkeypatch, tmp_path):
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    monkeypatch.setattr(todo_tool, "TODO_LIST_DIR", str(tmp_path / "todo_lists"))
+    monkeypatch.setattr(core.agent, "RAgent", _SessionAwareAgent)
+
+    todo_tool.todo_manage(
+        "init",
+        json.dumps({"tasks": [{"id": "tdel", "description": "Delegated"}]}),
+        session_id="learn_x",
+    )
+
+    parent = RAgent(model="test-model", max_iterations=3, enable_self_review=False, session_id="learn_x")
+    parent.client = _FakeClient([
+        _response(_message(tool_calls=[_tool_call("delegate_task", {
+            "tasks": json.dumps([{"task_id": "tdel", "goal": "finish"}]),
+            "max_workers": 1,
+            "default_max_iterations": 2,
+            "session_id": "default",
+            "default_wall_timeout_seconds": 5,
+        })])),
+        _response(_message(content="done", tool_calls=None)),
+    ])
+
+    assert parent.run_conversation("delegate", event_sink=lambda *args, **kwargs: None) == "done"
+    state = json.loads(todo_tool.todo_manage("view", "{}", session_id="learn_x"))
+    assert state["todo_list"][0]["status"] == "completed"
+    legacy = json.loads(todo_tool.todo_manage("view", "{}", session_id="default"))
+    assert legacy["todo_list"] == []
 

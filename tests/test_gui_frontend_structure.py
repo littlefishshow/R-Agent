@@ -220,13 +220,38 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "Download" in app
     assert "FloatingWindows" in app
     assert "nextWindowPlacement" in app
+    assert "function raiseWindow" in app
+    assert "minimized: false" in app
+    assert "Object.values(windows).filter(win => win.minimized).map" in app
+    assert "onClick={() => onRaise(win.id)}" in app
+    assert "Object.values(windows).filter(win => !win.minimized).map" in app
     assert "QuestionDialog" in app
     assert "TranslateDialog" in app
     assert "selection-highlight" in app
+    assert "restoreChatHighlights" in app
+    assert "chat_id: chatId" in app
+    assert "source.chat_id" in app
+    assert "sourceSessionId={sessionId}" in app
+    assert "entry.sourceSessionId === sourceSessionId" in app
     assert "buildCleanSelectionDisplay" in app
     assert "buildBranchColors" in app
     assert "makeBranchColor" in app
     assert "thinkingLabel" in app
+    assert "ThinkingState" in app
+    assert "startedAtRef" in app
+    assert "timerTick" in app
+    assert "window.setInterval(() => setTimerTick" in app
+    assert "window.clearInterval(timer)" in app
+    assert "textSelectionPointAroundMath" in app
+    assert ".katex, .math-inline, .math-block" in app
+    assert "firstUsableRect" in app
+    assert "TodoBoardPreview" in app
+    assert "agent 正在规划" in app
+    assert "todo_board" in app
+    assert "Do not hide it just because an assistant/tool-call message" in app
+    assert "if (hasTerminalEvent) return null" not in app
+    assert "thinking-todo-board" in styles
+    assert "todo-board-item" in styles
     assert "llm_request_snapshot" in app
     assert "onMove" in app
     assert "onResize" in app
@@ -301,3 +326,11 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "/workspace/tree" in api
     assert "/workspace/text" in api
     assert "DELETE" in api
+
+def test_learning_sidebar_keeps_root_order_from_backend():
+    app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
+    assert "Number(!!b.running) - Number(!!a.running)" not in app
+    assert "(b.event_count || 0) - (a.event_count || 0)" not in app
+    assert "return accountRootIds" in app
+    assert ".filter(item => item.node_kind !== 'file_root')" in app
+

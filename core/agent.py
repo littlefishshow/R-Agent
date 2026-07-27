@@ -2,6 +2,7 @@ import time
 import random
 import json
 import threading
+import re
 from pathlib import Path
 from core import config
 from core.context_control import compress_messages, resolve_context_window, should_compress_context
@@ -34,6 +35,33 @@ class AgentInterrupted(Exception):
 
 
 
+
+
+def _safe_tool_session_id(session_id) -> str:
+    """Normalize tool session ids for inheritance decisions.
+
+    ``default`` and blank values are legacy aliases for the unscoped todo board,
+    not an explicit GUI/CLI session.  Treat them as missing so Agent-level
+    injection can inherit the current RAgent.session_id.
+    """
+    raw = str(session_id or "").strip()
+    if not raw or raw == "default":
+        return ""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._")
+    return safe[:80] or ""
+
+
+def _should_inherit_current_session(explicit_session_id, current_session_id) -> bool:
+    return bool(_safe_tool_session_id(current_session_id)) and not _safe_tool_session_id(explicit_session_id)
+
+
+def _inject_current_session(args, current_session_id) -> bool:
+    if not isinstance(args, dict):
+        return False
+    if _should_inherit_current_session(args.get("session_id"), current_session_id):
+        args["session_id"] = _safe_tool_session_id(current_session_id)
+        return True
+    return False
 
 def _emit_event(event_sink, event_type: str, payload=None, **kwargs) -> None:
     if event_sink is None:
@@ -945,11 +973,10 @@ class RAgent:
                         except Exception as exc:
                             guard_denial = f"工具 {func_name} 被安全策略拒绝：{exc}"
 
-                    if func_name == "todo_manage" and self.session_id:
+                    if func_name == "todo_manage" and _safe_tool_session_id(self.session_id):
                         try:
                             todo_args_for_session = json.loads(func_args or "{}")
-                            if isinstance(todo_args_for_session, dict) and not todo_args_for_session.get("session_id"):
-                                todo_args_for_session["session_id"] = self.session_id
+                            if _inject_current_session(todo_args_for_session, self.session_id):
                                 func_args = json.dumps(todo_args_for_session, ensure_ascii=False)
                         except Exception:
                             pass
@@ -973,8 +1000,7 @@ class RAgent:
                                     delegate_args["event_sink"] = event_sink
                                     if allowed:
                                         delegate_args["allowed_tools"] = sorted(allowed)
-                                    if self.session_id and not delegate_args.get("session_id"):
-                                        delegate_args["session_id"] = self.session_id
+                                    _inject_current_session(delegate_args, self.session_id)
                                     result = registry._tools[func_name]["handler"](**delegate_args)
                                 else:
                                     result = registry.execute_tool(func_name, func_args)
@@ -984,8 +1010,7 @@ class RAgent:
                             try:
                                 delegate_args = json.loads(func_args or "{}")
                                 if isinstance(delegate_args, dict):
-                                    if self.session_id and not delegate_args.get("session_id"):
-                                        delegate_args["session_id"] = self.session_id
+                                    _inject_current_session(delegate_args, self.session_id)
                                     if allowed:
                                         delegate_args["allowed_tools"] = sorted(allowed)
                                     func_args = json.dumps(delegate_args, ensure_ascii=False)

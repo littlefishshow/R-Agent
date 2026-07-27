@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import shutil
 import threading
 import time
@@ -25,6 +27,8 @@ from core.memory import memory_manager
 from core.prompt_builder import build_system_prompt
 from core.skills import skill_manager
 from tools.registry import registry
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 SELF_EVOLUTION_PROMPT = (
     "\n\n【重要提示：自我进化能力】\n"
@@ -63,6 +67,109 @@ LEARNING_ALLOWED_TOOLS = {
     "speak_text",
     "text_to_speech",
 }
+
+
+def _safe_todo_session_id(session_id: str) -> str:
+    raw = str(session_id or "").strip()
+    if not raw or raw == "default":
+        return ""
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", raw).strip("._")
+    return safe[:80] or ""
+
+
+def _coerce_gui_session_id(session_id: Optional[str], *, prefix: str) -> str:
+    """Return a stable, non-legacy GUI session id.
+
+    GUI sessions must never use the legacy ``default`` todo scope: every browser
+    window / learning branch owns an explicit session id so Agent tool injection,
+    delegate_task and TodoBoardPreview all point at the same per-session todo
+    file.  Caller-provided ids are preserved after the same sanitization used by
+    todo_manage; blank/default ids are replaced with a new window-scoped id.
+    """
+    sid = _safe_todo_session_id(str(session_id or ""))
+    return sid or new_id(prefix)
+
+
+def _session_todo_board(session_id: str) -> Optional[Dict[str, Any]]:
+    """Return a compact, GUI-friendly todo board snapshot for this session.
+
+    The todo_manage tool stores per-session boards in sandbox/todo_lists. Reading
+    it from session.state() lets the Cockpit polling loop refresh progress even
+    when the agent is still inside a long tool/delegate call and no final chat
+    message has been appended yet.
+    """
+    sid = _safe_todo_session_id(session_id)
+    if not sid:
+        return None
+    path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"exists": True, "path": str(path), "error": "todo board is not readable"}
+    tasks = data.get("tasks", []) if isinstance(data, dict) else []
+    if not isinstance(tasks, list):
+        tasks = []
+    statuses = ["pending", "in_progress", "needs_split", "blocked", "completed", "failed", "cancelled"]
+    counts = {status: 0 for status in statuses}
+    compact_tasks = []
+    max_updated_at = 0
+    task_by_id = {}
+    for raw in tasks:
+        if not isinstance(raw, dict):
+            continue
+        task = dict(raw)
+        tid = str(task.get("id") or "")
+        if tid:
+            task_by_id[tid] = task
+        status = str(task.get("status") or "pending")
+        if status not in counts:
+            counts[status] = 0
+        counts[status] += 1
+        try:
+            max_updated_at = max(max_updated_at, int(float(task.get("updated_at") or 0)))
+        except Exception:
+            pass
+        compact_tasks.append({
+            "id": tid,
+            "description": str(task.get("description") or ""),
+            "parent_id": task.get("parent_id"),
+            "dependencies": task.get("dependencies") if isinstance(task.get("dependencies"), list) else [],
+            "status": status,
+            "assigned_to": str(task.get("assigned_to") or (task.get("claim") or {}).get("worker_id") or ""),
+            "deliverable": str(task.get("deliverable") or ""),
+            "updated_at": task.get("updated_at"),
+        })
+
+    def deps_met(task: Dict[str, Any]) -> bool:
+        for dep in task.get("dependencies") or []:
+            if (task_by_id.get(str(dep)) or {}).get("status") != "completed":
+                return False
+        return True
+
+    parent_ids = {str(task.get("parent_id")) for task in compact_tasks if task.get("parent_id")}
+    ready = [
+        task.get("id")
+        for task in compact_tasks
+        if task.get("id") and task.get("status") == "pending" and task.get("id") not in parent_ids and deps_met(task)
+    ]
+    total = len(compact_tasks)
+    completed = counts.get("completed", 0)
+    return {
+        "exists": True,
+        "session_id": sid,
+        "path": str(path),
+        "version": data.get("version", 2) if isinstance(data, dict) else 2,
+        "total": total,
+        "completed": completed,
+        "progress": (completed / total) if total else 0,
+        "status_counts": counts,
+        "ready_to_execute": ready,
+        "tasks": compact_tasks[:40],
+        "truncated": len(compact_tasks) > 40,
+        "updated_at": max_updated_at,
+    }
 
 
 def _make_learning_title(text: str, *, limit: int = 34) -> str:
@@ -398,6 +505,7 @@ class GuiSession:
             "total_token_usage_including_children": self.agent.get_total_token_usage_including_children(),
             "token_usage_breakdown": self.agent.get_token_usage_summary(include_children=True),
             "context_usage": self.agent.get_context_usage(),
+            "todo_board": _session_todo_board(self.session_id),
         }
 
 
@@ -556,6 +664,7 @@ class LearningSession(GuiSession):
 
     def state(self) -> Dict[str, Any]:
         state = super().state()
+        parent_board = _session_todo_board(self.parent_session_id) if self.parent_session_id else None
         state.update({
             "mode": "learning",
             "title": self.title,
@@ -570,6 +679,7 @@ class LearningSession(GuiSession):
             "allowed_tools": sorted(LEARNING_ALLOWED_TOOLS) if self.tools_enabled else [],
             "tools_enabled": self.tools_enabled,
             "selection": self.selection,
+            "parent_todo_board": parent_board,
         })
         return state
 
@@ -581,7 +691,7 @@ class AgentRuntimeService:
         self._lock = threading.Lock()
 
     def create_session(self, *, session_id: Optional[str] = None, agent: Optional[RAgent] = None) -> GuiSession:
-        sid = session_id or new_id("session")
+        sid = _coerce_gui_session_id(session_id, prefix="gui")
         with self._lock:
             if sid in self.sessions:
                 raise ValueError(f"session already exists: {sid}")
@@ -619,10 +729,23 @@ class LearningRuntimeService(AgentRuntimeService):
     # conversation tree: <root>/<id>/children/<child_id>/children/<grandchild>/...
     CHILDREN_DIRNAME = "children"
 
-    def __init__(self, *, store_root: str | Path = "outputs/learning_context", max_saved_sessions: int = 200, max_session_age_hours: float = 0.0):
+    def __init__(
+        self,
+        *,
+        store_root: str | Path = "outputs/learning_context",
+        max_saved_sessions: int = 200,
+        max_session_age_hours: float = 0.0,
+        max_context_bytes: Optional[int] = None,
+    ):
         super().__init__(store_root=store_root)
         self.max_saved_sessions = max(1, int(max_saved_sessions))
         self.max_session_age_hours = max(0.0, float(max_session_age_hours))
+        if max_context_bytes is None:
+            try:
+                max_context_bytes = int(os.environ.get("R_AGENT_COCKPIT_RESTORE_MAX_CONTEXT_MB", "50")) * 1024 * 1024
+            except ValueError:
+                max_context_bytes = 50 * 1024 * 1024
+        self.max_context_bytes = max(1, int(max_context_bytes))
         # session_id -> on-disk directory (Path). Authoritative location map so
         # children can be created/deleted relative to their parent's folder.
         self._dirs: Dict[str, Path] = {}
@@ -688,6 +811,13 @@ class LearningRuntimeService(AgentRuntimeService):
                 continue
             sid = session_dir.name
             try:
+                size = context_path.stat().st_size
+                if size > self.max_context_bytes:
+                    errors.append({
+                        "session_id": sid,
+                        "error": f"skipped oversized context.json ({size} bytes > {self.max_context_bytes} bytes)",
+                    })
+                    continue
                 data = json.loads(context_path.read_text(encoding="utf-8"))
                 metadata = dict(data.get("metadata") or {})
             except Exception as exc:
@@ -808,7 +938,7 @@ class LearningRuntimeService(AgentRuntimeService):
         selection: Optional[Dict[str, Any]] = None,
         restore: bool = False,
     ) -> LearningSession:
-        sid = session_id or new_id("learn")
+        sid = _coerce_gui_session_id(session_id, prefix="learn")
         with self._lock:
             if sid in self.sessions:
                 raise ValueError(f"session already exists: {sid}")
@@ -882,7 +1012,11 @@ class LearningRuntimeService(AgentRuntimeService):
             for session in self.sessions.values()
             if getattr(session, "parent_session_id", None) == session_id
         ]
-        children.sort(key=lambda item: item.get("event_count", 0), reverse=True)
+        children.sort(key=lambda item: (
+            item.get("source_message_index") is None,
+            item.get("source_message_index") if item.get("source_message_index") is not None else 10**12,
+            item.get("title") or item.get("session_id"),
+        ))
         return {
             "session_id": session_id,
             "account_id": getattr(parent, "account_id", "default"),
@@ -955,7 +1089,7 @@ class LearningRuntimeService(AgentRuntimeService):
         session.last_question = ""
         return {"session": session.state(), "draft": draft, "deleted": deleted}
 
-    def fork_from_message(self, session_id: str, message_index: int) -> Dict[str, Any]:
+    def fork_from_message(self, session_id: str, message_index: int, *, child_session_id: Optional[str] = None) -> Dict[str, Any]:
         parent = self.get_session(session_id)
         index = int(message_index)
         if index < 0 or index >= len(parent.agent.messages):
@@ -965,6 +1099,7 @@ class LearningRuntimeService(AgentRuntimeService):
             raise ValueError("fork target must be a user message")
         draft = normalized.get("content") or ""
         child = self.create_session(
+            session_id=child_session_id,
             title=_make_learning_title(draft, limit=10),
             root_question=draft,
             parent_session_id=session_id,
@@ -1008,6 +1143,7 @@ class LearningRuntimeService(AgentRuntimeService):
         question: str,
         title: str = "",
         background: bool = True,
+        child_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         question = str(question or "").strip()
         if not question:
@@ -1016,6 +1152,7 @@ class LearningRuntimeService(AgentRuntimeService):
         if source_session_id:
             source = self.get_session(source_session_id)
         session = self.create_session(
+            session_id=child_session_id,
             title=title or _make_learning_title(question),
             root_question=question,
             parent_session_id=source_session_id,
@@ -1057,6 +1194,7 @@ class LearningRuntimeService(AgentRuntimeService):
         title: str = "",
         source_context: Optional[Dict[str, Any]] = None,
         background: bool = True,
+        child_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         selected_text = str(selected_text or "").strip()
         if not selected_text:
@@ -1125,6 +1263,7 @@ class LearningRuntimeService(AgentRuntimeService):
         }
         display_title = title or f"{action_label}: {_make_learning_title(selected_text, limit=24)}"
         session = self.create_session(
+            session_id=child_session_id,
             title=display_title,
             root_question=selected_text,
             parent_session_id=source_session_id,
@@ -1151,6 +1290,7 @@ class LearningRuntimeService(AgentRuntimeService):
         note_text: str,
         title: str = "",
         source_context: Optional[Dict[str, Any]] = None,
+        child_session_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         selected_text = str(selected_text or "").strip()
         note_text = str(note_text or "").strip()
@@ -1169,6 +1309,7 @@ class LearningRuntimeService(AgentRuntimeService):
             "source_context": source_context,
         }
         session = self.create_session(
+            session_id=child_session_id,
             title=title or f"笔记: {_make_learning_title(note_text, limit=18)}",
             root_question=note_text,
             parent_session_id=source_session_id,

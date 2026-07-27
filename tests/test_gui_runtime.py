@@ -743,3 +743,95 @@ def test_file_workspace_extracts_pdf_text(tmp_path):
     assert result["pages"][0]["lines"]
     png = workspace.render_pdf_page_png("papers/text.pdf", 1, zoom=1.0)
     assert png.startswith(b"\x89PNG")
+
+def test_learning_child_nodes_use_stable_source_order(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path)
+    parent = service.create_session(session_id="stable-parent", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    older = service.create_session(
+        session_id="stable-child-later-clicked",
+        parent_session_id=parent.session_id,
+        source_message_index=1,
+        title="later clicked",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+    newer = service.create_session(
+        session_id="stable-child-earlier-source",
+        parent_session_id=parent.session_id,
+        source_message_index=0,
+        title="earlier source",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+    for _ in range(3):
+        older.event_bus.emit("message_appended", {"message": {"role": "user", "content": "clicked"}})
+
+    nodes = service.child_nodes(parent.session_id)["nodes"]
+    assert [node["session_id"] for node in nodes[:2]] == [newer.session_id, older.session_id]
+
+def test_learning_session_state_reads_session_scoped_todo_board(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.chdir(tmp_path)
+    from tools.todo_tool import todo_manage
+
+    service = LearningRuntimeService(store_root=tmp_path / "learning")
+    first = service.create_session(session_id="todo-visible-a", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    second = service.create_session(session_id="todo-visible-b", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    todo_manage(
+        "init",
+        '{"tasks":[{"id":"a1","description":"first board only"}]}',
+        session_id=first.session_id,
+    )
+    todo_manage(
+        "init",
+        '{"tasks":[{"id":"b1","description":"second board only"}]}',
+        session_id=second.session_id,
+    )
+
+    first_board = first.state()["todo_board"]
+    second_board = second.state()["todo_board"]
+    assert first_board["exists"] is True
+    assert second_board["exists"] is True
+    assert first_board["path"].endswith("todo_list_todo-visible-a.json")
+    assert second_board["path"].endswith("todo_list_todo-visible-b.json")
+    assert first_board["tasks"][0]["description"] == "first board only"
+    assert second_board["tasks"][0]["description"] == "second board only"
+    assert first_board["tasks"][0]["description"] != second_board["tasks"][0]["description"]
+
+
+
+def test_gui_sessions_never_use_default_todo_scope(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+
+    gui = AgentRuntimeService(store_root=tmp_path / "gui")
+    gui_session = gui.create_session(session_id="default", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    assert gui_session.session_id != "default"
+    assert gui_session.session_id.startswith("gui_")
+    assert gui_session.agent.session_id == gui_session.session_id
+
+    learning = LearningRuntimeService(store_root=tmp_path / "learn")
+    root = learning.create_session(session_id="default", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    assert root.session_id != "default"
+    assert root.session_id.startswith("learn_")
+    assert root.agent.session_id == root.session_id
+
+
+def test_learning_child_session_can_be_window_scoped_and_reports_parent_todo(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", lambda self, user_message, **kwargs: "child answer")
+    monkeypatch.setattr("app_gui.runtime.PROJECT_ROOT", tmp_path)
+    todo_dir = tmp_path / "sandbox" / "todo_lists"
+    todo_dir.mkdir(parents=True)
+    (todo_dir / "todo_list_parent.json").write_text(json.dumps({
+        "version": 2,
+        "tasks": [{"id": "p1", "description": "parent task", "status": "pending"}],
+    }), encoding="utf-8")
+
+    service = LearningRuntimeService(store_root=tmp_path / "contexts")
+    parent = service.create_session(session_id="parent", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    child_state = service.branch_session("parent", question="child question", child_session_id="win_child", background=False)
+
+    assert child_state["session_id"] == "win_child"
+    assert child_state["parent_session_id"] == "parent"
+    assert child_state["parent_todo_board"]["session_id"] == "parent"
+    assert child_state["parent_todo_board"]["tasks"][0]["id"] == "p1"
+    assert service.get_session("win_child").agent.session_id == "win_child"

@@ -245,8 +245,8 @@ attempt 的几条硬规矩：
 | `experiment_memory.json/md` | 实验记忆摘要 | 规划下一步的参考 |
 | `anomalies.jsonl` | 运行时发现的异常分类，比如缺输出、输出没变、导入失败、超时 | 想知道“**为什么这次验证不能算通过**” |
 | `regression_cases.json` | 回归用例 / 收尾契约 | 收尾阶段防止改坏 |
-| `debug/inflight.json` | **当前卡在哪个 LLM/shell/phase** | 感觉“卡住了”时看这个 |
-| `debug/debug.jsonl` | debug 事件流 | 详细排查 |
+| `debug_logs/inflight.json` | **当前卡在哪个 LLM/shell/phase** | 感觉“卡住了”时看这个 |
+| `debug_logs/debug.jsonl` | debug 事件流 | 详细排查 |
 | `step_traces/step_XXX_*.json` | 每一步的完整快照 | 事后复盘单步 |
 | `delegate_contexts/*.json` | 子任务拿到的完整上下文 | 想看“子任务当时看到了啥” |
 | `.auto/run_failure.md` | 最近一次失败的报错 | 排查为什么没跑通 |

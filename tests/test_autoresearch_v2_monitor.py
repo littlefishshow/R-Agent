@@ -66,6 +66,19 @@ def test_monitor_renders_inflight(tmp_path):
     assert "phase=execute" in text
 
 
+def test_debug_flag_and_log_dir_do_not_collide_on_case_insensitive_filesystems(tmp_path):
+    from autoresearch.observability.debug import debug_dir, inflight_start, set_debug
+
+    flag = set_debug(tmp_path, True)
+    inflight_start(tmp_path, "phase", phase="plan")
+
+    assert flag.name == "DEBUG"
+    assert debug_dir(tmp_path).name != flag.name.lower()
+    assert flag.is_file()
+    assert debug_dir(tmp_path).is_dir()
+    assert (debug_dir(tmp_path) / "inflight.json").is_file()
+
+
 def test_debug_summary_includes_monitor_budget_events_and_tasks(tmp_path):
     from autoresearch.observability.debug import build_debug_summary, debug_event, inflight_start, set_debug
     from autoresearch.state.gates import save_gate_state

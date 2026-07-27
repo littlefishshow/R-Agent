@@ -3,14 +3,44 @@ from __future__ import annotations
 import asyncio
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Dict, Optional
+import os
+from typing import Any, Callable, Dict, Optional
 
 from app_gui.file_workspace import FileWorkspace
 from app_gui.runtime import AgentRuntimeService, LearningRuntimeService
 
-runtime = AgentRuntimeService()
-learning_runtime = LearningRuntimeService()
-file_workspace = FileWorkspace()
+_runtime_service: Optional[AgentRuntimeService] = None
+_learning_runtime_service: Optional[LearningRuntimeService] = None
+_file_workspace: Optional[FileWorkspace] = None
+
+
+class _LazyServiceProxy:
+    def __init__(self, factory: Callable[[], Any]):
+        self._factory = factory
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._factory(), name)
+
+
+def get_runtime_service() -> AgentRuntimeService:
+    global _runtime_service
+    if _runtime_service is None:
+        _runtime_service = AgentRuntimeService()
+    return _runtime_service
+
+
+def get_learning_runtime_service() -> LearningRuntimeService:
+    global _learning_runtime_service
+    if _learning_runtime_service is None:
+        _learning_runtime_service = LearningRuntimeService()
+    return _learning_runtime_service
+
+
+def get_file_workspace() -> FileWorkspace:
+    global _file_workspace
+    if _file_workspace is None:
+        _file_workspace = FileWorkspace()
+    return _file_workspace
 
 
 def create_app(
@@ -29,9 +59,9 @@ def create_app(
     except ImportError as exc:  # pragma: no cover - exercised only without optional deps
         raise RuntimeError("R-Agent Cockpit server requires optional dependencies: fastapi, uvicorn, pydantic") from exc
 
-    service = runtime_service or runtime
-    learning = learning_service or learning_runtime
-    workspace = workspace_service or file_workspace
+    service = runtime_service or _LazyServiceProxy(get_runtime_service)
+    learning = learning_service or _LazyServiceProxy(get_learning_runtime_service)
+    workspace = workspace_service or _LazyServiceProxy(get_file_workspace)
     app = FastAPI(title="R-Agent Cockpit API", version="0.1.0")
     app.add_middleware(
         CORSMiddleware,
@@ -211,6 +241,7 @@ def create_app(
                 question=question,
                 title=str(request.get("title") or ""),
                 background=bool(request.get("background", True)),
+                child_session_id=request.get("session_id"),
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -227,7 +258,7 @@ def create_app(
     @app.post("/learning/sessions/{session_id}/fork-from-message")
     def fork_learning_session_from_message(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
-            return learning.fork_from_message(session_id, int(request.get("message_index")))
+            return learning.fork_from_message(session_id, int(request.get("message_index")), child_session_id=request.get("session_id"))
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -246,6 +277,7 @@ def create_app(
                 title=str(request.get("title") or ""),
                 source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
                 background=bool(request.get("background", True)),
+                child_session_id=request.get("session_id"),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -261,6 +293,7 @@ def create_app(
                 note_text=str(request.get("note_text") or ""),
                 title=str(request.get("title") or ""),
                 source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
+                child_session_id=request.get("session_id"),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -506,7 +539,12 @@ def main() -> None:  # pragma: no cover - manual server entrypoint
         raise RuntimeError("Starting R-Agent Cockpit requires uvicorn. Install fastapi and uvicorn first.") from exc
     if app is None:
         raise RuntimeError("R-Agent Cockpit FastAPI app is unavailable. Install fastapi, uvicorn and pydantic first.")
-    uvicorn.run("app_gui.server:app", host="127.0.0.1", port=8765, reload=False)
+    host = os.environ.get("R_AGENT_COCKPIT_HOST", "127.0.0.1")
+    try:
+        port = int(os.environ.get("R_AGENT_COCKPIT_PORT", "8765"))
+    except ValueError:
+        port = 8765
+    uvicorn.run("app_gui.server:app", host=host, port=port, reload=False)
 
 
 if __name__ == "__main__":  # pragma: no cover

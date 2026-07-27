@@ -8,6 +8,7 @@ from core import config
 from app_gui.schemas import EVENT_DELEGATE_SUBAGENT_STARTED, EVENT_DELEGATE_SUBAGENT_FINISHED
 from rich.panel import Panel
 from tools import progress_render
+from tools.todo_tool import _safe_session_id
 
 
 def _current_cli_status():
@@ -544,7 +545,7 @@ def delegate_task(
     except json.JSONDecodeError:
         return json.dumps({"error": "tasks must be a valid JSON string."}, ensure_ascii=False)
 
-    session_id = str(session_id or "")
+    session_id = _safe_session_id(session_id)
     return_mode = str(return_mode or "compact").lower()
     if return_mode not in {"compact", "full"}:
         return_mode = "compact"
@@ -972,7 +973,7 @@ registry.register(
             },
             "session_id": {
                 "type": "string",
-                "description": "可选会话编号；父子 Agent 会使用同一个 session_id 读写隔离 todo list。"
+                "description": "可选会话编号；通常不要手动传，CLI/GUI/父 Agent 会自动注入。'default' 是旧版空 session，不代表当前会话。"
             },
             "default_wall_timeout_seconds": {
                 "type": "number",

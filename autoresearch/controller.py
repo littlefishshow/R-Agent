@@ -20,7 +20,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from autoresearch.observability.debug import debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
+from autoresearch.observability.debug import debug_dir, debug_event, ensure_debug_from_settings, inflight_finish, inflight_start
 from autoresearch.state.gates import load_gate_state
 from autoresearch.state.memory import (
     DEFAULT_PROJECT_TEMPLATE,
@@ -444,8 +444,8 @@ class ThreeStepController:
             "todo_digest": self._ready_task_digest(),
             "monitor_path": str(self.settings.monitor_file()),
             "debug_paths": {
-                "debug_jsonl": str(self.root / ".autoresearch" / "debug" / "debug.jsonl"),
-                "inflight_json": str(self.root / ".autoresearch" / "debug" / "inflight.json"),
+                "debug_jsonl": str(debug_dir(self.root) / "debug.jsonl"),
+                "inflight_json": str(debug_dir(self.root) / "inflight.json"),
             },
         }
         path = d / f"step_{self._step_index:03d}_{phase}.json"

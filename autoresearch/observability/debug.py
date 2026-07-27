@@ -6,6 +6,10 @@ import time
 from pathlib import Path
 
 
+DEBUG_LOG_DIRNAME = "debug_logs"
+LEGACY_DEBUG_LOG_DIRNAME = "debug"
+
+
 def debug_enabled(root: str | Path) -> bool:
     root = Path(root)
     return (root / ".autoresearch" / "DEBUG").exists()
@@ -30,7 +34,7 @@ def set_debug(root: str | Path, enabled: bool) -> Path:
 
 
 def debug_dir(root: str | Path) -> Path:
-    return Path(root) / ".autoresearch" / "debug"
+    return Path(root) / ".autoresearch" / DEBUG_LOG_DIRNAME
 
 
 def debug_event(root: str | Path, event: str, **payload) -> None:
@@ -110,7 +114,9 @@ def build_debug_summary(root: str | Path, *, tail: int = 12) -> str:
     gate = _read_json(root / ".autoresearch" / "gate_signals.json")
     todo = _read_json(root / ".autoresearch" / "todo_state.json")
     inflight = read_inflight(root)
-    events = _read_events(root / ".autoresearch" / "debug" / "debug.jsonl")
+    events = _read_events(debug_dir(root) / "debug.jsonl")
+    if not events:
+        events = _read_events(root / ".autoresearch" / LEGACY_DEBUG_LOG_DIRNAME / "debug.jsonl")
 
     lines = ["# AutoResearch Debug Summary", ""]
     lines.append(f"project: {root}")

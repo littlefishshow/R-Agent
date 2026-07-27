@@ -17,6 +17,33 @@ export type SessionState = {
   token_usage?: string | number
 }
 
+
+export type TodoBoardTask = {
+  id: string
+  description: string
+  parent_id?: string | null
+  dependencies?: string[]
+  status: 'pending' | 'in_progress' | 'needs_split' | 'blocked' | 'completed' | 'failed' | 'cancelled' | string
+  assigned_to?: string
+  deliverable?: string
+  updated_at?: number
+}
+
+export type TodoBoardState = {
+  exists?: boolean
+  session_id?: string
+  path?: string
+  total?: number
+  completed?: number
+  progress?: number
+  status_counts?: Record<string, number>
+  ready_to_execute?: string[]
+  tasks?: TodoBoardTask[]
+  truncated?: boolean
+  updated_at?: number
+  error?: string
+}
+
 export type LearningSelectionState = {
   source_session_id?: string
   selected_text?: string
@@ -43,6 +70,8 @@ export type LearningSessionState = SessionState & {
   tools_enabled?: boolean
   selection?: LearningSelectionState
   send?: any
+  todo_board?: TodoBoardState | null
+  parent_todo_board?: TodoBoardState | null
 }
 
 export type WorkspaceItem = {
@@ -171,6 +200,7 @@ export async function createLearningSession(payload: {
   account_id?: string
   background?: boolean
   tools_enabled?: boolean
+  session_id?: string
 } = {}): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions`, {
     method: 'POST',
@@ -236,11 +266,11 @@ export async function setLearningToolsEnabled(sessionId: string, enabled: boolea
   return res.json()
 }
 
-export async function branchLearningSession(sessionId: string, question: string): Promise<LearningSessionState> {
+export async function branchLearningSession(sessionId: string, question: string, childSessionId?: string): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/branch`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ question, background: true }),
+    body: JSON.stringify({ question, background: true, session_id: childSessionId || undefined }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
@@ -256,11 +286,11 @@ export async function setbackLearningSession(sessionId: string, messageIndex: nu
   return res.json()
 }
 
-export async function forkLearningSessionFromMessage(sessionId: string, messageIndex: number): Promise<{ session: LearningSessionState, draft: string }> {
+export async function forkLearningSessionFromMessage(sessionId: string, messageIndex: number, childSessionId?: string): Promise<{ session: LearningSessionState, draft: string }> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/fork-from-message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message_index: messageIndex }),
+    body: JSON.stringify({ message_index: messageIndex, session_id: childSessionId || undefined }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
@@ -275,6 +305,7 @@ export async function selectionBranchLearningSession(sessionId: string, payload:
   title?: string
   source_context?: Record<string, any>
   background?: boolean
+  session_id?: string
 }): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/selection-branch`, {
     method: 'POST',
@@ -290,6 +321,7 @@ export async function saveSelectionNoteLearningSession(sessionId: string, payloa
   note_text: string
   title?: string
   source_context?: Record<string, any>
+  session_id?: string
 }): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/selection-note`, {
     method: 'POST',

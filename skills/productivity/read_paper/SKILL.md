@@ -44,14 +44,14 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
   python3 skills/productivity/read_paper/scripts/paper_locator.py "<query>" --category "<category>"
   ```
   该脚本默认递归搜索 `outputs/papers/`，默认输出到 `outputs/papers_output/`，并自动计算 Markdown 输出路径。匹配策略保持简单：明确路径/日期/文件名关键词/类别目录。
-- 论文含关键 Figure/Table 时通过 `run_command` 调用：
+- 论文含关键 Figure/Table/Algorithm/案例图表时通过 `run_command` 调用：
   ```bash
   python3 skills/productivity/read_paper/scripts/pdf_snapshot.py <pdf_path> --mode smart
   ```
-  默认根据 PDF 在 `outputs/papers/` 下的相对目录镜像输出到 `outputs/papers_output/<category>/assets/<pdf_stem>/`；自动裁剪不理想时，用 `--mode crops --crops-json '<json>'` 精裁。
+  默认根据 PDF 在 `outputs/papers/` 下的相对目录镜像输出到 `outputs/papers_output/<category>/assets/<pdf_stem>/`；**默认只截 Figure/Table/Algorithm/案例图表主体区域（含必要标题/图注），不得用整页截图冒充图表截图**。自动裁剪不理想或返回 suspicious/full-page 警告时，必须用 `--mode crops --crops-json '<json>'` 精裁；若暂时无法精裁，只能作为明确标注的降级资产使用，并在笔记中写明“降级整页/大区域截图，非最终图表主体裁剪”。
 - `skills/productivity/read_paper/scripts/` 中的核心脚本：
   - `paper_locator.py`：论文定位与输出路径计算。
-  - `pdf_snapshot.py`：PDF Figure/Table caption 定位、智能裁剪和渲染。
+  - `pdf_snapshot.py`：PDF Figure/Table/Algorithm caption 定位、智能裁剪和渲染。
 - 不再保留 `tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py` 全局 wrapper；维护算法逻辑时只改 skill-local scripts。
 - 每次确认要阅读某篇论文后，同时调用 `paper_research_scout` 的 skill-local read history 脚本登记该论文，避免后续论文调研重复推荐已经读过的文章：
   ```bash
@@ -170,7 +170,9 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ### 4.1 图表与截图的就地插入规则（服务输出第 1 章和第 3 章）
 对论文中的图、表、算法框、流程图、案例和错误样本进行系统梳理，但输出时要嵌入第 1 章或第 3 章对应论证位置：
-- 先用 `run_command` 调用 `pdf_snapshot.py` 为关键 Figure/Table 生成 PNG 截图；优先使用 `--mode smart`，结合 caption、相邻文本和像素内容自动精裁；不理想时再用 `--mode crops --crops-json ...` 指定 bbox 精裁。
+- 先用 `run_command` 调用 `pdf_snapshot.py` 为关键 Figure/Table/Algorithm/案例图表生成 PNG 截图；优先使用 `--mode smart`，结合 caption、相邻文本和像素内容自动精裁。
+- **默认截图粒度是图表主体区域**：只截对应 Figure/Table/Algorithm/案例图表本身及必要标题/图注，不得把整页截图当作图表截图交付，也不要把大片正文/其他图表混入截图。
+- 自动裁剪不理想、明显过大、包含整页或脚本返回 `full_page_snapshot` / `is_suspicious_large_crop` 时，必须用 `--mode crops --crops-json ...` 指定 bbox 精裁；若一时无法精裁，必须在 Markdown 图片说明和重检查记录中显式标注“降级整页/大区域截图，非最终图表主体裁剪”，并说明待精裁原因。
 - 将截图保存到阅读笔记所在输出目录的 `assets/<pdf_stem>/` 下，例如 `outputs/papers_output/agent_RL/assets/foo/foo_p001_figure_1.png`；图片链接必须写成相对当前 Markdown 文件的 `assets/<pdf_stem>/xxx.png`，不要写成 `outputs/papers_output/...` 绝对式路径，否则移动分类目录后 Markdown 预览可能找不到图片。
 - 图：在讲到相关方法/实验节点时插入截图，说明图号、标题、作者想表达的信息、与当前论证的关系。
 - 表：在讲到对应结果或消融时插入截图，说明比较对象、指标、最佳结果、相对提升，以及作者分析是否充分。
@@ -522,7 +524,8 @@ $$
 - 第 1 章是否完整包含 `### 1.1`-`### 1.6`，并明确问题、现有不足、作者方案、实验结果、相比已有方法的提升幅度/原因和代价局限？
 - 是否给出重要简称/术语的完整名称和中文解释，避免只堆缩写让用户困惑？
 - 是否在第 1 章和第 3 章就地覆盖关键图表、公式、代码/算法框、案例、原始输出，并解释作者分析？
-- 是否已对关键 Figure/Table 生成并插入截图，且 Markdown 图片路径可用？
+- 是否已对关键 Figure/Table/Algorithm/案例图表生成并插入截图，且 Markdown 图片路径可用？
+- 截图是否默认只覆盖图表主体区域（含必要标题/图注），没有用整页截图冒充；若自动裁剪失败，是否已用 crops 精裁，或在 Markdown 与重检查记录中明确标注降级整页/大区域截图？
 - 是否讲清任务输入、输出、成功标准和难点？
 - 是否找到了核心假设，而不是只复述方法？
 - 第 3 章是否按论文行文顺序完成完整主线串读/近似翻译式串读，把问题、方法、图表、公式、实验、局限和附录连接成一个统一叙事？
