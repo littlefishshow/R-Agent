@@ -168,7 +168,7 @@ def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
     monkeypatch.setattr(core.agent, "RAgent", _CapturingExcludeAgent)
 
     payload = json.loads(delegate_tool.delegate_task(
-        tasks=json.dumps([{"goal": "capture exclude tools"}]),
+        tasks=json.dumps([{"task_id": "capture", "goal": "capture exclude tools"}]),
         max_workers=1,
         default_max_iterations=1,
         default_wall_timeout_seconds=5,
@@ -185,6 +185,23 @@ def test_delegate_task_excludes_child_side_effect_tools(monkeypatch):
         "self_evolution_review",
     }.issubset(excluded)
     assert _CapturingExcludeAgent.captured_kwargs["allowed_tools"] == {"web_search", "read_file"}
+
+
+def test_delegate_task_rejects_subtask_without_task_id(monkeypatch):
+    class _ShouldNotRunAgent:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("subagent should not be created for task without task_id")
+
+    monkeypatch.setattr(core.agent, "RAgent", _ShouldNotRunAgent)
+    payload = json.loads(delegate_tool.delegate_task(
+        tasks=json.dumps([{"goal": "裸委托任务不应执行"}], ensure_ascii=False),
+        max_workers=1,
+        default_max_iterations=1,
+        default_wall_timeout_seconds=5,
+    ))
+
+    assert payload["tasks"][0]["status"] == "error"
+    assert "Missing task_id/id" in payload["tasks"][0]["result"]
 
 
 class _FakeCompletions:

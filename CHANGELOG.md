@@ -6,6 +6,8 @@
 
 #### Cockpit 启动、会话与 Todo 可观测性维护
 
+- **强化子 Agent 拆分提示与任务绑定**：`delegate_task` 现在要求每个子任务都必须携带 `task_id/id`，避免裸委托任务脱离 todo 看板；子进程 system prompt 也会简单强调“如果子任务比较复杂且困难，可以要求父进程进一步拆解”，并提示通过 `todo_manage propose_split` 记录建议。
+- **增强子 Agent token 可观测性**：父 Agent 现在会记录已观察到的 `delegate_task` 调用次数；当子 Agent 调用发生但底层模型未返回 usage 时，UI 总量显示为类似 `parent+unavailable`，避免误以为 children token 完全未纳入统计。
 - **后端运行时惰性初始化**：`app_gui.server` 改为按需创建 Agent、Learning runtime 与文件工作区，`/health` 可先快速就绪；学习会话恢复会跳过超过阈值的超大 `context.json`，避免历史上下文拖慢 Cockpit 启动。
 - **统一 GUI/Agent Todo 会话作用域**：GUI 会话、学习分支、`todo_manage` 与 `delegate_task` 统一规整 `session_id`，把空值或 `default` 视为旧版空 session 并继承当前会话，避免父窗口、子窗口和子 Agent 写到不同 todo 看板。
 - **前后端透传 Todo 看板状态**：GUI state 返回当前/父级 todo board 摘要，前端思考态与 Todo preview 可持续展示 session、ready/completed/failed 等进度，便于诊断长任务和委派执行。

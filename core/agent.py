@@ -364,6 +364,8 @@ class RAgent:
             "completion_tokens": 0,
             "total_tokens": 0,
             "available": False,
+            # delegate_task 调用次数；用于区分“从未委托”与“委托过但子模型未返回 usage”。
+            "observed_calls": 0,
         }
         self.context_usage = {
             "estimated_tokens": 0,
@@ -600,6 +602,8 @@ class RAgent:
         child_available = bool(self.delegated_token_usage.get("available"))
         if not parent_available and not child_available:
             return TOKEN_USAGE_UNAVAILABLE
+        if parent_available and not child_available and self.delegated_token_usage.get("observed_calls", 0):
+            return f"{self.token_usage.get('total_tokens', 0)}+unavailable"
         return (self.token_usage.get("total_tokens", 0) if parent_available else 0) + (
             self.delegated_token_usage.get("total_tokens", 0) if child_available else 0
         )
@@ -621,6 +625,7 @@ class RAgent:
                 "completion_tokens": self.delegated_token_usage.get("completion_tokens", 0),
                 "total_tokens": self.delegated_token_usage.get("total_tokens", 0),
                 "available": bool(self.delegated_token_usage.get("available")),
+                "observed_calls": int(self.delegated_token_usage.get("observed_calls", 0) or 0),
             }
             summary["delegated_token_usage"] = delegated
             summary["total_including_children"] = self.get_total_token_usage_including_children()
@@ -669,7 +674,10 @@ class RAgent:
                 payload = inner
         if not isinstance(payload, dict):
             return False
-        return self.merge_delegated_token_usage(payload.get("delegated_token_usage"))
+        usage = payload.get("delegated_token_usage")
+        if isinstance(usage, dict):
+            self.delegated_token_usage["observed_calls"] = int(self.delegated_token_usage.get("observed_calls", 0) or 0) + 1
+        return self.merge_delegated_token_usage(usage)
 
     # ------------------------------------------------------------------
     # 内部工具

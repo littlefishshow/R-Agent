@@ -161,6 +161,8 @@ def _compact_delegate_item(item, *, include_context_artifacts=True, include_toke
     }
     if include_goal and "goal" in item:
         compact["goal"] = item.get("goal")
+    if item.get("status") == "error" and item.get("result"):
+        compact["result"] = _summarize_delegate_result(item.get("result"), limit=300)
     if include_context_artifacts and item.get("context_artifact_path"):
         compact["context_artifact_path"] = item.get("context_artifact_path")
     if include_token_detail:
@@ -530,11 +532,10 @@ def delegate_task(
 ) -> str:
     """生成隔离上下文子智能体并行处理任务。
 
-    tasks 是 JSON 字符串，元素可以是：
-    - {"goal": "完整、自包含任务描述", "max_iterations": 20}
+    tasks 是 JSON 字符串，元素必须绑定动态 todo list 任务 id，例如：
     - {"task_id": "t1", "goal": "可选补充说明", "worker_id": "w1", "max_iterations": 20}
 
-    若提供 task_id，子智能体会被提示使用 todo_manage claim/get/propose_split/update 来遵循动态任务看板协议。
+    子智能体会被提示使用 todo_manage claim/get/propose_split/update 来遵循动态任务看板协议。
     delegate_task 会在启动、单个子 Agent 结束和整体结束时自动打印 todo 进度快照。
     默认 return_mode=compact 只返回任务状态、简表 token_usage、可选 todo_digest/context_artifact_path；return_mode=full 保留旧完整结构。
     """
@@ -640,6 +641,7 @@ def delegate_task(
             "执行原则：\n"
             "- 如果任务足够具体且依赖满足，直接完成它。\n"
             "- 如果任务过于笼统、上下文不足、需要进一步拆分，必须提出拆分建议，而不是盲目执行。\n"
+            "- 如果子任务比较复杂且困难，可以要求父进程进一步拆解；带 task_id 的任务应通过 todo_manage propose_split 记录建议。\n"
             "- 若使用 todo_manage propose_split，只提出建议，等待父进程判断。\n"
             "- 完成后提供清晰摘要，包含：做了什么、成果、问题、下一步建议。\n"
             "- 如果达到最大思考轮数或无法完成，明确说明未完成原因，并尽可能给出可执行的拆分建议。"
@@ -802,8 +804,9 @@ def delegate_task(
         if not isinstance(task, dict):
             results.append({"task_index": i, "task_id": None, "max_iterations": default_max_iterations, "status": "error", "truncated": False, "result": "Each task must be an object.", "token_usage": _agent_token_usage_summary(None)})
             continue
-        if not (task.get("goal") or task.get("description") or task.get("task_id") or task.get("id")):
-            results.append({"task_index": i, "task_id": None, "max_iterations": default_max_iterations, "status": "error", "truncated": False, "result": "Missing goal/description/task_id in task.", "token_usage": _agent_token_usage_summary(None)})
+        task_id = _task_id_of(task)
+        if not task_id:
+            results.append({"task_index": i, "task_id": None, "max_iterations": default_max_iterations, "status": "error", "truncated": False, "result": "Missing task_id/id in task. delegate_task now requires every subtask to be bound to a todo task id.", "token_usage": _agent_token_usage_summary(None)})
             continue
         valid_jobs.append((i, task))
 
@@ -945,7 +948,7 @@ registry.register(
     description=(
         "生成一个或多个具有隔离上下文的子智能体来并行处理任务。\n"
         "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考；默认墙钟预算来自 DELEGATE_TASK_WALL_TIMEOUT（当前默认 1800 秒）。\n"
-        "支持动态 todo list 协议：传入 task_id/id 时，子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
+        "支持动态 todo list 协议：每个子任务都必须传入 task_id/id；子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
         "默认 return_mode=compact：返回 tasks 中每项仅含 task_index/task_id/status/truncated/max_iterations、简表 token_usage、可选 context_artifact_path，并可附 todo_digest；不返回 goal/note。return_mode=full 保留旧完整结构。\n"
         "子 Agent 上下文不会回灌给父进程；会以 artifact 形式保留到整个 todo 成功完成后再统一清理，失败/超时/未完成时父进程可通过 context_artifact_path 显式读取。\n"
@@ -959,7 +962,7 @@ registry.register(
             "tasks": {
                 "type": "string",
                 "description": (
-                    "JSON 格式任务列表字符串。每个任务可包含：goal/description、task_id/id、worker_id、max_iterations、wall_timeout_seconds。"
+                    "JSON 格式任务列表字符串。每个任务必须包含 task_id/id，可包含 goal/description、worker_id、max_iterations、wall_timeout_seconds。"
                     "示例：'[{\"task_id\":\"t1\",\"goal\":\"完成 t1，背景...\",\"max_iterations\":20}]'"
                 )
             },

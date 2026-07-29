@@ -192,3 +192,21 @@ def test_agent_keeps_delegated_token_usage_unavailable_without_child_usage():
 
     assert agent.get_delegated_token_usage_total() == "unavailable"
     assert agent.get_total_token_usage_including_children() == "unavailable"
+
+
+def test_delegate_tool_call_with_unavailable_child_usage_marks_total_partial():
+    agent = RAgent(model="test", max_iterations=1)
+    agent._record_token_usage(_response_with_usage({"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}))
+    result = {
+        "success": True,
+        "result": json.dumps({
+            "tasks": [],
+            "delegated_token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "available": False},
+        }, ensure_ascii=False),
+    }
+
+    assert agent._merge_delegated_token_usage_from_tool_result(json.dumps(result)) is False
+
+    assert agent.get_delegated_token_usage_total() == "unavailable"
+    assert agent.get_total_token_usage_including_children() == "15+unavailable"
+    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: 15/15/unavailable/15+unavailable"
