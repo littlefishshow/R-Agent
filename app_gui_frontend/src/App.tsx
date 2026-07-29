@@ -225,6 +225,8 @@ export function App() {
   const [windowInputs, setWindowInputs] = useState<Record<string, string>>({})
   const windowInputDraftsRef = useRef<Record<string, string>>({})
   const [windowInputResetTokens, setWindowInputResetTokens] = useState<Record<string, number>>({})
+  const [windowSending, setWindowSending] = useState<Record<string, boolean>>({})
+  const windowSendingRef = useRef<Record<string, boolean>>({})
   const [messageBranchMenus, setMessageBranchMenus] = useState<Record<string, boolean>>({})
   const [collapsedMessages, setCollapsedMessages] = useState<Record<string, boolean>>({})
   const [workspace, setWorkspace] = useState<WorkspaceListing | null>(null)
@@ -274,6 +276,10 @@ export function App() {
   const sessionTree = useMemo(() => buildSessionTree(Object.values(sessions)), [sessions])
   const branchColors = useMemo(() => buildBranchColors(Object.values(sessions)), [sessions])
   const activeFile = activeFilePath ? openFiles[activeFilePath] || null : null
+  const conversationPanelRef = useRef<HTMLElement | null>(null)
+  const chatScrollPositionsRef = useRef<Record<string, number>>({})
+  const fileScrollPositionsRef = useRef<Record<string, number>>({})
+  const openFilesRef = useRef<Record<string, OpenFileTab>>({})
   activateSessionRef.current = activateSession
   toggleConversationNodeRef.current = toggleConversationNode
   deleteRootSessionRef.current = deleteRootSession
@@ -312,6 +318,23 @@ export function App() {
   useEffect(() => {
     windowEventsRef.current = windowEvents
   }, [windowEvents])
+
+  useEffect(() => {
+    openFilesRef.current = openFiles
+  }, [openFiles])
+
+  useEffect(() => {
+    if (activeMode !== 'chat' || !session?.session_id) return
+    const panel = conversationPanelRef.current
+    if (!panel) return
+    const sessionId = session.session_id
+    const scrollTop = chatScrollPositionsRef.current[sessionId] || 0
+    window.requestAnimationFrame(() => {
+      if (conversationPanelRef.current === panel && session?.session_id === sessionId) {
+        panel.scrollTop = scrollTop
+      }
+    })
+  }, [activeMode, session?.session_id, chatItems.length])
 
   useEffect(() => {
     if (!session) return
@@ -381,6 +404,34 @@ export function App() {
     }
   }
 
+  function setWindowSendingFlag(windowId: string, sending: boolean) {
+    windowSendingRef.current = { ...windowSendingRef.current, [windowId]: sending }
+    setWindowSending(prev => prev[windowId] === sending ? prev : ({ ...prev, [windowId]: sending }))
+  }
+
+  function seedWindowInput(windowId: string, value: string) {
+    if (!value) return
+    setWindowInputs(prev => {
+      const existingDraft = windowInputDraftsRef.current[windowId]
+      const existingValue = existingDraft ?? prev[windowId] ?? ''
+      if (existingValue) return prev
+      windowInputDraftsRef.current[windowId] = value
+      return { ...prev, [windowId]: value }
+    })
+  }
+
+  function restoreWindowInputAfterFailedSend(windowId: string, originalText: string) {
+    if (!originalText) return
+    setWindowInputs(prev => {
+      const currentDraft = windowInputDraftsRef.current[windowId] ?? prev[windowId] ?? ''
+      const restored = currentDraft
+        ? (currentDraft === originalText || currentDraft.includes(originalText) ? currentDraft : `${originalText}\n\n${currentDraft}`)
+        : originalText
+      windowInputDraftsRef.current[windowId] = restored
+      return prev[windowId] === restored ? prev : { ...prev, [windowId]: restored }
+    })
+  }
+
 
   function makeOptimisticBranch(sessionId: string, sourceSessionId: string, data: {
     title: string
@@ -446,7 +497,7 @@ export function App() {
     }
     // Nothing new and not mid-run: safe to skip. While running we keep
     // reconciling so a raced/dropped batch cannot leave the UI stuck.
-    if (expected === current.length && !state.running) return
+    if (expected === current.length && !state.running && !isPendingRun(sessionId)) return
     const since = current.length
     const result = await fetchLearningEventsSince(sessionId, since)
     if (!result.events.length) return
@@ -516,8 +567,12 @@ export function App() {
       const next = { ...prev }
       for (const item of valid) {
         resolvePendingRun(item.state.session_id, item.state)
-        if (!sameLearningSession(prev[item.state.session_id], item.state)) {
-          next[item.state.session_id] = item.state
+        const pendingActive = isPendingRun(item.state.session_id)
+        const effectiveState = pendingActive && !item.state.running && !item.state.last_response && !item.state.last_error
+          ? { ...item.state, running: true }
+          : item.state
+        if (!sameLearningSession(prev[effectiveState.session_id], effectiveState)) {
+          next[effectiveState.session_id] = effectiveState
           changed = true
         }
       }
@@ -534,7 +589,7 @@ export function App() {
       setWindowEvents(prev => sameEventList(prev[win.id] || [], ev) ? prev : ({ ...prev, [win.id]: ev }))
       return
     }
-    if (expected === current.length && !state.running) return
+    if (expected === current.length && !state.running && !isPendingRun(win.sessionId)) return
     const since = current.length
     const result = await fetchLearningEventsSince(win.sessionId, since)
     if (!result.events.length) return
@@ -704,7 +759,7 @@ export function App() {
         ...prev,
         [sessionId]: [branch.session_id, ...(prev[sessionId] || [])],
       }))
-      setWindowInputs(prev => ({ ...prev, [`win_${branch.session_id}`]: result.draft }))
+      seedWindowInput(`win_${branch.session_id}`, result.draft)
       await openFloatingSession(branch, {
         sourceSessionId: sessionId,
         title: branch.title || result.draft.slice(0, 10) || 'Fork',
@@ -726,7 +781,9 @@ export function App() {
         removeDeletedSessions(new Set(result.deleted))
       }
       if (windowId) {
-        setWindowInputs(prev => ({ ...prev, [windowId]: result.draft }))
+        windowInputDraftsRef.current[windowId] = result.draft
+        setWindowInputs(prev => prev[windowId] === result.draft ? prev : ({ ...prev, [windowId]: result.draft }))
+        setWindowInputResetTokens(prev => ({ ...prev, [windowId]: (prev[windowId] || 0) + 1 }))
         const ev = await fetchLearningEvents(sessionId)
         setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
       } else {
@@ -822,6 +879,25 @@ export function App() {
     setTopZ(prevZ => {
       const nextZ = prevZ + 1
       setWindows(current => {
+        const existing = current[windowId]
+        if (existing) {
+          return {
+            ...current,
+            [windowId]: {
+              ...existing,
+              sessionId: branch.session_id,
+              sourceSessionId: options.sourceSessionId || existing.sourceSessionId,
+              title: options.title || branch.title || existing.title || '新分支',
+              highlightId: options.highlightId ?? existing.highlightId,
+              color,
+              action: options.action ?? existing.action,
+              selectedText: options.selectedText ?? existing.selectedText,
+              displayQuestion: options.displayQuestion ?? existing.displayQuestion,
+              targetLanguage: options.targetLanguage ?? existing.targetLanguage,
+              noteText: options.noteText ?? existing.noteText,
+            },
+          }
+        }
         const placement = nextWindowPlacement(Object.values(current), options.sourceSessionId)
         return {
           ...current,
@@ -850,12 +926,19 @@ export function App() {
       return nextZ
     })
     if (options.initialEvents) {
-      setWindowEvents(prev => ({ ...prev, [windowId]: options.initialEvents || [] }))
+      setWindowEvents(prev => {
+        const existing = prev[windowId] || []
+        const incoming = options.initialEvents || []
+        return incoming.length >= existing.length ? { ...prev, [windowId]: incoming } : prev
+      })
     } else if (!options.skipInitialFetch) {
       setWindowEvents(prev => ({ ...prev, [windowId]: prev[windowId] || [] }))
       try {
         const ev = await fetchLearningEvents(branch.session_id)
-        setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
+        setWindowEvents(prev => {
+          const existing = prev[windowId] || []
+          return ev.length >= existing.length ? { ...prev, [windowId]: ev } : prev
+        })
       } catch {
         // Optimistic windows may be visible before the backend creates the
         // session. The poller will reconcile events as soon as the session exists.
@@ -1155,11 +1238,17 @@ export function App() {
 
   async function sendWindowMessage(windowId: string, textOverride?: string) {
     const win = windows[windowId]
-    const text = (textOverride ?? windowInputDraftsRef.current[windowId] ?? windowInputs[windowId] ?? '').trim()
+    const rawText = textOverride ?? windowInputDraftsRef.current[windowId] ?? windowInputs[windowId] ?? ''
+    const text = rawText.trim()
     if (!win || !text) return
+    if (windowSendingRef.current[windowId] || sessions[win.sessionId]?.running || isPendingRun(win.sessionId)) {
+      setError('Agent 正在运行，请稍候或点击 Stop。')
+      return
+    }
     windowInputDraftsRef.current[windowId] = ''
     setWindowInputs(prev => ({ ...prev, [windowId]: '' }))
     setWindowInputResetTokens(prev => ({ ...prev, [windowId]: (prev[windowId] || 0) + 1 }))
+    setWindowSendingFlag(windowId, true)
     markPendingRun(win.sessionId)
     setSessions(prev => prev[win.sessionId] ? { ...prev, [win.sessionId]: { ...prev[win.sessionId], running: true } } : prev)
     try {
@@ -1169,12 +1258,24 @@ export function App() {
         fetchLearningEvents(win.sessionId),
       ])
       resolvePendingRun(win.sessionId, state)
-      setSessions(prev => ({ ...prev, [state.session_id]: state }))
+      const pendingActive = isPendingRun(win.sessionId)
+      const effectiveState = pendingActive && !state.running && !state.last_response && !state.last_error
+        ? { ...state, running: true }
+        : state
+      setSessions(prev => ({ ...prev, [effectiveState.session_id]: effectiveState }))
       setWindowEvents(prev => ({ ...prev, [windowId]: ev }))
     } catch (err: any) {
       delete pendingRunsRef.current[win.sessionId]
       setSessions(prev => prev[win.sessionId] ? { ...prev, [win.sessionId]: { ...prev[win.sessionId], running: false } } : prev)
-      setError(err.message || String(err))
+      restoreWindowInputAfterFailedSend(windowId, rawText)
+      const message = err.message || String(err)
+      if (message.includes('session is already running')) {
+        setError('Agent 正在运行，请稍候或点击 Stop。')
+      } else {
+        setError(message)
+      }
+    } finally {
+      setWindowSendingFlag(windowId, false)
     }
   }
 
@@ -1311,13 +1412,35 @@ export function App() {
       }
       return next
     })
+    const deletedWindowIds = Object.entries(windows)
+      .filter(([, item]) => deleted.has(item.sessionId))
+      .map(([id]) => id)
     setWindowEvents(prev => {
       const next = { ...prev }
-      for (const [id, item] of Object.entries(windows)) {
-        if (deleted.has(item.sessionId)) delete next[id]
-      }
+      for (const id of deletedWindowIds) delete next[id]
       return next
     })
+    if (deletedWindowIds.length) {
+      windowInputDraftsRef.current = { ...windowInputDraftsRef.current }
+      for (const id of deletedWindowIds) delete windowInputDraftsRef.current[id]
+      windowSendingRef.current = { ...windowSendingRef.current }
+      for (const id of deletedWindowIds) delete windowSendingRef.current[id]
+      setWindowInputs(prev => {
+        const next = { ...prev }
+        for (const id of deletedWindowIds) delete next[id]
+        return next
+      })
+      setWindowInputResetTokens(prev => {
+        const next = { ...prev }
+        for (const id of deletedWindowIds) delete next[id]
+        return next
+      })
+      setWindowSending(prev => {
+        const next = { ...prev }
+        for (const id of deletedWindowIds) delete next[id]
+        return next
+      })
+    }
     setHighlights(prev => {
       const next = { ...prev }
       for (const [id, item] of Object.entries(next)) {
@@ -1453,6 +1576,11 @@ export function App() {
   async function openWorkspaceItem(item: WorkspaceItem) {
     if (item.type === 'directory') {
       await refreshWorkspace(item.path)
+      return
+    }
+    if (openFilesRef.current[item.path]) {
+      setActiveFilePath(item.path)
+      setActiveMode('files')
       return
     }
     if (item.is_pdf) {
@@ -1662,6 +1790,8 @@ export function App() {
         pdfHighlights={pdfHighlights}
         textHighlights={highlights}
         pdfZoom={pdfZoom}
+        scrollPositions={fileScrollPositionsRef.current}
+        onFileScroll={(path, scrollTop) => { fileScrollPositionsRef.current[path] = scrollTop }}
         onZoomOut={() => setPdfZoom(prev => Math.max(1.15, Math.round((prev - 0.15) * 100) / 100))}
         onZoomIn={() => setPdfZoom(prev => Math.min(2.6, Math.round((prev + 0.15) * 100) / 100))}
         onActivate={(path) => {
@@ -1742,7 +1872,13 @@ export function App() {
           })
         }}
         onOpenHighlight={openHighlight}
-      /> : <section className="conversation-panel">
+      /> : <section
+        ref={conversationPanelRef}
+        className="conversation-panel"
+        onScroll={event => {
+          if (session?.session_id) chatScrollPositionsRef.current[session.session_id] = event.currentTarget.scrollTop
+        }}
+      >
           {!chatItems.length && (session?.event_count || 0) > 0 && <div className="learning-empty">
             <BookOpen size={28}/>
             <div>正在载入对话上下文...</div>
@@ -1769,7 +1905,7 @@ export function App() {
                     title: child.title || (child.root_question || '').slice(0, 10) || '分支',
                     displayQuestion: child.root_question || child.last_question,
                   })
-                  setWindowInputs(prev => ({ ...prev, [`win_${child.session_id}`]: child.root_question || child.last_question || '' }))
+                  seedWindowInput(`win_${child.session_id}`, child.root_question || child.last_question || '')
                 }}
               />}
             </div>
@@ -1869,11 +2005,11 @@ export function App() {
       windows={windows}
       sessions={sessions}
       eventsByWindow={windowEvents}
-      inputs={windowInputs}
+      inputSeeds={windowInputs}
       inputResetTokens={windowInputResetTokens}
+      sendingByWindow={windowSending}
       collapsedMessages={collapsedMessages}
       highlights={highlights}
-      onInputChange={(windowId, value) => setWindowInputs(prev => ({ ...prev, [windowId]: value }))}
       onInputDraftChange={(windowId, value) => { windowInputDraftsRef.current[windowId] = value }}
       onToggleCollapse={(messageId) => setCollapsedMessages(prev => ({ ...prev, [messageId]: !prev[messageId] }))}
       onSend={sendWindowMessage}
@@ -1895,7 +2031,7 @@ export function App() {
             title: child.title || child.root_question || '新分支',
             displayQuestion: child.root_question || child.last_question,
           })
-          setWindowInputs(prev => ({ ...prev, [`win_${child.session_id}`]: child.root_question || child.last_question || '' }))
+          seedWindowInput(`win_${child.session_id}`, child.root_question || child.last_question || '')
         }
       }}
       onTextSelection={handleTextSelection}
@@ -2193,13 +2329,14 @@ function ToolsToggleButton({ enabled, disabled, onToggle }: {
   </button>
 }
 
-function ComposerInput({ value, onChange, onDraftChange, onSubmit, className, resetSignal = 0 }: {
+function ComposerInput({ value, onChange, onDraftChange, onSubmit, className, resetSignal = 0, disabled = false }: {
   value: string
-  onChange: (value: string) => void
+  onChange?: (value: string) => void
   onDraftChange?: (value: string) => void
   onSubmit: (value: string) => void
   className?: string
   resetSignal?: number
+  disabled?: boolean
 }) {
   const [draft, setDraft] = useState(value)
   const resetSignalRef = useRef(resetSignal)
@@ -2210,25 +2347,26 @@ function ComposerInput({ value, onChange, onDraftChange, onSubmit, className, re
   useEffect(() => {
     if (resetSignalRef.current === resetSignal) return
     resetSignalRef.current = resetSignal
-    setDraft('')
-    onDraftChange?.('')
-    onChange('')
+    setDraft(value)
+    onDraftChange?.(value)
+    onChange?.(value)
   }, [resetSignal])
   return <textarea
     className={className}
+    disabled={disabled}
     value={draft}
     onChange={event => {
       const next = event.target.value
       setDraft(next)
       onDraftChange?.(next)
     }}
-    onBlur={() => onChange(draft)}
+    onBlur={() => onChange?.(draft)}
     onKeyDown={event => {
       if (shouldSubmitFromKey(event)) {
         event.preventDefault()
         const text = draft
-        onChange(text)
-        onSubmit(text)
+        onChange?.(text)
+        if (!disabled) onSubmit(text)
       }
     }}
   />
@@ -2466,9 +2604,11 @@ function FileContextMenu({ menu, clipboardPath, onAction }: {
   </div>
 }
 
-function MarkdownFileEditor({ tab, highlights, onUpdate, onToggleMode, onSave, onSelection, onOpenHighlight }: {
+function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, onToggleMode, onSave, onSelection, onOpenHighlight }: {
   tab: OpenFileTab
   highlights: Record<string, HighlightRecord>
+  scrollTop: number
+  onScroll: (scrollTop: number) => void
   onUpdate: (content: string) => void
   onToggleMode: (mode: 'preview' | 'edit') => void
   onSave: () => void
@@ -2477,6 +2617,13 @@ function MarkdownFileEditor({ tab, highlights, onUpdate, onToggleMode, onSave, o
 }) {
   const mode = tab.viewMode || 'preview'
   const selectionAnchorRef = useRef<TextSelectionAnchor | null>(null)
+  const editorScrollRef = useRef<HTMLTextAreaElement | null>(null)
+  const previewScrollRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    const target = mode === 'edit' ? editorScrollRef.current : previewScrollRef.current
+    if (!target) return
+    window.requestAnimationFrame(() => { target.scrollTop = scrollTop || 0 })
+  }, [tab.path, tab.loading, mode])
   if (tab.loading) return <div className="pdf-text-status">正在读取 Markdown...</div>
   if (tab.error) return <div className="pdf-text-status error">Markdown 读取失败：{tab.error}</div>
   const content = tab.textContent || ''
@@ -2489,8 +2636,14 @@ function MarkdownFileEditor({ tab, highlights, onUpdate, onToggleMode, onSave, o
       <button className="secondary" disabled={!tab.dirty} onClick={onSave}>{tab.dirty ? <Save size={14}/> : <Check size={14}/>}保存</button>
     </div>
     {mode === 'edit'
-      ? <textarea className="markdown-editor" value={content} onChange={event => onUpdate(event.target.value)}/>
-      : <div className="markdown-preview" onMouseDown={event => {
+      ? <textarea
+          ref={editorScrollRef}
+          className="markdown-editor"
+          value={content}
+          onScroll={event => onScroll(event.currentTarget.scrollTop)}
+          onChange={event => onUpdate(event.target.value)}
+        />
+      : <div ref={previewScrollRef} className="markdown-preview" onScroll={event => onScroll(event.currentTarget.scrollTop)} onMouseDown={event => {
           if (!shouldManageMarkdownSelection(event)) return
           event.preventDefault()
           window.getSelection()?.removeAllRanges()
@@ -2513,13 +2666,15 @@ function MarkdownFileEditor({ tab, highlights, onUpdate, onToggleMode, onSave, o
   </section>
 }
 
-function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighlights, textHighlights, pdfZoom, onZoomOut, onZoomIn, onActivate, onClose, onUpdateMarkdown, onToggleMarkdownMode, onSaveMarkdown, onMarkdownSelection, onPdfSelection, onOpenHighlight }: {
+function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighlights, textHighlights, pdfZoom, scrollPositions, onFileScroll, onZoomOut, onZoomIn, onActivate, onClose, onUpdateMarkdown, onToggleMarkdownMode, onSaveMarkdown, onMarkdownSelection, onPdfSelection, onOpenHighlight }: {
   openFiles: Record<string, OpenFileTab>
   activeFile: OpenFileTab | null
   activeFilePath: string | null
   pdfHighlights: Record<string, PdfHighlightRecord>
   textHighlights: Record<string, HighlightRecord>
   pdfZoom: number
+  scrollPositions: Record<string, number>
+  onFileScroll: (path: string, scrollTop: number) => void
   onZoomOut: () => void
   onZoomIn: () => void
   onActivate: (path: string) => void
@@ -2555,18 +2710,32 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
     </div>
     {activeFile ? <div className="file-viewer clean">
       {activeFile.type === 'pdf'
-        ? <PdfTextReader tab={activeFile} highlights={pdfHighlights} zoom={pdfZoom} onSelection={onPdfSelection} onOpenHighlight={onOpenHighlight}/>
+        ? <PdfTextReader
+            tab={activeFile}
+            highlights={pdfHighlights}
+            zoom={pdfZoom}
+            scrollTop={scrollPositions[activeFile.path] || 0}
+            onScroll={scrollTop => onFileScroll(activeFile.path, scrollTop)}
+            onSelection={onPdfSelection}
+            onOpenHighlight={onOpenHighlight}
+          />
         : activeFile.type === 'markdown'
           ? <MarkdownFileEditor
               tab={activeFile}
               highlights={Object.fromEntries(Object.entries(textHighlights).filter(([, item]) => item.chatId === `markdown:${activeFile.path}`))}
+              scrollTop={scrollPositions[activeFile.path] || 0}
+              onScroll={scrollTop => onFileScroll(activeFile.path, scrollTop)}
               onUpdate={content => onUpdateMarkdown(activeFile.path, content)}
               onToggleMode={mode => onToggleMarkdownMode(activeFile.path, mode)}
               onSave={() => onSaveMarkdown(activeFile.path)}
               onSelection={result => onMarkdownSelection(result, activeFile.path)}
               onOpenHighlight={onOpenHighlight}
             />
-        : <iframe className="pdf-frame" title={activeFile.name} src={activeFile.url}/>}
+        : <WorkspaceFileFrame
+            tab={activeFile}
+            scrollTop={scrollPositions[activeFile.path] || 0}
+            onScroll={scrollTop => onFileScroll(activeFile.path, scrollTop)}
+          />}
     </div> : <div className="file-empty">
       <Folder size={30}/>
       <span>从右侧文件系统打开 PDF 或文件。</span>
@@ -2574,13 +2743,58 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
   </section>
 }
 
-function PdfTextReader({ tab, highlights, zoom, onSelection, onOpenHighlight }: {
+function WorkspaceFileFrame({ tab, scrollTop, onScroll }: {
+  tab: OpenFileTab
+  scrollTop: number
+  onScroll: (scrollTop: number) => void
+}) {
+  const frameRef = useRef<HTMLIFrameElement | null>(null)
+  const cleanupRef = useRef<(() => void) | null>(null)
+
+  const restoreAndBind = useCallback(() => {
+    cleanupRef.current?.()
+    cleanupRef.current = null
+    const frame = frameRef.current
+    if (!frame) return
+    try {
+      const win = frame.contentWindow
+      if (!win) return
+      window.requestAnimationFrame(() => win.scrollTo(0, scrollTop || 0))
+      const handleScroll = () => onScroll(win.scrollY || win.document?.documentElement?.scrollTop || win.document?.body?.scrollTop || 0)
+      win.addEventListener('scroll', handleScroll, { passive: true })
+      cleanupRef.current = () => win.removeEventListener('scroll', handleScroll)
+    } catch {
+      cleanupRef.current = null
+    }
+  }, [scrollTop, onScroll])
+
+  useEffect(() => {
+    restoreAndBind()
+    return () => {
+      cleanupRef.current?.()
+      cleanupRef.current = null
+    }
+  }, [tab.path, restoreAndBind])
+
+  return <iframe ref={frameRef} className="pdf-frame" title={tab.name} src={tab.url} onLoad={restoreAndBind}/>
+}
+
+function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection, onOpenHighlight }: {
   tab: OpenFileTab
   highlights: Record<string, PdfHighlightRecord>
   zoom: number
+  scrollTop: number
+  onScroll: (scrollTop: number) => void
   onSelection: (text: string, page: number, rect: DOMRect, rects: PdfSelectionRect[]) => void
   onOpenHighlight: (highlightId: string) => void
 }) {
+  const readerRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => {
+    if (tab.loading || tab.error || !tab.pdfText?.pages.length) return
+    const reader = readerRef.current
+    if (!reader) return
+    window.requestAnimationFrame(() => { reader.scrollTop = scrollTop || 0 })
+  }, [tab.path, tab.loading, tab.error, tab.pdfText?.pages.length, zoom])
   if (tab.loading) {
     return <div className="pdf-text-status">正在抽取 PDF 文本...</div>
   }
@@ -2590,7 +2804,7 @@ function PdfTextReader({ tab, highlights, zoom, onSelection, onOpenHighlight }: 
   if (!tab.pdfText?.pages.length) {
     return <div className="pdf-text-status">没有抽取到可选择文本。该 PDF 可能是扫描件，需要 OCR。</div>
   }
-  return <div className="pdf-text-reader">
+  return <div ref={readerRef} className="pdf-text-reader" onScroll={event => onScroll(event.currentTarget.scrollTop)}>
     {tab.pdfText.pages.map(page => <PdfPageView
       key={page.page}
       pdfPath={tab.path}
@@ -3105,11 +3319,11 @@ function FloatingWindows({
   windows,
   sessions,
   eventsByWindow,
-  inputs,
+  inputSeeds,
   inputResetTokens,
+  sendingByWindow,
   collapsedMessages,
   highlights,
-  onInputChange,
   onInputDraftChange,
   onToggleCollapse,
   onSend,
@@ -3132,11 +3346,11 @@ function FloatingWindows({
   windows: Record<string, FloatingWindowState>
   sessions: Record<string, LearningSessionState>
   eventsByWindow: Record<string, ContextEvent[]>
-  inputs: Record<string, string>
+  inputSeeds: Record<string, string>
   inputResetTokens: Record<string, number>
+  sendingByWindow: Record<string, boolean>
   collapsedMessages: Record<string, boolean>
   highlights: Record<string, HighlightRecord>
-  onInputChange: (windowId: string, value: string) => void
   onInputDraftChange: (windowId: string, value: string) => void
   onToggleCollapse: (messageId: string) => void
   onSend: (windowId: string, text?: string) => void
@@ -3174,6 +3388,8 @@ function FloatingWindows({
     </div>
     {Object.values(windows).filter(win => !win.minimized).map(win => {
       const session = sessions[win.sessionId]
+      const sending = !!sendingByWindow[win.id]
+      const busy = sending || !!session?.running
       const chatItems = buildChatItems(eventsByWindow[win.id] || [])
       const style = win.fullscreen
         ? { zIndex: win.zIndex }
@@ -3255,22 +3471,22 @@ function FloatingWindows({
               onOpenHighlight={onOpenHighlight}
             />
           </article>)}
-          {session?.running && <ThinkingState events={eventsByWindow[win.id] || []} running={session.running} todoBoard={session.todo_board}/>}
+          {busy && <ThinkingState events={eventsByWindow[win.id] || []} running={busy} todoBoard={session?.todo_board}/>}
         </div>
         <footer className="window-composer">
           <ComposerInput
-            value={inputs[win.id] || ''}
-            onChange={value => onInputChange(win.id, value)}
+            value={inputSeeds[win.id] || ''}
             onDraftChange={value => onInputDraftChange(win.id, value)}
             resetSignal={inputResetTokens[win.id] || 0}
+            disabled={busy}
             onSubmit={value => onSend(win.id, value)}
           />
-          <button className="primary" onClick={() => onSend(win.id)}><Send size={16}/></button>
+          <button className="primary" onClick={() => onSend(win.id)} disabled={busy}><Send size={16}/>{sending ? '发送中' : '发送'}</button>
           <div className="composer-side-actions">
-            <button className="secondary icon-only" onClick={() => onStop(win.id)}><Square size={16}/></button>
+            <button className="secondary icon-only" onClick={() => onStop(win.id)} disabled={!busy}><Square size={16}/></button>
             <ToolsToggleButton
               enabled={session?.tools_enabled !== false}
-              disabled={!session || !!session.running}
+              disabled={!session || busy}
               onToggle={(enabled) => onToggleTools(win.sessionId, enabled)}
             />
           </div>
@@ -3353,7 +3569,7 @@ function renderContent(value: any): string {
   }
 }
 
-function MessageContent({ sessionId, item, collapsed, highlights, onToggleCollapse, onTextSelection, onOpenHighlight }: {
+const MessageContent = memo(function MessageContent({ sessionId, item, collapsed, highlights, onToggleCollapse, onTextSelection, onOpenHighlight }: {
   sessionId: string
   item: ChatItem
   collapsed: boolean
@@ -3416,9 +3632,9 @@ function MessageContent({ sessionId, item, collapsed, highlights, onToggleCollap
     <MarkdownText text={visibleText} chatId={item.id} sourceSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight}/>
     {canCollapse && <button className="collapse-toggle" onClick={onToggleCollapse}>{collapsed ? `展开全部 ${lines.length} 行` : '折叠到 10 行'}</button>}
   </div>
-}
+})
 
-function MarkdownText({ text, chatId, sourceSessionId, highlights, onOpenHighlight, basePath = '' }: {
+const MarkdownText = memo(function MarkdownText({ text, chatId, sourceSessionId, highlights, onOpenHighlight, basePath = '' }: {
   text: string
   chatId: string
   sourceSessionId?: string
@@ -3448,7 +3664,7 @@ function MarkdownText({ text, chatId, sourceSessionId, highlights, onOpenHighlig
     }}
     dangerouslySetInnerHTML={{ __html: html }}
   />
-}
+})
 
 type MathRenderPlaceholder = {
   html: string
