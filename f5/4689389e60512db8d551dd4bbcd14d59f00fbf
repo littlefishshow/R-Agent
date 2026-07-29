@@ -1,0 +1,14 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f54689389e60512db8d551dd4bbcd14d59f00fbf",
+  "prompts": {},
+  "humans": {
+    "h_200a9ca5cd7f1a": {
+      "author": "littlefishshow <1790326323@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
