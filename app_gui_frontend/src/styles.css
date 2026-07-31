@@ -576,8 +576,9 @@ pre {
 }
 
 .collapse-toggle {
-  margin-top: 8px;
+  margin: 0 30px 8px 0;
   height: 28px;
+  max-width: calc(100% - 30px);
   padding: 0 9px;
   color: var(--branch-strong, #2563eb);
   background: color-mix(in srgb, var(--branch-bg, #eff6ff) 35%, #ffffff);

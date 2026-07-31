@@ -2,6 +2,45 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-07-31
+
+#### Cockpit GUI fork/回退与缩小窗口修复
+
+- **清理上下文改写后的旧对话事件**：`ContextSnapshotStore.replace_message_events` 在 setback/fork 等重写上下文时仅保留 session/system/memory 初始化事件，清除旧 `user_input_received`、LLM/tool/error 等运行事件，避免前端 fallback 又显示被改写前的旧对话。
+- **恢复已缩小的分支窗口**：`openFloatingSession` 命中已有浮窗时会取消 `minimized` 并提升 `zIndex`，保证通过 `...`/高亮/分支入口重新打开时窗口可见。
+- **隔离消息折叠状态**：主会话与浮窗的长消息折叠状态改为按 `sessionId:messageId` 记录，避免不同会话或窗口的同名消息互相串扰。
+
+#### Cockpit GUI 空对话占位修复
+
+- **区分真实加载态与空对话态**：`app_gui_frontend/src/App.tsx` 为切换会话增加显式 `eventsLoading` 标记；仅在拉取事件期间显示“正在载入对话上下文...”，当会话没有可展示聊天气泡或上下文事件不足以形成对话时，恢复显示“开始新对话”和输入引导。
+- **补充前端构建验证**：已通过 `npm run build`（`tsc && vite build`）确认本次 GUI 修改可编译，构建仅保留 Vite 大 chunk 体积提示。
+
+### 2026-07-30
+
+#### AutoResearch 文档维护
+
+- **补充 atr_playground benchmark 任务说明**：`autoresearch/AUTORESEARCH_EXPLAINED.md` 新增 `atr_playground` 章节，汇总 10 个小型确定性 benchmark 的任务定义、允许/固定文件边界、官方指标与完成标准，便于后续维护和回归检查。
+
+#### Cockpit GUI 消息折叠按钮位置
+
+- **上移长消息折叠控制**：主聊天区与浮动子窗口共用的 `MessageContent` 现在会在消息正文顶部显示“折叠到 10 行 / 展开全部”按钮，并保留原有文案与切换行为；按钮样式改为顶部间距并预留右侧空间，避免与右上复制按钮重叠。
+
+#### Cockpit learning_context 自动清扫
+
+- **删除工作区文件联动清理学习上下文**：`DELETE /workspace/files` 删除 PDF、读书笔记或目录成功后，会按删除前确认的文件/目录类型清理关联 learning sessions，并在响应中兼容保留 `deleted`、新增 `deleted_learning_sessions`。
+- **安全匹配学习会话来源路径**：`LearningRuntimeService` 新增按 workspace path 清理方法，匹配 `session.file_path` 与 `selection.source_context.path`；目录删除仅匹配相等或 `path/` 前缀，并去重到最小删除根后调用 `delete_subtree`，确保只删除服务管理的 `outputs/learning_context` 子树。
+- **补充临时目录单元测试**：新增 learning runtime 清扫测试，覆盖文件精确匹配、目录前缀匹配、最小根去重与相邻前缀不误删。
+
+#### Sandbox 自动清理保护维护
+
+- **保护 `sandbox/read_paper` 产物**：`core/sandbox_cleanup.py` 的自动清理会永久保留 `sandbox/read_paper` 及其所有后代，即使目录或文件已超过保留期且为空，避免论文阅读中间产物和截图资产被启动清理误删。
+- **补充清理回归测试**：`tests/test_sandbox_cleanup.py` 覆盖旧文件/空目录仍会被清理、但 `read_paper` 子树会被记录为 kept 且不会删除的场景。
+
+#### read_paper 长论文精读流程升级
+
+- **显式覆盖长论文六类失败模式**：`skills/productivity/read_paper/SKILL.md` 的长论文拆解规范补充信息瓶颈、拆分粒度过粗、缺少证据矩阵、图表没有硬门槛、最终内容级二次对照不足、跨章节一致性缺失六项风险，要求流程设计逐项防退化。
+- **固化 A-D 精读策略**：长论文流程明确 A 章节任务、B 图表任务、C 机制复原任务、D 最终审稿任务的职责边界，要求从章节证据矩阵、图表 ledger、跨章节机制复原到最终内容级二次对照形成可追溯闭环。
+
 ### 2026-07-29
 
 #### Cockpit GUI 阅读位置与子窗口输入修复

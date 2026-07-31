@@ -435,7 +435,18 @@ def create_app(
     @app.delete("/workspace/files")
     def delete_workspace_item(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
-            return workspace.delete(str(request.get("path") or ""))
+            requested_path = str(request.get("path") or "")
+            resolved_path = workspace._resolve(requested_path)
+            if resolved_path == workspace.root:
+                raise ValueError("cannot delete workspace root")
+            if not resolved_path.exists():
+                raise FileNotFoundError(workspace._rel(resolved_path))
+            is_directory = resolved_path.is_dir()
+            normalized_path = workspace._rel(resolved_path)
+            result = workspace.delete(requested_path)
+            cleanup = learning.delete_sessions_for_workspace_path(normalized_path, is_directory=is_directory)
+            result["deleted_learning_sessions"] = cleanup.get("deleted_learning_sessions", [])
+            return result
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
         except Exception as exc:

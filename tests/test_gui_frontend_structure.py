@@ -222,6 +222,12 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "nextWindowPlacement" in app
     assert "function raiseWindow" in app
     assert "minimized: false" in app
+    assert "zIndex: nextZ" in app
+    assert "function messageCollapseKey" in app
+    assert "messageCollapseKey(session?.session_id || '', item.id)" in app
+    assert "messageCollapseKey(win.sessionId, item.id)" in app
+    assert "eventsLoading" in app
+    assert "开始新对话" in app
     assert "Object.values(windows).filter(win => win.minimized).map" in app
     assert "onClick={() => onRaise(win.id)}" in app
     assert "Object.values(windows).filter(win => !win.minimized).map" in app

@@ -51,6 +51,61 @@ def test_cleanup_deletes_old_nested_files_and_empty_dirs_but_keeps_fresh_childre
     assert result["errors"] == []
 
 
+def test_cleanup_never_deletes_read_paper_subtree_even_when_old_and_empty(tmp_path):
+    sandbox = tmp_path / "sandbox"
+    sandbox.mkdir()
+    read_paper = sandbox / "read_paper"
+    read_paper.mkdir()
+    protected_file = read_paper / "old_paper.txt"
+    protected_file.write_text("keep", encoding="utf-8")
+    protected_nested = read_paper / "nested"
+    protected_nested.mkdir()
+    protected_nested_file = protected_nested / "old_nested_paper.txt"
+    protected_nested_file.write_text("keep nested", encoding="utf-8")
+    protected_empty_dir = read_paper / "old_empty_paper_dir"
+    protected_empty_dir.mkdir()
+    old_file = sandbox / "old.txt"
+    old_file.write_text("delete", encoding="utf-8")
+    old_empty_dir = sandbox / "old_empty_dir"
+    old_empty_dir.mkdir()
+
+    now = 1_000_000.0
+    original_created = sandbox_cleanup._entry_created_timestamp
+    created = {
+        read_paper: now - 10 * 24 * 60 * 60,
+        protected_file: now - 10 * 24 * 60 * 60,
+        protected_nested: now - 10 * 24 * 60 * 60,
+        protected_nested_file: now - 10 * 24 * 60 * 60,
+        protected_empty_dir: now - 10 * 24 * 60 * 60,
+        old_file: now - 10 * 24 * 60 * 60,
+        old_empty_dir: now - 10 * 24 * 60 * 60,
+    }
+    sandbox_cleanup._entry_created_timestamp = lambda path: created[Path(path)]
+    try:
+        result = sandbox_cleanup.cleanup_sandbox_by_creation_time(
+            sandbox_dir=sandbox,
+            retention_days=3,
+            now=now,
+        )
+    finally:
+        sandbox_cleanup._entry_created_timestamp = original_created
+
+    assert read_paper.exists()
+    assert protected_file.exists()
+    assert protected_nested.exists()
+    assert protected_nested_file.exists()
+    assert protected_empty_dir.exists()
+    assert not old_file.exists()
+    assert not old_empty_dir.exists()
+    assert str(read_paper) in result["kept"]
+    assert str(protected_file) in result["kept"]
+    assert str(protected_nested) in result["kept"]
+    assert str(protected_nested_file) in result["kept"]
+    assert str(protected_empty_dir) in result["kept"]
+    assert set(result["deleted"]) == {str(old_file), str(old_empty_dir)}
+    assert result["errors"] == []
+
+
 def test_cleanup_uses_st_birthtime_when_available_and_falls_back_to_st_ctime(monkeypatch):
     calls = []
 

@@ -16,6 +16,7 @@ DISABLE_ENV = "R_AGENT_SANDBOX_CLEANUP_DISABLED"
 # Workspace root is the parent of ``core/``.
 WORKSPACE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_SANDBOX_DIR = WORKSPACE_DIR / "sandbox"
+PROTECTED_SANDBOX_DIR_NAMES = frozenset({"read_paper"})
 
 _LAST_CLEANUP_AT: Optional[float] = None
 
@@ -85,6 +86,20 @@ def _is_within_sandbox(path: Path, sandbox_root: Path) -> bool:
         return False
 
 
+def _is_protected_sandbox_entry(path: Path, sandbox_root: Path) -> bool:
+    """Return True for sandbox/read_paper and anything below it.
+
+    The protection is based on the path relative to the configured sandbox root,
+    not on resolved targets, so symlink targets cannot expand or bypass the
+    protected subtree.
+    """
+    try:
+        relative = path.relative_to(sandbox_root)
+    except ValueError:
+        return False
+    return bool(relative.parts) and relative.parts[0] in PROTECTED_SANDBOX_DIR_NAMES
+
+
 def cleanup_sandbox_by_creation_time(
     *,
     sandbox_dir: str | os.PathLike[str] | None = None,
@@ -95,6 +110,7 @@ def cleanup_sandbox_by_creation_time(
 
     Safety boundaries:
     - The sandbox directory itself is never removed.
+    - ``sandbox/read_paper`` and all of its descendants are never removed.
     - Every descendant under ``sandbox_dir`` is considered, not only top-level
       entries, so stale nested artifacts are cleaned on startup too.
     - Files and symlinks older than the cutoff are removed directly; symlink
@@ -129,6 +145,10 @@ def cleanup_sandbox_by_creation_time(
 
     for entry in _iter_sandbox_entries(root):
         try:
+            if _is_protected_sandbox_entry(entry, root):
+                result["kept"].append(str(entry))
+                continue
+
             # Do not let surprising resolved paths escape the configured sandbox.
             # For symlinks, only the link itself is removed and the target is not
             # followed by stat/unlink/rmtree.

@@ -1355,6 +1355,97 @@ class LearningRuntimeService(AgentRuntimeService):
             stack.extend(children)
         return descendants
 
+    @staticmethod
+    def _normalize_workspace_path(path: str) -> str:
+        normalized = str(path or "").strip().replace("\\", "/")
+        while normalized.startswith("/"):
+            normalized = normalized[1:]
+        parts = [part for part in normalized.split("/") if part not in {"", "."}]
+        return "/".join(parts)
+
+    @staticmethod
+    def _selection_source_path(session: LearningSession) -> str:
+        selection = getattr(session, "selection", None)
+        if not isinstance(selection, dict):
+            return ""
+        source_context = selection.get("source_context")
+        if not isinstance(source_context, dict):
+            return ""
+        return str(source_context.get("path") or "")
+
+    @staticmethod
+    def _workspace_path_matches(candidate: str, deleted_path: str, *, is_directory: bool) -> bool:
+        candidate_path = LearningRuntimeService._normalize_workspace_path(candidate)
+        target_path = LearningRuntimeService._normalize_workspace_path(deleted_path)
+        if not candidate_path or not target_path:
+            return False
+        if candidate_path == target_path:
+            return True
+        if is_directory:
+            return candidate_path.startswith(target_path.rstrip("/") + "/")
+        return False
+
+    def _session_dir_is_managed(self, session_id: str) -> bool:
+        session = self.sessions.get(session_id)
+        session_dir = Path(session.store.base_dir) if session is not None else self._dirs.get(session_id)
+        if session_dir is None:
+            return False
+        try:
+            root = Path(self.store_root).resolve()
+            candidate = Path(session_dir).resolve()
+        except Exception:
+            return False
+        return candidate == root or root in candidate.parents
+
+    def delete_sessions_for_workspace_path(self, workspace_path: str, *, is_directory: bool = False) -> Dict[str, Any]:
+        """Delete learning session subtrees associated with a workspace file/path.
+
+        Matching is intentionally metadata-only: a session is associated when its
+        ``file_path`` or ``selection.source_context.path`` equals the deleted
+        workspace path.  For directory deletions, descendants under
+        ``path + '/'`` also match.  Only roots whose on-disk context directory is
+        inside this service's managed ``store_root`` are passed to
+        :meth:`delete_subtree`; the workspace deletion path is never used as a
+        filesystem deletion target.
+        """
+        target_path = self._normalize_workspace_path(workspace_path)
+        if not target_path:
+            return {"deleted_learning_sessions": []}
+
+        with self._lock:
+            matched = []
+            for sid, session in list(self.sessions.items()):
+                paths = [
+                    getattr(session, "file_path", ""),
+                    self._selection_source_path(session),
+                ]
+                if any(self._workspace_path_matches(path, target_path, is_directory=is_directory) for path in paths):
+                    matched.append(sid)
+
+            matched_set = set(matched)
+            delete_roots = []
+            for sid in matched:
+                parent_id = getattr(self.sessions.get(sid), "parent_session_id", None)
+                has_matched_ancestor = False
+                while parent_id:
+                    if parent_id in matched_set:
+                        has_matched_ancestor = True
+                        break
+                    parent = self.sessions.get(parent_id)
+                    parent_id = getattr(parent, "parent_session_id", None) if parent is not None else None
+                if not has_matched_ancestor and self._session_dir_is_managed(sid):
+                    delete_roots.append(sid)
+
+        deleted: list[str] = []
+        for sid in delete_roots:
+            if sid not in self.sessions:
+                continue
+            try:
+                deleted.extend(self.delete_subtree(sid).get("deleted", []))
+            except KeyError:
+                continue
+        return {"deleted_learning_sessions": deleted}
+
     def delete_subtree(self, session_id: str) -> Dict[str, Any]:
         ids = [session_id] + self.descendant_session_ids(session_id)
         deleted = []

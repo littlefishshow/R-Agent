@@ -8,7 +8,13 @@ import pytest
 
 from app_gui.runtime import AgentRuntimeService
 from app_gui.runtime import LEARNING_ALLOWED_TOOLS, LearningRuntimeService
-from app_gui.schemas import EVENT_SESSION_STARTED, EVENT_SYSTEM_PROMPT_BUILT, EVENT_USER_INPUT_RECEIVED
+from app_gui.schemas import (
+    EVENT_ERROR,
+    EVENT_LLM_REQUEST_SNAPSHOT,
+    EVENT_SESSION_STARTED,
+    EVENT_SYSTEM_PROMPT_BUILT,
+    EVENT_USER_INPUT_RECEIVED,
+)
 from app_gui.file_workspace import FileWorkspace
 from core.agent import RAgent
 
@@ -582,9 +588,42 @@ def test_learning_setback_and_fork_rewrite_context_file(monkeypatch, tmp_path):
         {"role": "assistant", "content": "answer"},
         {"role": "user", "content": "second"},
     ]
+    session.store.append_event({
+        "event_id": "legacy-user-input",
+        "event_type": EVENT_USER_INPUT_RECEIVED,
+        "session_id": session.session_id,
+        "source": "test",
+        "created_at": time.time(),
+        "payload": {"content": "stale fallback user input"},
+    })
+    session.store.append_event({
+        "event_id": "legacy-llm-request",
+        "event_type": EVENT_LLM_REQUEST_SNAPSHOT,
+        "session_id": session.session_id,
+        "source": "test",
+        "created_at": time.time(),
+        "payload": {"messages": ["stale run"]},
+    })
+    session.store.append_event({
+        "event_id": "legacy-error",
+        "event_type": EVENT_ERROR,
+        "session_id": session.session_id,
+        "source": "test",
+        "created_at": time.time(),
+        "payload": {"error": "stale error"},
+    })
     session.store.replace_message_events(
         [{"role": "system", "content": "sys"}, {"role": "user", "content": "first"}, {"role": "assistant", "content": "answer"}, {"role": "user", "content": "second"}],
         session_id=session.session_id,
+    )
+    event_types = [event["event_type"] for event in session.store.list_events()]
+    assert EVENT_USER_INPUT_RECEIVED not in event_types
+    assert EVENT_LLM_REQUEST_SNAPSHOT not in event_types
+    assert EVENT_ERROR not in event_types
+    assert all(
+        event.get("source") == "context_rewrite"
+        for event in session.store.list_events()
+        if event["event_type"] == "message_appended"
     )
 
     forked = service.fork_from_message("rewrite", 3)
@@ -637,6 +676,76 @@ def test_learning_delete_subtree_removes_descendants(monkeypatch, tmp_path):
         service.get_session(child.session_id)
     with pytest.raises(KeyError):
         service.get_session(grand.session_id)
+
+
+def test_learning_delete_sessions_for_workspace_path_prunes_minimal_roots(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    store_root = tmp_path / "learning_context"
+    service = LearningRuntimeService(store_root=store_root)
+    file_root = service.create_session(
+        session_id="file-root",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="papers/a.pdf",
+    )
+    child = service.create_session(
+        session_id="file-child",
+        parent_session_id="file-root",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="selection",
+        file_path="papers/a.pdf",
+        selection={"source_context": {"path": "papers/a.pdf", "location": "page 1"}},
+    )
+    note = service.create_session(
+        session_id="note",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="note",
+        selection={"source_context": {"path": "notes/a.md"}},
+    )
+    sibling = service.create_session(
+        session_id="sibling",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="papers/ab.pdf",
+    )
+
+    result = service.delete_sessions_for_workspace_path("papers/a.pdf", is_directory=False)
+
+    assert result["deleted_learning_sessions"] == ["file-root", "file-child"]
+    assert not Path(file_root.store.base_dir).exists()
+    with pytest.raises(KeyError):
+        service.get_session(child.session_id)
+    assert service.get_session(note.session_id) is note
+    assert service.get_session(sibling.session_id) is sibling
+    assert Path(note.store.base_dir).is_relative_to(store_root)
+
+
+def test_learning_delete_sessions_for_workspace_directory_matches_prefix(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path / "learning_context")
+    nested = service.create_session(
+        session_id="nested",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="papers/project/a.pdf",
+    )
+    exact_dir = service.create_session(
+        session_id="exact-dir",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="papers/project",
+    )
+    outside_prefix = service.create_session(
+        session_id="outside-prefix",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="papers/projectile/a.pdf",
+    )
+
+    result = service.delete_sessions_for_workspace_path("papers/project", is_directory=True)
+
+    assert set(result["deleted_learning_sessions"]) == {nested.session_id, exact_dir.session_id}
+    assert service.get_session(outside_prefix.session_id) is outside_prefix
 
 
 def test_learning_runtime_cleanup_saved_sessions(monkeypatch, tmp_path):

@@ -205,6 +205,7 @@ export function App() {
   const [session, setSession] = useState<LearningSessionState | null>(null)
   const [accountId] = useState('default')
   const [events, setEvents] = useState<ContextEvent[]>([])
+  const [eventsLoading, setEventsLoading] = useState(false)
   const eventsRef = useRef<ContextEvent[]>([])
   const [input, setInput] = useState('')
   const inputDraftRef = useRef('')
@@ -675,13 +676,21 @@ export function App() {
     setActiveMode('chat')
     // Optimistic switch: show the target conversation immediately from the
     // sidebar cache and clear stale bubbles so switching feels instant, then
-    // reconcile against the server.
+    // reconcile against the server. The explicit loading flag is cleared after
+    // events are fetched, so sessions whose stored events do not produce chat
+    // bubbles can still show the normal new-conversation empty state.
     const known = sessions[sessionId]
-    if (known && known.session_id !== session?.session_id) {
+    const switchingSession = known && known.session_id !== session?.session_id
+    if (switchingSession) {
+      setEventsLoading(true)
       setSession(known)
       setEvents([])
     }
-    await refreshActive(sessionId)
+    try {
+      await refreshActive(sessionId)
+    } finally {
+      if (switchingSession) setEventsLoading(false)
+    }
   }
 
   async function newQuestionChain() {
@@ -895,6 +904,8 @@ export function App() {
               displayQuestion: options.displayQuestion ?? existing.displayQuestion,
               targetLanguage: options.targetLanguage ?? existing.targetLanguage,
               noteText: options.noteText ?? existing.noteText,
+              minimized: false,
+              zIndex: nextZ,
             },
           }
         }
@@ -1879,12 +1890,13 @@ export function App() {
           if (session?.session_id) chatScrollPositionsRef.current[session.session_id] = event.currentTarget.scrollTop
         }}
       >
-          {!chatItems.length && (session?.event_count || 0) > 0 && <div className="learning-empty">
+          {!chatItems.length && eventsLoading && <div className="learning-empty">
             <BookOpen size={28}/>
             <div>正在载入对话上下文...</div>
           </div>}
-          {!chatItems.length && !(session?.event_count || 0) && <div className="learning-empty">
+          {!chatItems.length && !eventsLoading && <div className="learning-empty">
             <BookOpen size={28}/>
+            <div>开始新对话</div>
             <div>输入一个问题开始学习。当前问题链会独立保存上下文；遇到旁支问题时切换到“新分支”发送。</div>
           </div>}
           {chatItems.map(item => <article key={item.id} className={`learn-bubble ${item.role}`} style={colorVars(branchColors[session?.session_id || ''] || ROOT_BRANCH_COLOR)}>
@@ -1912,9 +1924,12 @@ export function App() {
             <MessageContent
               sessionId={session?.session_id || ''}
               item={item}
-              collapsed={!!collapsedMessages[item.id]}
+              collapsed={!!collapsedMessages[messageCollapseKey(session?.session_id || '', item.id)]}
               highlights={highlights}
-              onToggleCollapse={() => setCollapsedMessages(prev => ({ ...prev, [item.id]: !prev[item.id] }))}
+              onToggleCollapse={() => {
+                const key = messageCollapseKey(session?.session_id || '', item.id)
+                setCollapsedMessages(prev => ({ ...prev, [key]: !prev[key] }))
+              }}
               onTextSelection={(container, anchor, event) => handleTextSelection(session?.session_id || '', item.id, container, anchor, event)}
               onOpenHighlight={openHighlight}
             />
@@ -2112,6 +2127,10 @@ function sameJsonValue(a: any, b: any): boolean {
   } catch {
     return false
   }
+}
+
+function messageCollapseKey(sessionId: string, messageId: string): string {
+  return `${sessionId || 'unknown'}:${messageId}`
 }
 
 function buildChatItems(events: ContextEvent[]): ChatItem[] {
@@ -3464,9 +3483,9 @@ function FloatingWindows({
             <MessageContent
               sessionId={win.sessionId}
               item={item}
-              collapsed={!!collapsedMessages[item.id]}
+              collapsed={!!collapsedMessages[messageCollapseKey(win.sessionId, item.id)]}
               highlights={highlights}
-              onToggleCollapse={() => onToggleCollapse(item.id)}
+              onToggleCollapse={() => onToggleCollapse(messageCollapseKey(win.sessionId, item.id))}
               onTextSelection={(container, anchor, event) => onTextSelection(win.sessionId, item.id, container, anchor, event)}
               onOpenHighlight={onOpenHighlight}
             />
@@ -3629,8 +3648,8 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
         copyTextToClipboard(text)
       }}
     ><Copy size={13}/></button>}
-    <MarkdownText text={visibleText} chatId={item.id} sourceSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight}/>
     {canCollapse && <button className="collapse-toggle" onClick={onToggleCollapse}>{collapsed ? `展开全部 ${lines.length} 行` : '折叠到 10 行'}</button>}
+    <MarkdownText text={visibleText} chatId={item.id} sourceSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight}/>
   </div>
 })
 

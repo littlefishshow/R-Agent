@@ -156,9 +156,14 @@ class ContextSnapshotStore:
             return data
 
     def replace_message_events(self, messages: List[Dict[str, Any]], *, session_id: str = "") -> None:
-        """Replace persisted conversation messages while preserving prompt/runtime setup events."""
+        """Replace persisted conversation/run events while preserving session setup events."""
+        preserved_event_types = {
+            "session_started",
+            "system_prompt_built",
+            "memory_snapshot_loaded",
+        }
         with self._lock:
-            self.events = [event for event in self.events if event.get("event_type") != "message_appended"]
+            self.events = [event for event in self.events if event.get("event_type") in preserved_event_types]
             now = time.time()
             for index, message in enumerate(messages):
                 self.events.append({

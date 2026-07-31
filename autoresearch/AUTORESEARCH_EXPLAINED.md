@@ -494,3 +494,40 @@ flowchart TD
 - **安全**：只改 `train/**`，不碰 eval/oracle，默认不自动 commit。
 - **状态**：想知道“解没解决”看 `project.md`；想知道“跑到哪”看 `monitor.json`；想知道“能不能安全续跑”看 `state_check`。
 - **新检查员**：passport 贴身份证，state_check 做体检，anomalies 拉警报，reproducibility 给 best 复考。
+
+---
+
+## 12. atr_playground benchmark：10 个小题在考什么
+
+`atr_playground` 是一组 **CPU-only、无需网络、小型且确定性** 的 benchmark。它更像 10 道“小而准”的编程/规则归纳题：每题都给出固定评测入口和固定数据，要求研究员只在允许的实现侧改代码或产物生成逻辑，用官方 `eval.py` / `eval.sh` 计算 `metrics.json`。
+
+典型流程是：
+
+```bash
+python3 prepare.py
+bash train/train.sh
+bash eval.sh
+cat metrics.json
+```
+
+通用边界：
+
+- **可以改**：通常是 `train/**`、`solution.py` 或训练侧生成提交文件所需的实现逻辑；具体以每个题目的说明为准。
+- **不应改**：`eval.py`、`eval.sh`、固定测试/验证数据、oracle/expected 数据等官方评测资产。它们代表老师的判卷规则，改了不算真正解题。
+- **目标**：让官方指标达到该题的 completion threshold，而不是自报“看起来对了”。
+
+| 任务 | 在考什么 | 允许/固定文件概况 | 官方指标与完成标准 |
+|------|----------|------------------|--------------------|
+| `byte_codec_detector` | 改进 `solution.decode_text(text) -> str`，把短文本里的 mojibake、HTML entity、unicode escape 等编码/转义噪声还原成正确字符串。 | 实现侧重点在 `solution.decode_text`；官方 `eval.py` / `eval.sh` 和固定样例/期望输出不应修改。 | 指标：`decoded_exact_accuracy`；完成：`decoded_exact_accuracy >= 1`，即所有评测样例精确解码正确。 |
+| `coin_change_dp` | 经典最小硬币兑换：给定 `denominations` 和 `amount`，输出凑出金额所需最少硬币数；凑不出则输出 `-1`。 | 可改解题实现/训练侧脚本；评测入口、固定 cases 和指标计算固定。 | 指标：`score`，以 accuracy 为主、speed 为辅；完成：`score >= 0.99`。 |
+| `csv_cleaner` | 清洗 `dirty.csv`，把每行规范成 `name` / `age` / `email` / `state` 四个标准字段。 | 通常由训练侧读取脏 CSV 并生成清洗结果；`dirty.csv` 的官方评测版本、`eval.py` / `eval.sh` 和 expected 规则不应修改。 | 指标：`score`，综合行级准确率与 cell-level F1；完成：`score >= 0.99`。 |
+| `json_repair_micro` | 改进 `solution.repair_json(text) -> str`，修复小型损坏 JSON，使输出能被 `json.loads` 解析，并且解析后的语义等于 expected。 | 实现侧重点在 `solution.repair_json`；官方评测、固定损坏样例和 expected 语义不应修改。 | 指标：`repair_exact_accuracy`；完成：`repair_exact_accuracy >= 1`。 |
+| `knapsack_solver` | 0/1 背包：给 `capacity` 和 `items`，输出容量约束下的最优总价值。 | 可改求解实现；评测脚本、固定实例与最优值/评分逻辑不应修改。 | 指标：`score`，exact accuracy 为主，value ratio 给部分分；完成：`score >= 0.99`。 |
+| `log_anomaly_f1` | 改进 `solution.is_anomaly(line) -> bool`，判断合成服务日志中哪些行是异常。 | 实现侧重点在单行异常判定函数；官方日志数据、标签和评测脚本固定。 | 指标：`positive_f1`；完成：`positive_f1 >= 1`，即正类异常识别 F1 满分。 |
+| `mini_ir_ranker` | 改进 `solution.rank(query, documents)`，对小型检索任务排序，让相关文档尽量排在最前。 | 可改排序/打分逻辑；query、documents、相关性标注和评测脚本固定。 | 指标：`mean_reciprocal_rank`；完成：`mean_reciprocal_rank >= 1`，即每个 query 的首位就是相关文档。 |
+| `route_heuristic_optimizer` | 改进 `solution.solve(points) -> list[int]`，对小型 2D 点集返回一条 Hamiltonian cycle 的访问顺序，尽量短。 | 可改路线求解启发式/精确搜索；点集、known best 长度和评测脚本固定。输出需是合法点索引排列/环路。 | 指标：`route_quality_score = known_best_length / produced_length` 的平均；完成：`route_quality_score >= 0.999`。 |
+| `string_matcher` | 多 pattern 子串匹配：统计每个 pattern 在 `text` 中出现次数，**包含重叠出现**。 | 可改匹配实现；官方文本、patterns、答案和计时/评分逻辑固定。 | 指标：`score`，accuracy 为主、speed 为辅；完成：`score >= 0.99`。 |
+| `text_normalizer_editrules` | 改进 `solution.normalize(text) -> str`，把带噪声的产品/类别短字符串规范化到 canonical labels。 | 实现侧重点在 normalize 规则/映射/编辑距离等逻辑；官方标签集合、测试样例和评测脚本固定。 | 指标：`exact_match_accuracy`；完成：`exact_match_accuracy >= 1`。 |
+
+这些题共同测试的不是“大训练”，而是 AutoResearch 在受约束环境下能否：读懂题目边界、只改允许文件、跑官方流程、根据 `metrics.json` 机械判断是否达标，并在小型确定性任务上快速闭环。
+
