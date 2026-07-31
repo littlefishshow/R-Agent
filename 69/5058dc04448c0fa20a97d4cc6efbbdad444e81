@@ -1,0 +1,16 @@
+skills/productivity/read_paper/SKILL.md
+  h_200a9ca5cd7f1a 100-103,106-110,112-122
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "695058dc04448c0fa20a97d4cc6efbbdad444e81",
+  "prompts": {},
+  "humans": {
+    "h_200a9ca5cd7f1a": {
+      "author": "littlefishshow <1790326323@qq.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
