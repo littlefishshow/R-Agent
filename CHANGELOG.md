@@ -2,6 +2,26 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-08-06
+
+#### read_paper 长论文图表 ledger 交接与验收强化
+
+- **强化图表账本交接**：`skills/productivity/read_paper/SKILL.md` 明确长论文/多子任务必须通过 `handoff_manifest.json` 交接 `figure_table_ledger.md/json`、图片数量、缺失关键图表和验证状态；`figure_table_index` 只能作为候选索引，不能替代最终 ledger。
+- **收紧最终合成插图规则**：汇总阶段必须先读取 manifest 和 ledger，按 ledger 将关键 Figure/Table/Algorithm/案例图在最终 Markdown 对应论证位置就地插入；若找不到 ledger 必须回查交接路径，仍找不到则标记 blocked，不能静默跳过或用候选索引冒充。
+- **补齐验收硬门槛**：最终验收增加 `final_note_image_count`、图片路径存在性、ledger item count 与关键图表覆盖率检查；ledger 有截图时最终笔记图片数不得为 0，关键图表必须 100% 插入或逐项记录替代证据，避免长论文笔记漏图。
+
+### 2026-08-02
+
+#### Cockpit GUI 代码文本选区修复
+
+- **恢复反引号代码内容选中**：消息 Markdown 的托管选区现在会把 `pre` / `code` / `kbd` / `samp` 交还给浏览器原生文本选择，避免自定义 token 选择逻辑阻止单反引号 inline code 和三反引号代码块内容被拖选。
+- **恢复代码选区提问入口**：代码区走原生选区后，会在鼠标抬起后延迟读取稳定的浏览器 `Selection` 并弹出选区菜单；`CODE` / `PRE` / `KBD` / `SAMP` 文本也重新参与选中文本提取与 offset/occurrence 定位，保证代码块和行内代码可继续提问、翻译、记笔记或分支。
+- **补齐 markdown-it 默认代码样式**：为 `.markdown-body pre`、`.markdown-body pre code` 和 `.markdown-body :not(pre) > code` 显式保留代码块/行内代码样式与 `user-select: text`，兼容既有 `.md-code` / `.md-inline-code` 样式。
+
+#### 子 Agent 超时默认值调整
+
+- **缩短 delegate 子进程卡住等待时间**：`DELEGATE_TASK_WALL_TIMEOUT` 默认值从 1800 秒调整为 300 秒（5 分钟），并同步更新 `delegate_task` 工具描述，减少单个子 Agent 判断或执行卡住时父进程的等待时间。
+
 ### 2026-07-31
 
 #### Cockpit GUI fork/回退与缩小窗口修复

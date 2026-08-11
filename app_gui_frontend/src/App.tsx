@@ -816,32 +816,39 @@ export function App() {
   }
 
   function handleTextSelection(sourceSessionId: string, chatId: string, container: HTMLElement, anchor: TextSelectionAnchor | null, event: any) {
-    const result = readTextSelectionWithin(container, anchor, event)
-    if (result?.range) {
-      const selection = window.getSelection()
-      selection?.removeAllRanges()
-      selection?.addRange(result.range)
-    }
-    if (!result) return
-    showSelectionMenu({
-      sourceSessionId,
-      chatId,
-      text: result.text,
-      textOffset: result.textOffset,
-      occurrence: result.occurrence,
-      x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
-      y: Math.max(12, result.rect.top - 46),
-      // Unify with file/PDF selections: always describe where the text came
-      // from so the backend prompt gets kind/location/selected text.
-      sourceContext: {
-        kind: 'chat',
-        session_id: sourceSessionId,
-        location: `对话消息 ${chatId}`,
-        chat_id: chatId,
-        text_offset: result.textOffset,
+    const showResult = (result: TextSelectionResult | null) => {
+      if (result?.range) {
+        const selection = window.getSelection()
+        selection?.removeAllRanges()
+        selection?.addRange(result.range)
+      }
+      if (!result) return
+      showSelectionMenu({
+        sourceSessionId,
+        chatId,
+        text: result.text,
+        textOffset: result.textOffset,
         occurrence: result.occurrence,
-      },
-    }, result.range)
+        x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
+        y: Math.max(12, result.rect.top - 46),
+        // Unify with file/PDF selections: always describe where the text came
+        // from so the backend prompt gets kind/location/selected text.
+        sourceContext: {
+          kind: 'chat',
+          session_id: sourceSessionId,
+          location: `对话消息 ${chatId}`,
+          chat_id: chatId,
+          text_offset: result.textOffset,
+          occurrence: result.occurrence,
+        },
+      }, result.range)
+    }
+    const result = readTextSelectionWithin(container, anchor, event)
+    if (result || anchor) {
+      showResult(result)
+      return
+    }
+    window.setTimeout(() => showResult(readTextSelectionWithin(container)), 0)
   }
 
   function handleSelectionAction(action: SelectionAction) {
@@ -2663,7 +2670,10 @@ function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, on
           onChange={event => onUpdate(event.target.value)}
         />
       : <div ref={previewScrollRef} className="markdown-preview" onScroll={event => onScroll(event.currentTarget.scrollTop)} onMouseDown={event => {
-          if (!shouldManageMarkdownSelection(event)) return
+          if (!shouldManageMarkdownSelection(event)) {
+            selectionAnchorRef.current = null
+            return
+          }
           event.preventDefault()
           window.getSelection()?.removeAllRanges()
           selectionAnchorRef.current = makeTextSelectionAnchor(event.currentTarget, event)
@@ -2672,13 +2682,22 @@ function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, on
         }} onMouseLeave={() => {
           selectionAnchorRef.current = null
         }} onMouseUp={event => {
-          const result = readTextSelectionWithin(event.currentTarget, selectionAnchorRef.current, event)
+          const container = event.currentTarget
+          const anchor = selectionAnchorRef.current
+          const handleResult = (result: TextSelectionResult | null) => {
+            if (!result) return
+            const selection = window.getSelection()
+            selection?.removeAllRanges()
+            selection?.addRange(result.range)
+            onSelection(result)
+          }
+          const result = readTextSelectionWithin(container, anchor, anchor ? event : undefined)
           selectionAnchorRef.current = null
-          if (!result) return
-          const selection = window.getSelection()
-          selection?.removeAllRanges()
-          selection?.addRange(result.range)
-          onSelection(result)
+          if (result || anchor) {
+            handleResult(result)
+            return
+          }
+          window.setTimeout(() => handleResult(readTextSelectionWithin(container)), 0)
         }}>
           <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
         </div>}
@@ -3144,13 +3163,17 @@ function textSelectionResultFromRange(container: HTMLElement, range: Range): Tex
 
 function makeTextSelectionAnchor(container: HTMLElement, event: any): TextSelectionAnchor | null {
   const target = event.target as HTMLElement
-  if (target.closest('button, textarea, input, select, [data-highlight-id], .message-actions, .message-branch-menu')) return null
+  if (target.closest(markdownNativeSelectionSelector())) return null
   return textSelectionPointFromEvent(container, event)
 }
 
 function shouldManageMarkdownSelection(event: any): boolean {
   const target = event.target as HTMLElement
-  return !target.closest('button, textarea, input, select, [data-highlight-id], .message-actions, .message-branch-menu')
+  return !target.closest(markdownNativeSelectionSelector())
+}
+
+function markdownNativeSelectionSelector(): string {
+  return 'button, textarea, input, select, [data-highlight-id], .message-actions, .message-branch-menu, pre, code, kbd, samp'
 }
 
 function updateManagedTextSelection(container: HTMLElement, anchor: TextSelectionAnchor | null, event: any): void {
@@ -3624,7 +3647,10 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
     className={collapsed && canCollapse ? 'message-content collapsed' : 'message-content'}
     data-chat-id={item.id}
     onMouseDown={event => {
-      if (!shouldManageMarkdownSelection(event)) return
+      if (!shouldManageMarkdownSelection(event)) {
+        selectionAnchorRef.current = null
+        return
+      }
       event.preventDefault()
       window.getSelection()?.removeAllRanges()
       selectionAnchorRef.current = makeTextSelectionAnchor(event.currentTarget, event)
@@ -3636,7 +3662,8 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
       selectionAnchorRef.current = null
     }}
     onMouseUp={event => {
-      onTextSelection(event.currentTarget, selectionAnchorRef.current, event)
+      const anchor = selectionAnchorRef.current
+      onTextSelection(event.currentTarget, anchor, anchor ? event : undefined)
       selectionAnchorRef.current = null
     }}
   >
@@ -3886,7 +3913,7 @@ function normalizeComparableText(value: string): string {
 
 function selectableTextNodes(root: Node): Text[] {
   const nodes: Text[] = []
-  const skipTags = new Set(['SCRIPT', 'STYLE', 'CODE', 'PRE', 'KBD', 'SAMP', 'IMG', 'SVG', 'MATH'])
+  const skipTags = new Set(['SCRIPT', 'STYLE', 'IMG', 'SVG', 'MATH'])
   function visit(node: Node) {
     if (node.nodeType === Node.ELEMENT_NODE) {
       const element = node as HTMLElement

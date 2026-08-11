@@ -1,8 +1,10 @@
 import html as html_lib
 import json
+import os
 import re
 import shutil
 import subprocess
+import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List
@@ -77,6 +79,29 @@ def _fetch_text(url: str, timeout: int = 10) -> str:
             return raw.decode(charset or "utf-8", errors="replace")
     except Exception as exc:
         raise RuntimeError(f"curl failed: {curl_error}; urllib failed: {exc}") from exc
+
+
+def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
+    body = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={"Content-Type": "application/json", **headers},
+        method="POST",
+    )
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            raw = response.read()
+            text = raw.decode("utf-8", errors="replace")
+            data = json.loads(text)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON response: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unexpected JSON response type: {type(data).__name__}")
+    return data
 
 
 def _strip_html(source: str) -> str:
@@ -187,6 +212,195 @@ def _parse_yahoo_results(page_html: str, limit: int) -> List[Dict[str, str]]:
     return results[:limit]
 
 
+def _normalize_result(raw: Dict[str, Any], source: str) -> Dict[str, str]:
+    title = str(raw.get("title") or "")
+    url = str(raw.get("url") or raw.get("href") or raw.get("link") or "")
+    snippet = str(raw.get("snippet") or raw.get("content") or raw.get("body") or "")
+    # Keep href/body aliases for older R-Agent prompts or callers that already
+    # learned the previous shape, while making url/snippet the canonical names.
+    return {
+        "title": title,
+        "url": url,
+        "snippet": snippet,
+        "source": source,
+        "href": url,
+        "body": snippet,
+    }
+
+
+def _search_local_html(query: str, limit: int) -> Dict[str, Any]:
+    provider_errors = []
+    for provider in ("duckduckgo", "bing", "yahoo"):
+        try:
+            results = _search_with_provider(provider, query, limit)
+            if results:
+                normalized = [_normalize_result(result, provider) for result in results]
+                return {
+                    "success": True,
+                    "status": "ok",
+                    "query": query,
+                    "provider": "local_html",
+                    "source_provider": provider,
+                    "total_results": len(normalized),
+                    "results": normalized,
+                    "warnings": provider_errors,
+                }
+        except Exception as e:
+            provider_errors.append(f"{provider}: {e}")
+
+    return {
+        "success": True,
+        "status": "no_results",
+        "query": query,
+        "provider": "local_html",
+        "source_provider": None,
+        "total_results": 0,
+        "results": [],
+        "warnings": provider_errors,
+    }
+
+
+def _search_serper(query: str, limit: int) -> Dict[str, Any]:
+    api_key = os.getenv("SERPER_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "success": False,
+            "status": "missing_api_key",
+            "provider": "serper",
+            "query": query,
+            "error": "SERPER_API_KEY is not configured",
+        }
+
+    cleaned_query = query.strip()[:500]
+    count = max(1, min(limit, 10))
+    data = _post_json(
+        "https://google.serper.dev/search",
+        {"q": cleaned_query, "num": count},
+        {"X-API-KEY": api_key},
+        timeout=30,
+    )
+    items = data.get("organic") or []
+    if not isinstance(items, list):
+        return {
+            "success": False,
+            "status": "bad_response",
+            "provider": "serper",
+            "query": cleaned_query,
+            "error": "Serper returned an unexpected response format",
+        }
+
+    normalized = [
+        _normalize_result(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            },
+            "serper",
+        )
+        for item in items[:count]
+        if isinstance(item, dict)
+    ]
+    return {
+        "success": True,
+        "status": "ok" if normalized else "no_results",
+        "query": cleaned_query,
+        "provider": "serper",
+        "source_provider": "google",
+        "total_results": len(normalized),
+        "results": normalized,
+        "warnings": [],
+    }
+
+
+def _search_groundroute(query: str, limit: int) -> Dict[str, Any]:
+    api_key = os.getenv("GROUNDROUTE_API_KEY", "").strip()
+    if not api_key:
+        return {
+            "success": False,
+            "status": "missing_api_key",
+            "provider": "groundroute",
+            "query": query,
+            "error": "GROUNDROUTE_API_KEY is not configured",
+        }
+
+    count = max(1, min(limit, 50))
+    data = _post_json(
+        "https://api.groundroute.ai/v1/search",
+        {"query": query, "max_results": count},
+        {"Authorization": f"Bearer {api_key}"},
+        timeout=30,
+    )
+    items = data.get("results") or []
+    if not isinstance(items, list):
+        return {
+            "success": False,
+            "status": "bad_response",
+            "provider": "groundroute",
+            "query": query,
+            "error": "GroundRoute returned an unexpected response format",
+        }
+
+    normalized = [
+        _normalize_result(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("snippet") or item.get("content", ""),
+            },
+            str(item.get("source_engine") or "groundroute"),
+        )
+        for item in items[:count]
+        if isinstance(item, dict)
+    ]
+    return {
+        "success": True,
+        "status": "ok" if normalized else "no_results",
+        "query": query,
+        "provider": "groundroute",
+        "source_provider": "groundroute",
+        "total_results": len(normalized),
+        "results": normalized,
+        "warnings": [],
+    }
+
+
+def _provider_order(provider: str) -> List[str]:
+    normalized = (provider or "local_html").strip().lower().replace("-", "_")
+    if normalized in {"auto", "best"}:
+        order = []
+        if os.getenv("GROUNDROUTE_API_KEY", "").strip():
+            order.append("groundroute")
+        if os.getenv("SERPER_API_KEY", "").strip():
+            order.append("serper")
+        order.append("local_html")
+        return order
+    if normalized in {"local", "html", "local_html", "duckduckgo"}:
+        return ["local_html"]
+    if normalized in {"serper", "google"}:
+        return ["serper"]
+    if normalized in {"groundroute", "ground_route"}:
+        return ["groundroute"]
+    return [normalized]
+
+
+def _search_provider(provider: str, query: str, limit: int) -> Dict[str, Any]:
+    if provider == "local_html":
+        return _search_local_html(query, limit)
+    if provider == "serper":
+        return _search_serper(query, limit)
+    if provider == "groundroute":
+        return _search_groundroute(query, limit)
+    return {
+        "success": False,
+        "status": "unknown_provider",
+        "provider": provider,
+        "query": query,
+        "error": f"Unknown web_search provider: {provider}",
+        "available_providers": ["local_html", "serper", "groundroute", "auto"],
+    }
+
+
 def _search_with_provider(provider: str, query: str, limit: int) -> List[Dict[str, str]]:
     encoded = urllib.parse.quote(query)
     if provider == "duckduckgo":
@@ -203,26 +417,49 @@ def _search_with_provider(provider: str, query: str, limit: int) -> List[Dict[st
     return []
 
 
-def web_search_tool(query: str, limit: int = 5) -> str:
-    """Search the web using DuckDuckGo's lightweight HTML endpoint."""
+def web_search_tool(query: str, limit: int = 5, provider: str = "local_html") -> str:
+    """Search the web using a selectable provider.
+
+    Providers:
+    - local_html: zero-key DuckDuckGo -> Bing -> Yahoo fallback.
+    - serper: Google Search via SERPER_API_KEY.
+    - groundroute: meta search via GROUNDROUTE_API_KEY.
+    - auto: use configured API providers first, then local_html.
+    """
     try:
-        limit = max(1, min(int(limit), 10))
+        limit = max(1, min(int(limit), 50))
     except Exception:
         limit = 5
 
-    provider_errors = []
-    for provider in ("duckduckgo", "bing", "yahoo"):
+    warnings = []
+    normalized_provider = (provider or "local_html").strip().lower().replace("-", "_")
+    allow_fallback = normalized_provider in {"auto", "best"}
+    for selected_provider in _provider_order(provider):
         try:
-            results = _search_with_provider(provider, query, limit)
-            if results:
-                return _json_success({"results": results, "provider": provider})
+            payload = _search_provider(selected_provider, query, limit)
         except Exception as e:
-            provider_errors.append(f"{provider}: {e}")
+            warnings.append(f"{selected_provider}: {e}")
+            continue
 
-    payload: Dict[str, Any] = {"results": [], "provider": None}
-    if provider_errors:
-        payload["warnings"] = provider_errors
-    return _json_success(payload)
+        if payload.get("success") and payload.get("results"):
+            payload["warnings"] = [*warnings, *(payload.get("warnings") or [])]
+            return json.dumps(payload, ensure_ascii=False)
+
+        if not allow_fallback:
+            payload["warnings"] = [*warnings, *(payload.get("warnings") or [])]
+            return json.dumps(payload, ensure_ascii=False)
+
+        if not payload.get("success"):
+            warnings.append(f"{selected_provider}: {payload.get('error') or payload.get('status')}")
+
+    return _json_success({
+        "status": "no_results",
+        "query": query,
+        "provider": provider,
+        "total_results": 0,
+        "results": [],
+        "warnings": warnings,
+    })
 
 
 def web_extract_tool(urls: list) -> str:
@@ -247,12 +484,17 @@ def web_extract_tool(urls: list) -> str:
 
 registry.register(
     name="web_search",
-    description="在互联网上搜索信息。",
+    description="在互联网上搜索信息。默认使用零配置本地 HTML 搜索，也可通过 provider 选择 serper、groundroute 或 auto。",
     parameters={
         "type": "object",
         "properties": {
             "query": {"type": "string", "description": "搜索查询词"},
             "limit": {"type": "integer", "description": "最大返回结果数 (默认 5)", "default": 5},
+            "provider": {
+                "type": "string",
+                "description": "搜索提供方：local_html（默认，DuckDuckGo/Bing/Yahoo fallback）、serper、groundroute、auto",
+                "default": "local_html",
+            },
         },
         "required": ["query"],
     },

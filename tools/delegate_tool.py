@@ -947,7 +947,7 @@ registry.register(
     name="delegate_task",
     description=(
         "生成一个或多个具有隔离上下文的子智能体来并行处理任务。\n"
-        "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考；默认墙钟预算来自 DELEGATE_TASK_WALL_TIMEOUT（当前默认 1800 秒）。\n"
+        "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考；默认墙钟预算来自 DELEGATE_TASK_WALL_TIMEOUT（当前默认 300 秒）。\n"
         "支持动态 todo list 协议：每个子任务都必须传入 task_id/id；子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
         "默认 return_mode=compact：返回 tasks 中每项仅含 task_index/task_id/status/truncated/max_iterations、简表 token_usage、可选 context_artifact_path，并可附 todo_digest；不返回 goal/note。return_mode=full 保留旧完整结构。\n"
@@ -980,7 +980,7 @@ registry.register(
             },
             "default_wall_timeout_seconds": {
                 "type": "number",
-                "description": "单个子任务默认墙钟超时时间；超时后会暂停本轮委托、标记 blocked 并交回父 Agent 重新思考/拆分/延长预算。默认 1800 秒，可用 DELEGATE_TASK_WALL_TIMEOUT 调整；<=0 禁用。"
+                "description": "单个子任务默认墙钟超时时间；超时后会暂停本轮委托、标记 blocked 并交回父 Agent 重新思考/拆分/延长预算。默认 300 秒，可用 DELEGATE_TASK_WALL_TIMEOUT 调整；<=0 禁用。"
             },
             "event_sink": {
                 "type": "object",

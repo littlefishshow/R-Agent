@@ -57,3 +57,6 @@ app_gui/package-lock.json
 
 # Local paper research scout reading state
 skills/productivity/paper_research_scout/references/read_papers.json
+
+# Benchmark evaluation workspace (cloned benchmarks, adapters, results)
+evals/

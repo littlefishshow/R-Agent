@@ -109,7 +109,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 - 若当前执行者就是父进程，也应先重规划 todo_list，再按下述索引→章节/机制文件→证据账本→机制复原→最终汇总→内容审稿流程执行。
 
 执行策略：
-1. **先用 PDF 阅读/抽取工具建索引**：先定位 PDF，使用 PyMuPDF、pdftotext、OCR 或可用 PDF 阅读/抽取工具抽取目录、页码、章节标题、图表/公式/算法/附录位置，建立 `section_index.md/json`、图表/公式/算法候选索引，并写入 `sandbox/read_paper/<paper_stem>/`；主上下文只保留索引摘要、当前阶段目标、关键证据锚点和待解决问题。
+1. **先用 PDF 阅读/抽取工具建索引**：先定位 PDF，使用 PyMuPDF、pdftotext、OCR 或可用 PDF 阅读/抽取工具抽取目录、页码、章节标题、图表/公式/算法/附录位置，建立 `section_index.md/json`、图表/公式/算法候选索引，并写入 `sandbox/read_paper/<paper_stem>/`；主上下文只保留索引摘要、当前阶段目标、关键证据锚点和待解决问题。注意：`figure_table_index.md/json` 只能作为候选索引和截图任务输入，不能替代后续经过截图、质量检查、解释和去向确认的 `figure_table_ledger.md/json`。
 2. **按章节保存独立阅读文件**：根据章节索引把每个章节或页码范围保存为独立文件到 `sandbox/read_paper/<paper_stem>/sections/`，文件名建议包含顺序号、章节名和页码范围。每个章节文件开头必须记录来源 PDF、页码范围、章节标题、抽取方式和已知图表/公式锚点。
 3. **拆分粒度必须足够细**：章节任务必须细到“少数机制问题/少数实验问题/少数附录问题”，不能让一个任务吞掉多个信息密集模块（如完整 Method+Theory+Training 或完整 Experiments+Ablation+Cost）。若单章内部包含多个密集机制、训练目标、实验族或附录细节，必须从“章节拆分”升级为“机制专题任务/实验专题任务”。拆分任务的输入应指向 `sections/` 下的局部文件和必要图表材料，而不是整篇 PDF 全文。
 4. **第一层：章节任务（Section Tasks）**：父进程批准后，子进程并行或分批阅读不同章节/专题文件。每个章节任务除 `*_summary.md` 与 `*_details.md` 外，**强制**在 `sandbox/read_paper/<paper_stem>/notes/` 或等价位置输出：
@@ -118,10 +118,10 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
    - `*_formulas_algorithms.md`：公式、算法、伪代码、变量、输入输出和机制角色。
    - `*_missing_details.md`：未说明、未读到、冲突点、跨章节依赖、需要附录/原文回查的问题。
    - Claim-Evidence Matrix 必须含字段：`Claim` / `原文位置` / `图表公式` / `机制步骤` / `证据强度` / `未说明` / `汇总去向` / `跨章节依赖`。证据强度可用 强/中/弱/仅作者声称/未验证，但必须说明原因。
-5. **第二层：证据/图表任务（Evidence & Figure/Table Tasks）**：图表任务独立设置且是硬门槛。必须提取关键 Figure/Table/Algorithm/案例图，调用 `pdf_snapshot.py` 或手工 crops 完成截图，检查裁剪质量（主体完整、非整页冒充、caption/必要标题清楚、路径可访问），逐项解释，并维护 `figure_table_ledger.md/json`。评测子任务必须截图主结果表、消融表、成本/效率表或等价证据；关键图表缺失时最终验收不得通过，除非在 ledger 和重检查记录中明确写明无法截取原因与替代证据（如原文表格转写、页码、数值回查）。
+5. **第二层：证据/图表任务（Evidence & Figure/Table Tasks）**：图表任务独立设置且是硬门槛。必须提取关键 Figure/Table/Algorithm/案例图，调用 `pdf_snapshot.py` 或手工 crops 完成截图，检查裁剪质量（主体完整、非整页冒充、caption/必要标题清楚、路径可访问），逐项解释，并维护 `figure_table_ledger.md/json`。评测子任务必须截图主结果表、消融表、成本/效率表或等价证据；关键图表缺失时最终验收不得通过，除非在 ledger 和重检查记录中明确写明无法截取原因与替代证据（如原文表格转写、页码、数值回查）。`figure_table_index.md/json` 只是候选清单；只有 `figure_table_ledger.md/json` 才是最终合成和验收的图表账本。ledger 每项至少记录：图/表/算法编号、原文页码/章节、截图相对路径、裁剪质量状态、是否关键图表、解释摘要、最终 Markdown 插入章节/行文位置、缺失原因或替代证据。
 6. **第三层：机制复原/审稿任务（Mechanism Reconstruction & Review Tasks）**：机制复原任务按问题横跨章节读取，而不是按章节摘要拼接。每个关键机制/实验结论必须复原：输入、输出、步骤、训练/推理差异、监督信号或 evaluator 来源、成本、失败模式、适用边界、依赖的图表/公式/附录证据；必要时生成 `mechanism_<topic>.md`。
-7. **阶段性交接要可合并**：每个阶段应生成 `stage_summary.md`、`section_index.md/json`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`、`figure_table_ledger.md/json`、`mechanism_*.md` 或等价摘要，记录已读范围、关键结论、证据锚点、未解决问题、章节间冲突、需要父任务统一口径的地方。
-8. **汇总子进程统一合成最终 Markdown**：汇总阶段**不得只读 `summary` 拼接**；必须读取 Claim-Evidence Matrix、figure/table ledger、关键 `details`、公式/算法记录和机制复原文件，并按 `claim → evidence → mechanism` 写最终笔记。必须满足 `## 1 小白友好版论文解释` 的 1.1-1.6 要求，以及 `## 3 论文主线串读` 按行文顺序串联主文与附录的要求；同时统一术语、消除重复、检查章节结论冲突、补齐遗漏。
+7. **阶段性交接要可合并**：每个阶段应生成 `stage_summary.md`、`section_index.md/json`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`、`figure_table_ledger.md/json`、`mechanism_*.md` 或等价摘要，记录已读范围、关键结论、证据锚点、未解决问题、章节间冲突、需要父任务统一口径的地方。长论文/多子任务交接必须额外生成固定机器可读的 `handoff_manifest.json`，放在 `sandbox/read_paper/<paper_stem>/` 或阶段输出根目录；它是汇总/机制/验收任务寻找材料的第一入口，不替代原始文件。manifest 至少包含：`final_note_path`、`asset_dir`、`figure_table_ledger_md`、`figure_table_ledger_json`、`section_index`、`claims_files`、`details_files`、`mechanism_files`、`ledger_item_count`、`image_count`、`missing_required_figures`、`validation_status`。`validation_status` 建议取 `draft` / `ready_for_synthesis` / `blocked` / `validated`，并在 `missing_required_figures` 非空或关键文件缺失时不得标为 `validated`。
+8. **汇总子进程统一合成最终 Markdown**：汇总阶段**不得只读 `summary` 拼接**；必须先读取 `handoff_manifest.json`（若存在）定位 Claim-Evidence Matrix、figure/table ledger、关键 `details`、公式/算法记录和机制复原文件，并按 `claim → evidence → mechanism` 写最终笔记。若图表任务已完成，但汇总/机制阶段找不到 `figure_table_ledger.md/json`，必须依次回查 `handoff_manifest.json`、阶段 outputs、todo 摘要/result 中记录的路径；仍找不到则把任务标为 blocked/请求补交，不得静默跳过或用 `figure_table_index` 冒充 ledger。最终合成必须按 ledger 在正文对应论证位置就地插入关键图片（Markdown `![...](assets/<pdf_stem>/...)`），不能只写“见 Figure/Table x”或只保留文字引用；对于 ledger 中标为关键但未插图的项目，必须写明无法插入原因和替代证据。必须满足 `## 1 小白友好版论文解释` 的 1.1-1.6 要求，以及 `## 3 论文主线串读` 按行文顺序串联主文与附录的要求；同时统一术语、消除重复、检查章节结论冲突、补齐遗漏。
 9. **最终审稿与内容级二次对照**：最终审稿任务必须逐条关键 claim 回查原文 section/页码/图表/公式/数值，检查作者声称 vs 事实证据、负结果、附录细节、空泛概括、数值/设置混淆和未说明处。父进程应抽查关键章节原文；若抽查发现关键证据缺失或 claim 与原文不符，必须退回补读/修正，不能最终验收。
 10. **上下文预算优先**：当抽取文本或中间材料过长时，先写入 sandbox/artifact 并建立索引；当前对话只保留摘要、证据定位和下一步任务。禁止把整篇长论文全文、大段附录、整批 OCR 文本或所有子任务完整上下文复制到主对话。
 11. **拆解不能降低质量门槛**：即使采用多阶段或多子任务阅读，也必须满足第 1 章小白解释、第 3 章主线串读、Appendix/Limitations 覆盖、图表/公式就地解释、强制重检查和最终验收要求。最终 Markdown 应保留“重检查记录/内容审稿记录”，必要时说明分块阅读范围、章节笔记来源与补漏情况。
@@ -347,7 +347,7 @@ PY
 - 第 1 章是否包含 1.1-1.6，且把旧“一句话结论”和旧“全局扫描”职责合并为小白友好解释；是否在相关位置就地插入/列出关键图片、公式、表格或代码解释。
 - 第 3 章主线、图表和公式是否按论文行文顺序完整串联（含附录），而不是分裂成“主线清单 / 图表清单 / 公式清单”三块，或残留独立扫描式概览章节。
 - 每条关键 claim 是否能在 Claim-Evidence Matrix 中找到原文位置、图表/公式、机制步骤、证据强度、未说明项、汇总去向和跨章节依赖。
-- 图表是否覆盖主文所有关键 Figure/Table/Algorithm/案例；表格数值是否抄错；提升幅度是否算错。
+- 图表是否覆盖主文所有关键 Figure/Table/Algorithm/案例；表格数值是否抄错；提升幅度是否算错。长论文必须核对 `handoff_manifest.json` 中的 `ledger_item_count`、`image_count`、`missing_required_figures`、`validation_status` 与实际 ledger/final Markdown 是否一致。
 - 关键 Figure/Table/Algorithm 是否已通过 `pdf_snapshot.py` 截图并就地插入到对应解释附近；截图路径是否存在，Markdown 链接是否相对当前笔记可访问（通常应为 `assets/<pdf_stem>/xxx.png`）；自动裁剪是否截到主体，必要时是否用 crops 精裁。评测类论文的主结果表、消融表、成本/效率表缺失时不得通过，除非 ledger 记录无法截取原因与替代证据。
 - 关键公式是否就地出现在相关方法/实验/理论段落，而不是集中堆在公式表里；公式是否解释了它如何服务当前论证。
 - Appendix 中是否有重要细节未纳入：数据统计、prompt 模板、训练超参、额外实验、更多消融、案例、限制；尤其是主文只抽象描述的标签/critique/proxy/reward 构造细节。
@@ -379,9 +379,9 @@ PY
    - 主结果表格与附录表格的数值、设置差异，例如 strict/loose、ID/OOD、不同模型/数据集。
    - 方法公式、机制步骤、训练/推理差异、监督信号来源、硬件/推理成本、消融、局限、失败案例。
    - 作者声称 vs 事实证据是否区分；是否遗漏负结果、附录限制或把空泛概括写成已证事实。
-4. 父进程应抽查关键章节原文；若发现关键 claim 无法定位到原文/图表/公式/数值，或关键图表 ledger 缺失且无替代证据，最终验收不得通过。
+4. 父进程应抽查关键章节原文；若发现关键 claim 无法定位到原文/图表/公式/数值，或关键图表 ledger 缺失且无替代证据，最终验收不得通过。若图表任务完成但验收阶段找不到 ledger，必须回查 `handoff_manifest.json`、outputs 和 todo 摘要；仍找不到则标记 blocked，不得静默继续。
 5. 若发现遗漏、误读或可加强处，直接修改最终 Markdown；不要只在对话中说明。
-6. 最终验证至少包括：文件存在、行数合理、字符数、Markdown 代码围栏闭合、double-dollar 数学分隔符成对、关键截图路径存在、figure/table ledger 完整、内容审稿记录存在。
+6. 最终验证至少包括：文件存在、行数合理、字符数、Markdown 代码围栏闭合、double-dollar 数学分隔符成对、关键截图路径存在、figure/table ledger 完整、`image_count` 与 ledger coverage 硬门槛、内容审稿记录存在。只要 ledger 中存在截图路径或关键图表，`final_note_image_count` 不得为 0；关键图表覆盖率（已在正文就地插入或有明确替代证据的关键项 / ledger 关键项）必须达到 100%，否则不得通过。
 7. 在最终答复中给出：最终文件路径、验证结果、最关键的二次确认点。
 
 推荐最终验收命令：
@@ -391,19 +391,44 @@ python3 - <<'PY'
 from pathlib import Path
 import re
 p = Path('outputs/papers_output/xxx_阅读笔记.md')
+ledger_json = Path('sandbox/read_paper/xxx/figure_table_ledger.json')  # 按 handoff_manifest.json 实际路径替换
 text = p.read_text()
 delim = '$' * 2
+image_links = re.findall(r'!\[[^\]]*\]\(([^)]+)\)', text)
 missing_images = []
-for m in re.finditer(r'!\[[^\]]*\]\(([^)]+)\)', text):
-    img = Path(m.group(1))
+for link in image_links:
+    if '://' in link or link.startswith('#'):
+        continue
+    img = (p.parent / link).resolve()
     if not img.exists():
-        missing_images.append(str(img))
+        missing_images.append(link)
+final_note_image_count = len(image_links)
+ledger_item_count = 0
+critical_total = 0
+critical_covered = 0
+ledger_has_screenshot = False
+if ledger_json.exists():
+    import json
+    data = json.loads(ledger_json.read_text())
+    items = data.get('items', data if isinstance(data, list) else [])
+    ledger_item_count = len(items)
+    for it in items:
+        screenshot = it.get('screenshot_path') or it.get('image_path') or it.get('path')
+        is_critical = bool(it.get('is_critical') or it.get('required') or it.get('关键图表'))
+        inserted = bool(it.get('final_note_inserted') or it.get('final_markdown_position') or (screenshot and Path(screenshot).name in text))
+        alternative = bool(it.get('alternative_evidence') or it.get('missing_reason'))
+        ledger_has_screenshot = ledger_has_screenshot or bool(screenshot)
+        critical_total += int(is_critical)
+        critical_covered += int(is_critical and (inserted or alternative))
+coverage_ok = (critical_total == 0 or critical_covered == critical_total)
+image_count_ok = (not ledger_has_screenshot) or final_note_image_count > 0
 print('exists', p.exists())
 print('lines', len(text.splitlines()))
 print('chars', len(text))
 print('unclosed_fences?', text.count('```') % 2 != 0, 'fence_count', text.count('```'))
 print('unpaired_display_math?', text.count(delim) % 2 != 0, 'display_math_delimiters', text.count(delim))
-print('image_links', text.count('!['), 'missing_images', missing_images)
+print('final_note_image_count', final_note_image_count, 'missing_images', missing_images, 'image_count_ok', image_count_ok)
+print('ledger_item_count', ledger_item_count, 'critical_coverage', f'{critical_covered}/{critical_total}', 'coverage_ok', coverage_ok)
 print('has_recheck_record', '## 重检查记录' in text or '重检查记录' in text)
 PY
 ```
@@ -413,6 +438,7 @@ PY
 - 对“作者声称”与“我的判断”保持明确区分。
 - 长论文最终笔记必须可从 `claim → evidence → mechanism` 追溯到原文；关键 claim 没有证据矩阵或审稿回查记录时不得通过。
 - 关键图表/主结果表/消融表/成本表缺失时不得通过，除非明确记录无法截取与替代证据。
+- `image_count` 与 ledger coverage 是硬门槛：ledger 有截图时 `final_note_image_count` 不得为 0；ledger 标为关键/required 的图表必须 100% 在正文就地插入，或逐项记录无法插入原因与替代证据。
 - 最终 Markdown 应包含二次验收/内容审稿记录，便于以后复查。
 
 ### 10. 批判性总结与研究行动
@@ -446,9 +472,10 @@ PY
 
 ## 0.6 长论文证据交接记录（短论文可省略）
 - 章节/机制任务来源：`section_index.md`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`
-- 图表账本：`figure_table_ledger.md/json`
+- 图表账本：`figure_table_ledger.md/json`（`figure_table_index` 仅为候选索引，不能替代 ledger）
 - 机制复原文件：`mechanism_*.md`
-- 汇总原则：本笔记按 `claim → evidence → mechanism` 合成，不只拼接 summary。
+- 机器可读交接：`handoff_manifest.json`（含 final_note_path、asset_dir、ledger 路径、section_index、claims/details/mechanism 文件、ledger_item_count、image_count、missing_required_figures、validation_status）
+- 汇总原则：本笔记按 `claim → evidence → mechanism` 合成，不只拼接 summary；关键图片按 ledger 在正文就地插入。
 
 ## 1. 小白友好版论文解释
 > 本章合并旧版一句话结论与扫描式概览的职责。目标是让不熟悉该方向的读者先知道：论文研究什么问题、核心方法是什么、细节如何运作、结果大概怎样、为什么比已有方法好、代价和局限是什么。关键图片、表格、公式、代码片段必须在本章对应位置就地插入/列出并解释。
@@ -579,13 +606,13 @@ $$
 - 是否设置独立证据/图表任务，并维护 `figure_table_ledger.md/json`，逐项记录截图、裁剪质量检查、解释和汇总去向？
 - 评测子任务是否截图主结果表、消融表、成本/效率表；关键图表缺失时是否已明确记录无法截取原因与替代证据？
 - 是否设置跨章节机制复原任务，复原输入、输出、步骤、训练/推理差异、监督信号、成本、失败模式和依赖证据？
-- 最终汇总是否读取 evidence matrix、figure/table ledger、关键 details 和机制复原文件，并按 `claim → evidence → mechanism` 写作，而不是只拼接 summary？
+- 最终汇总是否先读取 `handoff_manifest.json` 定位 evidence matrix、figure/table ledger、关键 details 和机制复原文件，并按 `claim → evidence → mechanism` 写作，而不是只拼接 summary？
 - 是否写下阅读动机、预读预测和读后校正，而不是只总结作者结论？
 - 是否避免残留独立扫描式概览章节；新 `## 3` 必须是论文主线串读？
 - 第 1 章是否完整包含 `### 1.1`-`### 1.6`，并明确问题、现有不足、作者方案、实验结果、相比已有方法的提升幅度/原因和代价局限？
 - 是否给出重要简称/术语的完整名称和中文解释，避免只堆缩写让用户困惑？
 - 是否在第 1 章和第 3 章就地覆盖关键图表、公式、代码/算法框、案例、原始输出，并解释作者分析？
-- 是否已对关键 Figure/Table/Algorithm/案例图表生成并插入截图，且 Markdown 图片路径可用？
+- 是否已对关键 Figure/Table/Algorithm/案例图表生成并按 ledger 在正文就地插入截图，且 Markdown 图片路径可用？若图表任务已完成但找不到 ledger，是否已回查 manifest/outputs/todo 摘要，仍找不到则 blocked？
 - 截图是否默认只覆盖图表主体区域（含必要标题/图注），没有用整页截图冒充；若自动裁剪失败，是否已用 crops 精裁，或在 Markdown 与重检查记录中明确标注降级整页/大区域截图？
 - 是否讲清任务输入、输出、成功标准和难点？
 - 是否找到了核心假设，而不是只复述方法？
@@ -609,4 +636,4 @@ $$
 - 是否追加 `## 重检查记录`；长论文是否追加 `## 内容审稿记录`？
 - 最终审稿是否逐条关键 claim 回查原文 section/图表/公式/数值，检查作者声称 vs 事实、负结果、附录、空泛概括和未说明项？
 - 父进程是否抽查关键章节原文；抽查发现关键证据缺失时是否退回补读/修正？
-- 是否完成最终验收：文件存在、行数/字符数合理、代码围栏闭合、数学分隔符成对、关键截图存在、figure/table ledger 完整、主表/附录设置没有混淆？
+- 是否完成最终验收：文件存在、行数/字符数合理、代码围栏闭合、数学分隔符成对、关键截图存在、figure/table ledger 完整、`image_count` 与 ledger coverage 达到硬门槛、主表/附录设置没有混淆？ledger 有截图时 `final_note_image_count` 是否不为 0，关键图表覆盖率是否为 100%（或逐项有替代证据）？

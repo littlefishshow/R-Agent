@@ -251,6 +251,11 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "textSelectionPointAroundMath" in app
     assert ".katex, .math-inline, .math-block" in app
     assert "firstUsableRect" in app
+    assert "markdownNativeSelectionSelector" in app
+    assert "pre, code, kbd, samp" in app
+    assert "window.setTimeout(() => showResult(readTextSelectionWithin(container)), 0)" in app
+    assert "window.setTimeout(() => handleResult(readTextSelectionWithin(container)), 0)" in app
+    assert "const skipTags = new Set(['SCRIPT', 'STYLE', 'IMG', 'SVG', 'MATH'])" in app
     assert "TodoBoardPreview" in app
     assert "agent 正在规划" in app
     assert "todo_board" in app

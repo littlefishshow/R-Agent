@@ -94,7 +94,7 @@ def get_tool_execution_timeout():
 
 def get_delegate_task_wall_timeout():
     """单个 delegate 子任务默认墙钟超时时间（秒）；<=0 时禁用。"""
-    value = _env_float("DELEGATE_TASK_WALL_TIMEOUT", 1800.0, minimum=0.0)
+    value = _env_float("DELEGATE_TASK_WALL_TIMEOUT", 300.0, minimum=0.0)
     return None if value <= 0 else value
 
 def get_self_evolution_review_interval():

@@ -693,16 +693,26 @@ pre {
   color: #516177;
 }
 
-.md-code {
+.md-code,
+.markdown-body pre {
   overflow: auto;
   padding: 10px;
   border: 1px solid #dce3ec;
   border-radius: 8px;
   background: #0f172a;
   color: #e2e8f0;
+  user-select: text;
 }
 
-.md-inline-code {
+.md-code code,
+.markdown-body pre code,
+.md-inline-code,
+.markdown-body :not(pre) > code {
+  user-select: text;
+}
+
+.md-inline-code,
+.markdown-body :not(pre) > code {
   padding: 1px 4px;
   border-radius: 4px;
   background: #eef2f7;
