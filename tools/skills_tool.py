@@ -29,6 +29,34 @@ def skill_view_tool(skill_name: str, file_path: str = None) -> str:
         return _json_error(exc)
 
 
+def skill_activate_tool(action: str, skill_name: str = "") -> str:
+    """显式激活/停用 skill 的 allowed-tools policy；本工具只返回策略，由主循环应用。"""
+    normalized = (action or "").strip().lower()
+    if normalized == "deactivate":
+        return _json_ok(action="deactivate", skill_name=skill_name or "", allowed_tools=[])
+    if normalized != "activate":
+        return _json_error("action must be 'activate' or 'deactivate'.")
+    if not skill_name:
+        return _json_error("skill_name is required for activate.")
+    try:
+        content = skill_manager.view_skill(skill_name)
+        metadata = skill_manager.parse_skill_metadata(content)
+        allowed_tools = list(metadata.get("allowed_tools") or [])
+        if not allowed_tools:
+            return _json_error(
+                f"Skill '{skill_name}' does not declare allowed_tools; activation was not applied."
+            )
+        record_event(skill_name, "activate")
+        return _json_ok(
+            action="activate",
+            skill_name=skill_name,
+            allowed_tools=allowed_tools,
+            description=metadata.get("description", ""),
+        )
+    except Exception as exc:
+        return _json_error(exc)
+
+
 def skill_create_tool(skill_name: str, description: str, content: str, category: str = "uncategorized") -> str:
     """创建一个新的技能（兼容旧接口；实际逻辑委托给 skill_manage）。"""
     return skill_manage_tool(
@@ -127,4 +155,29 @@ registry.register(
         "required": ["action"],
     },
     handler=skill_manage_tool,
+)
+
+registry.register(
+    name="skill_activate",
+    description=(
+        "显式激活或停用某个 skill 的 allowed-tools policy。仅 activate 会收窄当前 Agent "
+        "可用工具；普通 skill_view 不会改变工具集。deactivate 可随时恢复。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["activate", "deactivate"],
+                "description": "activate 应用策略；deactivate 清除策略",
+            },
+            "skill_name": {
+                "type": "string",
+                "description": "activate 时必填；deactivate 时可选",
+            },
+        },
+        "required": ["action"],
+    },
+    handler=skill_activate_tool,
+    metadata={"summary": "显式激活或停用 skill 的工具白名单策略", "category": "meta"},
 )

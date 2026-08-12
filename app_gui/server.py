@@ -118,6 +118,18 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/sessions/{session_id}/continue")
+    def continue_session(session_id: str, request: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        try:
+            extra = request.get("extra_iterations")
+            extra_iterations = int(extra) if extra not in (None, "") else None
+            background = bool(request.get("background", True))
+            return service.continue_after_truncation(session_id, extra_iterations=extra_iterations, background=background)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/sessions/{session_id}/interrupt")
     def interrupt(session_id: str) -> Dict[str, Any]:
         try:
@@ -218,6 +230,18 @@ def create_app(
             text = str(request.get("text") or "")
             background = bool(request.get("background", True))
             return learning.send_message(session_id, text, background=background)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/continue")
+    def continue_learning_session(session_id: str, request: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        try:
+            extra = request.get("extra_iterations")
+            extra_iterations = int(extra) if extra not in (None, "") else None
+            background = bool(request.get("background", True))
+            return learning.continue_after_truncation(session_id, extra_iterations=extra_iterations, background=background)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:

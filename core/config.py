@@ -45,6 +45,25 @@ def get_max_iterations():
     except ValueError:
         return 50
 
+
+def get_gui_max_iterations():
+    """GUI/Cockpit 单次对话允许的最大思考轮数。
+
+    GUI 是长时交互界面，不应继承 CLI/子任务默认的 30 轮安全预算。
+    环境变量按更具体到更通用的顺序读取：
+    R_AGENT_GUI_MAX_ITERATIONS、GUI_MAX_ITERATIONS、COCKPIT_MAX_ITERATIONS。
+    """
+    for name in ("R_AGENT_GUI_MAX_ITERATIONS", "GUI_MAX_ITERATIONS", "COCKPIT_MAX_ITERATIONS"):
+        raw = os.environ.get(name)
+        if raw in (None, ""):
+            continue
+        try:
+            value = int(raw)
+        except ValueError:
+            continue
+        return max(1, value)
+    return 200
+
 def get_soft_warn_ratio():
     """软提醒阈值占 max_iterations 的比例（达到此比例后注入提醒）。"""
     try:
@@ -96,6 +115,16 @@ def get_delegate_task_wall_timeout():
     """单个 delegate 子任务默认墙钟超时时间（秒）；<=0 时禁用。"""
     value = _env_float("DELEGATE_TASK_WALL_TIMEOUT", 300.0, minimum=0.0)
     return None if value <= 0 else value
+
+
+def get_delegate_step_events_limit():
+    """每个委派子任务最多内嵌多少条采样 step event；0 表示不内嵌。"""
+    try:
+        value = int(os.environ.get("DELEGATE_STEP_EVENTS_LIMIT", "32"))
+    except ValueError:
+        value = 32
+    return max(0, min(value, 200))
+
 
 def get_self_evolution_review_interval():
     """每多少轮用户对话触发一次后台自演进复盘；<=0 表示关闭。"""
@@ -150,6 +179,150 @@ def get_context_compression_preserve_recent_messages():
     except ValueError:
         n = 16
     return max(4, n)
+
+
+def get_context_summarization_mode():
+    """上下文摘要策略：heuristic（默认、零额外调用）或 llm（质量更高、失败自动回退）。"""
+    raw = str(os.environ.get("CONTEXT_SUMMARIZATION_MODE", "heuristic")).strip().lower()
+    return raw if raw in ("heuristic", "llm") else "heuristic"
+
+
+def get_context_summarization_model():
+    """可选的专用摘要模型；为空时复用当前 run model。"""
+    return os.environ.get("CONTEXT_SUMMARIZATION_MODEL", "").strip()
+
+
+def get_run_events_enabled():
+    """是否把主循环运行事件写入 append-only 事件流（JSONL）。
+
+    默认开启：开销极小，且是后续升级的验证地基。设为 0/false/no 可关闭。
+    """
+    raw = str(os.environ.get("RUN_EVENTS_ENABLED", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_run_events_dir():
+    """运行事件流落盘目录；默认 sandbox/run_events。"""
+    return os.environ.get("RUN_EVENTS_DIR", "").strip() or os.path.join("sandbox", "run_events")
+
+
+def get_memory_provider_name():
+    """长期记忆 backend 名称；默认 file（零配置文件型）。"""
+    return os.environ.get("MEMORY_PROVIDER", "").strip().lower() or "file"
+
+
+def get_memory_injection_mode():
+    """记忆注入方式：'system'（现状，拼进 system prompt）或 'hidden_user'（降权为隐藏 user 段）。
+
+    默认保持 'system' 以确保零行为变化；设为 'hidden_user' 可启用 deer-flow 风格的
+    权限隔离（memory 作为数据而非最高指令）。
+    """
+    raw = str(os.environ.get("MEMORY_INJECTION_MODE", "system")).strip().lower()
+    return raw if raw in ("system", "hidden_user") else "system"
+
+
+def get_durable_context_enabled():
+    """是否每轮注入 durable context（summary_text + delegation_ledger + skill_context + memory）。
+
+    默认关闭，保持现状；开启后按 deer-flow 风格以隐藏低权限 user 段回注结构化上下文。
+    当 MEMORY_INJECTION_MODE=hidden_user 时强制开启，避免 memory 已退出 system prompt，
+    却因为 durable 通道关闭而在本轮完全不可见。
+    """
+    if get_memory_injection_mode() == "hidden_user":
+        return True
+    raw = str(os.environ.get("DURABLE_CONTEXT_ENABLED", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_tool_sanitization_enabled():
+    """兼容旧布尔开关：audit/enforce 都视为“已启用中间件”."""
+    return get_tool_sanitization_mode() != "off"
+
+
+def get_tool_sanitization_mode():
+    """工具结果注入防护：off（关闭）/ audit（只上报）/ enforce（上报并中和）。"""
+    raw = str(os.environ.get("TOOL_SANITIZATION_MODE", "")).strip().lower()
+    if raw in ("off", "audit", "enforce"):
+        return raw
+    legacy = str(os.environ.get("TOOL_SANITIZATION_ENABLED", "0")).strip().lower()
+    return "enforce" if legacy not in ("0", "false", "no", "off", "") else "off"
+
+
+def get_memory_write_middleware_enabled():
+    """是否启用 middleware 模式的记忆自动写入 hook。默认关闭，保持现状。
+
+    注意：即使开启，默认文件型 provider 的 add() 仍是 no-op（只提供 hook 点），
+    不会自动改写记忆文件；需要自定义 provider 才会真正萃取写入。
+    """
+    raw = str(os.environ.get("MEMORY_WRITE_MIDDLEWARE_ENABLED", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_loop_detection_enabled():
+    """委派子 Agent 是否启用循环保护（连续相同工具调用检测）。
+
+    默认**开启**：子任务自动执行、无人盯着，死循环风险高，循环保护是安全增强。
+    设为 0/false 可关闭。
+    """
+    raw = str(os.environ.get("LOOP_DETECTION_ENABLED", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_loop_detection_threshold():
+    """连续多少次相同工具调用（同名+同参）判定为循环并阻止；最小 2，默认 3。"""
+    try:
+        n = int(os.environ.get("LOOP_DETECTION_THRESHOLD", "3"))
+    except ValueError:
+        n = 3
+    return max(2, n)
+
+
+def get_deferred_tools_enabled():
+    """是否启用延迟工具暴露（deferred tools）：prompt 先给工具目录，模型用 tool_search 提升。
+
+    默认**关闭**：R-Agent 默认工具数不多，全量暴露更省事、零行为变化。工具很多或接入
+    大量 MCP 工具时开启，可显著降低上下文占用。
+    """
+    raw = str(os.environ.get("DEFERRED_TOOLS_ENABLED", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_deferred_tools_always_on():
+    """延迟暴露模式下始终可见的工具名（逗号分隔）。
+
+    默认保留"每轮都可能立刻要用"的日常工具（文件/命令/网页/调度/技能发现/记忆），
+    延迟暴露只藏起"体量大且专用"的工具（AutoResearch 套件、语音、skill 管理、artifact
+    切片、self-evolution 等）——它们经 tool_search 按需提升即可。可用环境变量覆盖。
+    """
+    raw = os.environ.get("DEFERRED_TOOLS_ALWAYS_ON", "").strip()
+    if raw:
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return [
+        # 检索入口（必需，否则无法发现被延迟的工具）
+        "tool_search",
+        # 调度骨架
+        "todo_manage", "delegate_task",
+        # 技能发现（小体量，用于找到并阅读技能）
+        "skill_search", "skill_view", "skill_activate",
+        # 核心文件 / 命令 / 代码执行
+        "read_file", "write_file", "search_files", "run_command", "run_python",
+        # 核心网页
+        "web_search", "web_extract",
+        # 核心记忆
+        "memory", "memory_search", "memory_review",
+    ]
+
+
+def get_session_sandbox_enabled():
+    """Whether the per-session sandbox compatibility layer is enabled."""
+    raw = str(os.environ.get("SESSION_SANDBOX_ENABLED", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_session_sandbox_root():
+    """Root for opt-in per-session sandboxes."""
+    return os.environ.get("SESSION_SANDBOX_ROOT", "").strip() or os.path.join("sandbox", "sessions")
+
 
 def create_llm_client(api_key=None):
     """

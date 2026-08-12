@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -158,6 +159,37 @@ def get_project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def build_runtime_context_block() -> str:
+    """构建动态运行时上下文块（当前只含日期）。
+
+    对齐 deer-flow 的 DynamicContextMiddleware（见学习文档第 6.1 节）：当前日期
+    属于**框架权限**信息，放在 system 层。它每次构建 system prompt 时刷新，弥补
+    R-Agent 此前"模型不知道今天几号"的缺口。
+
+    时区默认 Asia/Shanghai，可用环境变量 R_AGENT_TIMEZONE 覆盖；zoneinfo 不可用
+    时退回本地时间，绝不因此报错。
+    """
+    tz_name = os.environ.get("R_AGENT_TIMEZONE", "Asia/Shanghai")
+    now = None
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        try:
+            now = datetime.now()
+            tz_name = "local"
+        except Exception:
+            return ""
+    weekday_cn = "一二三四五六日"[now.weekday()]
+    return (
+        "# Runtime context\n"
+        f"Current date: {now.strftime('%Y-%m-%d')} (星期{weekday_cn}), timezone {tz_name}.\n"
+        "This is framework-provided ground truth. Use it for any relative-date reasoning "
+        "(\"today\", \"this week\", \"latest\"). For exact current time, still run a tool."
+    )
+
+
 def get_soul_path() -> Path:
     """Return the simplified R-Agent SOUL.md path."""
     return get_project_root() / SOUL_FILENAME
@@ -243,6 +275,11 @@ def build_system_prompt(agent_tools=None) -> str:
         parts.append(soul_content)
     else:
         parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # 1.5 Runtime context: 当前日期（框架权限，每次构建刷新）。
+    runtime_block = build_runtime_context_block()
+    if runtime_block:
+        parts.append(runtime_block)
 
     # 2. General Tool Use Enforcement
     parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)

@@ -11,7 +11,12 @@ export type SessionState = {
   session_id: string
   model: string
   running: boolean
+  truncated?: boolean
+  max_iterations?: number
   event_count: number
+  created_at?: number
+  updated_at?: number
+  last_activity_at?: number
   last_response?: string | null
   last_error?: string | null
   token_usage?: string | number
@@ -146,6 +151,16 @@ export async function sendMessage(sessionId: string, text: string): Promise<any>
   return res.json()
 }
 
+export async function continueSession(sessionId: string, extraIterations?: number): Promise<any> {
+  const res = await fetch(`${API_BASE}/sessions/${sessionId}/continue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ background: true, extra_iterations: extraIterations }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
 export async function interrupt(sessionId: string): Promise<any> {
   const res = await fetch(`${API_BASE}/sessions/${sessionId}/interrupt`, { method: 'POST' })
   if (!res.ok) throw new Error(await res.text())
@@ -251,6 +266,16 @@ export async function sendLearningMessage(sessionId: string, text: string): Prom
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, background: true }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function continueLearningSession(sessionId: string, extraIterations?: number): Promise<any> {
+  const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/continue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ background: true, extra_iterations: extraIterations }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()

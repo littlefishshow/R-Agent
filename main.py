@@ -1418,13 +1418,17 @@ def main():
     os.environ["R_AGENT_SESSION_ID"] = cli_session_id
     console.print(f"[dim]Todo session: {cli_session_id}[/dim]")
     agent = RAgent(session_id=cli_session_id)
+    # memory 注入权限：默认 'system'（拼进 system prompt，行为不变）；设为
+    # 'hidden_user' 时 memory 改由 durable context 以隐藏 user 段注入（权限降级），
+    # 此处就不再把 memory 快照拼进 system prompt，避免重复注入。
+    _memory_in_system = config.get_memory_injection_mode() != "hidden_user"
     system_prompt = (
         build_system_prompt()
         + "\n\n【重要提示：自我进化能力】\n"
         + "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具维护技能包；默认优先 patch 现有技能。只有当用户明确要求或发现高度可复用且现有技能无法承载的稳定工作流时，才创建新技能，避免每轮任务都新增 skill。\n"
         + "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
         + "请始终使用中文回复用户。"
-        + memory_manager.load_snapshot()
+        + (memory_manager.load_snapshot() if _memory_in_system else "")
     )
     
     # 初始化 prompt_toolkit session

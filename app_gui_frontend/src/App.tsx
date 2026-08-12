@@ -6,6 +6,7 @@ import 'katex/dist/katex.min.css'
 import {
   copyWorkspaceItem,
   createLearningSession,
+  continueLearningSession,
   createWorkspaceFolder,
   deleteLearningSession,
   deleteWorkspaceItem,
@@ -745,6 +746,24 @@ export function App() {
     if (!session) return
     await interruptLearning(session.session_id)
     await refreshActive(session.session_id)
+  }
+
+  async function continueActiveAfterTruncation() {
+    if (!session || session.running || !session.truncated) return
+    const sessionId = session.session_id
+    setError(null)
+    markPendingRun(sessionId)
+    setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: true } : prev)
+    setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: true } } : prev)
+    try {
+      await continueLearningSession(sessionId)
+      await refreshActive(sessionId)
+    } catch (err: any) {
+      delete pendingRunsRef.current[sessionId]
+      setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: false } : prev)
+      setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: false } } : prev)
+      setError(err.message || String(err))
+    }
   }
 
   async function toggleActiveSessionTools(enabled: boolean) {
@@ -1945,6 +1964,10 @@ export function App() {
         </section>}
 
       {activeMode === 'chat' && <section className="learning-composer">
+        {session?.truncated && !session.running && <div className="truncation-continue">
+          <span>本次回答已达到思考轮数上限（{session.max_iterations || '当前预算'}）。</span>
+          <button className="secondary" onClick={continueActiveAfterTruncation}>继续思考</button>
+        </div>}
         <div className="composer-row">
           <ComposerInput
             value={input}

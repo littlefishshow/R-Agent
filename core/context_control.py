@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # OpenAI/Azure-compatible chat APIs generally do not expose the model context
@@ -245,6 +245,7 @@ def compress_messages(
     target_ratio: float = DEFAULT_TARGET_RATIO,
     preserve_recent_messages: int = DEFAULT_PRESERVE_RECENT_MESSAGES,
     force: bool = False,
+    summarizer: Optional[Callable[[Sequence[Dict[str, Any]]], str]] = None,
 ) -> Dict[str, Any]:
     normalized = normalize_messages_for_context(messages)
     if not normalized:
@@ -319,6 +320,22 @@ def compress_messages(
         summary_msg = _build_summary_message(old_messages)
         compressed = list(leading_system[:1]) + [summary_msg] + _flatten(keep_units)
 
+    summary_strategy = "heuristic"
+    summary_error = None
+    if summarizer is not None:
+        try:
+            generated = str(summarizer(old_messages) or "").strip()
+            if generated:
+                summary_msg = {"role": "system", "content": generated}
+                compressed = list(leading_system[:1]) + [summary_msg] + _flatten(keep_units)
+                summary_strategy = "llm"
+            else:
+                summary_strategy = "heuristic_fallback"
+                summary_error = "summarizer returned empty content"
+        except Exception as exc:
+            summary_strategy = "heuristic_fallback"
+            summary_error = str(exc)
+
     compressed_estimated = estimate_request_tokens(compressed, tools)
     return {
         "success": True,
@@ -339,5 +356,7 @@ def compress_messages(
             "target_tokens": target_tokens,
             "usage_ratio_before": original_estimated / max_tokens if max_tokens else None,
             "usage_ratio_after": compressed_estimated / max_tokens if max_tokens else None,
+            "summary_strategy": summary_strategy,
+            **({"summary_error": summary_error} if summary_error else {}),
         },
     }

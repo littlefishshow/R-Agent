@@ -2,6 +2,20 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-08-12
+
+#### Cockpit GUI 思考轮数限制放开与截断续跑
+
+- **放开 GUI 默认思考预算**：Cockpit GUI 会通过 `get_gui_max_iterations()` 读取独立预算，默认提升到 200 轮，并可用 `R_AGENT_GUI_MAX_ITERATIONS` / `GUI_MAX_ITERATIONS` / `COCKPIT_MAX_ITERATIONS` 环境变量覆盖，避免沿用较低的 CLI/Agent 默认轮数。
+- **补充后端截断续跑 API**：新增会话 `continue` 路由与 runtime/service 续跑入口，支持在任务因轮数预算截断后继续追加思考轮数，并兼容学习会话续跑。
+- **增加前端继续思考按钮**：前端 API 封装 continue 请求，并在会话被截断且未运行时显示“继续思考”按钮，便于从 Cockpit 直接续跑被截断的回答。
+
+#### Cockpit 左侧问题链最近优先排序
+
+- **问题链按最近活动排序**：学习模式左侧问题对话框/问题链根节点改为按 `last_activity_at` 由近到远排序，刷新或重启后不再依赖目录恢复/字典插入顺序。
+- **子问题同样最近优先**：展开问题链子节点时也按最近活动时间倒序返回，保证分支列表中新近对话靠前。
+- **补充会话时间字段**：会话状态与树节点新增 `created_at`、`updated_at`、`last_activity_at`，优先从事件时间计算，旧空会话回退到 `context.json` 修改时间。
+
 ### 2026-08-06
 
 #### read_paper 长论文图表 ledger 交接与验收强化

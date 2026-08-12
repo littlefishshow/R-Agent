@@ -51,6 +51,53 @@ def test_context_compress_keeps_recent_messages_whole_and_summarizes_tool_result
     assert "read_file" in compressed[1]["content"]
 
 
+def test_context_compress_uses_optional_llm_summarizer():
+    messages = [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "旧目标 A" * 40},
+        {"role": "assistant", "content": "旧结论 B" * 40},
+        {"role": "user", "content": "保留的新问题"},
+    ]
+
+    result = compress_messages(
+        messages,
+        max_context_tokens=120,
+        preserve_recent_messages=1,
+        force=True,
+        summarizer=lambda old: "【LLM 摘要】目标 A；结论 B；继续处理新问题。",
+    )
+
+    assert result["compressed"] is True
+    assert result["summary"].startswith("【LLM 摘要】")
+    assert result["stats"]["summary_strategy"] == "llm"
+    assert result["compressed_messages"][-1]["content"] == "保留的新问题"
+
+
+def test_context_compress_falls_back_when_llm_summarizer_fails():
+    messages = [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "旧目标 A" * 40},
+        {"role": "assistant", "content": "旧结论 B" * 40},
+        {"role": "user", "content": "保留的新问题"},
+    ]
+
+    def broken_summarizer(_old):
+        raise RuntimeError("summary provider unavailable")
+
+    result = compress_messages(
+        messages,
+        max_context_tokens=120,
+        preserve_recent_messages=1,
+        force=True,
+        summarizer=broken_summarizer,
+    )
+
+    assert result["compressed"] is True
+    assert "自动上下文压缩摘要" in result["summary"]
+    assert result["stats"]["summary_strategy"] == "heuristic_fallback"
+    assert "summary provider unavailable" in result["stats"]["summary_error"]
+
+
 def test_archive_subtask_with_messages_low_threshold_returns_original_when_not_forced():
     messages = [{"role": "system", "content": "base"}, {"role": "user", "content": "short"}]
     raw = archive_subtask(
@@ -97,6 +144,35 @@ def test_agent_auto_compresses_before_llm_request(monkeypatch):
     assert any("自动上下文压缩摘要" in (m.get("content") or "") for m in sent_messages if isinstance(m, dict))
     assert any(isinstance(m, dict) and m.get("content") == "新问题" for m in sent_messages)
     assert agent.context_usage["compressed_count"] >= 1
+    assert len(fake_client.chat.completions.kwargs) == 1
+
+
+def test_agent_llm_summarization_calls_summary_then_main_model(monkeypatch):
+    monkeypatch.setattr(config, "get_llm_context_window", lambda: 180)
+    monkeypatch.setattr(config, "get_context_compression_trigger_ratio", lambda: 0.2)
+    monkeypatch.setattr(config, "get_context_compression_target_ratio", lambda: 0.5)
+    monkeypatch.setattr(config, "get_context_compression_preserve_recent_messages", lambda: 2)
+    monkeypatch.setattr(config, "get_context_summarization_mode", lambda: "llm")
+    monkeypatch.setattr(config, "get_context_summarization_model", lambda: "")
+
+    agent = RAgent(model="test", max_iterations=1, enable_self_review=False)
+    fake_client = _FakeClient()
+    agent.client = fake_client
+    agent.messages = [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "旧需求" * 80},
+        {"role": "assistant", "content": "旧分析" * 80},
+    ]
+
+    assert agent.run_conversation("新问题", system_message="base") == "ok"
+    assert len(fake_client.chat.completions.kwargs) == 2
+    summary_request, main_request = fake_client.chat.completions.kwargs
+    assert "上下文压缩器" in summary_request["messages"][0]["content"]
+    assert any(
+        isinstance(message, dict) and message.get("content") == "ok"
+        for message in main_request["messages"]
+    )
+    assert agent.context_usage["last_compression"]["summary_strategy"] == "llm"
 
 
 def test_archive_subtask_with_messages_merges_manual_summary():

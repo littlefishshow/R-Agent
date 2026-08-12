@@ -98,8 +98,14 @@ class ToolRegistry:
         self._lock = threading.RLock()
         self._tools_signature = None
 
-    def register(self, name: str, description: str, parameters: Dict[str, Any], handler: Callable):
-        """注册一个工具"""
+    def register(self, name: str, description: str, parameters: Dict[str, Any], handler: Callable,
+                 metadata: Optional[Dict[str, Any]] = None):
+        """注册一个工具。
+
+        ``metadata`` 是可选的轻量元信息（如 ``{"summary": "...", "category": "..."}``），
+        供工具目录（deferred exposure）使用。不传时向后兼容，目录会用 description 的
+        首行兜底。
+        """
         with self._lock:
             self._tools[name] = {
                 "schema": {
@@ -110,7 +116,8 @@ class ToolRegistry:
                         "parameters": parameters,
                     }
                 },
-                "handler": handler
+                "handler": handler,
+                "metadata": dict(metadata or {}),
             }
 
     def _iter_tool_files(self):
@@ -154,6 +161,56 @@ class ToolRegistry:
         self.reload_all(force=False)
         with self._lock:
             return [tool["schema"] for tool in self._tools.values()]
+
+    @staticmethod
+    def _summary_of(tool: Dict[str, Any]) -> str:
+        """取工具的一句话摘要：优先 metadata.summary，否则用 description 首行。"""
+        meta = tool.get("metadata") or {}
+        summary = meta.get("summary")
+        if summary:
+            return str(summary)
+        desc = tool.get("schema", {}).get("function", {}).get("description", "") or ""
+        return desc.strip().splitlines()[0] if desc.strip() else ""
+
+    def get_tool_catalog(self) -> List[Dict[str, Any]]:
+        """返回精简工具目录（name + summary + category），供延迟暴露时给模型看。
+
+        只含"是什么"，不含完整参数 schema，避免工具很多时把上下文撑爆。
+        """
+        self.reload_all(force=False)
+        with self._lock:
+            catalog = []
+            for name, tool in self._tools.items():
+                meta = tool.get("metadata") or {}
+                catalog.append({
+                    "name": name,
+                    "summary": self._summary_of(tool),
+                    "category": meta.get("category", ""),
+                })
+            return catalog
+
+    def get_schemas_for(self, names) -> List[Dict[str, Any]]:
+        """返回指定名字集合的完整 schema（供延迟暴露时提升已选工具）。"""
+        self.reload_all(force=False)
+        wanted = set(names or [])
+        with self._lock:
+            return [t["schema"] for n, t in self._tools.items() if n in wanted]
+
+    def search_catalog(self, query: str, limit: int = 8) -> List[Dict[str, Any]]:
+        """在工具目录里做轻量关键词匹配，返回 name+summary+category 列表。"""
+        q = str(query or "").strip().lower()
+        catalog = self.get_tool_catalog()
+        if not q:
+            return catalog[:limit]
+        terms = [t for t in q.replace(",", " ").split() if t]
+        scored = []
+        for entry in catalog:
+            hay = f"{entry['name']} {entry['summary']} {entry['category']}".lower()
+            score = sum(hay.count(t) for t in terms)
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: -x[0])
+        return [e for _s, e in scored[:limit]]
 
     def execute_tool(self, name: str, args_json: str) -> str:
         """执行工具，返回结果的 JSON 字符串"""

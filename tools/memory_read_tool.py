@@ -34,6 +34,19 @@ def memory_get(target: str, from_line: int = 1, lines: int = 50) -> str:
         return _json({"success": False, "error": f"Unexpected memory_get error: {e}"})
 
 
+def memory_review(target: str = "all", long_entry_chars: int = 400) -> str:
+    """只读审计长期 memory；只报告候选问题，不自动修改。"""
+    try:
+        return _json({
+            "success": True,
+            **memory_manager.review_memory(target=target, long_entry_chars=long_entry_chars),
+        })
+    except MemoryOperationError as e:
+        return _json({"success": False, "error": str(e)})
+    except Exception as e:
+        return _json({"success": False, "error": f"Unexpected memory_review error: {e}"})
+
+
 registry.register(
     name="memory_search",
     description=(
@@ -70,4 +83,29 @@ registry.register(
         "required": ["target"],
     },
     handler=memory_get,
+)
+
+registry.register(
+    name="memory_review",
+    description=(
+        "只读审计长期 memory 的健康状况：容量占用、重复条目、过长条目、"
+        "疑似易过期的日期/任务/提交引用。该工具是 dry-run，只给人工复核建议，"
+        "绝不会自动删除或修改 USER.md / MEMORY.md。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "enum": ["all", "user", "memory"],
+                "description": "审计范围，默认 all",
+            },
+            "long_entry_chars": {
+                "type": "integer",
+                "description": "超过多少字符视为过长候选，默认 400",
+            },
+        },
+    },
+    handler=memory_review,
+    metadata={"summary": "只读审计长期记忆的重复、容量和易过期风险", "category": "memory"},
 )

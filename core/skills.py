@@ -26,6 +26,98 @@ class SkillManager:
     def _display_category_name(self, category: str) -> str:
         return self.CATEGORY_DISPLAY_NAMES.get(category, category.capitalize())
 
+    @staticmethod
+    def parse_skill_metadata(content: str) -> dict:
+        """从 SKILL.md 内容里解析轻量 metadata：name / description / triggers。
+
+        兼容两种写法：
+        1. YAML 风格 front-matter（``---`` 包裹或顶部若干 ``key: value`` 行）；
+        2. 无 front-matter：description 兜底取首个非空行。
+
+        绝不抛异常——解析失败就返回尽力而为的兜底。
+        """
+        meta = {"name": "", "description": "", "triggers": "", "allowed_tools": []}
+        if not content:
+            return meta
+        try:
+            lines = content.splitlines()
+            # 收集 front-matter 区域：可能被 --- 包裹，也可能只是顶部的 key: value 行。
+            scan = []
+            if lines and lines[0].strip() == "---":
+                for line in lines[1:]:
+                    if line.strip() == "---":
+                        break
+                    scan.append(line)
+            else:
+                for line in lines[:8]:
+                    if ":" in line and not line.strip().startswith("#"):
+                        scan.append(line)
+                    elif line.strip() == "":
+                        continue
+                    else:
+                        break
+            for line in scan:
+                if ":" not in line:
+                    continue
+                key, _, val = line.partition(":")
+                key = key.strip().lower()
+                val = val.strip().strip('"\'')
+                if key in ("name", "description", "triggers") and val:
+                    meta[key] = val
+                elif key in ("allowed_tools", "allowed-tools") and val:
+                    raw_tools = val.strip("[]")
+                    meta["allowed_tools"] = [
+                        item.strip().strip('"\'')
+                        for item in raw_tools.split(",")
+                        if item.strip()
+                    ]
+            # description 兜底：首个非空、非 front-matter、非标题行。
+            if not meta["description"]:
+                for line in lines:
+                    s = line.strip()
+                    if not s or s == "---" or s.startswith("#") or ":" in s.split(" ")[0]:
+                        continue
+                    meta["description"] = s
+                    break
+                else:
+                    first = next((l.strip() for l in lines if l.strip()), "")
+                    meta["description"] = first
+        except Exception:
+            pass
+        return meta
+
+    def list_skills_structured(self) -> list:
+        """返回结构化技能目录：[{name, category, description, triggers}, ...]。
+
+        供延迟加载/skill_context 使用；metadata 缺失时用目录名 + 首行兜底。
+        """
+        catalog = []
+        for skill_path in glob.glob(os.path.join(self.skills_dir, "**", "SKILL.md"), recursive=True):
+            if not os.path.isfile(skill_path):
+                continue
+            rel_path = os.path.relpath(skill_path, self.skills_dir)
+            parts = rel_path.split(os.sep)
+            if len(parts) >= 3:
+                category, skill_name = parts[0], parts[-2]
+            else:
+                category, skill_name = "uncategorized", parts[-2] if len(parts) >= 2 else "unknown"
+            if category.startswith("."):
+                continue
+            try:
+                content = Path(skill_path).read_text(encoding="utf-8")
+                meta = self.parse_skill_metadata(content)
+            except Exception:
+                meta = {"name": "", "description": "无描述", "triggers": "", "allowed_tools": []}
+            catalog.append({
+                "name": meta.get("name") or skill_name,
+                "dir_name": skill_name,
+                "category": category,
+                "description": meta.get("description") or "无描述",
+                "triggers": meta.get("triggers", ""),
+                "allowed_tools": list(meta.get("allowed_tools") or []),
+            })
+        return catalog
+
     def _validate_simple_name(self, value: str, field_name: str) -> str:
         if not isinstance(value, str) or not value.strip():
             raise ValueError(f"{field_name} is required.")
@@ -95,11 +187,7 @@ class SkillManager:
             if category.startswith("."): continue
             try:
                 content = Path(skill_path).read_text(encoding="utf-8")
-                desc = content.split('\n')[0] if content else "无描述"
-                if desc.startswith("---") or desc.startswith("name:"):
-                    for line in content.split('\n'):
-                        if line.startswith("description:"):
-                            desc = line.replace("description:", "").strip().strip('"\''); break
+                desc = self.parse_skill_metadata(content).get("description") or "无描述"
                 categorized_skills[category].append(f"  - **{skill_name}**: {desc}")
             except Exception as e:
                 categorized_skills[category].append(f"  - **{skill_name}**: 加载描述失败 ({str(e)})")

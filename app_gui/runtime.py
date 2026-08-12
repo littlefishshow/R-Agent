@@ -30,6 +30,17 @@ from tools.registry import registry
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+
+def _memory_for_system_prompt() -> str:
+    """返回要拼进 system prompt 的 memory 快照。
+
+    默认 'system' 模式：返回冻结快照（行为不变）。'hidden_user' 模式：返回空串，
+    memory 改由 durable context 以隐藏 user 段注入（权限降级，见 03/04 文档）。
+    """
+    if config.get_memory_injection_mode() == "hidden_user":
+        return ""
+    return memory_manager.load_snapshot()
+
 SELF_EVOLUTION_PROMPT = (
     "\n\n【重要提示：自我进化能力】\n"
     "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具维护技能包；默认优先 patch 现有技能。只有当用户明确要求或发现高度可复用且现有技能无法承载的稳定工作流时，才创建新技能，避免每轮任务都新增 skill。\n"
@@ -88,6 +99,48 @@ def _coerce_gui_session_id(session_id: Optional[str], *, prefix: str) -> str:
     """
     sid = _safe_todo_session_id(str(session_id or ""))
     return sid or new_id(prefix)
+
+
+def _apply_gui_iteration_budget(agent: RAgent) -> RAgent:
+    max_iterations = config.get_gui_max_iterations()
+    agent.max_iterations = max_iterations
+    agent._default_max_iterations = max_iterations
+    return agent
+
+
+def _session_time_bounds(store: ContextSnapshotStore) -> tuple[float, float]:
+    """Return (created_at, last_activity_at) for a persisted GUI session.
+
+    Prefer event timestamps because they reflect conversation activity and survive
+    process restarts. Fall back to context.json mtime for old/empty sessions.
+    """
+    event_times = []
+    for event in getattr(store, "events", []) or []:
+        try:
+            event_times.append(float(event.get("created_at") or 0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        mtime = float(store.context_path.stat().st_mtime) if store.context_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    created_at = min(event_times) if event_times else mtime
+    last_activity_at = max(event_times) if event_times else mtime
+    return created_at, last_activity_at
+
+
+def _session_recent_sort_key(item: Dict[str, Any]) -> tuple[float, float, str]:
+    def _num(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return (
+        _num(item.get("last_activity_at")),
+        _num(item.get("updated_at")),
+        str(item.get("session_id") or item.get("title") or ""),
+    )
 
 
 def _session_todo_board(session_id: str) -> Optional[Dict[str, Any]]:
@@ -195,7 +248,7 @@ class GuiSession:
         self.event_bus = ContextEventBus(store=self.store, session_id=session_id)
         if restore:
             self.event_bus.events = list(self.store.events)
-        self.agent = agent or RAgent(session_id=session_id)
+        self.agent = _apply_gui_iteration_budget(agent or RAgent(session_id=session_id, max_iterations=config.get_gui_max_iterations()))
         self.agent.session_id = session_id
         self.cancel_event = threading.Event()
         self._lock = threading.Lock()
@@ -226,7 +279,7 @@ class GuiSession:
         return self._build_system_prompt_text()
 
     def _build_system_prompt_text(self) -> str:
-        return build_system_prompt() + SELF_EVOLUTION_PROMPT + memory_manager.load_snapshot()
+        return build_system_prompt() + SELF_EVOLUTION_PROMPT + _memory_for_system_prompt()
 
     def _restore_agent_messages(self) -> list:
         messages = []
@@ -272,7 +325,7 @@ class GuiSession:
         base_prompt = build_system_prompt() + SELF_EVOLUTION_PROMPT
         memory_snapshot = memory_manager.load_snapshot()
         self.event_bus.emit(EVENT_MEMORY_SNAPSHOT_LOADED, {"payload_ref": self.store.put_payload(memory_snapshot).to_dict()})
-        system_prompt = base_prompt + memory_snapshot
+        system_prompt = base_prompt + (memory_snapshot if config.get_memory_injection_mode() != "hidden_user" else "")
         self.event_bus.emit(EVENT_SYSTEM_PROMPT_BUILT, {"payload_ref": self.store.put_payload(system_prompt).to_dict()})
         return system_prompt
 
@@ -300,10 +353,10 @@ class GuiSession:
         return ScopedEventSink()
 
     def _new_agent_from_baseline(self, baseline_messages) -> RAgent:
-        agent = RAgent(session_id=self.session_id)
+        agent = RAgent(session_id=self.session_id, max_iterations=config.get_gui_max_iterations())
         agent.session_id = self.session_id
         agent.messages = list(baseline_messages or [])
-        return agent
+        return _apply_gui_iteration_budget(agent)
 
     def send_message(self, text: str, *, background: bool = True) -> Dict[str, Any]:
         text = str(text or "")
@@ -345,6 +398,65 @@ class GuiSession:
             response = active_agent.run_conversation(
                 text,
                 system_message=self.system_prompt,
+                cancel_event=cancel_event or self.cancel_event,
+                event_sink=sink,
+            )
+            if not run_id or self._is_current_run(run_id):
+                self.last_response = response
+            return response
+        except AgentInterrupted:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = "interrupted"
+                sink.emit(EVENT_ERROR, {"error": "interrupted"})
+            return "interrupted"
+        except Exception as exc:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = str(exc)
+                sink.emit(EVENT_ERROR, {"error": str(exc)})
+            raise
+        finally:
+            if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
+                self._thread = None
+
+    def continue_after_truncation(self, *, extra_iterations: Optional[int] = None, background: bool = True) -> Dict[str, Any]:
+        if extra_iterations is None:
+            extra_iterations = config.get_gui_max_iterations()
+        extra_iterations = int(extra_iterations)
+        with self._lock:
+            if self.running:
+                raise RuntimeError("session is already running")
+            if not self.agent.is_truncated():
+                raise RuntimeError("session is not truncated")
+            run_id = new_id("continue")
+            self._active_run_id = run_id
+            self._active_run_baseline = list(self.agent.messages)
+            self.cancel_event = threading.Event()
+            cancel_event = self.cancel_event
+            self.last_response = None
+            self.last_error = None
+            run_agent = self.agent
+            event_sink = self._scoped_event_sink(run_id)
+            if background:
+                self._thread = threading.Thread(
+                    target=self._run_continue_after_truncation,
+                    args=(extra_iterations, run_id, run_agent, event_sink, cancel_event),
+                    name=f"gui-session-{self.session_id}-continue",
+                    daemon=True,
+                )
+                self._thread.start()
+                return {"session_id": self.session_id, "status": "running", "extra_iterations": extra_iterations}
+        response = self._run_continue_after_truncation(extra_iterations, run_id, run_agent, event_sink, cancel_event)
+        return {"session_id": self.session_id, "status": "completed", "response": response, "extra_iterations": extra_iterations}
+
+    def _run_continue_after_truncation(self, extra_iterations: int, run_id: str = "", agent: Optional[RAgent] = None, event_sink=None, cancel_event=None) -> str:
+        active_agent = agent or self.agent
+        sink = event_sink or self.event_bus
+        try:
+            active_agent.model = config.get_model()
+            active_agent.session_id = self.session_id
+            active_agent.client = config.create_llm_client()
+            response = active_agent.continue_after_truncation(
+                extra_iterations,
                 cancel_event=cancel_event or self.cancel_event,
                 event_sink=sink,
             )
@@ -490,11 +602,17 @@ class GuiSession:
         }
 
     def state(self) -> Dict[str, Any]:
+        created_at, last_activity_at = _session_time_bounds(self.store)
         return {
             "session_id": self.session_id,
             "model": self.agent.model,
             "running": self.running,
+            "truncated": self.agent.is_truncated(),
+            "max_iterations": self.agent.max_iterations,
             "event_count": self.store.event_count(),
+            "created_at": created_at,
+            "updated_at": last_activity_at,
+            "last_activity_at": last_activity_at,
             "last_response": self.last_response,
             "last_error": self.last_error,
             # Backward compatible fields: token_usage remains the parent Agent session total.
@@ -557,12 +675,12 @@ class LearningSession(GuiSession):
         base_prompt = build_system_prompt() + LEARNING_AGENT_PROMPT
         memory_snapshot = memory_manager.load_snapshot()
         self.event_bus.emit(EVENT_MEMORY_SNAPSHOT_LOADED, {"payload_ref": self.store.put_payload(memory_snapshot).to_dict()})
-        system_prompt = base_prompt + memory_snapshot
+        system_prompt = base_prompt + (memory_snapshot if config.get_memory_injection_mode() != "hidden_user" else "")
         self.event_bus.emit(EVENT_SYSTEM_PROMPT_BUILT, {"payload_ref": self.store.put_payload(system_prompt).to_dict()})
         return system_prompt
 
     def _build_system_prompt_text(self) -> str:
-        return build_system_prompt() + LEARNING_AGENT_PROMPT + memory_manager.load_snapshot()
+        return build_system_prompt() + LEARNING_AGENT_PROMPT + _memory_for_system_prompt()
 
     def send_message(self, text: str, *, background: bool = True) -> Dict[str, Any]:
         cleaned = str(text or "").strip()
@@ -585,6 +703,36 @@ class LearningSession(GuiSession):
             response = active_agent.run_conversation(
                 text,
                 system_message=self.system_prompt,
+                cancel_event=cancel_event or self.cancel_event,
+                event_sink=sink,
+                allowed_tools=LEARNING_ALLOWED_TOOLS if self.tools_enabled else set(),
+            )
+            if not run_id or self._is_current_run(run_id):
+                self.last_response = response
+            return response
+        except AgentInterrupted:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = "interrupted"
+                sink.emit(EVENT_ERROR, {"error": "interrupted"})
+            return "interrupted"
+        except Exception as exc:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = str(exc)
+                sink.emit(EVENT_ERROR, {"error": str(exc)})
+            raise
+        finally:
+            if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
+                self._thread = None
+
+    def _run_continue_after_truncation(self, extra_iterations: int, run_id: str = "", agent: Optional[RAgent] = None, event_sink=None, cancel_event=None) -> str:
+        active_agent = agent or self.agent
+        sink = event_sink or self.event_bus
+        try:
+            active_agent.model = config.get_model()
+            active_agent.session_id = self.session_id
+            active_agent.client = config.create_llm_client()
+            response = active_agent.continue_after_truncation(
+                extra_iterations,
                 cancel_event=cancel_event or self.cancel_event,
                 event_sink=sink,
                 allowed_tools=LEARNING_ALLOWED_TOOLS if self.tools_enabled else set(),
@@ -710,6 +858,9 @@ class AgentRuntimeService:
 
     def send_message(self, session_id: str, text: str, *, background: bool = True) -> Dict[str, Any]:
         return self.get_session(session_id).send_message(text, background=background)
+
+    def continue_after_truncation(self, session_id: str, *, extra_iterations: Optional[int] = None, background: bool = True) -> Dict[str, Any]:
+        return self.get_session(session_id).continue_after_truncation(extra_iterations=extra_iterations, background=background)
 
     def interrupt(self, session_id: str) -> Dict[str, Any]:
         return self.get_session(session_id).interrupt()
@@ -1002,7 +1153,7 @@ class LearningRuntimeService(AgentRuntimeService):
             for session in self.sessions.values()
             if getattr(session, "account_id", "default") == account and not getattr(session, "parent_session_id", None)
         ]
-        roots.sort(key=lambda item: (item.get("node_kind") != "chat", item.get("title") or item.get("session_id")))
+        roots.sort(key=_session_recent_sort_key, reverse=True)
         return {"account_id": account, "nodes": roots}
 
     def child_nodes(self, session_id: str) -> Dict[str, Any]:
@@ -1012,11 +1163,7 @@ class LearningRuntimeService(AgentRuntimeService):
             for session in self.sessions.values()
             if getattr(session, "parent_session_id", None) == session_id
         ]
-        children.sort(key=lambda item: (
-            item.get("source_message_index") is None,
-            item.get("source_message_index") if item.get("source_message_index") is not None else 10**12,
-            item.get("title") or item.get("session_id"),
-        ))
+        children.sort(key=_session_recent_sort_key, reverse=True)
         return {
             "session_id": session_id,
             "account_id": getattr(parent, "account_id", "default"),
@@ -1024,11 +1171,15 @@ class LearningRuntimeService(AgentRuntimeService):
         }
 
     def _tree_node_state(self, session: LearningSession) -> Dict[str, Any]:
+        created_at, last_activity_at = _session_time_bounds(session.store)
         return {
             "session_id": session.session_id,
             "model": session.agent.model,
             "running": session.running,
             "event_count": session.store.event_count(),
+            "created_at": created_at,
+            "updated_at": last_activity_at,
+            "last_activity_at": last_activity_at,
             "mode": "learning",
             "title": session.title,
             "root_question": session.root_question,

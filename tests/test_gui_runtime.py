@@ -853,29 +853,32 @@ def test_file_workspace_extracts_pdf_text(tmp_path):
     png = workspace.render_pdf_page_png("papers/text.pdf", 1, zoom=1.0)
     assert png.startswith(b"\x89PNG")
 
-def test_learning_child_nodes_use_stable_source_order(monkeypatch, tmp_path):
+def test_learning_child_nodes_sort_by_recent_activity(monkeypatch, tmp_path):
+    # 2026-08-12 GUI change: 问题链子节点按 last_activity_at 由近到远排序，
+    # 让新近有对话的分支靠前，而不是沿用 source_message_index 顺序。
     monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
     service = LearningRuntimeService(store_root=tmp_path)
     parent = service.create_session(session_id="stable-parent", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
-    older = service.create_session(
+    recently_active = service.create_session(
         session_id="stable-child-later-clicked",
         parent_session_id=parent.session_id,
         source_message_index=1,
         title="later clicked",
         agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
     )
-    newer = service.create_session(
+    quiet = service.create_session(
         session_id="stable-child-earlier-source",
         parent_session_id=parent.session_id,
         source_message_index=0,
         title="earlier source",
         agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
     )
+    # 让 source_message_index 较大的分支获得更晚的活动时间，验证排序按活动而非 source 顺序。
     for _ in range(3):
-        older.event_bus.emit("message_appended", {"message": {"role": "user", "content": "clicked"}})
+        recently_active.event_bus.emit("message_appended", {"message": {"role": "user", "content": "clicked"}})
 
     nodes = service.child_nodes(parent.session_id)["nodes"]
-    assert [node["session_id"] for node in nodes[:2]] == [newer.session_id, older.session_id]
+    assert [node["session_id"] for node in nodes[:2]] == [recently_active.session_id, quiet.session_id]
 
 def test_learning_session_state_reads_session_scoped_todo_board(monkeypatch, tmp_path):
     monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
