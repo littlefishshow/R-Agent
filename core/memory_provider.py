@@ -102,6 +102,13 @@ class FileMemoryProvider:
         except Exception as exc:
             return {"dry_run": True, "target": target, "error": str(exc)}
 
+    def consolidate(self, target: str = "all", apply: bool = False) -> dict:
+        """去重合并治理；apply=False 只返回计划，apply=True 才落盘（人工批准闸门）。"""
+        try:
+            return self._manager.consolidate_memory(target=target, apply=apply)
+        except Exception as exc:
+            return {"dry_run": not apply, "applied": False, "target": target, "error": str(exc)}
+
 
 # 模块级默认 provider（文件型、零配置）。
 default_memory_provider = FileMemoryProvider()

@@ -1,6 +1,6 @@
 # 04 · Memory 系统
 
-**状态：🚧 进行中（2026-08-11：backend/注入/降权/只读治理 已落地；自动 consolidation 待人工审核方案）**
+**状态：🚧 进行中（2026-08-12：backend/注入/降权/只读治理 + 去重 consolidation（人工批准）已落地；staleness 自动整理仍留人工）**
 **对应 deer-flow 学习文档：** 第 7 章（Memory 系统）+ 13.3（Memory backend contract）
 **建议顺序：** 第 5 步（在 middleware 骨架之后，可把 memory 注入/写入做成 hook）
 **依赖：** `03_上下文管理`（memory 注入路径与权限隔离在那里落地）；`01_Agent循环中间件化`（memory 写入做成 middleware 更干净）。
@@ -67,7 +67,7 @@ R-Agent 已经有可用实现，所以这里是"抽象化 + 补注入/写入路�
 - ✅ **步骤 4 · 每轮注入（durable context）**：`core/agent.py:_maybe_inject_durable_context` 在每轮 `run_conversation` 里，把 `summary_text + delegation_ledger + skill_context + memory` 拼成一条**隐藏 user 消息**注入（`core/state.py:build_durable_context`，带 authority contract）。默认关闭，`DURABLE_CONTEXT_ENABLED=1` 开启；当 `MEMORY_INJECTION_MODE=hidden_user` 时会**强制启用 durable 通道**，避免长期记忆静默消失。
 - ✅ **步骤 5（= 03 步骤 5）· memory 权限降级**：`MEMORY_INJECTION_MODE=hidden_user` 时，`main.py` 与 `app_gui/runtime.py`（4 处）不再把 memory 拼进 **system prompt**，改由 durable context 以隐藏 user 段注入——memory 不再获得 system 权限。
 - 🔨 **步骤 6（原步骤 5）· middleware 自动写入**：hook 点已落地——`core/middleware/builtins.py:MemoryWriteMiddleware` 在 `after_iteration` 调用 `provider.add(...)`（`MEMORY_WRITE_MIDDLEWARE_ENABLED=1` 开启，默认关）。但默认文件型 `FileMemoryProvider.add()` 仍是**有意的 no-op**——即"自动写入的机制通道已通，但默认不会自动改写记忆文件"。真正的萃取逻辑需要自定义 provider 实现 `add()`，留作后续。
-- 🔨 **治理 dry-run 已落地**：`MemoryManager.review_memory()` 与 `memory_review` 工具只读报告容量、跨文件重复、过长条目、日期/PR/MR/issue/commit/task-progress 等疑似易过期候选；调用前后 memory 文件字节不变。`FileMemoryProvider.review()` 透出统一接口。真正的自动 consolidation / 删除仍未开启，必须人工确认后继续用现有 memory replace/remove。
+- 🔨 **治理 dry-run + 去重 consolidation 已落地**：`MemoryManager.review_memory()` 与 `memory_review` 只读报告容量、跨文件重复、过长条目、日期/PR/MR/issue/commit/task-progress 等疑似易过期候选；调用前后 memory 文件字节不变。`MemoryManager.consolidate_memory()` 与 `memory_consolidate` 工具支持**去重合并**（保留每组首次出现），带**人工批准闸门**：默认 `apply/confirm=false` 只返回删除计划（dry-run），必须显式 `confirm=true` 才落盘；过长/易过期条目仍只报告、需人工判断，不在自动删除范围。`FileMemoryProvider.review()/consolidate()` 透出统一接口。staleness 自动整理仍留人工。
 
 > 同时兑现了 `03_上下文管理` 的步骤 4（durable context 注入）与步骤 5（memory 降权）——因为它们与本章的注入路径是同一件事。
 
@@ -145,3 +145,4 @@ DURABLE_CONTEXT_ENABLED=1 MEMORY_INJECTION_MODE=hidden_user python3 -m pytest te
 - 2026-08-11 · **步骤 6 hook 落地**：`core/middleware/builtins.py:MemoryWriteMiddleware` 在 `after_iteration` 调用 `provider.add(...)`，打通 middleware 模式记忆自动写入的通道（`MEMORY_WRITE_MIDDLEWARE_ENABLED` 开关，默认关）。默认文件型 `add()` 仍是 no-op——通道已通、默认不改写。真正萃取逻辑需自定义 provider，留后续。详见 `01` 文档。仅剩「治理（staleness/consolidation）」待做。
 - 2026-08-11 · **P0 配置安全修复**：`MEMORY_INJECTION_MODE=hidden_user` 现在自动使 `get_durable_context_enabled()` 返回 true，即使用户把 `DURABLE_CONTEXT_ENABLED=0` 写进环境也不会让 memory 两头落空。新增回归测试验证该不变量。
 - 2026-08-11 · **P2-1 治理 dry-run 落地**：新增 `review_memory()` + `memory_review` 只读工具，报告容量、重复、过长和疑似易过期候选，不自动修改。新增测试严格断言调用前后 USER.md / MEMORY.md 内容不变。Memory 定向测试 17 passed，新功能回归 47 passed。自动 consolidation 仍保留人工审核边界。
+- 2026-08-12 · **P2-1 去重 consolidation（人工批准）落地**：新增 `consolidate_memory()` + `memory_consolidate` 工具，仅去重（保留每组首次出现），默认 dry-run 返回计划，须 `confirm=true` 才原子落盘；过长/易过期条目不在范围内。`MemoryProvider.consolidate()` 透出接口。新增 3 个测试严格断言 dry-run 不改文件、apply 只删重复、confirm 闸门有效。Memory 测试 20 passed，全量（排除既有问题文件）426 passed。

@@ -500,5 +500,76 @@ class MemoryManager:
             "recommendations": recommendations,
         }
 
+    def consolidate_memory(self, target: str = "all", apply: bool = False) -> dict:
+        """去重合并长期记忆：仅处理**重复条目**（保留每组首次出现，删除后续重复）。
+
+        安全边界（人工批准闸门）：
+        - 默认 ``apply=False`` 只返回计划（dry-run），不改任何文件；
+        - 只做去重这一**无歧义**操作；过长 / 易过期条目仍只在 review 里报告，需人工判断，
+          本方法不动它们；
+        - 每个文件在锁内一次性原子重写，保留首个出现的行顺序。
+        """
+        normalized_target = (target or "all").strip().lower()
+        if normalized_target not in {"all", "user", "memory"}:
+            raise MemoryOperationError("target must be 'all', 'user', or 'memory'.")
+
+        selected = ["user", "memory"] if normalized_target == "all" else [normalized_target]
+        planned = []
+        removed = []
+
+        with self._lock():
+            for current_target in selected:
+                target_file, label, _limit = self._target_file(current_target)
+                raw = self._read_file(target_file)
+                lines = raw.splitlines()
+
+                seen = set()
+                kept_lines = []
+                dropped_here = []
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        kept_lines.append(line)
+                        continue
+                    key = self._normalize_entry(stripped)
+                    if key and key in seen:
+                        dropped_here.append(stripped)
+                        continue
+                    if key:
+                        seen.add(key)
+                    kept_lines.append(line)
+
+                for text in dropped_here:
+                    entry = {"target": label.lower(), "text": text}
+                    planned.append(entry)
+                    if apply:
+                        removed.append(entry)
+
+                if apply and dropped_here:
+                    cleaned = []
+                    for line in kept_lines:
+                        stripped = line.strip()
+                        if stripped in {"", "-", "*"}:
+                            continue
+                        cleaned.append(line.rstrip())
+                    new_text = "\n".join(cleaned)
+                    if new_text:
+                        new_text += "\n"
+                    self._atomic_write(target_file, new_text)
+
+        return {
+            "target": normalized_target,
+            "applied": bool(apply),
+            "dry_run": not apply,
+            "duplicate_removal_count": len(planned),
+            "planned_removals": planned,
+            "removed": removed if apply else [],
+            "note": (
+                "已删除重复条目（保留每组首次出现）。"
+                if apply else
+                "这是计划（dry-run）；传 apply=true 才会真正删除重复条目。过长/易过期条目不在本操作范围内。"
+            ),
+        }
+
 
 memory_manager = MemoryManager()

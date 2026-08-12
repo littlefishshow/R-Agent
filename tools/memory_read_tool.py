@@ -47,6 +47,21 @@ def memory_review(target: str = "all", long_entry_chars: int = 400) -> str:
         return _json({"success": False, "error": f"Unexpected memory_review error: {e}"})
 
 
+def memory_consolidate(target: str = "all", confirm: bool = False) -> str:
+    """去重合并长期 memory：仅删除重复条目（保留每组首次出现）。
+
+    人工批准闸门：``confirm`` 缺省为 false，只返回计划（dry-run）；必须显式传
+    ``confirm=true`` 才真正删除。过长/易过期条目不在本操作范围内。
+    """
+    try:
+        result = memory_manager.consolidate_memory(target=target, apply=bool(confirm))
+        return _json({"success": True, **result})
+    except MemoryOperationError as e:
+        return _json({"success": False, "error": str(e)})
+    except Exception as e:
+        return _json({"success": False, "error": f"Unexpected memory_consolidate error: {e}"})
+
+
 registry.register(
     name="memory_search",
     description=(
@@ -108,4 +123,30 @@ registry.register(
     },
     handler=memory_review,
     metadata={"summary": "只读审计长期记忆的重复、容量和易过期风险", "category": "memory"},
+)
+
+registry.register(
+    name="memory_consolidate",
+    description=(
+        "去重合并长期 memory：仅删除重复条目（保留每组首次出现），不动过长/易过期条目。"
+        "**人工批准闸门**：默认 confirm=false 只返回删除计划（dry-run，不改文件）；"
+        "必须在向用户说明后显式传 confirm=true 才会真正删除。请先用 memory_review 复核，"
+        "再在得到确认后执行。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "enum": ["all", "user", "memory"],
+                "description": "处理范围，默认 all",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "false（默认）只返回计划；true 才真正删除重复条目",
+            },
+        },
+    },
+    handler=memory_consolidate,
+    metadata={"summary": "去重合并长期记忆（需 confirm=true 才落盘）", "category": "memory"},
 )
