@@ -20,6 +20,14 @@ from core.context.budget_config import BudgetConfig, DEFAULT_BUDGET
 PERSISTED_OUTPUT_TAG = "<persisted-output>"
 PERSISTED_OUTPUT_CLOSING_TAG = "</persisted-output>"
 ARTIFACT_DIR = Path("sandbox") / "tool_outputs"
+# 迁移到 per-session 沙箱时，Agent 会设置该环境变量指向 <session-root>/tool_outputs。
+# 未设置时回退到全局 sandbox/tool_outputs（默认行为不变）。env 变量便于跨隔离子进程继承。
+ARTIFACT_DIR_ENV = "R_AGENT_TOOL_OUTPUTS_DIR"
+
+
+def _artifact_dir() -> Path:
+    override = os.environ.get(ARTIFACT_DIR_ENV, "").strip()
+    return Path(override) if override else ARTIFACT_DIR
 
 
 _ERROR_PATTERNS = (
@@ -38,11 +46,12 @@ def _safe_name(value: str, default: str = "tool") -> str:
 
 
 def _artifact_path(tool_name: str, tool_use_id: str, content: str) -> Path:
-    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    artifact_dir = _artifact_dir()
+    artifact_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S") + f"-{int(time.time() * 1000) % 1000:03d}"
     digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[:10]
     name = f"{stamp}_{_safe_name(tool_name)}_{_safe_name(tool_use_id, 'call')}_{digest}.txt"
-    return ARTIFACT_DIR / name
+    return artifact_dir / name
 
 
 def generate_preview(content: str, max_chars: int) -> tuple[str, bool]:

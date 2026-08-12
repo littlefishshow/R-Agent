@@ -1,6 +1,7 @@
 import time
 import random
 import json
+import os
 import threading
 import re
 from pathlib import Path
@@ -506,6 +507,14 @@ class RAgent:
             )
         self._sandbox_workspace.ensure()
         self.state.sandbox = self._sandbox_workspace.describe()
+        # 让大工具结果落盘也迁到本 session 沙箱下。用 env 变量传递，便于跨隔离
+        # 子进程继承；未启用时 tool_result_storage 仍回退全局 sandbox/tool_outputs。
+        try:
+            tool_outputs = self._sandbox_workspace.root / "tool_outputs"
+            tool_outputs.mkdir(parents=True, exist_ok=True)
+            os.environ["R_AGENT_TOOL_OUTPUTS_DIR"] = str(tool_outputs)
+        except Exception:
+            pass
         return self._sandbox_workspace
 
     def _resolve_run_events_dir(self):
@@ -514,6 +523,9 @@ class RAgent:
         默认沿用全局 ``sandbox/run_events``（旧路径）。仅当 per-session 沙箱启用时，
         把事件流迁到 ``<session-root>/run_events``，实现按会话隔离。异常时回退旧路径，
         绝不因目录解析问题打断对话。
+
+        同时负责协调 ``R_AGENT_TOOL_OUTPUTS_DIR`` 进程级 env：沙箱关闭时清除该 env，
+        避免上一次启用会话留下的路径污染本次全局落盘。
         """
         try:
             workspace = self.get_sandbox_workspace()
@@ -523,6 +535,8 @@ class RAgent:
                 return str(target)
         except Exception:
             pass
+        # 沙箱未启用（或解析失败）：清除可能残留的 tool_outputs 覆盖，回退全局路径。
+        os.environ.pop("R_AGENT_TOOL_OUTPUTS_DIR", None)
         return config.get_run_events_dir()
 
     def _apply_deferred_tool_filter(self, tools):
