@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import threading
 from pathlib import Path
@@ -267,9 +268,23 @@ def _shorten(text, limit=90):
     return text[: limit - 1] + "…"
 
 
+DELEGATE_CONTEXTS_DIR_ENV = "R_AGENT_DELEGATE_CONTEXTS_DIR"
+
+
+def _delegate_contexts_base() -> Path:
+    """委派上下文归档的根目录。
+
+    默认 ``sandbox/delegate_contexts``（旧路径）。启用 per-session 沙箱时，Agent 会把
+    env ``R_AGENT_DELEGATE_CONTEXTS_DIR`` 指向 ``<session-root>/delegate_contexts``，实现
+    按会话隔离。用 env 传递便于跨进程一致，也让删除的安全边界能覆盖两处根。
+    """
+    override = os.environ.get(DELEGATE_CONTEXTS_DIR_ENV, "").strip()
+    return Path(override) if override else Path("sandbox") / "delegate_contexts"
+
+
 def _context_dir(session_id=None):
     safe = str(session_id or "default").replace("/", "_").replace("..", "_")[:80] or "default"
-    path = Path("sandbox") / "delegate_contexts" / safe
+    path = _delegate_contexts_base() / safe
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -336,8 +351,12 @@ def _delete_context_artifact(path):
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
         candidate = candidate.resolve()
-        root = (Path.cwd() / "sandbox" / "delegate_contexts").resolve()
-        if root in candidate.parents and candidate.is_file():
+        # 安全边界：只允许删除位于全局或 per-session 委派上下文根下的文件。
+        allowed_roots = {
+            (Path.cwd() / "sandbox" / "delegate_contexts").resolve(),
+            _delegate_contexts_base().resolve(),
+        }
+        if any(root in candidate.parents for root in allowed_roots) and candidate.is_file():
             candidate.unlink()
             return True
     except Exception:

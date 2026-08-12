@@ -515,6 +515,13 @@ class RAgent:
             os.environ["R_AGENT_TOOL_OUTPUTS_DIR"] = str(tool_outputs)
         except Exception:
             pass
+        # 委派子 Agent 上下文归档同样迁到本 session 沙箱下。
+        try:
+            delegate_contexts = self._sandbox_workspace.root / "delegate_contexts"
+            delegate_contexts.mkdir(parents=True, exist_ok=True)
+            os.environ["R_AGENT_DELEGATE_CONTEXTS_DIR"] = str(delegate_contexts)
+        except Exception:
+            pass
         return self._sandbox_workspace
 
     def _resolve_run_events_dir(self):
@@ -535,8 +542,10 @@ class RAgent:
                 return str(target)
         except Exception:
             pass
-        # 沙箱未启用（或解析失败）：清除可能残留的 tool_outputs 覆盖，回退全局路径。
+        # 沙箱未启用（或解析失败）：清除可能残留的 tool_outputs / delegate_contexts
+        # 覆盖，回退全局路径。
         os.environ.pop("R_AGENT_TOOL_OUTPUTS_DIR", None)
+        os.environ.pop("R_AGENT_DELEGATE_CONTEXTS_DIR", None)
         return config.get_run_events_dir()
 
     def _apply_deferred_tool_filter(self, tools):
