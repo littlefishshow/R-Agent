@@ -12,3 +12,4 @@ uvicorn>=0.29.0
 websockets>=12.0
 pymupdf>=1.26.0
 pillow>=10.0.0
+prompt_toolkit>=3.0.0
