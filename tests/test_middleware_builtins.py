@@ -109,7 +109,7 @@ def test_sanitizer_rewrites_tool_message_in_loop(monkeypatch, tmp_path):
 # --------------------------------------------------------------------------- #
 # 2. MemoryWriteMiddleware
 # --------------------------------------------------------------------------- #
-def test_memory_write_calls_provider_add(monkeypatch, tmp_path):
+def test_memory_write_only_after_context_compression(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(registry, "get_all_schemas", lambda: [])
 
@@ -117,6 +117,9 @@ def test_memory_write_calls_provider_add(monkeypatch, tmp_path):
 
     class _P:
         def add(self, thread_id="", messages=None, agent_name=None, user_id=None):
+            raise AssertionError("compression hook should use add_compression")
+
+        def add_compression(self, thread_id="", messages=None):
             calls["add"] += 1
             calls["last_thread"] = thread_id
 
@@ -125,7 +128,39 @@ def test_memory_write_calls_provider_add(monkeypatch, tmp_path):
     agent.client = _FakeClient([_response(_message(content="ok", tool_calls=None))])
 
     assert agent.run_conversation("hi") == "ok"
-    # 一轮（最终答复）触发一次 after_iteration -> add
+    # 普通一轮不再触发 memory 抽取。
+    assert calls["add"] == 0
+
+    import core.agent as agent_mod
+
+    monkeypatch.setattr(
+        agent_mod,
+        "should_compress_context",
+        lambda *a, **k: {
+            "should_compress": True,
+            "estimated_tokens": 9000,
+            "usage_ratio": 0.9,
+        },
+    )
+    monkeypatch.setattr(
+        agent_mod,
+        "compress_messages",
+        lambda *a, **k: {
+            "success": True,
+            "compressed": True,
+            "compressed_messages": [{"role": "system", "content": "summary"}],
+            "summary": "summary",
+            "stats": {
+                "compressed_estimated_tokens": 3000,
+                "usage_ratio_after": 0.3,
+            },
+        },
+    )
+    agent.messages = [
+        {"role": "user", "content": "我偏好中文回复"},
+        {"role": "assistant", "content": "好的"},
+    ]
+    agent._maybe_compress_context([])
     assert calls["add"] == 1
     assert calls["last_thread"] == "sess-x"
 

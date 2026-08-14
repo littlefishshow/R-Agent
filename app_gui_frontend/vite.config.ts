@@ -5,6 +5,8 @@ import react from '@vitejs/plugin-react'
 
 const projectRoot = fileURLToPath(new URL('.', import.meta.url))
 const katexFontDir = resolve(projectRoot, '../node_modules/katex/dist/fonts')
+const backendPort = process.env.R_AGENT_COCKPIT_PORT || '8765'
+const backendTarget = `http://127.0.0.1:${backendPort}`
 
 export default defineConfig({
   plugins: [react()],
@@ -17,14 +19,14 @@ export default defineConfig({
       allow: [projectRoot, katexFontDir],
     },
     proxy: {
-      '/health': 'http://127.0.0.1:8765',
-      '/frontend': 'http://127.0.0.1:8765',
+      '/health': backendTarget,
+      '/frontend': backendTarget,
       '/sessions': {
-        target: 'http://127.0.0.1:8765',
+        target: backendTarget,
         ws: true,
       },
-      '/learning': 'http://127.0.0.1:8765',
-      '/workspace': 'http://127.0.0.1:8765',
+      '/learning': backendTarget,
+      '/workspace': backendTarget,
     },
   },
 })

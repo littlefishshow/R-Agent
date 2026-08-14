@@ -2,6 +2,15 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-08-14
+
+#### Web Search 默认搜索加速与可配置化
+
+- **避免默认搜索先卡 DuckDuckGo**：`web_search` 默认 provider 改为 `auto`，零配置回退的 `local_html` 默认顺序调整为 Bing → Yahoo → DuckDuckGo，避免 DuckDuckGo 不可达时每次先等待约 10 秒超时。
+- **增加搜索 provider 顺序配置**：新增 `WEB_SEARCH_PROVIDER_ORDER`，可自定义 `auto` 下的 API/provider 顺序；有 `GROUNDROUTE_API_KEY` / `SERPER_API_KEY` 时仍会优先对应 API provider，无 key 时自动跳过并回退本地 HTML 搜索。
+- **增加本地搜索与超时配置**：新增 `WEB_SEARCH_LOCAL_HTML_ORDER`、`WEB_SEARCH_LOCAL_HTML_TIMEOUT`、`WEB_SEARCH_API_TIMEOUT`，默认本地 HTML 单源超时缩短为 5 秒，API provider 超时默认 20 秒。
+- **补齐回归测试与实测验证**：更新 `tests/test_web_search_providers.py` 覆盖新默认值、可配置顺序和 fallback；实测 `auto`/`local_html` 查询均走 Bing，耗时约 1 秒内且无 DuckDuckGo timeout warning。
+
 ### 2026-08-12
 
 #### Cockpit GUI 思考轮数限制放开与截断续跑

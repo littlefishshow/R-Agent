@@ -305,7 +305,7 @@ export function App() {
       setSessions(Object.fromEntries((first ? roots.nodes : [s]).map(item => [item.session_id, item])))
       setAccountRootIds(first ? roots.nodes.map(item => item.session_id) : [s.session_id])
       await activateSession(s.session_id)
-      await refreshWorkspace('')
+      await refreshWorkspace('', s.session_id)
     } catch (err: any) {
       setError(err.message || String(err))
     }
@@ -608,13 +608,13 @@ export function App() {
     }
   }
 
-  async function refreshWorkspace(path = workspace?.cwd || '') {
+  async function refreshWorkspace(path = workspace?.cwd || '', sessionId = session?.session_id || '') {
     const expandedPaths = Object.entries(expandedFolders)
       .filter(([, value]) => value)
       .map(([key]) => key)
     const [listing, tree] = await Promise.all([
-      listWorkspaceFiles(path),
-      fetchWorkspaceTree(expandedPaths),
+      listWorkspaceFiles(path, sessionId),
+      fetchWorkspaceTree(expandedPaths, sessionId),
     ])
     setWorkspace(listing)
     setWorkspaceTree(tree.root)
@@ -624,7 +624,7 @@ export function App() {
     setExpandedFolders(prev => {
       const next = { ...prev, [path]: !prev[path] }
       const expandedPaths = Object.entries(next).filter(([, value]) => value).map(([key]) => key)
-      fetchWorkspaceTree(expandedPaths)
+      fetchWorkspaceTree(expandedPaths, session?.session_id || '')
         .then(tree => setWorkspaceTree(tree.root))
         .catch((err: any) => setError(err.message || String(err)))
       return next
@@ -689,6 +689,7 @@ export function App() {
     }
     try {
       await refreshActive(sessionId)
+      await refreshWorkspace('', sessionId)
     } finally {
       if (switchingSession) setEventsLoading(false)
     }
@@ -1621,13 +1622,13 @@ export function App() {
       return
     }
     if (item.is_pdf) {
-      const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path), type: 'pdf', loading: true }
+      const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path, false, session?.session_id || ''), type: 'pdf', loading: true }
       setOpenFiles(prev => ({ ...prev, [item.path]: tab }))
       setActiveFilePath(item.path)
       setActiveMode('files')
       await restoreFileHighlights(item.path)
       try {
-        const pdfText = await fetchWorkspacePdfText(item.path)
+        const pdfText = await fetchWorkspacePdfText(item.path, session?.session_id || '')
         setOpenFiles(prev => ({
           ...prev,
           [item.path]: {
@@ -1650,13 +1651,13 @@ export function App() {
       return
     }
     if (item.is_markdown) {
-      const markdownTab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path), type: 'markdown', loading: true, viewMode: 'preview' }
+      const markdownTab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path, false, session?.session_id || ''), type: 'markdown', loading: true, viewMode: 'preview' }
       setOpenFiles(prev => ({ ...prev, [item.path]: markdownTab }))
       setActiveFilePath(item.path)
       setActiveMode('files')
       await restoreFileHighlights(item.path)
       try {
-        const text = await fetchWorkspaceText(item.path)
+        const text = await fetchWorkspaceText(item.path, session?.session_id || '')
         setOpenFiles(prev => ({
           ...prev,
           [item.path]: {
@@ -1678,7 +1679,7 @@ export function App() {
       }
       return
     }
-    const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path), type: 'file' }
+    const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path, false, session?.session_id || ''), type: 'file' }
     setOpenFiles(prev => ({ ...prev, [item.path]: tab }))
     setActiveFilePath(item.path)
     setActiveMode('files')
@@ -1688,7 +1689,7 @@ export function App() {
     if (!files || !workspace) return
     try {
       for (const file of Array.from(files)) {
-        await uploadWorkspaceFile(targetPath, file)
+        await uploadWorkspaceFile(targetPath, file, session?.session_id || '')
       }
       await refreshWorkspace(targetPath)
     } catch (err: any) {
@@ -1701,7 +1702,7 @@ export function App() {
     const name = window.prompt('新文件夹名称')
     if (!name) return
     try {
-      await createWorkspaceFolder(targetPath, name)
+      await createWorkspaceFolder(targetPath, name, session?.session_id || '')
       await refreshWorkspace(targetPath)
     } catch (err: any) {
       setError(err.message || String(err))
@@ -1711,7 +1712,7 @@ export function App() {
   async function pasteClipboard() {
     if (!workspace || !clipboardPath) return
     try {
-      await copyWorkspaceItem(clipboardPath, workspace.cwd)
+      await copyWorkspaceItem(clipboardPath, workspace.cwd, undefined, session?.session_id || '')
       setClipboardPath(null)
       await refreshWorkspace(workspace.cwd)
     } catch (err: any) {
@@ -1722,7 +1723,7 @@ export function App() {
   async function removeWorkspaceItem(item: WorkspaceItem) {
     if (!window.confirm(`删除 ${item.name}？`)) return
     try {
-      await deleteWorkspaceItem(item.path)
+      await deleteWorkspaceItem(item.path, session?.session_id || '')
       setOpenFiles(prev => {
         const next = { ...prev }
         delete next[item.path]
@@ -1768,7 +1769,7 @@ export function App() {
     if (action === 'paste') {
       const target = contextTargetDir(item)
       if (!clipboardPath) return
-      copyWorkspaceItem(clipboardPath, target)
+      copyWorkspaceItem(clipboardPath, target, undefined, session?.session_id || '')
         .then(() => {
           setClipboardPath(null)
           return refreshWorkspace(target)
@@ -1781,7 +1782,7 @@ export function App() {
       return
     }
     if (action === 'download' && item?.type === 'file') {
-      window.open(workspaceOpenUrl(item.path, true), '_blank', 'noreferrer')
+      window.open(workspaceOpenUrl(item.path, true, session?.session_id || ''), '_blank', 'noreferrer')
       return
     }
     if (action === 'open' && item) {
@@ -1821,6 +1822,7 @@ export function App() {
 
     <main className={activeMode === 'files' ? 'learning-main file-mode' : 'learning-main'}>
       {activeMode === 'files' ? <FileWorkspacePanel
+        sessionId={session?.session_id || ''}
         openFiles={openFiles}
         activeFile={activeFile}
         activeFilePath={activeFilePath}
@@ -1870,7 +1872,7 @@ export function App() {
           const tab = openFiles[path]
           if (!tab) return
           try {
-            await saveWorkspaceText(path, tab.textContent || '')
+            await saveWorkspaceText(path, tab.textContent || '', session?.session_id || '')
             setOpenFiles(prev => ({
               ...prev,
               [path]: {
@@ -2653,8 +2655,9 @@ function FileContextMenu({ menu, clipboardPath, onAction }: {
   </div>
 }
 
-function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, onToggleMode, onSave, onSelection, onOpenHighlight }: {
+function MarkdownFileEditor({ tab, sessionId, highlights, scrollTop, onScroll, onUpdate, onToggleMode, onSave, onSelection, onOpenHighlight }: {
   tab: OpenFileTab
+  sessionId: string
   highlights: Record<string, HighlightRecord>
   scrollTop: number
   onScroll: (scrollTop: number) => void
@@ -2722,12 +2725,13 @@ function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, on
           }
           window.setTimeout(() => handleResult(readTextSelectionWithin(container)), 0)
         }}>
-          <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
+          <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} sourceSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
         </div>}
   </section>
 }
 
-function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighlights, textHighlights, pdfZoom, scrollPositions, onFileScroll, onZoomOut, onZoomIn, onActivate, onClose, onUpdateMarkdown, onToggleMarkdownMode, onSaveMarkdown, onMarkdownSelection, onPdfSelection, onOpenHighlight }: {
+function FileWorkspacePanel({ sessionId, openFiles, activeFile, activeFilePath, pdfHighlights, textHighlights, pdfZoom, scrollPositions, onFileScroll, onZoomOut, onZoomIn, onActivate, onClose, onUpdateMarkdown, onToggleMarkdownMode, onSaveMarkdown, onMarkdownSelection, onPdfSelection, onOpenHighlight }: {
+  sessionId: string
   openFiles: Record<string, OpenFileTab>
   activeFile: OpenFileTab | null
   activeFilePath: string | null
@@ -2773,6 +2777,7 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
       {activeFile.type === 'pdf'
         ? <PdfTextReader
             tab={activeFile}
+            sessionId={sessionId}
             highlights={pdfHighlights}
             zoom={pdfZoom}
             scrollTop={scrollPositions[activeFile.path] || 0}
@@ -2783,6 +2788,7 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
         : activeFile.type === 'markdown'
           ? <MarkdownFileEditor
               tab={activeFile}
+              sessionId={sessionId}
               highlights={Object.fromEntries(Object.entries(textHighlights).filter(([, item]) => item.chatId === `markdown:${activeFile.path}`))}
               scrollTop={scrollPositions[activeFile.path] || 0}
               onScroll={scrollTop => onFileScroll(activeFile.path, scrollTop)}
@@ -2840,8 +2846,9 @@ function WorkspaceFileFrame({ tab, scrollTop, onScroll }: {
   return <iframe ref={frameRef} className="pdf-frame" title={tab.name} src={tab.url} onLoad={restoreAndBind}/>
 }
 
-function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection, onOpenHighlight }: {
+function PdfTextReader({ tab, sessionId, highlights, zoom, scrollTop, onScroll, onSelection, onOpenHighlight }: {
   tab: OpenFileTab
+  sessionId: string
   highlights: Record<string, PdfHighlightRecord>
   zoom: number
   scrollTop: number
@@ -2869,6 +2876,7 @@ function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection
     {tab.pdfText.pages.map(page => <PdfPageView
       key={page.page}
       pdfPath={tab.path}
+      sessionId={sessionId}
       page={page}
       highlights={Object.values(highlights).filter(item => item.path === tab.path && item.page === page.page)}
       zoom={zoom}
@@ -2878,8 +2886,9 @@ function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection
   </div>
 }
 
-function PdfPageView({ pdfPath, page, highlights, zoom, onSelection, onOpenHighlight }: {
+function PdfPageView({ pdfPath, sessionId, page, highlights, zoom, onSelection, onOpenHighlight }: {
   pdfPath: string
+  sessionId: string
   page: NonNullable<OpenFileTab['pdfText']>['pages'][number]
   highlights: PdfHighlightRecord[]
   zoom: number
@@ -2949,7 +2958,7 @@ function PdfPageView({ pdfPath, page, highlights, zoom, onSelection, onOpenHighl
       onSelection(selected.text, page.page, rect, selected.rects)
     }}
   >
-    <img className="pdf-page-image" src={workspacePdfPageImageUrl(pdfPath, page.page, zoom)} alt={`Page ${page.page}`}/>
+    <img className="pdf-page-image" src={workspacePdfPageImageUrl(pdfPath, page.page, zoom, sessionId)} alt={`Page ${page.page}`}/>
     <div className="pdf-highlight-layer" aria-hidden="true">
       {highlightRects.map(rect => <span
         key={rect.id}
@@ -3757,7 +3766,7 @@ function renderMarkdownToHtml(text: string, options: {
   mathItems.forEach((item, index) => {
     html = html.split(`@@RAGENT_MATH_${index}@@`).join(renderMathPlaceholder(item))
   })
-  html = rewriteMarkdownAssetUrls(html, options.basePath || '')
+  html = rewriteMarkdownAssetUrls(html, options.basePath || '', options.sourceSessionId || '')
   html = applyMarkdownHighlights(html, options.chatId, options.sourceSessionId, options.highlights)
   html = wrapMarkdownTextTokens(html)
   return html
@@ -3804,16 +3813,16 @@ function renderMathPlaceholder(item: MathRenderPlaceholder): string {
   return `<${tag} class="${className}" data-md-math="1">${item.html}${source}</${tag}>`
 }
 
-function rewriteMarkdownAssetUrls(html: string, basePath: string): string {
+function rewriteMarkdownAssetUrls(html: string, basePath: string, sessionId = ''): string {
   if (!basePath) return html
   return html.replace(/\s(src|href)="([^"]+)"/g, (match, attr, rawUrl) => {
     const url = String(rawUrl || '')
     if (/^(https?:|data:|blob:|mailto:|#)/i.test(url)) return match
-    return ` ${attr}="${markdownRenderer.utils.escapeHtml(resolveWorkspaceRelativeUrl(basePath, url))}"`
+    return ` ${attr}="${markdownRenderer.utils.escapeHtml(resolveWorkspaceRelativeUrl(basePath, url, sessionId))}"`
   })
 }
 
-function resolveWorkspaceRelativeUrl(basePath: string, url: string): string {
+function resolveWorkspaceRelativeUrl(basePath: string, url: string, sessionId = ''): string {
   const cleanUrl = url.replace(/^\.\//, '')
   const baseParts = String(basePath || '').split('/').filter(Boolean)
   baseParts.pop()
@@ -3825,7 +3834,7 @@ function resolveWorkspaceRelativeUrl(basePath: string, url: string): string {
       baseParts.push(part)
     }
   }
-  return workspaceOpenUrl(baseParts.join('/'))
+  return workspaceOpenUrl(baseParts.join('/'), false, sessionId)
 }
 
 function wrapMarkdownTextTokens(html: string): string {

@@ -1,5 +1,291 @@
 # 07 · Skills 与自定义 Agent
 
+> 本章解释 R-Agent 如何发现、阅读、激活、维护和治理 Skills，以及当前所谓“自定义
+> Agent”究竟由哪些能力组合而成。实现快照：2026-08-14。
+
+## 1. Skill 不是一句 Prompt，而是一个受管理的能力包
+
+一个典型 Skill：
+
+```text
+skills/
+└── productivity/
+    └── weekly-report/
+        ├── SKILL.md
+        ├── references/
+        ├── templates/
+        ├── scripts/
+        └── assets/
+```
+
+`SKILL.md` 描述何时使用、怎样执行，并可声明工具白名单：
+
+```yaml
+---
+name: weekly-report
+description: 从项目记录生成结构化周报
+triggers: 周报, weekly report
+allowed_tools: [read_file, search_files, write_file]
+---
+```
+
+核心代码：
+
+- `core/skills.py:SkillManager`
+- `tools/skill_hierarchy_tool.py`
+- `tools/skills_tool.py`
+- `core/agent.py:_maybe_record_skill_context`
+- `core/agent.py:_maybe_apply_skill_policy`
+- `core/skill_usage.py`
+- `tools/skill_curator_tool.py`
+- `core/prompt_builder.py:build_system_prompt`
+
+## 2. 渐进式加载：先找目录，再读正文
+
+把所有 Skill 全文塞进 system prompt 会迅速撑大上下文。当前流程是：
+
+```mermaid
+flowchart LR
+    Q[用户任务] --> C[skill_search 查类目/关键词]
+    C --> V[skill_view 读取 SKILL.md]
+    V --> SC[写入 ThreadState.skill_context]
+    V --> A{需要限制工具?}
+    A -- 是 --> AC[skill_activate]
+    AC --> P[active_skill_policy]
+    P --> T[Schema + 执行期双重收窄]
+    A -- 否 --> E[按 Skill 指南执行]
+```
+
+### `skill_search`
+
+统一支持：
+
+- `categories`：列出类目和数量；
+- `by_category`：按类目列 Skill 摘要；
+- `search`：按名称、描述和 “When to Use” 关键词搜索。
+
+### `skill_view`
+
+读取完整 `SKILL.md` 或 supporting file。路径只能是：
+
+- `SKILL.md`
+- `references/`
+- `templates/`
+- `scripts/`
+- `assets/`
+- `Project_progress/`
+
+绝对路径、`..` 和未知顶层目录会被拒绝。
+
+## 3. Metadata 怎样解析
+
+`parse_skill_metadata()` 支持：
+
+1. `---` 包围的 YAML 风格 front matter；
+2. 文件顶部连续的 `key: value`；
+3. 无 metadata 时，从首个有意义文本行推断 description。
+
+当前解析字段：
+
+- `name`
+- `description`
+- `triggers`
+- `allowed_tools` / `allowed-tools`
+
+解析采用尽力而为策略，不引入完整 YAML 依赖。复杂多行 YAML、嵌套结构不是它的目标。
+
+## 4. 读过 Skill 后为什么不会立刻忘
+
+`skill_view` 工具执行后，主循环从结果中解析 Skill description，并写入：
+
+```json
+{
+  "skill": "weekly-report",
+  "summary": "从项目记录生成结构化周报"
+}
+```
+
+`merge_skill_context()` 按 Skill 名去重。开启 durable context 时，后续请求会看到精简
+Skill 引用，即使最初读取 `SKILL.md` 的完整消息已经被上下文压缩。
+
+这里保留的是“读过哪个 Skill、它做什么”，不是把全文永久复制进 `ThreadState`。
+需要 supporting file 时仍应按需读取。
+
+## 5. `skill_view` 和 `skill_activate` 不同
+
+### 只读 Skill
+
+`skill_view` 只加载知识，不改变工具权限。这允许 Agent 阅读一个 Skill 作为参考，而不被
+它的工具声明意外锁住。
+
+### 显式激活
+
+`skill_activate(action="activate", skill_name="weekly-report")`：
+
+1. 重新读取 `SKILL.md`；
+2. 解析 `allowed_tools`；
+3. 返回结构化策略；
+4. 主循环写入 `ThreadState.active_skill_policy`；
+5. 将这些工具加入 deferred promotion；
+6. 本轮后续 schema 与执行期都受白名单限制。
+
+若 Skill 没声明 `allowed_tools`，激活会失败，而不是把空列表解释成“禁止一切”。
+
+### 权限取交集
+
+```text
+有效工具 = 外部 allowed_tools ∩ Skill allowed_tools - exclude_tools
+```
+
+另外保留 `skill_activate`、`skill_view`、`skill_search`、`tool_search`，让模型仍能查看、
+切换或停用策略。
+
+`skill_activate(action="deactivate")` 会清空策略，恢复其它上层约束允许的工具。
+
+## 6. Skill 包的安全管理
+
+`skill_manage` 提供：
+
+- `create`
+- `edit` / `write_file`
+- `patch`
+- `remove_file`
+- `delete`
+- `usage`
+
+确定性边界包括：
+
+- Skill 名和类目必须是简单相对目录名；
+- 不允许路径穿越和隐藏目录；
+- 同名 Skill 出现在多个类目时要求先消歧；
+- `patch` 的 `old_string` 必须唯一匹配；
+- 不能用 `remove_file` 删除 `SKILL.md`，删除整个 Skill 必须走 `delete`；
+- supporting file 必须位于允许目录；
+- create 默认拒绝覆盖或创建跨类目同名副本。
+
+这些约束比单纯告诉模型“请小心修改 Skill”更可靠。
+
+## 7. 使用记录和生命周期治理
+
+`core/skill_usage.py` 在 `skills/.usage.json` 记录：
+
+- view/use/patch 次数；
+- 最近查看、使用、修改时间；
+- 创建来源；
+- `active` / `stale` / `archived`；
+- 是否 pinned；
+- 归档路径。
+
+写入采用锁和原子替换，失败不会打断 Skill 主功能。
+
+`skill_curator_manage` 支持：
+
+- `status`：查看状态；
+- `run`：按未活跃天数标 stale 或归档；
+- `pin`：保护某个 Skill；
+- `restore`：从 `.archive` 恢复。
+
+默认 `run` 是 dry-run。只有 Agent 创建的记录进入自动生命周期治理，人工维护 Skill 不会
+因为一段时间没用就被自动归档。
+
+需要注意：
+
+- 当前常规 `skill_view` 会增加 view 计数；
+- create/patch/edit 等操作会更新 create/patch 记录；
+- `skill_activate` 虽调用 `record_event(..., "activate")`，但 telemetry 的
+  `record_event()` 目前没有 `activate` 分支，因此不会增加 use/view/patch 计数；
+- 仓库也没有统一钩子能准确判断“模型是否真正遵循了 Skill 完成任务”，所以
+  `use_count` 不是完整的真实使用指标。
+
+## 8. R-Agent 当前的“自定义 Agent”是什么
+
+当前没有一个独立的：
+
+```text
+custom_agents/*.yaml
+→ 自动注册具名 Agent Profile
+→ 每个 Profile 声明 model/prompt/tools/middleware
+```
+
+已经实现的是三种可组合能力：
+
+### 8.1 `SOUL.md`：主 Agent 的稳定人格
+
+`build_system_prompt()` 首先加载项目根 `SOUL.md`。它控制身份、语气和稳定行为原则：
+
+- 文件不存在时可创建默认模板；
+- 内容过长时保留头尾并标注截断；
+- 明显 prompt injection / secret exfiltration 模式会被阻断；
+- 修改通常只影响之后重新构建 prompt 的会话。
+
+### 8.2 Skill：任务级方法和工具策略
+
+Skill 告诉同一个主 Agent “这类任务该怎么做”，可选地限制工具，但不会创建新的模型
+实例或独立身份。
+
+### 8.3 Sub-agent：运行级隔离执行者
+
+`delegate_task` 创建新的 `RAgent`，注入专用 system prompt、任务和工具边界。它是临时
+工作单元，不是可注册、可复用的具名 Custom Agent Profile。
+
+因此更准确的表述是：
+
+```text
+自定义行为 = SOUL 人格 + Skill 工作法/工具策略 + Sub-agent 临时角色
+```
+
+## 9. 一个完整例子
+
+用户要求生成周报：
+
+```text
+1. skill_search("周报") 找到 weekly-report
+2. skill_view("weekly-report") 读取流程
+3. skill_context 记录其摘要
+4. Skill 声明 read/search/write 三个工具
+5. 如任务需要严格只用这些工具，显式 skill_activate
+6. Agent 读取项目记录、套用 template、写出报告
+7. 完成后 skill_activate(deactivate)
+8. view/activate/patch 等行为进入 usage sidecar
+```
+
+如果周报任务很大，父 Agent 还可以把“收集提交记录”和“整理风险”交给隔离 Sub-agent，
+但它们仍是临时角色，不会自动变成永久自定义 Agent。
+
+## 10. 当前边界
+
+- metadata 不是完整 YAML parser；
+- Skill 目录来自仓库本地 `skills/`，没有内置远程 marketplace 安装协议；
+- `skill_context` 只保存摘要，不保存全文和 supporting files；
+- 激活策略只存在于当前 `RAgent` 的 `ThreadState`；
+- 没有 model override、middleware profile、temperature 等 Custom Agent 配置注册表；
+- 同名 Skill 跨类目会报歧义，不会静默任选；
+- curator 是确定性文件治理，不会自动判断 Skill 内容质量；
+- `SOUL.md` 是 system 权限内容，必须比普通 Skill/Memory 更严格审查。
+
+## 11. 如何验证
+
+```bash
+PYTHONPATH=. pytest -q \
+  tests/test_skill_context.py \
+  tests/test_skill_core_tools.py \
+  tests/test_self_evolution_skill_manage.py \
+  tests/test_self_evolution_review.py
+```
+
+重点测试：
+
+- `test_parse_metadata_front_matter_wrapped`
+- `test_list_skills_structured`
+- `test_skill_view_populates_skill_context`
+- `test_skill_policy_only_applies_after_explicit_activation`
+- `test_skill_policy_deactivate_restores_unrestricted_state`
+- `test_default_registry_exposes_five_core_skill_tools_only`
+
+---
+
+<template data-legacy-upgrade-log>
+
 **状态：🚧 进行中（2026-08-11：metadata 发现 + 结构化目录 + skill_context 持久 + 权限契约 + allowed-tools 已落地；仅 custom agent 待做）**
 **对应 deer-flow 学习文档：** 第 10 章（Skills 与 custom agent）
 **建议顺序：** 第 8 步（体验增强，可最后做）
@@ -108,8 +394,5 @@ python3 -m pytest tests/ -q -k "skill or agent or context or thread or event or 
 
 ## 6. 进度记录
 - 2026-08-11 · 建立简略计划。
-- 2026-08-11 · **落地步骤 1/2/3/5**：`core/skills.py` 加 `parse_skill_metadata` + `list_skills_structured`（`list_skills` 改用统一解析）；`core/agent.py` 加 `_maybe_record_skill_context`，`skill_view` 后把 skill 摘要写入 `skill_context`（去重，经 `03` durable context 回注 + authority contract）。新增 `tests/test_skill_context.py`（7 passed），零回归（272 passed）。allowed-tools（步骤 4）与 custom agent（步骤 6）留作独立后续项。
-- 2026-08-11 · **P2-2 allowed-tools 落地**：metadata 解析 `allowed_tools`；新增显式 `skill_activate activate/deactivate`；`ThreadState.active_skill_policy` 持久化当前策略；主循环 schema 与执行期双重收窄，并与外部 allowed_tools 取交集。普通 skill_view 不改变工具集。Skills 定向 9 passed，工具过滤回归 25 passed。仅 custom agent 待做。
 
-## 6. 进度记录
-- 2026-08-11 · 建立简略计划。
+</template>

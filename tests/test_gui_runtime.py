@@ -748,6 +748,38 @@ def test_learning_delete_sessions_for_workspace_directory_matches_prefix(monkeyp
     assert service.get_session(outside_prefix.session_id) is outside_prefix
 
 
+def test_learning_workspace_delete_can_be_scoped_to_one_session_tree(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path / "learning_context")
+    first = service.create_session(
+        session_id="first",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="notes/shared.md",
+    )
+    first_child = service.create_session(
+        session_id="first-child",
+        parent_session_id="first",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="selection",
+        file_path="notes/shared.md",
+    )
+    second = service.create_session(
+        session_id="second",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+        node_kind="file_root",
+        file_path="notes/shared.md",
+    )
+
+    result = service.delete_sessions_for_workspace_path(
+        "notes/shared.md",
+        session_id=first.session_id,
+    )
+
+    assert set(result["deleted_learning_sessions"]) == {first.session_id, first_child.session_id}
+    assert service.get_session(second.session_id) is second
+
+
 def test_learning_runtime_cleanup_saved_sessions(monkeypatch, tmp_path):
     monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
     root = tmp_path / "learn"

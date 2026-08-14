@@ -139,11 +139,10 @@ class LoopDetectionMiddleware(Middleware):
 
 
 class MemoryWriteMiddleware(Middleware):
-    """middleware 模式的记忆自动写入：一轮结束后把对话交给 provider.add(...)。
+    """上下文压缩成功后，把被压缩前的对话交给 provider.add(...)。
 
-    默认 provider 是文件型（``add`` 为 no-op），因此本中间件即使启用，默认也不会
-    自动改写记忆文件——它只是提供了自动写入的 **hook 点**。传入自定义 provider
-    （实现了实际 add 逻辑）时才会真正萃取写入。
+    不再每轮 after_iteration 写入，避免短对话/工具循环反复调用抽取 LLM。只有上下文
+    真正触发并成功完成压缩时才更新一次 memory；手动 ``memory`` 工具仍可随时写入。
     """
 
     name = "memory_write"
@@ -162,15 +161,21 @@ class MemoryWriteMiddleware(Middleware):
         except Exception:
             return None
 
-    def after_iteration(self, ctx: AgentContext) -> None:
+    def after_context_compression(self, ctx: AgentContext) -> None:
         provider = self._resolve_provider()
         if provider is None or not hasattr(provider, "add"):
             return
         agent = ctx.agent
         try:
-            messages = list(getattr(agent, "messages", []) or [])
+            messages = list(ctx.extra.get("pre_compression_messages") or [])
+            if not messages:
+                return
             thread_id = getattr(agent, "session_id", "") or ""
-            provider.add(thread_id=thread_id, messages=messages)
+            add_compression = getattr(provider, "add_compression", None)
+            if callable(add_compression):
+                add_compression(thread_id=thread_id, messages=messages)
+            else:
+                provider.add(thread_id=thread_id, messages=messages)
         except Exception:
             # 记忆写入是增强项，绝不打断主循环。
             return

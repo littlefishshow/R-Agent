@@ -81,6 +81,10 @@ class Middleware:
     def after_iteration(self, ctx: AgentContext) -> None:
         return None
 
+    def after_context_compression(self, ctx: AgentContext) -> None:
+        """上下文实际压缩成功后调用。"""
+        return None
+
 
 class MiddlewareChain:
     """按注册顺序运行中间件的调度器；单个中间件异常被吞掉，绝不打断主循环。"""
@@ -159,6 +163,13 @@ class MiddlewareChain:
                 mw.after_iteration(ctx)
             except Exception as exc:  # noqa: BLE001
                 self._record_error("after_iteration", mw, exc)
+
+    def run_after_context_compression(self, ctx: AgentContext) -> None:
+        for mw in self._middlewares:
+            try:
+                mw.after_context_compression(ctx)
+            except Exception as exc:  # noqa: BLE001
+                self._record_error("after_context_compression", mw, exc)
 
 
 def build_default_middlewares() -> list:

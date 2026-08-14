@@ -27,6 +27,28 @@ _USER_AGENT = (
 # a result."  Disabling implicit OS proxy discovery keeps web tools fork-safe.
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+_DEFAULT_LOCAL_HTML_ORDER = "bing,yahoo,duckduckgo"
+_DEFAULT_LOCAL_HTML_TIMEOUT_SECONDS = 5
+_DEFAULT_API_TIMEOUT_SECONDS = 20
+
+
+def _env_int(name: str, default: int, *, minimum: int = 1, maximum: int = 120) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(minimum, min(int(raw), maximum))
+    except ValueError:
+        return default
+
+
+def _split_provider_list(raw: str) -> List[str]:
+    return [
+        item.strip().lower().replace("-", "_")
+        for item in re.split(r"[,\s]+", raw or "")
+        if item.strip()
+    ]
+
 
 def _json_success(payload: Dict[str, Any]) -> str:
     return json.dumps({"success": True, **payload}, ensure_ascii=False)
@@ -228,9 +250,18 @@ def _normalize_result(raw: Dict[str, Any], source: str) -> Dict[str, str]:
     }
 
 
+def _local_html_provider_order() -> List[str]:
+    raw_order = os.getenv("WEB_SEARCH_LOCAL_HTML_ORDER", _DEFAULT_LOCAL_HTML_ORDER)
+    providers = []
+    for provider in _split_provider_list(raw_order):
+        if provider in {"duckduckgo", "bing", "yahoo"} and provider not in providers:
+            providers.append(provider)
+    return providers or _split_provider_list(_DEFAULT_LOCAL_HTML_ORDER)
+
+
 def _search_local_html(query: str, limit: int) -> Dict[str, Any]:
     provider_errors = []
-    for provider in ("duckduckgo", "bing", "yahoo"):
+    for provider in _local_html_provider_order():
         try:
             results = _search_with_provider(provider, query, limit)
             if results:
@@ -277,7 +308,7 @@ def _search_serper(query: str, limit: int) -> Dict[str, Any]:
         "https://google.serper.dev/search",
         {"q": cleaned_query, "num": count},
         {"X-API-KEY": api_key},
-        timeout=30,
+        timeout=_env_int("WEB_SEARCH_API_TIMEOUT", _DEFAULT_API_TIMEOUT_SECONDS),
     )
     items = data.get("organic") or []
     if not isinstance(items, list):
@@ -329,7 +360,7 @@ def _search_groundroute(query: str, limit: int) -> Dict[str, Any]:
         "https://api.groundroute.ai/v1/search",
         {"query": query, "max_results": count},
         {"Authorization": f"Bearer {api_key}"},
-        timeout=30,
+        timeout=_env_int("WEB_SEARCH_API_TIMEOUT", _DEFAULT_API_TIMEOUT_SECONDS),
     )
     items = data.get("results") or []
     if not isinstance(items, list):
@@ -366,14 +397,26 @@ def _search_groundroute(query: str, limit: int) -> Dict[str, Any]:
 
 
 def _provider_order(provider: str) -> List[str]:
-    normalized = (provider or "local_html").strip().lower().replace("-", "_")
+    normalized = (provider or "auto").strip().lower().replace("-", "_")
     if normalized in {"auto", "best"}:
+        configured_order = _split_provider_list(os.getenv("WEB_SEARCH_PROVIDER_ORDER", ""))
+        base_order = configured_order or ["groundroute", "serper", "local_html"]
         order = []
-        if os.getenv("GROUNDROUTE_API_KEY", "").strip():
-            order.append("groundroute")
-        if os.getenv("SERPER_API_KEY", "").strip():
-            order.append("serper")
-        order.append("local_html")
+        for candidate in base_order:
+            if candidate in {"ground_route", "groundroute"}:
+                candidate = "groundroute"
+            elif candidate in {"google", "serper"}:
+                candidate = "serper"
+            elif candidate in {"local", "html", "local_html", "duckduckgo", "bing", "yahoo"}:
+                candidate = "local_html"
+            if candidate == "groundroute" and not os.getenv("GROUNDROUTE_API_KEY", "").strip():
+                continue
+            if candidate == "serper" and not os.getenv("SERPER_API_KEY", "").strip():
+                continue
+            if candidate in {"groundroute", "serper", "local_html"} and candidate not in order:
+                order.append(candidate)
+        if "local_html" not in order:
+            order.append("local_html")
         return order
     if normalized in {"local", "html", "local_html", "duckduckgo"}:
         return ["local_html"]
@@ -404,27 +447,33 @@ def _search_provider(provider: str, query: str, limit: int) -> Dict[str, Any]:
 def _search_with_provider(provider: str, query: str, limit: int) -> List[Dict[str, str]]:
     encoded = urllib.parse.quote(query)
     if provider == "duckduckgo":
-        page_html = _fetch_text("https://html.duckduckgo.com/html/?q=" + encoded, timeout=10)
+        page_html = _fetch_text("https://html.duckduckgo.com/html/?q=" + encoded, timeout=_env_int("WEB_SEARCH_LOCAL_HTML_TIMEOUT", _DEFAULT_LOCAL_HTML_TIMEOUT_SECONDS))
         if "anomaly" in page_html[:20000].lower() and "result__" not in page_html:
             return []
         return _parse_duckduckgo_results(page_html, limit)
     if provider == "bing":
-        page_html = _fetch_text("https://www.bing.com/search?q=" + encoded, timeout=10)
+        page_html = _fetch_text("https://www.bing.com/search?q=" + encoded, timeout=_env_int("WEB_SEARCH_LOCAL_HTML_TIMEOUT", _DEFAULT_LOCAL_HTML_TIMEOUT_SECONDS))
         return _parse_bing_results(page_html, limit)
     if provider == "yahoo":
-        page_html = _fetch_text("https://search.yahoo.com/search?p=" + encoded, timeout=10)
+        page_html = _fetch_text("https://search.yahoo.com/search?p=" + encoded, timeout=_env_int("WEB_SEARCH_LOCAL_HTML_TIMEOUT", _DEFAULT_LOCAL_HTML_TIMEOUT_SECONDS))
         return _parse_yahoo_results(page_html, limit)
     return []
 
 
-def web_search_tool(query: str, limit: int = 5, provider: str = "local_html") -> str:
+def web_search_tool(query: str, limit: int = 5, provider: str = "auto") -> str:
     """Search the web using a selectable provider.
 
     Providers:
-    - local_html: zero-key DuckDuckGo -> Bing -> Yahoo fallback.
+    - auto: use configured API providers first, then local_html.
+    - local_html: zero-key Bing -> Yahoo -> DuckDuckGo fallback by default.
     - serper: Google Search via SERPER_API_KEY.
     - groundroute: meta search via GROUNDROUTE_API_KEY.
-    - auto: use configured API providers first, then local_html.
+
+    Environment knobs:
+    - WEB_SEARCH_PROVIDER_ORDER=groundroute,serper,local_html
+    - WEB_SEARCH_LOCAL_HTML_ORDER=bing,yahoo,duckduckgo
+    - WEB_SEARCH_LOCAL_HTML_TIMEOUT=5
+    - WEB_SEARCH_API_TIMEOUT=20
     """
     try:
         limit = max(1, min(int(limit), 50))
@@ -432,7 +481,7 @@ def web_search_tool(query: str, limit: int = 5, provider: str = "local_html") ->
         limit = 5
 
     warnings = []
-    normalized_provider = (provider or "local_html").strip().lower().replace("-", "_")
+    normalized_provider = (provider or "auto").strip().lower().replace("-", "_")
     allow_fallback = normalized_provider in {"auto", "best"}
     for selected_provider in _provider_order(provider):
         try:
@@ -484,7 +533,7 @@ def web_extract_tool(urls: list) -> str:
 
 registry.register(
     name="web_search",
-    description="在互联网上搜索信息。默认使用零配置本地 HTML 搜索，也可通过 provider 选择 serper、groundroute 或 auto。",
+    description="在互联网上搜索信息。默认 auto：优先使用已配置 API provider，再回退到零配置本地 HTML 搜索。",
     parameters={
         "type": "object",
         "properties": {
@@ -492,8 +541,8 @@ registry.register(
             "limit": {"type": "integer", "description": "最大返回结果数 (默认 5)", "default": 5},
             "provider": {
                 "type": "string",
-                "description": "搜索提供方：local_html（默认，DuckDuckGo/Bing/Yahoo fallback）、serper、groundroute、auto",
-                "default": "local_html",
+                "description": "搜索提供方：auto（默认；已配置 API provider 优先，否则 local_html）、local_html（默认 Bing/Yahoo/DuckDuckGo fallback，可用 WEB_SEARCH_LOCAL_HTML_ORDER 调整）、serper、groundroute",
+                "default": "auto",
             },
         },
         "required": ["query"],

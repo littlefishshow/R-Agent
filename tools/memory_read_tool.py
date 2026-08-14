@@ -14,8 +14,29 @@ def _json(data) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def memory_search(query: str, target: str = "all", max_results: int = 5) -> str:
-    """在持久化 memory 中搜索关键词，返回匹配行摘要。"""
+def memory_search(
+    query: str,
+    target: str = "all",
+    max_results: int = 5,
+    session_id: str = "",
+) -> str:
+    """在持久化 memory 中搜索关键词，返回匹配行摘要。
+
+    MEMORY_PROVIDER=deermem 时走结构化事实库的 FTS5 检索（返回带 confidence/category
+    的 fact）；默认 file backend 时走原有的关键词计数搜索，行为不变。
+    """
+    try:
+        from core import config
+        from core.memory_provider import get_memory_provider
+
+        provider_name = config.get_memory_provider_name()
+        if provider_name == "deermem":
+            provider = get_memory_provider("deermem")
+            result = provider.search(query, top_k=max_results, thread_id=session_id or None)
+            return _json({"success": True, "provider": "deermem", **result})
+    except Exception:
+        # 解析/检索出错时退回文件型搜索，保证 memory_search 永不因新 backend 崩溃。
+        pass
     try:
         return _json({"success": True, **memory_manager.search_memory(query, target, max_results)})
     except MemoryOperationError as e:
@@ -75,6 +96,10 @@ registry.register(
             "query": {"type": "string", "description": "搜索关键词；可包含多个空格分隔词"},
             "target": {"type": "string", "enum": ["all", "user", "memory"], "description": "搜索范围，默认 all"},
             "max_results": {"type": "integer", "description": "最大返回结果数，范围 1-50，默认 5"},
+            "session_id": {
+                "type": "string",
+                "description": "当前 session ID；Agent 会自动注入，用于检索临时情节记忆",
+            },
         },
         "required": ["query"],
     },

@@ -1,8 +1,11 @@
 openai>=1.0.0
 rich>=13.0.0
+cloudpickle>=3.0.0
 python-dotenv>=1.0.0
 pytest>=8.0.0
 PyNaCl>=1.5.0
+# deermem 记忆检索的中文分词（缺失时回退到无依赖的 CJK unigram+bigram 切分）
+jieba>=0.42.1
 # /bbb 终端语音输入录音后端；系统也可用 sox/rec/arecord/ffmpeg 替代
 sounddevice>=0.4.6
 

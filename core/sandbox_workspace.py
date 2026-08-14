@@ -1,17 +1,13 @@
 """Per-session sandbox compatibility layer.
 
-This module introduces deer-flow-style workspace semantics without migrating
-existing R-Agent paths yet. It is deliberately opt-in and lazy:
+This module provides deer-flow-style workspace semantics for session-scoped
+tools and GUI resources. It is deliberately opt-in and lazy:
 
 * no directory is created until ``ensure()`` or ``resolve_virtual()`` is called;
 * each session gets an isolated root under ``sandbox/sessions/<session_id>``;
 * virtual paths map to local directories:
   ``/mnt/user-data/workspace``, ``uploads``, ``outputs``, and ``/mnt/skills``;
 * path traversal and unknown virtual roots are rejected.
-
-Existing ``sandbox/todo_lists``, ``delegate_contexts``, ``tool_outputs`` and
-``run_events`` remain untouched. Later migration can route tools through this
-layer one subsystem at a time.
 """
 
 from __future__ import annotations
@@ -58,6 +54,10 @@ class SandboxWorkspace:
     def outputs(self) -> Path:
         return self.root / "outputs"
 
+    @property
+    def todo_lists(self) -> Path:
+        return self.root / "todo_lists"
+
     def ensure(self) -> "SandboxWorkspace":
         for directory in (self.workspace, self.uploads, self.outputs):
             directory.mkdir(parents=True, exist_ok=True)
@@ -70,6 +70,7 @@ class SandboxWorkspace:
             "workspace": str(self.workspace),
             "uploads": str(self.uploads),
             "outputs": str(self.outputs),
+            "todo_lists": str(self.todo_lists),
             "skills": str(self.skills_root),
             "virtual_paths": {
                 VIRTUAL_WORKSPACE: str(self.workspace),

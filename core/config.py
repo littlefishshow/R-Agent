@@ -1,3 +1,4 @@
+import json
 import os
 from dotenv import load_dotenv
 
@@ -181,15 +182,66 @@ def get_context_compression_preserve_recent_messages():
     return max(4, n)
 
 
+def _parse_context_size(value, *, allow_list=False):
+    try:
+        parsed = json.loads(value) if isinstance(value, str) else value
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    items = parsed if allow_list and isinstance(parsed, list) else [parsed]
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            return None
+        kind = str(item.get("type") or "").strip().lower()
+        raw_value = item.get("value")
+        if kind not in ("tokens", "messages", "fraction"):
+            return None
+        try:
+            number = float(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if number <= 0 or (kind == "fraction" and number > 1):
+            return None
+        normalized.append((kind, int(number) if kind in ("tokens", "messages") else number))
+    return normalized if allow_list else normalized[0]
+
+
+def get_context_compression_triggers():
+    """上下文压缩触发条件；列表内任一 tokens/messages/fraction 条件满足即触发。"""
+    raw = os.environ.get("CONTEXT_COMPRESSION_TRIGGERS", "").strip()
+    parsed = _parse_context_size(raw, allow_list=True) if raw else None
+    if parsed:
+        return parsed
+    return [("fraction", get_context_compression_trigger_ratio())]
+
+
+def get_context_compression_keep():
+    """压缩后保留策略；支持 messages、tokens 或模型窗口 fraction。"""
+    raw = os.environ.get("CONTEXT_COMPRESSION_KEEP", "").strip()
+    parsed = _parse_context_size(raw) if raw else None
+    if parsed:
+        return parsed
+    return ("messages", get_context_compression_preserve_recent_messages())
+
+
 def get_context_summarization_mode():
-    """上下文摘要策略：heuristic（默认、零额外调用）或 llm（质量更高、失败自动回退）。"""
-    raw = str(os.environ.get("CONTEXT_SUMMARIZATION_MODE", "heuristic")).strip().lower()
-    return raw if raw in ("heuristic", "llm") else "heuristic"
+    """上下文摘要策略：llm（默认、复用当前模型）或 heuristic（零额外调用）。"""
+    raw = str(os.environ.get("CONTEXT_SUMMARIZATION_MODE", "llm")).strip().lower()
+    return raw if raw in ("heuristic", "llm") else "llm"
 
 
 def get_context_summarization_model():
     """可选的专用摘要模型；为空时复用当前 run model。"""
     return os.environ.get("CONTEXT_SUMMARIZATION_MODEL", "").strip()
+
+
+def get_context_summarization_input_tokens():
+    """摘要模型可接收的旧摘要 + 新历史预算，不含固定 prompt 文本。"""
+    try:
+        value = int(os.environ.get("CONTEXT_SUMMARIZATION_INPUT_TOKENS", "15564"))
+    except ValueError:
+        value = 15564
+    return max(256, value)
 
 
 def get_run_events_enabled():
@@ -249,13 +301,162 @@ def get_tool_sanitization_mode():
 
 
 def get_memory_write_middleware_enabled():
-    """是否启用 middleware 模式的记忆自动写入 hook。默认关闭，保持现状。
+    """是否启用“上下文压缩成功后”自动更新 memory 的 hook。默认关闭。
 
     注意：即使开启，默认文件型 provider 的 add() 仍是 no-op（只提供 hook 点），
     不会自动改写记忆文件；需要自定义 provider 才会真正萃取写入。
     """
     raw = str(os.environ.get("MEMORY_WRITE_MIDDLEWARE_ENABLED", "0")).strip().lower()
     return raw not in ("0", "false", "no", "off", "")
+
+
+# ---------------------------------------------------------------------------
+# deermem backend 私有旋钮（仅在 MEMORY_PROVIDER=deermem 时生效）。默认值对齐
+# deer-flow DeerMemConfig，按 R-Agent 场景微调（见 memory_progress/）。
+# ---------------------------------------------------------------------------
+def get_memory_max_facts():
+    """事实库容量上限；超出按 confidence 淘汰最低的。默认 200。"""
+    try:
+        n = int(os.environ.get("MEMORY_MAX_FACTS", "200"))
+    except ValueError:
+        n = 200
+    return max(10, n)
+
+
+def get_memory_fact_confidence_threshold():
+    """新 fact 落盘的最小 confidence。默认 0.5（比 deer-flow 的 0.7 更宽松，首轮少漏写）。"""
+    try:
+        v = float(os.environ.get("MEMORY_FACT_CONFIDENCE_THRESHOLD", "0.5"))
+    except ValueError:
+        v = 0.5
+    return max(0.0, min(v, 1.0))
+
+
+def get_memory_max_injection_tokens():
+    """记忆注入的 token/字符预算上限。默认 2000。"""
+    try:
+        n = int(os.environ.get("MEMORY_MAX_INJECTION_TOKENS", "2000"))
+    except ValueError:
+        n = 2000
+    return max(100, n)
+
+
+def get_memory_guaranteed_categories():
+    """无论预算如何都优先注入的保底类别（逗号分隔）。默认 correction。"""
+    raw = os.environ.get("MEMORY_GUARANTEED_CATEGORIES", "").strip()
+    if raw:
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return ["correction"]
+
+
+def get_memory_guaranteed_token_budget():
+    """保底类别 fact 的 token/字符预算上限。默认 500。"""
+    try:
+        n = int(os.environ.get("MEMORY_GUARANTEED_TOKEN_BUDGET", "500"))
+    except ValueError:
+        n = 500
+    return max(50, n)
+
+
+def get_memory_staleness_enabled():
+    """是否启用 staleness 自动复查（过期 fact 删除/续期）。默认关闭。"""
+    raw = str(os.environ.get("MEMORY_STALENESS_ENABLED", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_memory_consolidation_enabled():
+    """是否启用 consolidation 自动合并（碎片 fact 合并）。默认关闭。"""
+    raw = str(os.environ.get("MEMORY_CONSOLIDATION_ENABLED", "0")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_memory_governance_interval_days():
+    """自动整理 memory 的最小间隔天数。默认 3 天。"""
+    try:
+        value = float(os.environ.get("MEMORY_GOVERNANCE_INTERVAL_DAYS", "3"))
+    except ValueError:
+        value = 3.0
+    return max(0.0, value)
+
+
+def get_memory_session_facts_enabled():
+    """是否启用 session 级情节记忆：细粒度、带溯源 metadata（dia_id/session/date/speaker）、
+    可检索、session 结束即消失。默认**开启**——它不写入 durable 库、不影响跨会话记忆，
+    只是在当前 session 内保留细节供检索（如 LoCoMo evidence recall）。设 0 关闭。
+    """
+    raw = str(os.environ.get("MEMORY_SESSION_FACTS_ENABLED", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off", "")
+
+
+def get_memory_staleness_age_days():
+    """fact 超过多少天成为 staleness 候选。默认 90。"""
+    try:
+        n = int(os.environ.get("MEMORY_STALENESS_AGE_DAYS", "90"))
+    except ValueError:
+        n = 90
+    return max(1, n)
+
+
+def get_memory_staleness_max_removals_per_cycle():
+    """单个 staleness 周期最多删除多少 fact。默认 10。"""
+    try:
+        n = int(os.environ.get("MEMORY_STALENESS_MAX_REMOVALS_PER_CYCLE", "10"))
+    except ValueError:
+        n = 10
+    return max(1, n)
+
+
+def get_memory_staleness_protected_categories():
+    """staleness/consolidation 免疫的保护类别（逗号分隔）。默认 correction。"""
+    raw = os.environ.get("MEMORY_STALENESS_PROTECTED_CATEGORIES", "").strip()
+    if raw:
+        return [t.strip() for t in raw.split(",") if t.strip()]
+    return ["correction"]
+
+
+def get_memory_staleness_max_extension_days():
+    """续期后 expected_valid_days 的绝对上限。默认 3650。"""
+    try:
+        n = int(os.environ.get("MEMORY_STALENESS_MAX_EXTENSION_DAYS", "3650"))
+    except ValueError:
+        n = 3650
+    return max(1, n)
+
+
+def get_memory_staleness_max_lifetime_multiplier():
+    """创建时 expected_valid_days 的钳制倍数（staleness_age_days * multiplier）。默认 20。"""
+    try:
+        v = float(os.environ.get("MEMORY_STALENESS_MAX_LIFETIME_MULTIPLIER", "20.0"))
+    except ValueError:
+        v = 20.0
+    return max(1.0, v)
+
+
+def get_memory_consolidation_min_facts():
+    """单类别 fact 数达到多少才触发合并复查。默认 8。"""
+    try:
+        n = int(os.environ.get("MEMORY_CONSOLIDATION_MIN_FACTS", "8"))
+    except ValueError:
+        n = 8
+    return max(3, n)
+
+
+def get_memory_consolidation_max_groups_per_cycle():
+    """单周期最多合并多少组。默认 3。"""
+    try:
+        n = int(os.environ.get("MEMORY_CONSOLIDATION_MAX_GROUPS_PER_CYCLE", "3"))
+    except ValueError:
+        n = 3
+    return max(1, n)
+
+
+def get_memory_consolidation_max_sources():
+    """单组最多合并多少源 fact。默认 8。"""
+    try:
+        n = int(os.environ.get("MEMORY_CONSOLIDATION_MAX_SOURCES", "8"))
+    except ValueError:
+        n = 8
+    return max(2, n)
 
 
 def get_loop_detection_enabled():

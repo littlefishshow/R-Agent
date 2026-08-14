@@ -60,3 +60,5 @@ skills/productivity/paper_research_scout/references/read_papers.json
 
 # Benchmark evaluation workspace (cloned benchmarks, adapters, results)
 evals/
+memories/
+memory_progress/

@@ -8,6 +8,8 @@ import multiprocessing
 import threading
 from typing import Callable, Dict, Any, List, Optional, Type
 
+import cloudpickle
+
 
 def _json_error(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
@@ -27,6 +29,11 @@ def _terminate_process(process: multiprocessing.Process, join_timeout: float = 1
         if callable(kill):
             kill()
             process.join(timeout=join_timeout)
+
+
+def _tool_process_start_method(platform: Optional[str] = None) -> str:
+    """Choose a safe multiprocessing start method for isolated tools."""
+    return "spawn" if (platform or sys.platform) in ("darwin", "win32") else "fork"
 
 
 def _execute_tool_from_mapping(tools: Dict[str, Dict[str, Any]], name: str, args_json: str) -> str:
@@ -50,7 +57,7 @@ def _execute_tool_from_mapping(tools: Dict[str, Dict[str, Any]], name: str, args
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def _tool_process_entry(conn, tools_snapshot, name: str, args_json: str):
+def _tool_process_entry(conn, tools_payload, name: str, args_json: str):
     """Child-process entry point for isolated tool execution.
 
     The child always attempts to send a JSON string back to the parent.  When a
@@ -59,6 +66,7 @@ def _tool_process_entry(conn, tools_snapshot, name: str, args_json: str):
     tools in the child as a compatibility fallback for spawn-based platforms.
     """
     try:
+        tools_snapshot = cloudpickle.loads(tools_payload) if tools_payload is not None else None
         if tools_snapshot is not None:
             result = _execute_tool_from_mapping(tools_snapshot, name, args_json)
         else:
@@ -241,28 +249,31 @@ class ToolRegistry:
                 return json.dumps({"error": f"Tool '{name}' not found."})
             tools_snapshot = dict(self._tools)
 
-        # Prefer fork where available: it preserves dynamically registered or
-        # otherwise unpickleable handlers while still isolating execution in a
-        # child process.  Fall back to the platform default (usually spawn on
-        # Windows), where module-defined tools are reloaded if the snapshot cannot
-        # be serialized.
+        # macOS warns (and may deadlock) when a multi-threaded process forks.
+        # cloudpickle preserves dynamically registered lambdas/closures across
+        # spawn, so macOS and Windows can use the safe start method without
+        # losing the registry snapshot. Linux keeps fork for lower overhead.
+        start_method = _tool_process_start_method()
         try:
-            ctx = multiprocessing.get_context("fork")
+            ctx = multiprocessing.get_context(start_method)
         except ValueError:
-            ctx = multiprocessing.get_context()
+            ctx = multiprocessing.get_context("spawn")
+        try:
+            tools_payload = cloudpickle.dumps(tools_snapshot)
+        except Exception:
+            tools_payload = None
 
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
             target=_tool_process_entry,
-            args=(child_conn, tools_snapshot, name, args_json),
+            args=(child_conn, tools_payload, name, args_json),
             daemon=True,
         )
 
         try:
             process.start()
         except Exception as exc:
-            # Spawn may fail when a dynamically registered handler is not
-            # pickleable.  Retry without the snapshot; child reloads module tools.
+            # Retry without the snapshot; child reloads module-defined tools.
             start_error = exc
             try:
                 parent_conn.close()

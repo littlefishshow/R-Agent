@@ -1,5 +1,307 @@
 # 05 · 子 Agent 委派契约
 
+> 本章解释父 Agent 如何拆任务、并行启动隔离子 Agent、共享 Todo 状态但不共享完整对话，
+> 以及失败、超时和上下文回收如何处理。实现快照：2026-08-14。
+
+## 1. 一句话理解
+
+父 Agent 像项目经理，子 Agent 像外包工程师：
+
+- 项目经理维护任务看板和依赖；
+- 每位工程师只拿到自己的任务说明；
+- 工程师有独立聊天历史和 `ThreadState`；
+- 进度写回共享 Todo，而不是把全部聊天记录交给经理；
+- 失败时完整上下文保存为 artifact，只有需要排障才读取；
+- 全部任务成功后统一清理上下文 artifact。
+
+核心代码：
+
+- `tools/todo_tool.py:todo_manage`
+- `tools/delegate_tool.py:delegate_task`
+- `tools/delegate_tool.py:_run_subagent`
+- `core/middleware/builtins.py:LoopDetectionMiddleware`
+- `core/agent.py:_parse_delegation_entries`
+
+## 2. Todo 是调度真值
+
+委派前，父 Agent 应先用 `todo_manage` 建立任务图。任务不仅有描述，还可以包含：
+
+```json
+{
+  "id": "docs.memory",
+  "description": "核对并重写 Memory 章节",
+  "parent_id": "docs",
+  "dependencies": ["docs.context"],
+  "acceptance_criteria": ["覆盖双 backend", "包含可运行测试"],
+  "deliverable": "Improve_progress/04_Memory系统.md",
+  "status": "pending"
+}
+```
+
+### 状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> pending
+    pending --> in_progress: claim
+    in_progress --> completed: update
+    in_progress --> failed: update
+    in_progress --> blocked: 超时/预算耗尽/模型错误
+    pending --> needs_split: propose_split
+    needs_split --> blocked: approve_split 并创建子任务
+    needs_split --> pending: reject_split 后重试
+    pending --> cancelled
+```
+
+### Ready 任务
+
+`_ready_tasks()` 只返回：
+
+- `status=pending`；
+- 所有依赖都 completed；
+- 自己没有子任务的叶子节点。
+
+因此父任务一旦拆成子任务，就不会再和子任务同时被领取。
+
+### Session 隔离
+
+每个 session 使用独立 Todo 文件：
+
+- 默认兼容路径：`sandbox/todo_lists/todo_list_<session>.json`；
+- 开启 session sandbox：`<session-root>/todo_lists/todo_list.json`；
+- 空 session 保留旧 `sandbox/todo_list.json` 行为。
+
+`ContextVar`、显式 `session_id` 和 Agent 工具参数注入共同保证父子 Agent 操作同一块看板，
+而不同终端不会互相覆盖。
+
+## 3. 委派前的契约
+
+`delegate_task(tasks=...)` 现在要求每个任务必须绑定 `task_id` 或 `id`。裸 goal 会被拒绝，
+因为没有看板 id 就无法可靠领取、更新、阻塞和重试。
+
+推荐调用：
+
+```json
+[
+  {
+    "task_id": "docs.memory",
+    "goal": "阅读 memory provider、extractor、facts 和对应测试后重写章节",
+    "max_iterations": 20,
+    "wall_timeout_seconds": 300
+  }
+]
+```
+
+父 Agent 必须让 goal/context_summary 自包含。子 Agent 看不到父对话完整历史，不能依赖
+“你知道我刚才说的那个文件”这类隐含上下文。
+
+## 4. 子 Agent 如何被创建
+
+每个任务创建一个新的：
+
+```python
+RAgent(
+    max_iterations=max_iters,
+    session_id=parent_session,
+    middlewares=[LoopDetectionMiddleware(...)],
+)
+```
+
+它获得：
+
+- 新的 `ThreadState` 和 `messages`；
+- 专用 system prompt；
+- 任务 id、worker id、补充目标；
+- 与父 Agent 相同的 session id；
+- 父层允许工具的进一步收窄；
+- 独立的取消事件和迭代预算。
+
+它不会获得：
+
+- 父 Agent 的完整聊天历史；
+- 父 Agent 的 `ThreadState` 对象；
+- 写长期 Memory、再次 delegate、语音播放、自演进复盘等副作用工具。
+
+默认排除：
+
+```text
+delegate_task
+memory
+speak_text
+text_to_speech
+self_evolution_review
+```
+
+这既防递归委派爆炸，也防子 Agent 擅自修改跨会话状态。
+
+## 5. 子 Agent 必须遵守的 Todo 协议
+
+系统提示要求它：
+
+1. `todo_manage get` 查看任务和子树；
+2. `todo_manage claim` 领取任务并写 worker/lease；
+3. 判断任务是否足够具体；
+4. 太大时 `propose_split`，但不得自行 approve；
+5. 可执行时完成任务并 `update completed`；
+6. 失败时写明原因；
+7. 达到预算时明确未完成事项。
+
+拆分批准属于父 Agent，因为只有父 Agent 看得到完整依赖图和可用并发预算。
+
+## 6. 并行和两种预算
+
+`delegate_task` 使用 `ThreadPoolExecutor`：
+
+- 默认并发数 `min(3, 任务数)`；
+- 显式 `max_workers` 上限 10；
+- 每个 Agent 有 `max_iterations` 思考轮数；
+- 每个任务还有 `wall_timeout_seconds` 墙钟预算；
+- 父线程每 0.2 秒检查完成和超时。
+
+两种预算含义不同：
+
+| 预算 | 防什么 | 停止原因 |
+| --- | --- | --- |
+| `max_iterations` | 工具调用轮数发散 | `turn_capped` |
+| wall timeout | 模型/工具/网络长时间不返回 | `timeout` |
+| loop threshold | 相同工具同参重复 | `loop_capped` |
+
+## 7. 结果契约
+
+默认 `return_mode=compact`，每个结果只保留调度所需字段：
+
+```json
+{
+  "task_id": "docs.memory",
+  "status": "success",
+  "stop_reason": "completed",
+  "truncated": false,
+  "max_iterations": 20,
+  "token_usage": {
+    "prompt_tokens": 1200,
+    "completion_tokens": 300,
+    "total_tokens": 1500,
+    "available": true
+  },
+  "step_events": [
+    {"seq": 1, "event_type": "llm.step"},
+    {"seq": 2, "event_type": "tool.start", "name": "read_file"},
+    {"seq": 3, "event_type": "tool.end", "name": "read_file"}
+  ]
+}
+```
+
+### `status` 与 `stop_reason`
+
+旧 `status` 保持兼容，新 `stop_reason` 补充统一语义：
+
+| status/条件 | stop_reason |
+| --- | --- |
+| `success` | `completed` |
+| `truncated` | `turn_capped` |
+| wall timeout | `timeout` |
+| 循环保护 | `loop_capped` |
+| 其它异常 | `error` |
+
+### 有界步骤事件
+
+`step_events` 默认最多 32 条，只记录模型轮次、工具名和短预览。它提供足够的调度证据，
+但不会把完整子 Agent transcript 塞回父上下文。
+
+## 8. 上下文隔离与 Artifact 生命周期
+
+当前实现采用比“成功就立即删除”更保守的策略：
+
+1. 每个子 Agent 结束后，把完整 `messages` 保存到 context artifact；
+2. 内存中的子 Agent messages 随后清空；
+3. Todo metadata 只保存 `context_artifact_path`；
+4. 父 Agent 默认只读 compact result 和 todo digest；
+5. 只有排障时才显式读取 artifact；
+6. 整棵 Todo 树全部 completed 后，统一删除所有 context artifacts。
+
+为什么成功任务也暂时保留？因为兄弟任务或父任务尚未完成时，成功任务的上下文仍可能用于
+定位集成问题。为什么不 inline 返回？因为那会立刻破坏父子上下文隔离。
+
+删除有路径边界：只允许全局 `sandbox/delegate_contexts` 或当前 session 的迁移根，避免
+把任意用户路径误当作上下文 artifact 删除。
+
+## 9. 失败怎样回到父 Agent
+
+| 场景 | Todo 处理 | 上下文处理 |
+| --- | --- | --- |
+| 正常完成且任务已 update | completed | 保留到整树成功后清理 |
+| 达到迭代上限仍 in_progress | blocked | 保存 artifact |
+| 模型请求失败 | blocked | 保存 artifact |
+| 墙钟超时 | blocked | 发送 cancel，保存 artifact |
+| Python 异常 | blocked | 保存 artifact |
+| claim 过期 | `reap_stale_claims` 标 blocked 或重置 pending | 由父 Agent决定 |
+| 子 Agent 提议拆分 | needs_split | 父 Agent approve/reject |
+
+“blocked”表示需要重新调度，不等于任务永久失败。
+
+## 10. 一个并行例子
+
+任务图：
+
+```text
+docs
+├── docs.context
+├── docs.memory      depends_on docs.context
+└── docs.tools
+```
+
+第一轮 ready 是 `docs.context` 和 `docs.tools`，可以并行。`docs.memory` 必须等待
+`docs.context` completed。父 Agent 的正确做法是：
+
+```text
+todo_manage ready
+→ delegate(context, tools)
+→ todo_manage digest
+→ ready 现在出现 memory
+→ delegate(memory)
+→ 所有叶子 completed
+→ 更新父任务
+→ 统一清理 context artifacts
+```
+
+这比一次性并发三个任务可靠，因为依赖由代码而不是 prompt 自觉保证。
+
+## 11. 当前边界
+
+- 子 Agent 是同一 Python 进程中的线程级并发，不是独立容器；
+- 工具通常仍会各自进入隔离子进程；
+- 子 Agent 共享仓库文件系统，写同一文件仍需父 Agent 划分不重叠任务；
+- `cancel_event` 是协作式取消，无法保证第三方阻塞调用立即停止；
+- `ThreadState` 不共享，但 Todo 文件和 session sandbox 是有意共享的协调层；
+- `delegate.start/end` 会进入父 RunEventStore；详细 step events 当前主要在 delegate
+  返回和 GUI event sink 中，不会逐条统一 emit 为 `delegate.step`；
+- compact digest 是默认路径，完整 artifact 读取应是例外。
+
+## 12. 如何验证
+
+```bash
+PYTHONPATH=. pytest -q \
+  tests/test_delegate_contract.py \
+  tests/test_delegate_progress.py \
+  tests/test_todo_session_isolation.py
+
+PYTHONPATH=. pytest -q tests/test_token_usage_display.py tests/test_run_event_stream.py
+```
+
+重点测试：
+
+- `test_delegate_task_rejects_subtask_without_task_id`
+- `test_delegate_task_excludes_child_side_effect_tools`
+- `test_loop_detection_reports_loop_capped`
+- `test_step_events_are_bounded_and_included`
+- `test_delegate_saves_failed_context_by_artifact_only`
+- `test_delegate_context_migrates_to_per_session_sandbox`
+- `test_reap_stale_claims_blocks_expired_task`
+
+---
+
+<template data-legacy-upgrade-log>
+
 **状态：✅ 已完成（2026-08-11）**
 **对应 deer-flow 学习文档：** 第 8 章（Sub-agent 系统）+ 13.4（子 Agent 要有结构化 contract）
 **建议顺序：** 第 6 步（R-Agent 这块已最成熟，属收尾增强）
@@ -125,3 +427,5 @@ python3 -m pytest tests/ -q -k "delegate or middleware or agent or todo or memor
 - 2026-08-11 · 建立简略计划。
 - 2026-08-11 · **落地步骤 1/3/5/6**：`tools/delegate_tool.py` 加 `stop_reason`（`_derive_stop_reason`+`_normalize_result_contract`，集中补齐、只增不改）、`started_at`/`completed_at`；`core/middleware/builtins.py` 加 `LoopDetectionMiddleware`（子 Agent 默认开，命中记 `loop_capped`）；`core/config.py` 加 2 个 loop 开关；确认防递归已在 `DELEGATE_CHILD_EXCLUDED_TOOLS`。新增 `tests/test_delegate_contract.py`（5 passed），既有 `test_delegate_progress.py`（8 passed）零回归，整体 230 passed。step_events 内嵌（步骤 2）待后续；delegation_ledger 沉淀（步骤 4）已由 `02` 承担。
 - 2026-08-11 · **步骤 2 落地，本章完成**：delegate 结果新增有界 `step_events`（默认最多 32 条），采样模型轮次、工具开始/结束短预览；异常与 timeout 路径也尽力保留已采样事件。父 Agent 的 delegation ledger 同步保留 stop_reason、时间戳和 step_events。委派定向 + 基础设施回归 35 passed。
+
+</template>

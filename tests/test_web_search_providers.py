@@ -8,7 +8,7 @@ def test_local_html_provider_returns_unified_shape(monkeypatch):
     monkeypatch.setattr(
         web_tools,
         "_search_with_provider",
-        lambda provider, query, limit: [{"title": "Example", "href": "https://example.com", "body": "Snippet"}],
+        lambda provider, query, limit: [{"title": "Example", "href": "https://example.com", "body": "Snippet"}] if provider == "bing" else [],
     )
 
     payload = json.loads(web_tools.web_search_tool("example", limit=3))
@@ -16,7 +16,7 @@ def test_local_html_provider_returns_unified_shape(monkeypatch):
     assert payload["success"] is True
     assert payload["status"] == "ok"
     assert payload["provider"] == "local_html"
-    assert payload["source_provider"] == "duckduckgo"
+    assert payload["source_provider"] == "bing"
     assert payload["total_results"] == 1
     assert payload["results"][0]["url"] == "https://example.com"
     assert payload["results"][0]["snippet"] == "Snippet"
@@ -31,14 +31,14 @@ def test_auto_provider_falls_back_to_local_html_without_keys(monkeypatch):
     monkeypatch.setattr(
         web_tools,
         "_search_with_provider",
-        lambda provider, query, limit: [{"title": "Fallback", "href": "https://fallback.test", "body": ""}],
+        lambda provider, query, limit: [{"title": "Fallback", "href": "https://fallback.test", "body": ""}] if provider == "bing" else [],
     )
 
     payload = json.loads(web_tools.web_search_tool("fallback", provider="auto"))
 
     assert payload["success"] is True
     assert payload["provider"] == "local_html"
-    assert payload["results"][0]["source"] == "duckduckgo"
+    assert payload["results"][0]["source"] == "bing"
 
 
 def test_serper_provider_reports_missing_key(monkeypatch):
@@ -67,4 +67,28 @@ def test_web_search_schema_exposes_provider_parameter():
 
     properties = web_search_schema["function"]["parameters"]["properties"]
     assert "provider" in properties
-    assert properties["provider"]["default"] == "local_html"
+    assert properties["provider"]["default"] == "auto"
+
+
+def test_local_html_order_can_be_configured(monkeypatch):
+    seen = []
+
+    def fake_search(provider, query, limit):
+        seen.append(provider)
+        return [{"title": "Y", "href": "https://y.test", "body": ""}] if provider == "yahoo" else []
+
+    monkeypatch.setenv("WEB_SEARCH_LOCAL_HTML_ORDER", "yahoo,bing,duckduckgo")
+    monkeypatch.setattr(web_tools, "_search_with_provider", fake_search)
+
+    payload = json.loads(web_tools.web_search_tool("custom", provider="local_html"))
+
+    assert payload["source_provider"] == "yahoo"
+    assert seen == ["yahoo"]
+
+
+def test_auto_provider_order_can_be_configured(monkeypatch):
+    monkeypatch.setenv("SERPER_API_KEY", "dummy")
+    monkeypatch.setenv("GROUNDROUTE_API_KEY", "dummy")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER_ORDER", "serper,groundroute,local_html")
+
+    assert web_tools._provider_order("auto") == ["serper", "groundroute", "local_html"]

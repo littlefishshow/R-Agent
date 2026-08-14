@@ -44,7 +44,7 @@ def _memory_for_system_prompt() -> str:
 SELF_EVOLUTION_PROMPT = (
     "\n\n【重要提示：自我进化能力】\n"
     "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具维护技能包；默认优先 patch 现有技能。只有当用户明确要求或发现高度可复用且现有技能无法承载的稳定工作流时，才创建新技能，避免每轮任务都新增 skill。\n"
-    "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
+    "2. 文件工作区：启用 session sandbox 时，`write_file` 的相对路径属于当前 session workspace，不是宿主仓库。只有用户明确要求并授权修改仓库工具代码时，才能写宿主仓库中的 `tools/`。\n"
     "请始终使用中文回复用户。"
 )
 
@@ -146,15 +146,24 @@ def _session_recent_sort_key(item: Dict[str, Any]) -> tuple[float, float, str]:
 def _session_todo_board(session_id: str) -> Optional[Dict[str, Any]]:
     """Return a compact, GUI-friendly todo board snapshot for this session.
 
-    The todo_manage tool stores per-session boards in sandbox/todo_lists. Reading
-    it from session.state() lets the Cockpit polling loop refresh progress even
-    when the agent is still inside a long tool/delegate call and no final chat
-    message has been appended yet.
+    Reading the per-session board from session.state() lets the Cockpit polling
+    loop refresh progress even when the agent is still inside a long
+    tool/delegate call and no final chat message has been appended yet.
     """
     sid = _safe_todo_session_id(session_id)
     if not sid:
         return None
-    path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
+    try:
+        from core import config
+        from core.sandbox_workspace import SandboxWorkspace
+
+        if config.get_session_sandbox_enabled():
+            workspace = SandboxWorkspace(sid, root=config.get_session_sandbox_root())
+            path = workspace.todo_lists / "todo_list.json"
+        else:
+            path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
+    except Exception:
+        path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
     if not path.exists():
         return None
     try:
@@ -1548,7 +1557,13 @@ class LearningRuntimeService(AgentRuntimeService):
             return False
         return candidate == root or root in candidate.parents
 
-    def delete_sessions_for_workspace_path(self, workspace_path: str, *, is_directory: bool = False) -> Dict[str, Any]:
+    def delete_sessions_for_workspace_path(
+        self,
+        workspace_path: str,
+        *,
+        is_directory: bool = False,
+        session_id: str = "",
+    ) -> Dict[str, Any]:
         """Delete learning session subtrees associated with a workspace file/path.
 
         Matching is intentionally metadata-only: a session is associated when its
@@ -1564,8 +1579,13 @@ class LearningRuntimeService(AgentRuntimeService):
             return {"deleted_learning_sessions": []}
 
         with self._lock:
+            allowed_sessions = None
+            if session_id:
+                allowed_sessions = {session_id, *self.descendant_session_ids(session_id)}
             matched = []
             for sid, session in list(self.sessions.items()):
+                if allowed_sessions is not None and sid not in allowed_sessions:
+                    continue
                 paths = [
                     getattr(session, "file_path", ""),
                     self._selection_source_path(session),

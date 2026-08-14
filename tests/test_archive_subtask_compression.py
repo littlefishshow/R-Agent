@@ -1,7 +1,9 @@
+from core import config
 from core.agent import RAgent
 
 
-def test_archive_subtask_compresses_messages_with_unified_summary():
+def test_archive_subtask_compresses_messages_with_unified_summary(monkeypatch):
+    monkeypatch.setattr(config, "get_context_summarization_mode", lambda: "heuristic")
     agent = RAgent(model="test", max_iterations=2)
     agent.messages = [
         {"role": "system", "content": "base"},

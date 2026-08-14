@@ -402,90 +402,99 @@ export async function fetchLearningResources(sessionId: string): Promise<Record<
   return res.json()
 }
 
-export async function listWorkspaceFiles(path = ''): Promise<WorkspaceListing> {
-  const res = await fetch(`${API_BASE}/workspace/files?path=${encodeURIComponent(path)}`)
+export async function listWorkspaceFiles(path = '', sessionId = ''): Promise<WorkspaceListing> {
+  const query = new URLSearchParams({ path })
+  if (sessionId) query.set('session_id', sessionId)
+  const res = await fetch(`${API_BASE}/workspace/files?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function fetchWorkspaceTree(expanded: string[] = ['']): Promise<{ root: WorkspaceTreeNode }> {
+export async function fetchWorkspaceTree(expanded: string[] = [''], sessionId = ''): Promise<{ root: WorkspaceTreeNode }> {
   const query = new URLSearchParams({ expanded: expanded.join(',') })
+  if (sessionId) query.set('session_id', sessionId)
   const res = await fetch(`${API_BASE}/workspace/tree?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function createWorkspaceFolder(path: string, name: string): Promise<WorkspaceItem> {
+export async function createWorkspaceFolder(path: string, name: string, sessionId = ''): Promise<WorkspaceItem> {
   const res = await fetch(`${API_BASE}/workspace/folders`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, name }),
+    body: JSON.stringify({ path, name, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function uploadWorkspaceFile(path: string, file: File): Promise<WorkspaceItem> {
+export async function uploadWorkspaceFile(path: string, file: File, sessionId = ''): Promise<WorkspaceItem> {
   const content_base64 = await fileToBase64(file)
   const res = await fetch(`${API_BASE}/workspace/files`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, name: file.name, content_base64 }),
+    body: JSON.stringify({ path, name: file.name, content_base64, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function copyWorkspaceItem(source: string, targetDir: string, name?: string): Promise<WorkspaceItem> {
+export async function copyWorkspaceItem(source: string, targetDir: string, name?: string, sessionId = ''): Promise<WorkspaceItem> {
   const res = await fetch(`${API_BASE}/workspace/copy`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source, target_dir: targetDir, name: name || undefined }),
+    body: JSON.stringify({ source, target_dir: targetDir, name: name || undefined, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function deleteWorkspaceItem(path: string): Promise<{ deleted: string }> {
+export async function deleteWorkspaceItem(path: string, sessionId = ''): Promise<{ deleted: string }> {
   const res = await fetch(`${API_BASE}/workspace/files`, {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export function workspaceOpenUrl(path: string, download = false): string {
+export function workspaceOpenUrl(path: string, download = false, sessionId = ''): string {
   const query = new URLSearchParams({ path })
   if (download) query.set('download', 'true')
+  if (sessionId) query.set('session_id', sessionId)
   return `${API_BASE}/workspace/open?${query.toString()}`
 }
 
-export async function fetchWorkspaceText(path: string): Promise<{ path: string, name: string, content: string, item: WorkspaceItem }> {
-  const res = await fetch(`${API_BASE}/workspace/text?path=${encodeURIComponent(path)}`)
+export async function fetchWorkspaceText(path: string, sessionId = ''): Promise<{ path: string, name: string, content: string, item: WorkspaceItem }> {
+  const query = new URLSearchParams({ path })
+  if (sessionId) query.set('session_id', sessionId)
+  const res = await fetch(`${API_BASE}/workspace/text?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function saveWorkspaceText(path: string, content: string): Promise<WorkspaceItem> {
+export async function saveWorkspaceText(path: string, content: string, sessionId = ''): Promise<WorkspaceItem> {
   const res = await fetch(`${API_BASE}/workspace/text`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, content }),
+    body: JSON.stringify({ path, content, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function fetchWorkspacePdfText(path: string): Promise<PdfTextDocument> {
-  const res = await fetch(`${API_BASE}/workspace/pdf-text?path=${encodeURIComponent(path)}`)
+export async function fetchWorkspacePdfText(path: string, sessionId = ''): Promise<PdfTextDocument> {
+  const query = new URLSearchParams({ path })
+  if (sessionId) query.set('session_id', sessionId)
+  const res = await fetch(`${API_BASE}/workspace/pdf-text?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export function workspacePdfPageImageUrl(path: string, page: number, zoom = 1.6): string {
+export function workspacePdfPageImageUrl(path: string, page: number, zoom = 1.6, sessionId = ''): string {
   const query = new URLSearchParams({ path, page: String(page), zoom: String(zoom) })
+  if (sessionId) query.set('session_id', sessionId)
   return `${API_BASE}/workspace/pdf-page-image?${query.toString()}`
 }
 

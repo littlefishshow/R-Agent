@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import core.config as cfg
 from core.agent import RAgent
 from core.memory_provider import (
+    DeerMemProvider,
     FileMemoryProvider,
     MemoryProvider,
     get_memory_provider,
@@ -34,7 +35,8 @@ def test_file_provider_satisfies_protocol():
 
 def test_provider_name_resolution():
     assert isinstance(get_memory_provider(None), FileMemoryProvider)
-    assert isinstance(get_memory_provider("deermem"), FileMemoryProvider)
+    # deermem 现在解析为真正的结构化 backend（此前是 file 别名，已在 Phase 6 切换）。
+    assert isinstance(get_memory_provider("deermem"), DeerMemProvider)
     assert isinstance(get_memory_provider("unknown-typo"), FileMemoryProvider)  # 容错退回默认
     noop = get_memory_provider("noop")
     assert noop.get_context() == "" and noop.search("x")["count"] == 0
@@ -72,12 +74,16 @@ def test_durable_context_empty_when_no_channels():
 # --------------------------------------------------------------------------- #
 class _FakeClient:
     def __init__(self):
-        self.chat = SimpleNamespace(completions=SimpleNamespace(
-            create=lambda **k: SimpleNamespace(
+        self.requests = []
+
+        def create(**kwargs):
+            self.requests.append(kwargs)
+            return SimpleNamespace(
                 usage={"total_tokens": 1},
                 choices=[SimpleNamespace(message=SimpleNamespace(content="ok", tool_calls=None))],
             )
-        ))
+
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=create))
 
 
 def _agent_with_channels():
@@ -101,11 +107,39 @@ def test_durable_context_injected_when_enabled(monkeypatch):
     monkeypatch.setattr(registry, "get_all_schemas", lambda: [])
     monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "1")
     agent = _agent_with_channels()
-    assert agent.run_conversation("hi") == "ok"
-    injected = [m for m in agent.messages if isinstance(m, dict) and m.get("role") == "user" and "参考上下文" in str(m.get("content", ""))]
+    assert agent.run_conversation("hi", system_message="system prompt") == "ok"
+    assert not any(
+        isinstance(message, dict) and "参考上下文" in str(message.get("content", ""))
+        for message in agent.messages
+    )
+    request_messages = agent.client.requests[-1]["messages"]
+    injected = [m for m in request_messages if isinstance(m, dict) and m.get("role") == "user" and "参考上下文" in str(m.get("content", ""))]
     assert len(injected) == 1
     assert "历史摘要 X" in injected[0]["content"]
     assert "td1" in injected[0]["content"]
+    assert request_messages[0]["role"] == "system"
+    assert request_messages[1] is injected[0]
+    assert request_messages[2]["content"] == "hi"
+
+
+def test_durable_context_is_transient_across_multiple_turns(monkeypatch):
+    monkeypatch.setattr(registry, "get_all_schemas", lambda: [])
+    monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "1")
+    agent = _agent_with_channels()
+
+    assert agent.run_conversation("first", system_message="system prompt") == "ok"
+    assert agent.run_conversation("second", system_message="system prompt") == "ok"
+
+    for request in agent.client.requests:
+        durable_messages = [
+            message for message in request["messages"]
+            if isinstance(message, dict) and "参考上下文" in str(message.get("content", ""))
+        ]
+        assert len(durable_messages) == 1
+    assert not any(
+        isinstance(message, dict) and "参考上下文" in str(message.get("content", ""))
+        for message in agent.messages
+    )
 
 
 def test_durable_context_includes_memory_only_in_hidden_user_mode(monkeypatch):
@@ -124,9 +158,14 @@ def test_durable_context_includes_memory_only_in_hidden_user_mode(monkeypatch):
 
     agent = _agent_with_channels()
     assert agent.run_conversation("hi") == "ok"
-    injected = [m for m in agent.messages if isinstance(m, dict) and "参考上下文" in str(m.get("content", ""))]
+    request_messages = agent.client.requests[-1]["messages"]
+    injected = [m for m in request_messages if isinstance(m, dict) and "参考上下文" in str(m.get("content", ""))]
     assert len(injected) == 1
     assert "MEMTOKEN-preferences" in injected[0]["content"]
+    assert not any(
+        isinstance(message, dict) and "参考上下文" in str(message.get("content", ""))
+        for message in agent.messages
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -139,6 +178,7 @@ def test_config_defaults(monkeypatch):
     assert cfg.get_memory_injection_mode() == "system"       # 默认不降权
     assert cfg.get_durable_context_enabled() is False         # 默认不注入
     assert cfg.get_memory_provider_name() == "file"           # 默认文件型
+    assert cfg.get_context_summarization_mode() == "llm"      # 默认复用当前模型摘要
 
 
 def test_hidden_user_forces_durable_context(monkeypatch):
