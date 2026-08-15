@@ -63,6 +63,8 @@ def test_detect_signals():
     assert "preference" in detect_signals(messages)
     messages2 = [{"role": "user", "content": "不对，应该用 tabs"}]
     assert "correction" in detect_signals(messages2)
+    messages3 = [{"role": "user", "content": "已验证根因位于 session memory gate"}]
+    assert "verified_result" in detect_signals(messages3)
 
 
 def test_prepare_update_returns_none_for_trivial_only():
@@ -140,6 +142,24 @@ def test_governance_due_prompt_is_added():
         governance_due=True,
     )
     assert "<governance_due>" in messages[1]["content"]
+
+
+def test_session_prompt_defines_scope_durability_and_authority_candidates():
+    from core.memory_extractor import build_extraction_messages
+
+    messages = build_extraction_messages(
+        [{"role": "user", "content": "x"}, {"role": "assistant", "content": "y"}],
+        [],
+        frozenset(),
+        session_facts_enabled=True,
+    )
+    system = messages[0]["content"]
+    user = messages[1]["content"]
+    assert "scope：user / project / task" in system
+    assert "durability：durable / transient" in system
+    assert "authority：descriptive / imperative" in system
+    assert "scope=project" in user
+    assert "scope=task" in user
 
 
 # --------------------------------------------------------------------------- #

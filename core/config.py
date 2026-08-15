@@ -380,12 +380,29 @@ def get_memory_governance_interval_days():
 
 
 def get_memory_session_facts_enabled():
-    """是否启用 session 级情节记忆：细粒度、带溯源 metadata（dia_id/session/date/speaker）、
-    可检索、session 结束即消失。默认**开启**——它不写入 durable 库、不影响跨会话记忆，
-    只是在当前 session 内保留细节供检索（如 LoCoMo evidence recall）。设 0 关闭。
+    """是否启用 session 级工作记忆：保存 user/project/task transient descriptive facts，
+    可检索、session 结束即消失。默认开启；不写入 durable 库。设 0 关闭。
     """
     raw = str(os.environ.get("MEMORY_SESSION_FACTS_ENABLED", "1")).strip().lower()
     return raw not in ("0", "false", "no", "off", "")
+
+
+def get_memory_session_fact_confidence_threshold():
+    """Session fact 最低置信度。默认 0.3，低于 durable 阈值以减少工作事实漏写。"""
+    try:
+        value = float(os.environ.get("MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD", "0.3"))
+    except ValueError:
+        value = 0.3
+    return max(0.0, min(value, 1.0))
+
+
+def get_memory_session_max_facts():
+    """单个 session 最多保留的事实数。默认 100。"""
+    try:
+        value = int(os.environ.get("MEMORY_SESSION_MAX_FACTS", "100"))
+    except ValueError:
+        value = 100
+    return max(10, value)
 
 
 def get_memory_staleness_age_days():

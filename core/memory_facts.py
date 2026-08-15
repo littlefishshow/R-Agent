@@ -33,8 +33,21 @@ except Exception:  # pragma: no cover - Windows fallback
     fcntl = None
 
 
-# fact 的准入分类字段（Phase 2 的 scope gate 依据）。
+# fact 的准入分类字段与受支持取值（apply-layer gate 的唯一事实来源）。
 FACT_CLASSIFICATION_FIELDS = ("scope", "durability", "authority")
+FACT_SCOPES = frozenset({"user", "project", "task"})
+FACT_DURABILITIES = frozenset({"durable", "transient"})
+FACT_AUTHORITIES = frozenset({"descriptive", "imperative"})
+
+# Session working-memory categories. Existing durable categories remain valid;
+# these extra categories preserve operational facts without turning them into
+# long-term user-profile data.
+SESSION_PRIORITY_CATEGORIES = frozenset({
+    "decision",
+    "constraint",
+    "blocker",
+    "verified_result",
+})
 
 # session 级情节记忆的默认落盘子目录（相对 memory_dir）。
 SESSION_FACTS_SUBDIR = "sessions"

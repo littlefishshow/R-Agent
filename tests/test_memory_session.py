@@ -303,3 +303,156 @@ def test_durable_fact_only_persists_in_durable_store(tmp_path, monkeypatch):
     assert store.count() == 1
     assert provider._get_session_store().count() == 0
     assert provider.search("中文回复", thread_id="conv-1")["count"] == 1
+
+
+def test_project_and_task_transient_facts_enter_session_store(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_SESSION_FACTS_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD", "0.3")
+    store = FactStore(memory_dir=str(tmp_path))
+    provider = DeerMemProvider(
+        store=store,
+        extractor=None,
+        async_extract=False,
+        memory_dir=str(tmp_path),
+    )
+    provider.set_session("conv-work")
+    update = {
+        "newFacts": [
+            {
+                "content": "当前项目的 durable store 尚未按 project namespace 隔离",
+                "category": "constraint",
+                "confidence": 0.9,
+                "scope": "project",
+                "durability": "transient",
+                "authority": "descriptive",
+            },
+            {
+                "content": "当前任务已定位到 _apply_session_facts 准入过窄",
+                "category": "verified_result",
+                "confidence": 0.8,
+                "scope": "task",
+                "durability": "transient",
+                "authority": "descriptive",
+            },
+        ],
+    }
+
+    assert provider._apply_session_facts(update, "conv-work") == 2
+    facts = provider._get_session_store().load_facts()
+    assert {fact["scope"] for fact in facts} == {"project", "task"}
+    assert store.count() == 0
+
+
+def test_session_gate_rejects_unknown_scope_durable_and_imperative(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_SESSION_FACTS_ENABLED", "1")
+    provider = DeerMemProvider(
+        store=FactStore(memory_dir=str(tmp_path)),
+        extractor=None,
+        async_extract=False,
+        memory_dir=str(tmp_path),
+    )
+    provider.set_session("conv-gate")
+    base = {
+        "category": "context",
+        "confidence": 0.9,
+        "durability": "transient",
+        "authority": "descriptive",
+    }
+    update = {
+        "newFacts": [
+            {**base, "content": "未知 scope", "scope": "workspace"},
+            {**base, "content": "项目 durable", "scope": "project", "durability": "durable"},
+            {**base, "content": "任务命令", "scope": "task", "authority": "imperative"},
+        ],
+    }
+
+    assert provider._apply_session_facts(update, "conv-gate") == 0
+    assert provider._get_session_store().count() == 0
+
+
+def test_session_confidence_threshold_is_independent_from_durable(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_SESSION_FACTS_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_FACT_CONFIDENCE_THRESHOLD", "0.8")
+    monkeypatch.setenv("MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD", "0.3")
+    provider = DeerMemProvider(
+        store=FactStore(memory_dir=str(tmp_path)),
+        extractor=None,
+        async_extract=False,
+        memory_dir=str(tmp_path),
+    )
+    provider.set_session("conv-confidence")
+    update = {
+        "newFacts": [
+            {
+                "content": "低于 session 阈值",
+                "category": "context",
+                "confidence": 0.2,
+                "scope": "task",
+                "durability": "transient",
+                "authority": "descriptive",
+            },
+            {
+                "content": "高于 session 但低于 durable 阈值",
+                "category": "verified_result",
+                "confidence": 0.4,
+                "scope": "task",
+                "durability": "transient",
+                "authority": "descriptive",
+            },
+        ],
+    }
+
+    assert provider._apply_session_facts(update, "conv-confidence") == 1
+    assert [fact["content"] for fact in provider._get_session_store().load_facts()] == [
+        "高于 session 但低于 durable 阈值"
+    ]
+
+
+def test_session_capacity_prioritizes_operational_facts_and_provenance(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEMORY_SESSION_FACTS_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD", "0.0")
+    monkeypatch.setenv("MEMORY_SESSION_MAX_FACTS", "10")
+    provider = DeerMemProvider(
+        store=FactStore(memory_dir=str(tmp_path)),
+        extractor=None,
+        async_extract=False,
+        memory_dir=str(tmp_path),
+    )
+    provider.set_session("conv-capacity")
+    ordinary = [
+        {
+            "content": f"普通上下文 {index}",
+            "category": "context",
+            "confidence": 0.99,
+            "scope": "task",
+            "durability": "transient",
+            "authority": "descriptive",
+        }
+        for index in range(10)
+    ]
+    important = [
+        {
+            "content": "必须保持 API 向后兼容",
+            "category": "constraint",
+            "confidence": 0.4,
+            "scope": "project",
+            "durability": "transient",
+            "authority": "descriptive",
+        },
+        {
+            "content": "测试已确认 task scope 可以检索",
+            "category": "verified_result",
+            "confidence": 0.4,
+            "scope": "task",
+            "durability": "transient",
+            "authority": "descriptive",
+            "metadata": {"source_turn_ids": ["D1:2"], "primary_turn_id": "D1:2"},
+        },
+    ]
+
+    assert provider._apply_session_facts({"newFacts": ordinary + important}, "conv-capacity") == 12
+    facts = provider._get_session_store().load_facts()
+    assert len(facts) == 10
+    contents = {fact["content"] for fact in facts}
+    assert "必须保持 API 向后兼容" in contents
+    assert "测试已确认 task scope 可以检索" in contents

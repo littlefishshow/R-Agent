@@ -216,13 +216,15 @@ def _fact_scope_gate_reason(fact: dict) -> Optional[str]:
 
 
 def _session_fact_gate_reason(fact: dict) -> Optional[str]:
-    """Session facts must be transient descriptive user facts."""
+    """Session facts must be transient descriptive user/project/task facts."""
+    from core.memory_facts import FACT_SCOPES
+
     if any(
         _normalize_gate_label(fact.get(field)) is None
         for field in _FACT_CLASSIFICATION_FIELDS
     ):
         return "missing"
-    if _normalize_gate_label(fact.get("scope")) != "user":
+    if _normalize_gate_label(fact.get("scope")) not in FACT_SCOPES:
         return "scope"
     if _normalize_gate_label(fact.get("durability")) != "transient":
         return "durability"
@@ -581,8 +583,8 @@ class DeerMemProvider:
             )
             if governance_due:
                 self._mark_governance_run(self._store.load_facts())
-            # 2) session 级情节记忆：细粒度、带 metadata、不经 scope gate，
-            #    session 结束即消失。用于 LoCoMo 这类需要 dia_id/date/speaker 的检索。
+            # 2) session 工作记忆：user/project/task 的 transient descriptive facts，
+            #    session 结束即消失；可保留 LoCoMo provenance 与工程任务中间事实。
             self._apply_session_facts(update, thread_id)
         except Exception:
             logger.exception("deermem extraction/apply failed (ignored)")
@@ -658,14 +660,18 @@ class DeerMemProvider:
             })
 
     def _apply_session_facts(self, update: dict, thread_id: str) -> int:
-        """把 transient descriptive user facts 写入当前 session 的情节记忆。
+        """把 transient descriptive working facts 写入当前 session memory。
 
-        Durable facts only enter the durable store. Task-scoped, imperative,
-        missing-classification, and durable facts never enter the session store.
-        Session facts keep detailed provenance and disappear when the session ends.
+        ``scope`` may be user, project, or task. Durable, imperative, unknown-scope,
+        low-confidence, empty, and duplicate facts never enter the session store.
+        Session facts disappear when the session ends.
         """
         from core import config
-        from core.memory_facts import coerce_confidence, content_key
+        from core.memory_facts import (
+            SESSION_PRIORITY_CATEGORIES,
+            coerce_confidence,
+            content_key,
+        )
 
         if not config.get_memory_session_facts_enabled():
             return 0
@@ -679,6 +685,27 @@ class DeerMemProvider:
         new_facts = update.get("newFacts", [])
         if not new_facts:
             return 0
+        threshold = config.get_memory_session_fact_confidence_threshold()
+        max_facts = config.get_memory_session_max_facts()
+
+        def retention_key(fact: dict) -> tuple[int, int, float, str]:
+            category = str(fact.get("category") or "context").strip().lower()
+            metadata = fact.get("metadata")
+            has_provenance = int(
+                isinstance(metadata, dict)
+                and bool(
+                    metadata.get("source_turn_ids")
+                    or metadata.get("primary_turn_id")
+                    or metadata.get("dia_id")
+                )
+            )
+            return (
+                int(category in SESSION_PRIORITY_CATEGORIES),
+                has_provenance,
+                coerce_confidence(fact),
+                str(fact.get("created_at") or ""),
+            )
+
         added = 0
         with self._session_lock:
             existing = store.load_facts()
@@ -689,13 +716,16 @@ class DeerMemProvider:
             for fact in new_facts:
                 if _session_fact_gate_reason(fact) is not None:
                     continue
+                confidence = coerce_confidence(fact)
+                if confidence < threshold:
+                    continue
                 key = content_key(fact.get("content"))
                 if key is None or key in existing_keys:
                     continue
                 entry = store.make_fact(
                     fact["content"],
                     category=fact.get("category", "context"),
-                    confidence=coerce_confidence(fact),
+                    confidence=confidence,
                     scope=fact.get("scope"),
                     durability=fact.get("durability"),
                     authority=fact.get("authority"),
@@ -707,6 +737,8 @@ class DeerMemProvider:
                 existing_keys.add(key)
                 added += 1
             if added:
+                if len(existing) > max_facts:
+                    existing = sorted(existing, key=retention_key, reverse=True)[:max_facts]
                 store.write_all(existing)
         return added
 
@@ -1044,6 +1076,10 @@ class DeerMemProvider:
             "category": fact.get("category", "context"),
             "confidence": coerce_confidence(fact),
         }
+        for field in ("scope", "durability", "authority"):
+            value = fact.get(field)
+            if isinstance(value, str) and value:
+                out[field] = value
         # 溯源 metadata（dia_id/session/date/speaker）随结果返回，供 evidence recall
         # 与检索排序使用。
         meta = fact.get("metadata")

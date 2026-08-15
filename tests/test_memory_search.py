@@ -163,6 +163,8 @@ def test_search_deduplicates_legacy_durable_and_session_copy(tmp_path):
     result = provider.search("中文回复", top_k=5, thread_id="conv-1")
     assert result["count"] == 1
     assert result["results"][0]["metadata"]["source_turn_ids"] == ["D1:2"]
+    assert result["results"][0]["scope"] == "user"
+    assert result["results"][0]["durability"] == "transient"
 
 
 def test_memory_search_tool_dispatches_to_deermem(tmp_path, monkeypatch):

@@ -199,10 +199,14 @@ def test_config_defaults(monkeypatch):
     monkeypatch.delenv("MEMORY_INJECTION_MODE", raising=False)
     monkeypatch.delenv("DURABLE_CONTEXT_ENABLED", raising=False)
     monkeypatch.delenv("MEMORY_PROVIDER", raising=False)
+    monkeypatch.delenv("MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD", raising=False)
+    monkeypatch.delenv("MEMORY_SESSION_MAX_FACTS", raising=False)
     assert cfg.get_memory_injection_mode() == "system"       # 默认不降权
     assert cfg.get_durable_context_enabled() is False         # 默认不注入
     assert cfg.get_memory_provider_name() == "file"           # 默认文件型
     assert cfg.get_context_summarization_mode() == "llm"      # 默认复用当前模型摘要
+    assert cfg.get_memory_session_fact_confidence_threshold() == 0.3
+    assert cfg.get_memory_session_max_facts() == 100
 
 
 def test_hidden_user_forces_durable_context(monkeypatch):

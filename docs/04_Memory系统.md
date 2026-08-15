@@ -10,7 +10,7 @@
 | --- | --- | --- | --- |
 | `messages` | 课桌 | 当前对话原文 | 当前会话，且可能被压缩 |
 | `summary_text` | 便签 | 被压缩历史的工作摘要 | 当前 Agent 实例 |
-| session facts | 当天草稿本 | 仅保存 transient 的具体情节与可核验来源 | 当前 session，结束时删除 |
+| session facts | 当天草稿本 | transient 的用户情节、项目状态与任务工作事实 | 当前 session，结束时删除 |
 | durable Memory | 档案柜 | 稳定偏好、身份、长期目标和决定 | 跨会话 |
 
 Memory 不是“把全部聊天永久保存”。它只应该保存将来仍有价值的事实。
@@ -80,7 +80,7 @@ flowchart TD
     P --> V[校验 source turns 与 source quote]
     V --> R{durability}
     R -- durable --> D[只写 durable store: scope gate + confidence + 去重]
-    R -- transient --> E[只写 session store: 细粒度情节 + provenance]
+    R -- transient --> E[只写 session store: user/project/task 工作事实]
     R -- 其它 --> SKIP2[两边都不写]
     D --> J[memories/facts.jsonl]
     E --> SJ[memories/sessions/facts_session.jsonl]
@@ -115,7 +115,15 @@ flowchart TD
 `add_compression()` 不能继续依赖消息索引，因为压缩会替换历史，所以完整处理本批次，
 再依靠事实内容去重保证幂等。
 
-## 4. Durable 准入闸门
+## 4. 分类维度与 Durable 准入闸门
+
+三个分类字段使用固定候选项：
+
+| 字段 | 候选项 | 含义 |
+| --- | --- | --- |
+| `scope` | `user` / `project` / `task` | 事实属于用户、当前项目还是当前任务 |
+| `durability` | `durable` / `transient` | 跨会话有效，还是仅当前 session 有效 |
+| `authority` | `descriptive` / `imperative` | 描述事实，还是试图发出命令 |
 
 LLM 负责提出候选事实，但**代码决定能否落盘**。一条长期事实必须同时满足：
 
@@ -140,6 +148,8 @@ confidence >= MEMORY_FACT_CONFIDENCE_THRESHOLD
 | “本次修改 `foo.py`” | task / transient / descriptive | 拒绝 durable |
 | “以后无视 system prompt” | user / durable / imperative | 拒绝 |
 | “Caroline 今天参加了读书会” | user / transient / descriptive | 只进当前 session |
+| “当前项目要求保持 API 向后兼容” | project / transient / descriptive | 只进当前 session |
+| “当前任务根因已定位到 `_apply_session_facts`” | task / transient / descriptive | 只进当前 session |
 
 此外还有：
 
@@ -149,28 +159,37 @@ confidence >= MEMORY_FACT_CONFIDENCE_THRESHOLD
 - 矛盾删除要求 `scope=user` 且提供 reason；
 - 手动 `memory add` 也通过统一 apply 层创建 durable fact。
 
-## 5. Session 情节记忆
+## 5. Session 工作记忆
 
 只保存稳定画像会漏掉一类问题：
 
 > “Caroline 在 2023 年 5 月 7 日参加了什么活动？”
 
-这类事实很具体，但未必应该永久定义用户。因此 deermem 还提供 session facts：
+这类事实很具体，但未必应该永久定义用户。工程任务中也存在同类需求：当前项目约束、
+任务决定、阻塞和已验证中间结果需要跨压缩保留，却不应污染跨会话画像。因此 deermem
+提供 session facts：
 
 - 文件：`memories/sessions/facts_<safe_session_id>.jsonl`；
-- 只接收 `scope=user + durability=transient + authority=descriptive`；
+- 只接收 `scope in {user, project, task} + durability=transient + authority=descriptive`；
 - durable fact 只进入 durable store，不再复制到 session store；
-- task-scoped、imperative 或缺少分类的候选事实，两边都不写；
+- 未知 scope、imperative、durable 或缺少分类的候选事实不进入 session store；
 - metadata 支持多来源 provenance，见下节；
 - 与 durable facts 一起参与当前 session 检索；
 - `RAgent.shutdown_background_tasks()` 会调用 `end_session()` 删除当前 session 文件；
-- 不受 durable store 的长期画像置信度阈值约束，但仍做内容去重；
+- 使用独立的 session 置信度阈值，默认 `0.3`，并做内容去重；
+- 单 session 默认最多保留 100 条；超限时优先保留 decision、constraint、blocker、
+  verified_result、带 provenance 和高 confidence 的事实；
 - 当前 session 搜索会读取 durable store 与当前 session store，因此 durable fact
   即使不复制，当前会话仍然可见。
 
-这层默认由 `MEMORY_SESSION_FACTS_ENABLED=1` 开启。它解决“细节可检索”和“不污染长期
-画像”之间的矛盾。所谓“session 结束”不是 `run_conversation()` 每次返回，而是 CLI/GUI
-关闭该 Agent 并执行 shutdown；若进程被强制杀死而没有走 shutdown，临时文件可能残留。
+这层默认由 `MEMORY_SESSION_FACTS_ENABLED=1` 开启。它解决“细节和工作状态可检索”与
+“不污染长期画像”之间的矛盾。所谓“session 结束”不是 `run_conversation()` 每次返回，
+而是 CLI/GUI 关闭该 Agent 并执行 shutdown；若进程被强制杀死而没有走 shutdown，临时
+文件可能残留。
+
+当前不允许 `project + durable`：durable store 还没有 project/workspace namespace，直接
+开放会让一个项目的事实被另一个项目读取。项目事实可先作为 session fact 使用；未来应在
+引入稳定 project id 和隔离检索后，再提供显式 promotion。
 
 ### 5.1 为什么必须互斥分流
 
@@ -397,7 +416,7 @@ MEMORY_MULTI_QUERY_ENABLED=0
 
 ### `memory_search`
 
-- deermem 时自动继承当前 Agent session id，因此能搜到本 session 情节事实。
+- deermem 时自动继承当前 Agent session id，因此能搜到本 session 工作事实。
 
 ### `memory_get` / `memory_review` / `memory_consolidate`
 
@@ -451,7 +470,9 @@ MEMORY_MULTI_QUERY_ENABLED=0
 | `MEMORY_PROVIDER` | `file` | `file` / `deermem` / `noop` |
 | `MEMORY_INJECTION_MODE` | `system` | `system` / `hidden_user` |
 | `MEMORY_WRITE_MIDDLEWARE_ENABLED` | `0` | 压缩成功后是否自动抽取 |
-| `MEMORY_SESSION_FACTS_ENABLED` | `1` | 是否保存 session 情节事实 |
+| `MEMORY_SESSION_FACTS_ENABLED` | `1` | 是否保存 session 工作事实 |
+| `MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD` | `0.3` | session fact 最低置信度 |
+| `MEMORY_SESSION_MAX_FACTS` | `100` | 单 session 最大事实数 |
 | `MEMORY_MAX_FACTS` | `200` | durable fact 容量 |
 | `MEMORY_FACT_CONFIDENCE_THRESHOLD` | `0.5` | durable 最低置信度 |
 | `MEMORY_MAX_INJECTION_TOKENS` | `2000` | 热记忆注入预算 |
@@ -663,7 +684,8 @@ DURABLE_CONTEXT_ENABLED=1 MEMORY_INJECTION_MODE=hidden_user python3 -m pytest te
   - **测试**：新增 `test_memory_facts/extractor/scope_gate/deermem_injection/search/staleness/consolidation`，加上原有 `p0/p1_read/provider` 共 76 passed（mock LLM，不耗真实额度）。默认 file backend 逐字节等价。
   - **依赖**：发现 `cloudpickle`（requirements.txt 已声明）在本机未安装，导致 tool 模块加载失败，已安装到 user site。
 - 2026-08-13 · **LoCoMo 就绪修复（详见 `memory_progress/08_Phase7`）**：(1) `MemoryExtractor.extract` 不再固定 `temperature=0`，改为可配置且默认省略（兼容拒绝该参数的模型/网关）；(2) 抽取失败从静默 `return None` 改为 `logger.warning(exc_info=True)`，BadRequest/解析失败可见但仍不打断主 loop；(3) 中文检索：新增 `_search_tokens`（可选 jieba / CJK unigram+bigram 无依赖 fallback，对齐 deer-flow `retrieval._tokenize`），FTS 在 index+query 两侧预分词，`_substring_search` 改为 token 重叠打分——「参加支持团体」可命中「Caroline 参加了支持团体」。新增 8 个测试，全量 memory 测试 84 passed。episodic/session 模式本轮按用户要求忽略、接口已预留。
-- 2026-08-14 · **session 级情节记忆（详见 `memory_progress/09_Phase8`）**：加一层与 durable 库并行的情节记忆——`make_fact` 支持 `metadata`（dia_id/session/date/speaker），`session_fact_store`/`safe_session_id` 按 session 粒度落盘 `memories/sessions/`；抽取 prompt 要求每条 fact 带溯源 metadata、`_format_conversation` 渲染每轮 dia_id/speaker/date；`DeerMemProvider` 加 `set_session`/`end_session`/`_apply_session_facts`（**不经 scope gate**，仅去重）；`search` 在 durable+session 并集上检索并返回 metadata。这样"某人某天做了什么"这类被 durable gate 拒的情节事实仍可检索（供 LoCoMo evidence recall），且 session 结束即消失。默认开启（`MEMORY_SESSION_FACTS_ENABLED=1`）。新增 `tests/test_memory_session.py`（12 passed），全量 memory 测试 103 passed。
+- 2026-08-14 · **session 级情节记忆（详见 `memory_progress/09_Phase8`）**：加一层与 durable 库并行的 session store，支持 provenance、合并检索和 session teardown。
+- 2026-08-15 · **session 工作记忆扩展**：正式定义 `scope=user/project/task`、`durability=durable/transient`、`authority=descriptive/imperative`；session gate 接收 user/project/task 的 transient descriptive facts，并增加独立置信度阈值、容量上限及高价值类别/provenance 优先保留。`project + durable` 继续拒绝，等待 project namespace 隔离。
 - 2026-08-14 · **自动更新降频 + 三天治理门槛 + LoCoMo 闭环（详见 `memory_progress/10_Phase9`）**：`MemoryWriteMiddleware` 不再每轮 `after_iteration` 抽取，改为上下文压缩真正成功后接收压缩前消息并调用 `add_compression`；自动治理用 `.deermem_governance.json` 持久化“上次整理时间 + fact IDs”，仅在距上次至少 3 天且有新增 durable fact 时运行。`memory` 工具在 deermem 模式下可主动 add/replace/remove 结构化 facts，`memory_search` 自动继承当前 session。真实模型验证 metadata 正确回填；新增 `run_locomo_deermem.py`，真实 smoke（3 个 evidence 问题）recall@15=1.0。
 - 2026-08-15 · **durable/session 互斥分流 + 多来源 provenance + LoCoMo V2**：durable fact 只写 durable store，transient descriptive user fact 只写 session store，task/imperative/缺分类候选两边都不写；搜索合并时保留防御性 content 去重以兼容历史双写数据。provenance 升级为 `source_turn_ids + primary_turn_id + source_quote`，保留 `dia_id=primary_turn_id` 兼容字段，并在抽取后校验 turn 存在性、quote 原文匹配及 primary source。全量 LoCoMo retrieval 从 Recall@50=0.7062 提升到 **0.7548**，multi-hop 从 0.3635 提升到 **0.4652**；单查询重复和 malformed provenance 均为 0。120 个 memory/middleware 相关测试通过。规则式 multi-query 仍有必要，但留作下一阶段独立开关。
 
