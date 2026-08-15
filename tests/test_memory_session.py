@@ -17,6 +17,7 @@ from core.memory_extractor import (
     build_extraction_messages,
     _normalize_fact,
     _format_conversation,
+    _validate_update_provenance,
 )
 from core.memory_provider import DeerMemProvider
 
@@ -32,6 +33,20 @@ def test_make_fact_keeps_metadata(tmp_path):
         metadata={"dia_id": "D1:2", "speaker": "Caroline", "date": "2023-05-07", "empty": "  "},
     )
     assert f["metadata"] == {"dia_id": "D1:2", "speaker": "Caroline", "date": "2023-05-07"}
+
+
+def test_make_fact_keeps_source_turn_ids(tmp_path):
+    store = FactStore(memory_dir=str(tmp_path))
+    f = store.make_fact(
+        "新鞋用于跑步",
+        metadata={
+            "source_turn_ids": ["D7:18", "D7:19", "D7:19", ""],
+            "primary_turn_id": "D7:19",
+            "source_quote": "these are for running",
+        },
+    )
+    assert f["metadata"]["source_turn_ids"] == ["D7:18", "D7:19"]
+    assert f["metadata"]["primary_turn_id"] == "D7:19"
 
 
 def test_safe_session_id():
@@ -83,13 +98,79 @@ def test_normalize_fact_preserves_metadata():
         "metadata": {"dia_id": "D3:1", "speaker": "Melanie", "date": "2022"},
     }
     n = _normalize_fact(raw)
-    assert n["metadata"] == {"dia_id": "D3:1", "speaker": "Melanie", "date": "2022"}
+    assert n["metadata"] == {
+        "dia_id": "D3:1",
+        "source_turn_ids": ["D3:1"],
+        "primary_turn_id": "D3:1",
+        "speaker": "Melanie",
+        "date": "2022",
+    }
+
+
+def test_normalize_fact_splits_legacy_multi_source_dia_id():
+    n = _normalize_fact({
+        "content": "多轮事实",
+        "category": "context",
+        "confidence": 0.8,
+        "scope": "user",
+        "durability": "transient",
+        "authority": "descriptive",
+        "metadata": {"dia_id": "D20:6; D20:8"},
+    })
+    assert n["metadata"]["source_turn_ids"] == ["D20:6", "D20:8"]
+    assert n["metadata"]["primary_turn_id"] == "D20:6"
+    assert n["metadata"]["dia_id"] == "D20:6"
+
+
+def test_provenance_quote_realigns_primary_turn():
+    update = {
+        "newFacts": [{
+            "content": "Melanie 的新鞋用于跑步",
+            "metadata": {
+                "source_turn_ids": ["D7:18", "D99:1"],
+                "primary_turn_id": "D7:18",
+                "source_quote": "these are for running",
+            },
+        }],
+    }
+    conversation = [
+        {
+            "role": "user",
+            "content": "I just got some new shoes.",
+            "metadata": {
+                "dia_id": "D7:18",
+                "session": "session_7",
+                "speaker": "Melanie",
+                "date": "2023-07-12",
+            },
+        },
+        {
+            "role": "assistant",
+            "content": "These are for running.",
+            "metadata": {
+                "dia_id": "D7:19",
+                "session": "session_7",
+                "speaker": "Melanie",
+                "date": "2023-07-12",
+            },
+        },
+    ]
+    validated = _validate_update_provenance(update, conversation)
+    metadata = validated["newFacts"][0]["metadata"]
+    assert metadata["source_turn_ids"] == ["D7:18", "D7:19"]
+    assert metadata["primary_turn_id"] == "D7:19"
+    assert metadata["dia_id"] == "D7:19"
+    assert metadata["source_quote"] == "these are for running"
+    assert metadata["speaker"] == "Melanie"
 
 
 def test_extraction_prompt_requests_metadata():
     messages = build_extraction_messages([], [], frozenset())
     system = messages[0]["content"]
     assert "metadata" in system
+    assert "source_turn_ids" in system
+    assert "primary_turn_id" in system
+    assert "source_quote" in system
     assert "dia_id" in system and "speaker" in system
 
 
@@ -201,7 +282,7 @@ def test_session_facts_disabled_by_flag(tmp_path, monkeypatch):
     assert store.count() == 0
 
 
-def test_durable_fact_still_persists_alongside_session(tmp_path, monkeypatch):
+def test_durable_fact_only_persists_in_durable_store(tmp_path, monkeypatch):
     monkeypatch.setenv("MEMORY_SESSION_FACTS_ENABLED", "1")
     monkeypatch.setenv("MEMORY_FACT_CONFIDENCE_THRESHOLD", "0.0")
     durable = {
@@ -218,6 +299,7 @@ def test_durable_fact_still_persists_alongside_session(tmp_path, monkeypatch):
         {"role": "user", "content": "我偏好中文回复"},
         {"role": "assistant", "content": "好的"},
     ])
-    # durable 事实进 durable 库（也进 session 库，因为 session 不设 gate）。
+    # durable 事实只进 durable 库；当前 session 搜索仍会合并 durable store。
     assert store.count() == 1
-    assert provider._get_session_store().count() == 1
+    assert provider._get_session_store().count() == 0
+    assert provider.search("中文回复", thread_id="conv-1")["count"] == 1

@@ -4,6 +4,7 @@ import { renderToString } from 'katex'
 import { BookOpen, Check, Copy, Edit3, Ellipsis, Eye, File, FileText, Folder, Languages, Lightbulb, ListTree, Maximize2, MessageCircle, Minimize2, Plus, Search, Save, Send, Square, Trash2, Workflow, X, ZoomIn, ZoomOut } from 'lucide-react'
 import 'katex/dist/katex.min.css'
 import {
+  acceptSelectionModification,
   copyWorkspaceItem,
   createLearningSession,
   continueLearningSession,
@@ -50,7 +51,7 @@ type ChatItem = {
   messageIndex?: number
 }
 
-type SelectionAction = 'question' | 'translate' | 'explain' | 'summarize' | 'note'
+type SelectionAction = 'question' | 'translate' | 'explain' | 'summarize' | 'note' | 'modify'
 
 type SelectionMenuState = {
   sourceSessionId: string
@@ -123,6 +124,7 @@ type FloatingWindowState = {
   displayQuestion?: string
   targetLanguage?: string
   noteText?: string
+  modificationInstruction?: string
   x: number
   y: number
   width: number
@@ -188,6 +190,7 @@ const SELECTION_ACTIONS: Array<{ action: SelectionAction, label: string, icon: a
   { action: 'explain', label: '解释', icon: Lightbulb },
   { action: 'summarize', label: '总结', icon: FileText },
   { action: 'note', label: '笔记', icon: Edit3 },
+  { action: 'modify', label: '修改', icon: Save },
 ]
 
 const ROOT_BRANCH_COLOR = makeBranchColor(212, 0)
@@ -217,6 +220,7 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<PendingSelectionAction | null>(null)
   const [questionDraft, setQuestionDraft] = useState('')
   const [noteDraft, setNoteDraft] = useState('')
+  const [modificationDraft, setModificationDraft] = useState('')
   const [translationChoice, setTranslationChoice] = useState<'英语' | '中文' | '其他'>('英语')
   const [customLanguage, setCustomLanguage] = useState('')
   const [highlights, setHighlights] = useState<Record<string, HighlightRecord>>({})
@@ -442,6 +446,7 @@ export function App() {
     customQuestion?: string
     targetLanguage?: string
     noteText?: string
+    modificationInstruction?: string
     sourceContext?: Record<string, any>
   }): LearningSessionState {
     return {
@@ -462,6 +467,7 @@ export function App() {
         custom_question: data.customQuestion,
         target_language: data.targetLanguage,
         note_text: data.noteText,
+        modification_instruction: data.modificationInstruction,
         source_context: data.sourceContext,
       } : undefined,
     }
@@ -892,6 +898,19 @@ export function App() {
       setPendingAction({ ...menu, action })
       return
     }
+    if (action === 'modify') {
+      if (menu.sourceContext?.kind !== 'markdown' || !menu.sourceContext?.path) {
+        setError('修改功能目前只支持 Markdown 文件中的选中文本。')
+        return
+      }
+      if (menu.sourceContext?.unsaved_changes) {
+        setError('当前 Markdown 有未保存修改，请先保存文件，再选中文本让 AI 修改。')
+        return
+      }
+      setModificationDraft('')
+      setPendingAction({ ...menu, action })
+      return
+    }
     createSelectionBranch({ ...menu, action })
   }
 
@@ -904,6 +923,7 @@ export function App() {
     displayQuestion?: string
     targetLanguage?: string
     noteText?: string
+    modificationInstruction?: string
     color?: BranchColor
     fullscreen?: boolean
     initialEvents?: ContextEvent[]
@@ -931,6 +951,7 @@ export function App() {
               displayQuestion: options.displayQuestion ?? existing.displayQuestion,
               targetLanguage: options.targetLanguage ?? existing.targetLanguage,
               noteText: options.noteText ?? existing.noteText,
+              modificationInstruction: options.modificationInstruction ?? existing.modificationInstruction,
               minimized: false,
               zIndex: nextZ,
             },
@@ -951,6 +972,7 @@ export function App() {
             displayQuestion: options.displayQuestion,
             targetLanguage: options.targetLanguage,
             noteText: options.noteText,
+            modificationInstruction: options.modificationInstruction,
             x: placement.x,
             y: placement.y,
             width: placement.width,
@@ -986,7 +1008,7 @@ export function App() {
     }
   }
 
-  async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string, noteText?: string } = {}) {
+  async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string, noteText?: string, modificationInstruction?: string } = {}) {
     const menu = actionState
     const actionMeta = SELECTION_ACTIONS.find(item => item.action === menu.action)
     const requestedSourceSessionId = menu.sourceSessionId
@@ -1028,6 +1050,7 @@ export function App() {
       customQuestion: options.customQuestion,
       targetLanguage: options.targetLanguage,
       noteText: options.noteText,
+      modificationInstruction: options.modificationInstruction,
       sourceContext: menu.sourceContext,
     })
     await openFloatingSession(optimisticBranch, {
@@ -1039,6 +1062,7 @@ export function App() {
       displayQuestion: options.customQuestion,
       targetLanguage: options.targetLanguage,
       noteText: options.noteText,
+      modificationInstruction: options.modificationInstruction,
       color: provisionalColor,
       skipInitialFetch: true,
     })
@@ -1064,6 +1088,7 @@ export function App() {
         custom_question: options.customQuestion,
         target_language: options.targetLanguage,
         note_text: options.noteText,
+        modification_instruction: options.modificationInstruction,
         source_context: menu.sourceContext,
       })
       const color = branchColors[branch.session_id] || provisionalColor
@@ -1093,6 +1118,7 @@ export function App() {
         displayQuestion: options.customQuestion,
         targetLanguage: options.targetLanguage,
         noteText: options.noteText,
+        modificationInstruction: options.modificationInstruction,
         color,
         skipInitialFetch: true,
       })
@@ -1128,6 +1154,15 @@ export function App() {
     const action = pendingAction
     setPendingAction(null)
     createSelectionBranch(action, { customQuestion: questionDraft.trim() })
+  }
+
+  function submitModificationDialog() {
+    if (!pendingAction || !modificationDraft.trim()) return
+    const action = pendingAction
+    const instruction = modificationDraft.trim()
+    setPendingAction(null)
+    setModificationDraft('')
+    createSelectionBranch(action, { modificationInstruction: instruction })
   }
 
   function submitTranslationDialog() {
@@ -1400,6 +1435,29 @@ export function App() {
     }
   }
 
+  async function acceptWindowModification(windowId: string) {
+    const win = windows[windowId]
+    const branch = win ? sessions[win.sessionId] : null
+    if (!win || win.action !== 'modify' || branch?.running) return
+    if (!window.confirm('接受当前最终修改，并替换 Markdown 中原来选中的文本？')) return
+    try {
+      const result = await acceptSelectionModification(win.sessionId)
+      setOpenFiles(prev => prev[result.path] ? {
+        ...prev,
+        [result.path]: {
+          ...prev[result.path],
+          textContent: result.content,
+          dirty: false,
+          error: undefined,
+        },
+      } : prev)
+      removeDeletedSessions(new Set(result.deleted?.length ? result.deleted : [win.sessionId]))
+      await refreshWorkspace(workspace?.cwd || '')
+    } catch (err: any) {
+      setError(err.message || String(err))
+    }
+  }
+
   async function deleteRootSession(sessionId: string) {
     try {
       let result: { deleted: string[] }
@@ -1519,6 +1577,7 @@ export function App() {
         displayQuestion: branch.selection?.custom_question,
         targetLanguage: branch.selection?.target_language,
         noteText: branch.selection?.note_text,
+        modificationInstruction: branch.selection?.modification_instruction,
       })
     } catch (err: any) {
       setError(err.message || String(err))
@@ -1533,6 +1592,7 @@ export function App() {
       for (const child of children.nodes) {
         const selection = child.selection || {}
         const source = selection.source_context || {}
+        if (selection.accepted) continue
         if (source.kind !== 'chat' || !selection.selected_text) continue
         const chatId = typeof source.chat_id === 'string'
           ? source.chat_id
@@ -1577,6 +1637,7 @@ export function App() {
       for (const child of children.nodes) {
         const selection = child.selection || {}
         const source = selection.source_context || {}
+        if (selection.accepted) continue
         if (source.path !== path || !selection.selected_text) continue
         const highlightId = `persist_${child.session_id}`
         const color = branchColors[child.session_id] || deriveChildColor(fileRoot.session_id, [...Object.values(sessions), fileRoot, ...children.nodes], branchColors)
@@ -1886,7 +1947,12 @@ export function App() {
           }
         }}
         onMarkdownSelection={(result, path) => {
-          const location = describeMarkdownSelectionLocation(openFiles[path]?.textContent || '', result.text)
+          const sourceContent = openFiles[path]?.textContent || ''
+          const sourceRange = locateMarkdownSourceSelection(sourceContent, result.text, result.occurrence)
+          const lineRange = sourceRange ? markdownLineRange(sourceContent, sourceRange.start, sourceRange.end) : null
+          const location = lineRange
+            ? (lineRange.startLine === lineRange.endLine ? `line ${lineRange.startLine}` : `lines ${lineRange.startLine}-${lineRange.endLine}`)
+            : describeMarkdownSelectionLocation(sourceContent, result.text)
           showSelectionMenu({
             sourceSessionId: session?.session_id || '',
             chatId: `markdown:${path}`,
@@ -1895,7 +1961,20 @@ export function App() {
             occurrence: result.occurrence,
             x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
             y: Math.max(12, result.rect.top - 46),
-            sourceContext: { kind: 'markdown', path, location, text_offset: result.textOffset, occurrence: result.occurrence },
+            sourceContext: {
+              kind: 'markdown',
+              path,
+              location,
+              text_offset: result.textOffset,
+              occurrence: result.occurrence,
+              source_text_offset: sourceRange?.start,
+              source_line_start: lineRange?.startLine,
+              source_line_end: lineRange?.endLine,
+              source_line_start_offset: lineRange?.start,
+              source_line_end_offset: lineRange?.end,
+              source_line_text: lineRange?.text,
+              unsaved_changes: !!openFiles[path]?.dirty,
+            },
           }, result.range)
         }}
         onPdfSelection={(text, page, rect, rects) => {
@@ -2048,6 +2127,13 @@ export function App() {
       onSave={() => saveNoteDialog(false)}
       onSend={() => saveNoteDialog(true)}
     />}
+    {pendingAction?.action === 'modify' && <ModificationDialog
+      selectedText={pendingAction.text}
+      value={modificationDraft}
+      onChange={setModificationDraft}
+      onCancel={() => setPendingAction(null)}
+      onSubmit={submitModificationDialog}
+    />}
     <FloatingWindows
       windows={windows}
       sessions={sessions}
@@ -2064,6 +2150,7 @@ export function App() {
       onMinimize={minimizeWindow}
       onMaximize={maximizeWindow}
       onClose={closeWindowAndDeleteSubtree}
+      onAcceptModification={acceptWindowModification}
       onRaise={raiseWindow}
       onMove={moveWindow}
       onResize={resizeWindow}
@@ -2289,6 +2376,13 @@ function todoStatusIcon(status: string): string {
 
 function buildCleanSelectionDisplay(win: FloatingWindowState): string {
   const selected = win.selectedText || ''
+  if (win.action === 'modify') {
+    return `修改要求：
+${win.modificationInstruction || ''}
+
+原选中文本：
+${selected}`
+  }
   if (win.action === 'note') {
     return `笔记：\n${win.noteText || ''}\n\n关联文本：\n${selected}`
   }
@@ -2343,6 +2437,34 @@ function describeMarkdownSelectionLocation(content: string, selectedText: string
   return startLine === endLine ? `line ${startLine}` : `lines ${startLine}-${endLine}`
 }
 
+function locateMarkdownSourceSelection(content: string, selectedText: string, occurrence = 0): { start: number, end: number } | null {
+  const source = String(content || '')
+  const selected = String(selectedText || '').trim()
+  if (!source || !selected) return null
+  const start = nthIndexOf(source, selected, Math.max(0, occurrence || 0))
+  if (start >= 0) return { start, end: start + selected.length }
+  return findNormalizedTextRange(source, selected, Math.max(0, occurrence || 0))
+}
+
+function markdownLineRange(content: string, selectionStart: number, selectionEnd: number): {
+  start: number
+  end: number
+  startLine: number
+  endLine: number
+  text: string
+} {
+  const source = String(content || '')
+  const safeStart = Math.max(0, Math.min(selectionStart, source.length))
+  const safeEnd = Math.max(safeStart, Math.min(selectionEnd, source.length))
+  const start = source.lastIndexOf('\n', Math.max(0, safeStart - 1)) + 1
+  const probe = Math.max(safeStart, safeEnd - 1)
+  const nextNewline = source.indexOf('\n', probe)
+  const end = nextNewline < 0 ? source.length : nextNewline
+  const startLine = source.slice(0, start).split('\n').length
+  const endLine = startLine + source.slice(start, end).split('\n').length - 1
+  return { start, end, startLine, endLine, text: source.slice(start, end) }
+}
+
 function parentPath(path: string): string {
   const parts = String(path || '').split('/').filter(Boolean)
   parts.pop()
@@ -2356,7 +2478,7 @@ function shouldSubmitFromKey(event: any): boolean {
 
 function SelectionMenu({ menu, onAction }: { menu: SelectionMenuState, onAction: (action: SelectionAction) => void }) {
   return <div className="selection-menu" style={{ left: menu.x, top: menu.y }} onPointerDown={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()}>
-    {SELECTION_ACTIONS.map(item => {
+    {SELECTION_ACTIONS.filter(item => item.action !== 'modify' || menu.sourceContext?.kind === 'markdown').map(item => {
       const Icon = item.icon
       return <button key={item.action} onClick={() => onAction(item.action)}><Icon size={14}/>{item.label}</button>
     })}
@@ -2485,6 +2607,26 @@ function NoteDialog({ selectedText, value, onChange, onCancel, onSave, onSend }:
         <button className="secondary" onClick={onCancel}>取消</button>
         <button className="secondary" disabled={!value.trim()} onClick={onSave}>保存笔记</button>
         <button className="primary" disabled={!value.trim()} onClick={onSend}>发送给模型</button>
+      </footer>
+    </section>
+  </div>
+}
+
+function ModificationDialog({ selectedText, value, onChange, onCancel, onSubmit }: {
+  selectedText: string
+  value: string
+  onChange: (value: string) => void
+  onCancel: () => void
+  onSubmit: () => void
+}) {
+  return <div className="modal-backdrop">
+    <section className="action-dialog">
+      <header>修改选中的 Markdown</header>
+      <div className="selected-preview">{selectedText}</div>
+      <textarea value={value} onChange={event => onChange(event.target.value)} placeholder="输入修改要求，例如：改得更简洁、补充一个例子、修正这段表述..."/>
+      <footer>
+        <button className="secondary" onClick={onCancel}>取消</button>
+        <button className="primary" disabled={!value.trim()} onClick={onSubmit}>生成修改建议</button>
       </footer>
     </section>
   </div>
@@ -2725,7 +2867,7 @@ function MarkdownFileEditor({ tab, sessionId, highlights, scrollTop, onScroll, o
           }
           window.setTimeout(() => handleResult(readTextSelectionWithin(container)), 0)
         }}>
-          <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} sourceSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
+          <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} assetSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
         </div>}
   </section>
 }
@@ -3405,6 +3547,7 @@ function FloatingWindows({
   onMinimize,
   onMaximize,
   onClose,
+  onAcceptModification,
   onRaise,
   onMove,
   onResize,
@@ -3432,6 +3575,7 @@ function FloatingWindows({
   onMinimize: (windowId: string) => void
   onMaximize: (windowId: string) => void
   onClose: (windowId: string) => void
+  onAcceptModification: (windowId: string) => void
   onRaise: (windowId: string) => void
   onMove: (windowId: string, x: number, y: number) => void
   onResize: (windowId: string, width: number, height: number) => void
@@ -3515,6 +3659,12 @@ function FloatingWindows({
           <div className="window-controls">
             <button title="缩小" onClick={() => onMinimize(win.id)}><Minimize2 size={15}/></button>
             <button title="全屏" onClick={() => onMaximize(win.id)}><Maximize2 size={15}/></button>
+            {win.action === 'modify' && <button
+              className="accept-modification"
+              title={session?.selection?.accepted ? '该修改已接受' : '用当前最终候选替换原选区'}
+              disabled={busy || !!session?.selection?.accepted}
+              onClick={() => onAcceptModification(win.id)}
+            ><Check size={14}/>{session?.selection?.accepted ? '已接受' : '接受修改'}</button>}
             <button className="delete-window" title="删除并删除子树" onClick={() => onClose(win.id)}><Trash2 size={14}/>删除</button>
           </div>
         </header>
@@ -3712,15 +3862,19 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
   </div>
 })
 
-const MarkdownText = memo(function MarkdownText({ text, chatId, sourceSessionId, highlights, onOpenHighlight, basePath = '' }: {
+const MarkdownText = memo(function MarkdownText({ text, chatId, sourceSessionId, assetSessionId = '', highlights, onOpenHighlight, basePath = '' }: {
   text: string
   chatId: string
   sourceSessionId?: string
+  assetSessionId?: string
   highlights: Record<string, HighlightRecord>
   onOpenHighlight: (highlightId: string) => void
   basePath?: string
 }) {
-  const html = useMemo(() => renderMarkdownToHtml(text || '', { basePath, chatId, sourceSessionId, highlights }), [text, basePath, chatId, sourceSessionId, highlights])
+  const html = useMemo(
+    () => renderMarkdownToHtml(text || '', { basePath, chatId, sourceSessionId, assetSessionId, highlights }),
+    [text, basePath, chatId, sourceSessionId, assetSessionId, highlights],
+  )
   return <div
     className="markdown-body"
     onMouseDown={event => {
@@ -3754,6 +3908,7 @@ function renderMarkdownToHtml(text: string, options: {
   basePath?: string
   chatId: string
   sourceSessionId?: string
+  assetSessionId?: string
   highlights: Record<string, HighlightRecord>
 }): string {
   const mathItems: MathRenderPlaceholder[] = []
@@ -3766,7 +3921,7 @@ function renderMarkdownToHtml(text: string, options: {
   mathItems.forEach((item, index) => {
     html = html.split(`@@RAGENT_MATH_${index}@@`).join(renderMathPlaceholder(item))
   })
-  html = rewriteMarkdownAssetUrls(html, options.basePath || '', options.sourceSessionId || '')
+  html = rewriteMarkdownAssetUrls(html, options.basePath || '', options.assetSessionId || '')
   html = applyMarkdownHighlights(html, options.chatId, options.sourceSessionId, options.highlights)
   html = wrapMarkdownTextTokens(html)
   return html

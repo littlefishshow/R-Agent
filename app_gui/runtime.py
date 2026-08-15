@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from app_gui.event_bus import ContextEventBus
 from app_gui.schemas import (
     EVENT_ERROR,
+    EVENT_LLM_REQUEST_SNAPSHOT,
     EVENT_MEMORY_SNAPSHOT_LOADED,
     EVENT_MESSAGE_APPENDED,
     EVENT_SESSION_STARTED,
@@ -247,7 +248,28 @@ SELECTION_ACTIONS = {
     "explain": ("解释", "请解释选中文本本身的含义、背景、关键概念和常见误区。"),
     "summarize": ("总结", "请总结选中文本本身的核心要点。"),
     "note": ("笔记", "请结合选中文本和用户手写笔记回答，优先围绕笔记中的想法、疑问或判断展开。"),
+    "modify": (
+        "修改",
+        "请根据用户的修改要求改写选中的 Markdown 文本。"
+        "当前阶段只讨论和生成候选替换文本，不要调用任何文件写入工具。"
+        "只回复修改好的 Markdown 内容，不要解释，不要添加标签或 Markdown 代码围栏。"
+        "用户后续可以继续提出意见。"
+    ),
 }
+
+MODIFICATION_BRANCH_PROMPT = (
+    "\n\n【Markdown 修改分支协议】\n"
+    "本会话只讨论来源 Markdown 中已选中的文本及其对应完整原始行。"
+    "用户可能连续提出修改意见；每次回答都必须基于此前候选和最新意见，"
+    "给出一份用于替换这些完整原始行的最新 Markdown。"
+    "只回复修改好的 Markdown 内容，不要解释、不要添加标签、不要使用 Markdown 代码围栏。"
+    "不要调用文件写入、删除或命令工具；只有用户在界面点击“接受修改”后，"
+    "宿主程序才会写入文件。"
+)
+
+_PERSISTED_OUTPUT_PATH_RE = re.compile(r"Full output saved to:\s*(.+)")
+_PERSISTED_OUTPUT_SIZE_RE = re.compile(r"too large \(([\d,]+) characters")
+_DURABLE_SUMMARY_RE = re.compile(r"<durable_summary>\s*(.*?)\s*</durable_summary>", re.DOTALL)
 
 
 class GuiSession:
@@ -269,9 +291,11 @@ class GuiSession:
         if restore:
             self.system_prompt = self._restore_system_prompt()
             self.agent.messages = self._restore_agent_messages()
+            self._restore_thread_state()
         else:
             self.system_prompt = self._build_and_emit_system_prompt()
             self.event_bus.emit(EVENT_SESSION_STARTED, {"session_id": session_id, "model": self.agent.model})
+            self._persist_thread_state()
 
     def _restore_system_prompt(self) -> str:
         for event in reversed(self.store.events):
@@ -330,6 +354,82 @@ class GuiSession:
             return [self._expand_payload_refs(item) for item in value]
         return value
 
+    def _thread_state_snapshot(self, agent: Optional[RAgent] = None) -> Dict[str, Any]:
+        active_agent = agent or self.agent
+        state = getattr(active_agent, "state", None)
+        if state is None:
+            return {"version": 1, "summary_text": "", "artifact_index": []}
+        artifacts = []
+        for entry in getattr(state, "artifact_index", None) or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                artifacts.append(dict(entry))
+        return {
+            "version": 1,
+            "summary_text": str(getattr(state, "summary_text", "") or ""),
+            "artifact_index": artifacts,
+        }
+
+    def _persist_thread_state(self, agent: Optional[RAgent] = None, *, save: bool = True) -> None:
+        try:
+            self.store.update_thread_state(self._thread_state_snapshot(agent), save=save)
+        except Exception:
+            pass
+
+    def _restore_thread_state(self) -> None:
+        snapshot = dict(getattr(self.store, "thread_state", None) or {})
+        summary_text = str(snapshot.get("summary_text") or "").strip()
+        if not summary_text:
+            summary_text = self._restore_summary_from_request_events()
+        self.agent.state.summary_text = summary_text
+
+        for entry in snapshot.get("artifact_index") or []:
+            self.agent.state.add_artifact(entry)
+        for entry in self._restore_artifacts_from_messages(self.agent.messages):
+            self.agent.state.add_artifact(entry)
+
+        # Migrate old GUI sessions forward once they have been reconstructed.
+        self._persist_thread_state()
+
+    def _restore_summary_from_request_events(self) -> str:
+        for event in reversed(self.store.events):
+            if event.get("event_type") != EVENT_LLM_REQUEST_SNAPSHOT:
+                continue
+            payload = self._expand_payload_refs(event.get("payload") or {})
+            for message in reversed(payload.get("messages") or []):
+                if not isinstance(message, dict):
+                    continue
+                content = self._expand_payload_refs(message.get("content", ""))
+                match = _DURABLE_SUMMARY_RE.search(str(content or ""))
+                if match:
+                    return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _restore_artifacts_from_messages(messages) -> list[Dict[str, Any]]:
+        artifacts = []
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+            content = str(message.get("content") or "")
+            if "<persisted-output>" not in content:
+                continue
+            path_match = _PERSISTED_OUTPUT_PATH_RE.search(content)
+            if not path_match:
+                continue
+            entry = {
+                "path": path_match.group(1).strip(),
+                "tool": message.get("name") or "",
+                "call_id": message.get("tool_call_id"),
+            }
+            size_match = _PERSISTED_OUTPUT_SIZE_RE.search(content)
+            if size_match:
+                try:
+                    entry["original_chars"] = int(size_match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+            artifacts.append(entry)
+        return artifacts
+
     def _build_and_emit_system_prompt(self) -> str:
         base_prompt = build_system_prompt() + SELF_EVOLUTION_PROMPT
         memory_snapshot = memory_manager.load_snapshot()
@@ -352,12 +452,16 @@ class GuiSession:
             def emit(self, event_type: str, payload=None, **kwargs):
                 if not session._is_current_run(run_id):
                     return {}
-                return session.event_bus.emit(event_type, payload, **kwargs)
+                session._persist_thread_state(save=False)
+                event = session.event_bus.emit(event_type, payload, **kwargs)
+                return event
 
             def __call__(self, event_type: str, payload=None, **kwargs):
                 if not session._is_current_run(run_id):
                     return {}
-                return session.event_bus(event_type, payload, **kwargs)
+                session._persist_thread_state(save=False)
+                event = session.event_bus(event_type, payload, **kwargs)
+                return event
 
         return ScopedEventSink()
 
@@ -424,6 +528,8 @@ class GuiSession:
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
+            if not run_id or self._is_current_run(run_id):
+                self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
 
@@ -483,6 +589,8 @@ class GuiSession:
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
+            if not run_id or self._is_current_run(run_id):
+                self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
 
@@ -668,6 +776,12 @@ class LearningSession(GuiSession):
         super().__init__(session_id, store_root=store_root, agent=agent, restore=restore, base_dir=base_dir)
         if not self.selection and isinstance(self.store.metadata.get("selection"), dict):
             self.selection = dict(self.store.metadata.get("selection") or {})
+        if self.selection.get("action") == "modify" and MODIFICATION_BRANCH_PROMPT not in self.system_prompt:
+            self.system_prompt += MODIFICATION_BRANCH_PROMPT
+            self.event_bus.emit(
+                EVENT_SYSTEM_PROMPT_BUILT,
+                {"payload_ref": self.store.put_payload(self.system_prompt).to_dict()},
+            )
         self.store.update_metadata({
             "title": self.title,
             "root_question": self.root_question,
@@ -730,6 +844,8 @@ class LearningSession(GuiSession):
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
+            if not run_id or self._is_current_run(run_id):
+                self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
 
@@ -760,6 +876,8 @@ class LearningSession(GuiSession):
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
+            if not run_id or self._is_current_run(run_id):
+                self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
 
@@ -1351,6 +1469,7 @@ class LearningRuntimeService(AgentRuntimeService):
         custom_question: str = "",
         target_language: str = "",
         note_text: str = "",
+        modification_instruction: str = "",
         title: str = "",
         source_context: Optional[Dict[str, Any]] = None,
         background: bool = True,
@@ -1364,14 +1483,22 @@ class LearningRuntimeService(AgentRuntimeService):
         question = str(custom_question or "").strip()
         target_language = str(target_language or "").strip()
         note_text = str(note_text or "").strip()
+        modification_instruction = str(modification_instruction or "").strip()
         if action_key == "question" and not question:
             raise ValueError("custom_question is required for question action")
         if action_key == "translate" and not target_language:
             raise ValueError("target_language is required for translate action")
         if action_key == "note" and not note_text:
             raise ValueError("note_text is required for note action")
+        if action_key == "modify" and not modification_instruction:
+            raise ValueError("modification_instruction is required for modify action")
         source = self.get_session(source_session_id)
         source_context = source_context or {}
+        if action_key == "modify":
+            if str(source_context.get("kind") or "").strip().lower() != "markdown":
+                raise ValueError("modify action only supports markdown selections")
+            if not str(source_context.get("path") or "").strip():
+                raise ValueError("source markdown path is required for modify action")
         context_lines = []
         if source_context:
             source_kind = str(source_context.get("kind") or "").strip()
@@ -1405,6 +1532,16 @@ class LearningRuntimeService(AgentRuntimeService):
                 f"【选中文本】\n{selected_text}\n\n"
                 f"【我的手写笔记】\n{note_text}"
             )
+        elif action_key == "modify":
+            source_lines = str(source_context.get("source_line_text") or selected_text)
+            initial_question = (
+                f"{action_instruction}\n\n"
+                f"{context_block}"
+                f"【选中文本】\n{selected_text}\n\n"
+                f"【接受修改时将被整体替换的原始行】\n{source_lines}\n\n"
+                f"【修改要求】\n{modification_instruction}\n\n"
+                "请只输出用于替换上述完整原始行的最终 Markdown 内容。"
+            )
         else:
             initial_question = (
                 f"{action_instruction}\n\n"
@@ -1419,6 +1556,7 @@ class LearningRuntimeService(AgentRuntimeService):
             "custom_question": question,
             "target_language": target_language,
             "note_text": note_text,
+            "modification_instruction": modification_instruction,
             "source_context": source_context,
         }
         display_title = title or f"{action_label}: {_make_learning_title(selected_text, limit=24)}"
@@ -1431,7 +1569,7 @@ class LearningRuntimeService(AgentRuntimeService):
             node_kind="selection",
             file_path=getattr(source, "file_path", ""),
             source_message_index=len(source.agent.messages),
-            tools_enabled=getattr(source, "tools_enabled", True),
+            tools_enabled=False if action_key == "modify" else getattr(source, "tools_enabled", True),
             selection=selection_meta,
         )
         if action_key in {"question", "explain", "summarize", "note"}:
@@ -1441,6 +1579,138 @@ class LearningRuntimeService(AgentRuntimeService):
         state["send"] = send_result
         state["selection"] = selection_meta
         return state
+
+    def accept_selection_modification(
+        self,
+        session_id: str,
+        *,
+        workspace,
+    ) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        selection = dict(getattr(session, "selection", None) or {})
+        if selection.get("action") != "modify":
+            raise ValueError("session is not a modify selection branch")
+        if selection.get("accepted"):
+            raise ValueError("modification has already been accepted")
+        if session.running:
+            raise ValueError("session is still running")
+
+        source_context = selection.get("source_context")
+        if not isinstance(source_context, dict):
+            raise ValueError("modify selection source context is missing")
+        if str(source_context.get("kind") or "").strip().lower() != "markdown":
+            raise ValueError("modify action only supports markdown selections")
+        path = str(source_context.get("path") or "").strip()
+        if not path:
+            raise ValueError("source markdown path is missing")
+
+        replacement = self._latest_modification_candidate(session)
+        if replacement is None:
+            raise ValueError("no replacement candidate found; wait for the model response first")
+
+        current = workspace.read_text_file(path)
+        content = str(current.get("content") or "")
+        selected_text = str(selection.get("selected_text") or "")
+        line_start = source_context.get("source_line_start_offset")
+        line_end = source_context.get("source_line_end_offset")
+        original_lines = source_context.get("source_line_text")
+        if (
+            isinstance(line_start, int)
+            and isinstance(line_end, int)
+            and 0 <= line_start <= line_end <= len(content)
+            and isinstance(original_lines, str)
+        ):
+            if content[line_start:line_end] != original_lines:
+                raise ValueError("the original markdown lines have changed; reopen the file and select them again")
+            start, end = line_start, line_end
+        else:
+            text_offset = source_context.get("source_text_offset")
+            occurrence = source_context.get("occurrence")
+            selected_start = self._resolve_selection_offset(content, selected_text, text_offset, occurrence)
+            if selected_start < 0:
+                raise ValueError("the original selected text has changed; reopen the file and select it again")
+            start, end = self._line_span_for_selection(
+                content,
+                selected_start,
+                selected_start + len(selected_text),
+            )
+
+        updated = content[:start] + replacement + content[end:]
+        item = workspace.write_text_file(path, updated)
+        deleted = []
+        try:
+            deleted = self.delete_subtree(session_id).get("deleted", [])
+        except Exception:
+            # 文件修改已经成功；上下文清理失败不应把成功响应伪装成写入失败。
+            deleted = [session_id]
+        return {
+            "success": True,
+            "session_id": session_id,
+            "path": path,
+            "replacement_text": replacement,
+            "line_start": source_context.get("source_line_start"),
+            "line_end": source_context.get("source_line_end"),
+            "content": updated,
+            "item": item,
+            "deleted": deleted,
+        }
+
+    @staticmethod
+    def _latest_modification_candidate(session: LearningSession) -> Optional[str]:
+        legacy_pattern = re.compile(
+            r"<replacement_markdown>(.*?)</replacement_markdown>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        fence_pattern = re.compile(
+            r"^\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*$",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for message in reversed(normalize_messages(session.agent.messages)):
+            if message.get("role") != "assistant":
+                continue
+            content = str(message.get("content") or "")
+            legacy_match = legacy_pattern.search(content)
+            if legacy_match:
+                content = legacy_match.group(1)
+            else:
+                fence_match = fence_pattern.match(content)
+                if fence_match:
+                    content = fence_match.group(1)
+            candidate = content.strip("\r\n")
+            if candidate.strip():
+                return candidate
+        return None
+
+    @staticmethod
+    def _line_span_for_selection(content: str, start: int, end: int) -> tuple[int, int]:
+        safe_start = max(0, min(start, len(content)))
+        safe_end = max(safe_start, min(end, len(content)))
+        line_start = content.rfind("\n", 0, safe_start) + 1
+        probe = max(safe_start, safe_end - 1)
+        newline = content.find("\n", probe)
+        line_end = len(content) if newline < 0 else newline
+        return line_start, line_end
+
+    @staticmethod
+    def _resolve_selection_offset(
+        content: str,
+        selected_text: str,
+        text_offset: Any,
+        occurrence: Any,
+    ) -> int:
+        if not selected_text:
+            return -1
+        if isinstance(text_offset, int) and text_offset >= 0:
+            if content[text_offset:text_offset + len(selected_text)] == selected_text:
+                return text_offset
+        target_occurrence = occurrence if isinstance(occurrence, int) and occurrence >= 0 else 0
+        start = 0
+        for _ in range(target_occurrence + 1):
+            found = content.find(selected_text, start)
+            if found < 0:
+                return -1
+            start = found + len(selected_text)
+        return found
 
     def save_selection_note(
         self,

@@ -1,18 +1,214 @@
-"""内置中间件：把之前"待做"的横切逻辑以 Middleware 形式落地。
-
-对齐 deer-flow：
-* ``ToolResultSanitizationMiddleware`` —— 工具结果清洗（学习文档 6.4，防 prompt injection）。
-* ``MemoryWriteMiddleware`` —— middleware 模式的记忆自动写入（学习文档第 7 章）。
-
-两者都**默认关闭**（由 core/config 的开关控制），开启后才进入默认链，保证零行为变化。
-"""
+"""R-Agent 内置运行时、治理与安全中间件。"""
 
 from __future__ import annotations
 
 import re
+import json
 from typing import Any, Optional
 
 from core.middleware.base import AgentContext, Middleware, ToolCallView
+
+
+class DeferredToolFilterMiddleware(Middleware):
+    """在上下文估算前隐藏尚未提升的延迟工具 schema。"""
+
+    name = "deferred_tool_filter"
+
+    def before_model(self, ctx: AgentContext) -> None:
+        filtered = ctx.agent._apply_deferred_tool_filter(ctx.tools)
+        if filtered is not ctx.tools:
+            ctx.tools[:] = filtered
+
+
+class ContextCompressionMiddleware(Middleware):
+    """在主模型请求前检查上下文预算并按需压缩。"""
+
+    name = "context_compression"
+
+    def before_model(self, ctx: AgentContext) -> None:
+        ctx.agent._maybe_compress_context(ctx.tools, mw_ctx=ctx)
+
+
+class SoftIterationBudgetMiddleware(Middleware):
+    """在每次迭代开始时注入一次软预算收敛提醒。"""
+
+    name = "soft_iteration_budget"
+
+    def before_iteration(self, ctx: AgentContext) -> None:
+        from core import config
+
+        agent = ctx.agent
+        threshold = max(1, int(agent.max_iterations * config.get_soft_warn_ratio()))
+        if not agent._soft_warned and ctx.iteration >= threshold:
+            agent._inject_soft_warning(ctx.iteration, agent.max_iterations)
+            agent._soft_warned = True
+
+
+class ToolRuntimeStateMiddleware(Middleware):
+    """把工具结果带来的运行时状态更新集中在单工具后处理阶段。"""
+
+    name = "tool_runtime_state"
+
+    def after_tool_execution(self, ctx: AgentContext, call: ToolCallView, result: Any) -> Optional[str]:
+        agent = ctx.agent
+        if call.name == "delegate_task":
+            agent._merge_delegated_token_usage_from_tool_result(result)
+        agent._maybe_promote_from_tool_search(call.name, result)
+        agent._maybe_record_skill_context(call.name, call.arguments, result)
+        agent._maybe_apply_skill_policy(call.name, result)
+        return None
+
+
+class ToolOutputBudgetMiddleware(Middleware):
+    """外置超大单工具结果，并约束同一 assistant turn 的工具结果总量。"""
+
+    name = "tool_output_budget"
+
+    def after_tool_execution(self, ctx: AgentContext, call: ToolCallView, result: Any) -> Optional[str]:
+        from core.context.tool_result_storage import maybe_persist_tool_result
+
+        persisted = maybe_persist_tool_result(
+            content=result,
+            tool_name=call.name,
+            tool_use_id=call.call_id,
+        )
+        return persisted if persisted != result else None
+
+    def after_tool_batch(
+        self,
+        ctx: AgentContext,
+        calls: list[ToolCallView],
+        tool_messages: list[dict],
+    ) -> Optional[list[dict]]:
+        from core.context.tool_result_storage import enforce_turn_budget
+
+        enforced = enforce_turn_budget(tool_messages)
+        return enforced if enforced is not tool_messages else None
+
+
+def _persisted_path(text: str) -> Optional[str]:
+    match = re.search(r"Full output saved to:\s*(.+)", text or "")
+    return match.group(1).strip() if match else None
+
+
+def _delegation_entries(result_text: str) -> list[dict]:
+    try:
+        data = json.loads(result_text)
+    except Exception:
+        return []
+    if isinstance(data, dict) and "result" in data and isinstance(data["result"], (dict, list, str)):
+        inner = data["result"]
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except Exception:
+                inner = data
+        data = inner
+
+    entries: list[dict] = []
+
+    def collect(obj):
+        if not isinstance(obj, dict) or not (obj.get("task_id") or obj.get("task_index") is not None):
+            return
+        entry = {
+            key: obj.get(key)
+            for key in (
+                "task_id",
+                "task_index",
+                "status",
+                "truncated",
+                "stop_reason",
+                "started_at",
+                "completed_at",
+                "step_events",
+                "context_artifact_path",
+                "token_usage",
+            )
+            if key in obj
+        }
+        if entry:
+            entries.append(entry)
+
+    if isinstance(data, dict):
+        candidates = data.get("results") if isinstance(data.get("results"), list) else None
+        if candidates is None:
+            candidates = data.get("tasks") if isinstance(data.get("tasks"), list) else None
+        if candidates is not None:
+            for item in candidates:
+                collect(item)
+        else:
+            collect(data)
+    elif isinstance(data, list):
+        for item in data:
+            collect(item)
+    return entries
+
+
+class ToolResultTrackingMiddleware(Middleware):
+    """记录最终预算化工具结果，并更新 artifact/delegation 结构化状态。"""
+
+    name = "tool_result_tracking"
+
+    def before_tool_message(self, ctx: AgentContext, call: ToolCallView, result: Any) -> None:
+        from app_gui.schemas import EVENT_TOOL_CALL_FINISHED
+        from core import events as run_events
+
+        agent = ctx.agent
+        result_text = result if isinstance(result, str) else str(result)
+        event_payload = {
+            "call_id": call.call_id,
+            "name": call.name,
+            "arguments": call.arguments,
+            "result": result,
+        }
+        event_sink = ctx.event_sink
+        if event_sink is not None:
+            try:
+                if hasattr(event_sink, "emit"):
+                    event_sink.emit(EVENT_TOOL_CALL_FINISHED, event_payload)
+                else:
+                    event_sink(EVENT_TOOL_CALL_FINISHED, event_payload)
+            except TypeError:
+                event_sink({
+                    "event_type": EVENT_TOOL_CALL_FINISHED,
+                    "payload": event_payload,
+                })
+            except Exception:
+                pass
+
+        persisted = "<persisted-output>" in result_text
+        agent._emit_run_event(
+            run_events.EV_TOOL_RESULT,
+            {
+                "name": call.name,
+                "call_id": call.call_id,
+                "result_chars": len(result_text),
+                "persisted": persisted,
+            },
+            iteration=ctx.iteration,
+            result_preview=result_text[:500],
+        )
+        if persisted:
+            path = _persisted_path(result_text)
+            agent._emit_run_event(
+                run_events.EV_ARTIFACT_CREATED,
+                {"tool": call.name, "call_id": call.call_id, "path": path},
+            )
+            agent.state.add_artifact({
+                "path": path,
+                "tool": call.name,
+                "call_id": call.call_id,
+                "chars": len(result_text),
+            })
+
+        if call.name == "delegate_task":
+            agent._emit_run_event(
+                run_events.EV_DELEGATE_END,
+                {"call_id": call.call_id, "result_chars": len(result_text)},
+                iteration=ctx.iteration,
+            )
+            for entry in _delegation_entries(result_text):
+                agent.state.add_delegation(entry)
 
 
 # 明显的注入式指令特征。命中后不删除内容（可能是正常引用），而是**中和**：

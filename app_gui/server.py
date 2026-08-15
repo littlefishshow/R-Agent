@@ -309,6 +309,7 @@ def create_app(
                 custom_question=str(request.get("custom_question") or ""),
                 target_language=str(request.get("target_language") or ""),
                 note_text=str(request.get("note_text") or ""),
+                modification_instruction=str(request.get("modification_instruction") or ""),
                 title=str(request.get("title") or ""),
                 source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
                 background=bool(request.get("background", True)),
@@ -329,6 +330,18 @@ def create_app(
                 title=str(request.get("title") or ""),
                 source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
                 child_session_id=request.get("session_id"),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/accept-modification")
+    def accept_learning_selection_modification(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.accept_selection_modification(
+                session_id,
+                workspace=_workspace_for_session(workspace, session_id),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

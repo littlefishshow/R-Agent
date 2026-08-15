@@ -137,6 +137,34 @@ def test_search_falls_back_when_fts_returns_none(tmp_path, monkeypatch):
     assert "keyword" in result["results"][0]["content"]
 
 
+def test_search_deduplicates_legacy_durable_and_session_copy(tmp_path):
+    store = _store_with(tmp_path, [("用户偏好中文回复", 0.9)])
+    provider = DeerMemProvider(
+        store=store,
+        async_extract=False,
+        memory_dir=str(tmp_path),
+    )
+    session_store = provider.set_session("conv-1")
+    session_store.write_all([
+        session_store.make_fact(
+            "用户偏好中文回复",
+            confidence=0.9,
+            scope="user",
+            durability="transient",
+            authority="descriptive",
+            metadata={
+                "source_turn_ids": ["D1:2"],
+                "primary_turn_id": "D1:2",
+                "dia_id": "D1:2",
+            },
+        ),
+    ])
+
+    result = provider.search("中文回复", top_k=5, thread_id="conv-1")
+    assert result["count"] == 1
+    assert result["results"][0]["metadata"]["source_turn_ids"] == ["D1:2"]
+
+
 def test_memory_search_tool_dispatches_to_deermem(tmp_path, monkeypatch):
     from tools import memory_read_tool
     import core.memory_provider as mp

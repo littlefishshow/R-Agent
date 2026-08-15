@@ -1,21 +1,19 @@
-"""轻量 Agent 中间件框架。
+"""R-Agent 的轻量运行时中间件框架。
 
-对齐 deer-flow 的 middleware chain 思想（见 deer-flow 学习文档第 3 章 / 13.1）：
-不要把 agent loop 写成一个越来越大的循环函数，而是把横切逻辑（上下文、memory、
-安全、观测、预算）拆成职责单一、可编排的 hook。
+``RAgent._loop`` 保留模型/工具控制流，横切逻辑通过职责单一、可编排的 hook 运行。
+内核运行时中间件始终安装；配置中间件和调用方中间件插入稳定扩展位置。
 
-与 deer-flow 的差异（有意为之）：R-Agent **不引入 LangGraph**——那会是一次大重写，
-且破坏 R-Agent 现有轻量特性。这里只提供一个最小的 hook 协议，让 ``RAgent._loop``
-在固定阶段依次调用已注册中间件。默认中间件链为空 => 完全等价于现状（零行为变化）。
-
-hook 阶段（对齐学习文档第 3 章的分类）：
+hook 阶段：
 
 * ``before_iteration(ctx)``  每轮循环开始
 * ``before_model(ctx)``      调用模型前（此时 tools 已组装、上下文已压缩）
 * ``after_model(ctx)``       拿到模型回复后
 * ``before_tool(ctx, call)`` 执行某个工具前——可返回字符串**否决**该工具（作为工具结果）
-* ``after_tool(ctx, call, result)`` 某个工具执行后
+* ``after_tool_execution(ctx, call, result)`` handler 返回后的单结果处理
+* ``after_tool_batch(ctx, calls, tool_messages)`` 同一轮全部工具结果的聚合处理
+* ``after_tool(ctx, call, result)`` 最终 tool message 写入历史前
 * ``after_iteration(ctx)``   每轮循环结束
+* ``after_context_compression(ctx)`` 上下文压缩成功后
 
 安全原则：单个中间件抛异常**绝不打断主循环**（与 events/durable-context 一致）。
 ``MiddlewareChain`` 捕获每个 hook 的异常并记录，然后继续。
@@ -74,8 +72,20 @@ class Middleware:
         """执行工具前调用。返回非空字符串表示**否决**该工具，该字符串会作为工具结果。"""
         return None
 
+    def after_tool_execution(self, ctx: AgentContext, call: ToolCallView, result: Any) -> Optional[str]:
+        """工具 handler 返回后调用；可在整轮预算前改写单个结果。"""
+        return None
+
+    def after_tool_batch(self, ctx: AgentContext, calls: list[ToolCallView], tool_messages: list[dict]) -> Optional[list[dict]]:
+        """同一 assistant turn 的全部工具执行完后调用；可改写整批 tool messages。"""
+        return None
+
+    def before_tool_message(self, ctx: AgentContext, call: ToolCallView, result: Any) -> None:
+        """预算处理完成后、外部回调和最终文本清洗前调用。"""
+        return None
+
     def after_tool(self, ctx: AgentContext, call: ToolCallView, result: Any) -> Optional[str]:
-        """工具执行后调用。返回非空字符串表示**改写**工具结果（如清洗注入内容）；返回 None 保持不变。"""
+        """最终 tool message 写入历史前调用；返回非空字符串表示改写结果。"""
         return None
 
     def after_iteration(self, ctx: AgentContext) -> None:
@@ -139,6 +149,48 @@ class MiddlewareChain:
                 return str(denial)
         return None
 
+    def run_after_tool_execution(self, ctx: AgentContext, call: ToolCallView, result: Any) -> Optional[str]:
+        """链式运行单工具后处理；后一个中间件读取前一个的改写结果。"""
+        replaced: Optional[str] = None
+        current = result
+        for mw in self._middlewares:
+            try:
+                out = mw.after_tool_execution(ctx, call, current)
+            except Exception as exc:  # noqa: BLE001
+                self._record_error("after_tool_execution", mw, exc)
+                continue
+            if out is not None:
+                replaced = str(out)
+                current = replaced
+        return replaced
+
+    def run_after_tool_batch(
+        self,
+        ctx: AgentContext,
+        calls: list[ToolCallView],
+        tool_messages: list[dict],
+    ) -> Optional[list[dict]]:
+        """链式运行整批工具后处理；返回最终（可能替换的）消息列表。"""
+        replaced: Optional[list[dict]] = None
+        current = tool_messages
+        for mw in self._middlewares:
+            try:
+                out = mw.after_tool_batch(ctx, calls, current)
+            except Exception as exc:  # noqa: BLE001
+                self._record_error("after_tool_batch", mw, exc)
+                continue
+            if out is not None:
+                replaced = list(out)
+                current = replaced
+        return replaced
+
+    def run_before_tool_message(self, ctx: AgentContext, call: ToolCallView, result: Any) -> None:
+        for mw in self._middlewares:
+            try:
+                mw.before_tool_message(ctx, call, result)
+            except Exception as exc:  # noqa: BLE001
+                self._record_error("before_tool_message", mw, exc)
+
     def run_after_tool(self, ctx: AgentContext, call: ToolCallView, result: Any) -> Optional[str]:
         """依次调用 after_tool；若某中间件返回改写串，则用它作为后续结果并继续。
 
@@ -172,11 +224,34 @@ class MiddlewareChain:
                 self._record_error("after_context_compression", mw, exc)
 
 
-def build_default_middlewares() -> list:
-    """默认中间件链：按 config 开关组装已启用的内置中间件。
+def build_runtime_middlewares(optional_middlewares=None) -> list:
+    """构造完整运行时链，并把调用方中间件放到稳定的扩展位置。"""
+    from core.middleware.builtins import (
+        ContextCompressionMiddleware,
+        DeferredToolFilterMiddleware,
+        SoftIterationBudgetMiddleware,
+        ToolOutputBudgetMiddleware,
+        ToolResultTrackingMiddleware,
+        ToolRuntimeStateMiddleware,
+    )
 
-    所有内置中间件**默认关闭**，因此默认返回空链 => 行为与现状逐字节一致。
-    通过环境变量开启对应开关后，相应中间件才进入链：
+    return [
+        DeferredToolFilterMiddleware(),
+        ContextCompressionMiddleware(),
+        ToolRuntimeStateMiddleware(),
+        ToolResultTrackingMiddleware(),
+        *list(optional_middlewares or []),
+        # 调用方可以先规范化结果，但输出预算必须最后兜底，避免重新放大上下文。
+        ToolOutputBudgetMiddleware(),
+        # 保持旧顺序：调用方 before_iteration 先运行，随后才注入软预算提醒。
+        SoftIterationBudgetMiddleware(),
+    ]
+
+
+def build_default_middlewares() -> list:
+    """按 config 开关构造可选中间件。
+
+    内核运行时中间件由 :func:`build_runtime_middlewares` 单独构造；本函数只返回：
       * TOOL_SANITIZATION_ENABLED=1        -> ToolResultSanitizationMiddleware
       * MEMORY_WRITE_MIDDLEWARE_ENABLED=1  -> MemoryWriteMiddleware
     """

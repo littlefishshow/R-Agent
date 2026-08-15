@@ -1351,6 +1351,19 @@ textarea:focus {
   color: #9f1239;
 }
 
+.window-controls .accept-modification {
+  width: auto;
+  padding: 0 8px;
+  color: #166534;
+  background: #f0fdf4;
+}
+
+.window-controls .accept-modification:disabled {
+  color: #64748b;
+  background: #e2e8f0;
+  cursor: default;
+}
+
 .window-body {
   min-height: 0;
   overflow-y: auto;

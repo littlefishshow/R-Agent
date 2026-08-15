@@ -229,8 +229,9 @@ class FactStore:
     ) -> dict[str, Any]:
         """构造一条规范化 fact（不落盘）。
 
-        metadata：可选的溯源元数据（如 dia_id/session/date/speaker）。原样保留，
-        供 session 级情节记忆做官方 evidence recall 与检索排序。仅收非空标量/字符串值。
+        metadata：可选的溯源元数据（如 primary_turn_id/source_turn_ids/source_quote）。
+        原样保留，供 session 级情节记忆做 evidence recall 与检索排序。仅收非空标量、
+        字符串或非空字符串列表。
         """
         fact: dict[str, Any] = {
             "id": fact_id or generate_fact_id(),
@@ -256,6 +257,14 @@ class FactStore:
                     v = v.strip()
                     if v:
                         clean_meta[k.strip()] = v
+                elif isinstance(v, (list, tuple)):
+                    values = list(dict.fromkeys(
+                        item.strip()
+                        for item in v
+                        if isinstance(item, str) and item.strip()
+                    ))
+                    if values:
+                        clean_meta[k.strip()] = values
                 elif isinstance(v, (int, float, bool)):
                     clean_meta[k.strip()] = v
             if clean_meta:

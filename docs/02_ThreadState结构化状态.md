@@ -47,8 +47,8 @@ ThreadState(
 | Channel | 谁写入 | 谁读取 | 生命周期 |
 | --- | --- | --- | --- |
 | `messages` | `run_conversation` / `_loop` | LLM 请求构建器 | 当前 Agent 实例 |
-| `summary_text` | 上下文压缩 | durable context / 下次滚动摘要 | 当前 Agent 实例 |
-| `artifact_index` | 大工具结果落盘路径 | 诊断、后续按需读取 | 当前 Agent 实例 |
+| `summary_text` | 上下文压缩 | durable context / 下次滚动摘要 | 当前 Agent 实例；GUI 会话随 `context.json` 恢复 |
+| `artifact_index` | 大工具结果落盘路径 | durable context 目录 / 后续按需读取 | 当前 Agent 实例；GUI 会话随 `context.json` 恢复 |
 | `delegation_ledger` | `delegate_task` 结果解析 | durable context / 调度 | 当前 Agent 实例 |
 | `skill_context` | `skill_view` 后处理 | durable context | 当前 Agent 实例 |
 | `active_skill_policy` | `skill_activate` 后处理 | tools schema 与执行期检查 | 直到 deactivate |
@@ -147,6 +147,7 @@ LLM 不需要每轮重新阅读 12 万字符，也不会因为聊天历史被压
 
 - `summary_text`
 - `delegation_ledger`
+- `artifact_index`（最近 20 条且总字符受限，只注入路径和摘要元数据）
 - `skill_context`
 - `active_skill_policy`
 - Memory provider 返回的文本
@@ -166,7 +167,7 @@ LLM 不需要每轮重新阅读 12 万字符，也不会因为聊天历史被压
 
 | 层 | 回答的问题 | 是否持久化 | 是否直接给模型 |
 | --- | --- | --- | --- |
-| `ThreadState` | 现在是什么状态？ | 否，主要在内存 | 只投影部分 |
+| `ThreadState` | 现在是什么状态？ | 主要在内存；GUI 额外快照 `summary_text` / `artifact_index` | 只投影部分 |
 | `messages` | 当前对话说过什么？ | 由上层会话机制决定 | 是 |
 | `RunEventStore` | 按顺序发生过什么？ | JSONL | 否 |
 | Memory | 下次会话还应知道什么？ | Markdown 或 JSONL | 预算化注入/检索 |
@@ -181,6 +182,7 @@ LLM 不需要每轮重新阅读 12 万字符，也不会因为聊天历史被压
 - reducer 只覆盖 artifact、delegation、skill 三类列表；
 - `sandbox`、`active_skill_policy` 等字段采用直接替换；
 - 没有统一 checkpoint/restore API；
+- GUI `context.json` 目前只保存并恢复 `summary_text` 与 `artifact_index` 的轻量快照；旧 GUI 会话会从最后的 durable 请求和 `<persisted-output>` 消息尽力回填；
 - 父 Agent 和每个子 Agent 都创建自己的 `ThreadState`，不会共享同一个对象；
 - Todo 真值在 session 文件，不在 `state.todos`；
 - Memory 是跨会话事实层，不属于 `ThreadState` 本体。

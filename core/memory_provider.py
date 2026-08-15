@@ -215,6 +215,22 @@ def _fact_scope_gate_reason(fact: dict) -> Optional[str]:
     return None
 
 
+def _session_fact_gate_reason(fact: dict) -> Optional[str]:
+    """Session facts must be transient descriptive user facts."""
+    if any(
+        _normalize_gate_label(fact.get(field)) is None
+        for field in _FACT_CLASSIFICATION_FIELDS
+    ):
+        return "missing"
+    if _normalize_gate_label(fact.get("scope")) != "user":
+        return "scope"
+    if _normalize_gate_label(fact.get("durability")) != "transient":
+        return "durability"
+    if _normalize_gate_label(fact.get("authority")) != "descriptive":
+        return "authority"
+    return None
+
+
 def _removal_scope_gate_reason(removal: dict) -> Optional[str]:
     """矛盾删除的确定性拒绝理由；None 表示通过。要求 scope=user 且有 reason。"""
     scope = _normalize_gate_label(removal.get("scope"))
@@ -642,11 +658,11 @@ class DeerMemProvider:
             })
 
     def _apply_session_facts(self, update: dict, thread_id: str) -> int:
-        """把抽取到的 newFacts 原样（含 metadata）写入当前 session 的情节记忆。
+        """把 transient descriptive user facts 写入当前 session 的情节记忆。
 
-        与 durable 库不同：**不经 scope gate、不经置信度阈值**——情节事实是"某人某天做了
-        什么"，本就不是持久用户偏好，但对 evidence recall 有价值。仅做内容去重。
-        session 未开启时（无 session store）直接跳过。
+        Durable facts only enter the durable store. Task-scoped, imperative,
+        missing-classification, and durable facts never enter the session store.
+        Session facts keep detailed provenance and disappear when the session ends.
         """
         from core import config
         from core.memory_facts import coerce_confidence, content_key
@@ -671,6 +687,8 @@ class DeerMemProvider:
                 if content_key(f.get("content")) is not None
             }
             for fact in new_facts:
+                if _session_fact_gate_reason(fact) is not None:
+                    continue
                 key = content_key(fact.get("content"))
                 if key is None or key in existing_keys:
                     continue
@@ -963,17 +981,40 @@ class DeerMemProvider:
 
     # ── 检索路径（Phase 4 + session 情节记忆） ─────────────────────────
     def _searchable_facts(self, thread_id: Optional[str] = None) -> list[dict]:
-        """durable 事实 + 当前 session 情节事实的并集（session 事实带 metadata）。"""
-        facts = list(self._store.load_facts())
+        """Return a defensive, content-deduplicated durable/session union.
+
+        New writes are mutually exclusive by durability, but old stores may
+        contain the same fact in both locations. Session entries override an
+        equal-content durable entry because they usually carry richer provenance.
+        """
+        from core.memory_facts import content_key
+
+        durable_facts = list(self._store.load_facts())
+        session_facts = []
         store = self._get_session_store(thread_id)
         if store is None and thread_id:
             store = self.set_session(thread_id)
         if store is not None:
             try:
-                facts.extend(store.load_facts())
+                session_facts = store.load_facts()
             except Exception:
                 logger.exception("deermem session facts load failed (ignored)")
-        return facts
+
+        merged: dict[str, dict] = {}
+        unkeyed: list[dict] = []
+        for fact in durable_facts:
+            key = content_key(fact.get("content"))
+            if key is None:
+                unkeyed.append(fact)
+            else:
+                merged[key] = fact
+        for fact in session_facts:
+            key = content_key(fact.get("content"))
+            if key is None:
+                unkeyed.append(fact)
+            else:
+                merged[key] = fact
+        return [*merged.values(), *unkeyed]
 
     def search(self, query: str, top_k: int = 5, user_id: Optional[str] = None,
                agent_name: Optional[str] = None,

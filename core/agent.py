@@ -8,7 +8,6 @@ from pathlib import Path
 from core import config
 from core.context_control import compress_messages, resolve_context_window, should_compress_context
 from tools.registry import registry
-from core.context.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
 from core.sandbox_cleanup import maybe_cleanup_sandbox
 from core import events as run_events
 from core.state import ThreadState, build_durable_context
@@ -19,13 +18,13 @@ from core.middleware import (
     MiddlewareChain,
     ToolCallView,
     build_default_middlewares,
+    build_runtime_middlewares,
 )
 from app_gui.normalizer import build_llm_request_snapshot, normalize_message
 from app_gui.schemas import (
     EVENT_LLM_REQUEST_SNAPSHOT,
     EVENT_LLM_RESPONSE_RECEIVED,
     EVENT_MESSAGE_APPENDED,
-    EVENT_TOOL_CALL_FINISHED,
     EVENT_TOOL_CALL_STARTED,
     EVENT_TOOL_RESULT_APPENDED,
     EVENT_TRUNCATION_FORCED,
@@ -101,69 +100,6 @@ def _msg_get(message, key, default=None):
     if isinstance(message, dict):
         return message.get(key, default)
     return getattr(message, key, default)
-
-
-def _extract_persisted_path(text: str):
-    """从 <persisted-output> 块里解析出 `Full output saved to: <path>` 的路径。"""
-    if not text:
-        return None
-    m = re.search(r"Full output saved to:\s*(.+)", text)
-    return m.group(1).strip() if m else None
-
-
-def _parse_delegation_entries(result_text: str) -> list:
-    """把 delegate_task 的返回解析成一组 {task_id, status, ...} 结构，供 ledger 合并。
-
-    delegate_task 的返回结构在 compact/full 模式下略有不同，这里只做尽力而为的
-    抽取：能拿到 task_id/task_index 的条目就收进 ledger，拿不到就跳过。绝不抛异常。
-    """
-    entries: list = []
-    try:
-        data = json.loads(result_text)
-    except Exception:
-        return entries
-    # 可能是 {"result": {...}} 包一层，也可能直接是结果对象/列表。
-    if isinstance(data, dict) and "result" in data and isinstance(data["result"], (dict, list, str)):
-        inner = data["result"]
-        if isinstance(inner, str):
-            try:
-                inner = json.loads(inner)
-            except Exception:
-                inner = data
-        data = inner
-
-    def _one(obj):
-        if isinstance(obj, dict) and (obj.get("task_id") or obj.get("task_index") is not None):
-            keep = {
-                k: obj.get(k)
-                for k in (
-                    "task_id",
-                    "task_index",
-                    "status",
-                    "truncated",
-                    "stop_reason",
-                    "started_at",
-                    "completed_at",
-                    "step_events",
-                    "context_artifact_path",
-                    "token_usage",
-                )
-                if k in obj
-            }
-            if keep:
-                entries.append(keep)
-
-    if isinstance(data, dict):
-        candidates = data.get("results") if isinstance(data.get("results"), list) else None
-        if candidates is not None:
-            for item in candidates:
-                _one(item)
-        else:
-            _one(data)
-    elif isinstance(data, list):
-        for item in data:
-            _one(item)
-    return entries
 
 
 def _tool_call_ids(message) -> list:
@@ -440,10 +376,15 @@ class RAgent:
         # 惰性创建：每次 run_conversation 开启一个新 run_id 的 store。
         self.event_store = None
         self._run_counter = 0
-        # 中间件链（见 core/middleware）。默认空链 => 行为与现状逐字节一致。
-        # 传入自定义 middlewares 可在固定 hook 阶段插入横切逻辑。
+        # 内核运行时中间件始终安装；调用方传入的中间件替换“可选默认链”，
+        # 但不会移除输出预算、状态追踪等运行时不变量。
+        optional_middlewares = (
+            list(middlewares)
+            if middlewares is not None
+            else build_default_middlewares()
+        )
         self.middleware = MiddlewareChain(
-            middlewares if middlewares is not None else build_default_middlewares()
+            build_runtime_middlewares(optional_middlewares)
         )
         # 延迟工具暴露：本次 run 内已被 tool_search 提升的工具名集合（见 06 章）。
         self._promoted_tools = set()
@@ -1399,7 +1340,6 @@ class RAgent:
     def _loop(self, start_iteration: int, on_think=None,
               on_tool_start=None, on_tool_end=None, exclude_tools=None,
               cancel_event=None, tool_call_guard=None, allowed_tools=None, event_sink=None) -> str:
-        soft_threshold = max(1, int(self.max_iterations * config.get_soft_warn_ratio()))
         iteration = start_iteration
         excluded = set(exclude_tools or [])
         allowed = set(allowed_tools or []) if allowed_tools is not None else None
@@ -1411,11 +1351,6 @@ class RAgent:
             # 中间件：每轮开始
             mw_ctx = AgentContext(agent=self, iteration=iteration, event_sink=event_sink)
             self.middleware.run_before_iteration(mw_ctx)
-
-            # 软提醒（一次性）
-            if not self._soft_warned and iteration >= soft_threshold:
-                self._inject_soft_warning(iteration, self.max_iterations)
-                self._soft_warned = True
 
             tools = registry.get_all_schemas()
             effective_allowed = set(allowed) if allowed is not None else None
@@ -1436,11 +1371,9 @@ class RAgent:
                     schema for schema in tools
                     if schema.get("function", {}).get("name") not in excluded
                 ]
-            # 延迟工具暴露（默认关）：只暴露 always-on + 已提升工具，其余先隐藏。
-            tools = self._apply_deferred_tool_filter(tools)
-            self._maybe_compress_context(tools, mw_ctx=mw_ctx)
 
-            # 中间件：调用模型前（tools 已组装、上下文已压缩）
+            # 中间件：调用模型前。内核运行时链先完成上下文压缩，
+            # 随后调用方中间件看到压缩后的状态。
             mw_ctx.tools = tools
             self.middleware.run_before_model(mw_ctx)
 
@@ -1632,21 +1565,16 @@ class RAgent:
                     if _is_cancelled(cancel_event):
                         raise AgentInterrupted()
 
-                    if func_name == "delegate_task":
-                        self._merge_delegated_token_usage_from_tool_result(result)
-
-                    # 延迟暴露：tool_search 返回后，把命中的工具提升为本次 run 可见。
-                    self._maybe_promote_from_tool_search(func_name, result)
-                    # skill_view 返回后，把该 skill 摘要记入 skill_context channel。
-                    self._maybe_record_skill_context(func_name, func_args, result)
-                    # skill_activate 返回后，显式应用或清除 skill 工具策略。
-                    self._maybe_apply_skill_policy(func_name, result)
-
-                    result = maybe_persist_tool_result(
-                        content=result,
-                        tool_name=func_name,
-                        tool_use_id=getattr(tool_call, "id", None),
+                    call_view = ToolCallView(
+                        func_name,
+                        func_args,
+                        getattr(tool_call, "id", None),
                     )
+                    replaced = self.middleware.run_after_tool_execution(
+                        mw_ctx, call_view, result
+                    )
+                    if replaced is not None:
+                        result = replaced
 
                     pending_tool_events.append({
                         "call_id": getattr(tool_call, "id", None),
@@ -1660,63 +1588,36 @@ class RAgent:
                         "content": result,
                     })
 
-                pending_tool_messages = enforce_turn_budget(pending_tool_messages)
+                batch_calls = [
+                    ToolCallView(
+                        event["name"],
+                        event.get("arguments"),
+                        event.get("call_id"),
+                    )
+                    for event in pending_tool_events
+                ]
+                replaced_batch = self.middleware.run_after_tool_batch(
+                    mw_ctx, batch_calls, pending_tool_messages
+                )
+                if replaced_batch is not None:
+                    pending_tool_messages = replaced_batch
 
                 for tool_event, tool_msg in zip(pending_tool_events, pending_tool_messages):
                     result = tool_msg.get("content", "")
-                    _emit_event(event_sink, EVENT_TOOL_CALL_FINISHED, {
-                        **tool_event,
-                        "result": result,
-                    })
-                    result_text = result if isinstance(result, str) else str(result)
-                    persisted = "<persisted-output>" in result_text
-                    self._emit_run_event(
-                        run_events.EV_TOOL_RESULT,
-                        {
-                            "name": tool_event["name"],
-                            "call_id": tool_event.get("call_id"),
-                            "result_chars": len(result_text),
-                            "persisted": persisted,
-                        },
-                        iteration=iteration,
-                        result_preview=result_text[:500],
+                    call_view = ToolCallView(
+                        tool_event["name"],
+                        tool_event.get("arguments"),
+                        tool_event.get("call_id"),
                     )
-                    if persisted:
-                        artifact_path = _extract_persisted_path(result_text)
-                        self._emit_run_event(
-                            run_events.EV_ARTIFACT_CREATED,
-                            {"tool": tool_event["name"], "call_id": tool_event.get("call_id"), "path": artifact_path},
-                        )
-                        # 把产物记入 artifact_index channel（reducer 内部永不抛异常）。
-                        try:
-                            self.state.add_artifact({
-                                "path": artifact_path,
-                                "tool": tool_event["name"],
-                                "call_id": tool_event.get("call_id"),
-                                "chars": len(result_text),
-                            })
-                        except Exception:
-                            pass
-                    if tool_event["name"] == "delegate_task":
-                        self._emit_run_event(
-                            run_events.EV_DELEGATE_END,
-                            {"call_id": tool_event.get("call_id"), "result_chars": len(result_text)},
-                            iteration=iteration,
-                        )
-                        # 把子任务结果记入 delegation_ledger channel。delegate_task 返回
-                        # 的是一个 JSON（可能含多条子任务），逐条按 task_id 合并去重。
-                        try:
-                            for entry in _parse_delegation_entries(result_text):
-                                self.state.add_delegation(entry)
-                        except Exception:
-                            pass
+                    self.middleware.run_before_tool_message(
+                        mw_ctx, call_view, result
+                    )
                     if on_tool_end:
                         on_tool_end(tool_event["name"], result)
-
-                    # 中间件：工具执行后（可改写结果，如清洗 prompt injection）
+                    # 最终 tool message 写入历史前的中间件阶段。
                     replaced = self.middleware.run_after_tool(
                         mw_ctx,
-                        ToolCallView(tool_event["name"], tool_event.get("arguments"), tool_event.get("call_id")),
+                        call_view,
                         result,
                     )
                     if replaced is not None:

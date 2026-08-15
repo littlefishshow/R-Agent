@@ -224,14 +224,18 @@ _EXTRACTION_SYSTEM_PROMPT = """你是长期记忆抽取助手。你的唯一任�
 - scope / durability / authority：如上
 - expected_valid_days：预计多少天内有效（稳定偏好可给较大值，如 3650）
 - metadata：**溯源信息**，是一个对象。若对话轮上标注了 dia_id/session/date/speaker（形如
-  `speaker [dia_id=D1:2 | date=2023-05-07]: ...`），请把该事实所依据的那一轮的
-  dia_id、session、speaker、date 原样填进 metadata（如 {"dia_id": "D1:2", "session": "session_1", "speaker": "Caroline", "date": "2023-05-07"}）。
-  没有就省略。这用于官方 evidence recall 与检索排序，非常重要，不要编造。
+  `speaker [dia_id=D1:2 | date=2023-05-07]: ...`），请填写：
+  - source_turn_ids：该事实依据的全部轮次 ID 数组，如 ["D1:2", "D1:3"]；
+  - primary_turn_id：最直接支持事实结论的主要轮次 ID；
+  - source_quote：从 primary_turn_id 对应原文逐字复制的一小段证据；
+  - session / speaker / date：优先填写 primary_turn_id 对应轮次的值。
+  同时可填写兼容字段 dia_id，其值必须等于 primary_turn_id。不要把多个 ID 用分号拼成
+  一个字符串，也不要编造输入中不存在的 ID 或 quote。
 
 若对话明确纠正/否定了某条已存在的事实，放进 factsToRemove（给出该 fact 的 id、scope=user、reason）。
 
 严格只输出如下 JSON（不要 markdown 代码块、不要多余文字）：
-{"user": {}, "history": {}, "newFacts": [ {"content": "...", "category": "preference", "confidence": 0.9, "scope": "user", "durability": "durable", "authority": "descriptive", "expected_valid_days": 3650, "metadata": {"dia_id": "D1:2", "session": "session_1", "speaker": "Caroline", "date": "2023-05-07"}} ], "factsToRemove": [], "staleFactsToRemove": [], "staleFactsToExtend": [], "factsToConsolidate": []}
+{"user": {}, "history": {}, "newFacts": [ {"content": "...", "category": "preference", "confidence": 0.9, "scope": "user", "durability": "durable", "authority": "descriptive", "expected_valid_days": 3650, "metadata": {"source_turn_ids": ["D1:2"], "primary_turn_id": "D1:2", "source_quote": "...", "dia_id": "D1:2", "session": "session_1", "speaker": "Caroline", "date": "2023-05-07"}} ], "factsToRemove": [], "staleFactsToRemove": [], "staleFactsToExtend": [], "factsToConsolidate": []}
 
 若本轮没有值得记住的用户级事实，返回：{"user": {}, "history": {}, "newFacts": [], "factsToRemove": [], "staleFactsToRemove": [], "staleFactsToExtend": [], "factsToConsolidate": []}"""
 
@@ -361,6 +365,18 @@ def _normalize_gate_label(value: Any) -> Optional[str]:
     return normalized or None
 
 
+def _clean_string_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        values = re.findall(r"D\d+:\d+", value)
+        if not values and value.strip():
+            values = [part.strip() for part in re.split(r"[;,]", value) if part.strip()]
+    elif isinstance(value, (list, tuple)):
+        values = [item.strip() for item in value if isinstance(item, str) and item.strip()]
+    else:
+        values = []
+    return list(dict.fromkeys(values))
+
+
 def _normalize_fact(fact: Any) -> Optional[dict]:
     """规范化一条 newFact（移植 deer-flow _normalize_memory_update_fact）。"""
     if not isinstance(fact, dict):
@@ -405,8 +421,8 @@ def _normalize_fact(fact: Any) -> Optional[dict]:
     if isinstance(source_error, str) and source_error.strip():
         normalized["source_error"] = source_error.strip()
 
-    # 溯源 metadata（dia_id/session/date/speaker 等）：原样保留标量值，供 session
-    # 级情节记忆做 evidence recall 与检索排序。
+    # 溯源 metadata：保留标量和字符串列表。具体 turn/quote 的存在性在拿到本次
+    # conversation 后由 _validate_update_provenance 做确定性校验。
     meta_raw = fact.get("metadata")
     if isinstance(meta_raw, dict):
         clean_meta = {}
@@ -415,8 +431,22 @@ def _normalize_fact(fact: Any) -> Optional[dict]:
                 continue
             if isinstance(v, str) and v.strip():
                 clean_meta[k.strip()] = v.strip()
+            elif isinstance(v, (list, tuple)):
+                values = _clean_string_list(v)
+                if values:
+                    clean_meta[k.strip()] = values
             elif isinstance(v, (int, float, bool)):
                 clean_meta[k.strip()] = v
+        source_ids = _clean_string_list(
+            clean_meta.get("source_turn_ids") or clean_meta.get("dia_id")
+        )
+        primary_id = str(clean_meta.get("primary_turn_id") or "").strip()
+        if primary_id and primary_id not in source_ids:
+            source_ids.insert(0, primary_id)
+        if source_ids:
+            clean_meta["source_turn_ids"] = source_ids
+            clean_meta["primary_turn_id"] = primary_id or source_ids[0]
+            clean_meta["dia_id"] = clean_meta["primary_turn_id"]
         if clean_meta:
             normalized["metadata"] = clean_meta
 
@@ -425,6 +455,88 @@ def _normalize_fact(fact: Any) -> Optional[dict]:
         if label is not None:
             normalized[field] = label
     return normalized
+
+
+def _normalize_quote(text: Any) -> str:
+    return " ".join(str(text or "").split()).strip().casefold()
+
+
+def _validate_update_provenance(update: dict, conversation: list[dict]) -> dict:
+    """Keep only source turns from this extraction batch and verify source_quote.
+
+    Legacy ``dia_id`` remains as an alias of ``primary_turn_id`` so existing
+    readers continue to work while new callers can consume all source_turn_ids.
+    """
+    turns: dict[str, dict] = {}
+    for message in conversation:
+        metadata = _turn_meta(message)
+        turn_id = str(metadata.get("dia_id") or "").strip()
+        if turn_id:
+            turns[turn_id] = {
+                "text": _message_text(message),
+                "metadata": metadata,
+            }
+
+    if not turns:
+        return update
+
+    for fact in update.get("newFacts", []):
+        metadata = fact.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        source_ids = _clean_string_list(
+            metadata.get("source_turn_ids")
+            or metadata.get("primary_turn_id")
+            or metadata.get("dia_id")
+        )
+        source_ids = [turn_id for turn_id in source_ids if turn_id in turns]
+        quote = str(metadata.get("source_quote") or "").strip()
+        quote_key = _normalize_quote(quote)
+        quote_matches = [
+            turn_id
+            for turn_id, turn in turns.items()
+            if quote_key and quote_key in _normalize_quote(turn["text"])
+        ]
+        for turn_id in quote_matches:
+            if turn_id not in source_ids:
+                source_ids.append(turn_id)
+
+        primary_id = str(metadata.get("primary_turn_id") or "").strip()
+        if quote_matches:
+            primary_id = (
+                primary_id
+                if primary_id in quote_matches
+                else quote_matches[0]
+            )
+        elif primary_id not in source_ids:
+            primary_id = source_ids[0] if source_ids else ""
+
+        if not source_ids:
+            for key in (
+                "source_turn_ids",
+                "primary_turn_id",
+                "source_quote",
+                "dia_id",
+            ):
+                metadata.pop(key, None)
+            continue
+
+        if primary_id and primary_id not in source_ids:
+            source_ids.insert(0, primary_id)
+        metadata["source_turn_ids"] = source_ids
+        metadata["primary_turn_id"] = primary_id or source_ids[0]
+        metadata["dia_id"] = metadata["primary_turn_id"]
+        if quote_matches:
+            metadata["source_quote"] = quote
+        else:
+            metadata.pop("source_quote", None)
+
+        primary_meta = turns[metadata["primary_turn_id"]]["metadata"]
+        for key in ("session", "speaker", "date"):
+            value = primary_meta.get(key)
+            if value not in (None, ""):
+                metadata[key] = value
+    return update
 
 
 def _normalize_update_data(data: dict) -> dict:
@@ -594,7 +706,8 @@ class MemoryExtractor:
                 kwargs["temperature"] = self._temperature
             response = client.chat.completions.create(**kwargs)
             content = response.choices[0].message.content
-            return parse_memory_update_response(content)
+            update = parse_memory_update_response(content)
+            return _validate_update_provenance(update, conversation)
         except Exception:
             # 抽取失败绝不打断主 loop；调用方（DeerMemProvider.add）也会兜底吞异常。
             # 但要留可观测性：否则 BadRequest / 解析失败会静默无 fact，难以排查。

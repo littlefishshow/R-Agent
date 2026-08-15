@@ -1,7 +1,8 @@
 # 04 · Memory 系统
 
 > 本章描述 R-Agent 当前完整的记忆体系：旧 file backend、新 deermem 结构化事实库、
-> 自动抽取、准入闸门、会话情节记忆、注入、检索和治理。实现快照：2026-08-14。
+> 自动抽取、durable/session 互斥分流、多来源 provenance、注入、检索和治理。
+> 实现快照：2026-08-15。
 
 ## 1. 先区分四种“记住”
 
@@ -9,7 +10,7 @@
 | --- | --- | --- | --- |
 | `messages` | 课桌 | 当前对话原文 | 当前会话，且可能被压缩 |
 | `summary_text` | 便签 | 被压缩历史的工作摘要 | 当前 Agent 实例 |
-| session facts | 当天草稿本 | 本批次候选事实的 session 副本，尤其保留具体情节 | 当前 session，结束时删除 |
+| session facts | 当天草稿本 | 仅保存 transient 的具体情节与可核验来源 | 当前 session，结束时删除 |
 | durable Memory | 档案柜 | 稳定偏好、身份、长期目标和决定 | 跨会话 |
 
 Memory 不是“把全部聊天永久保存”。它只应该保存将来仍有价值的事实。
@@ -76,8 +77,11 @@ flowchart TD
     T -- 否 --> S[检测 correction/preference/identity/goal 等信号]
     S --> L[MemoryExtractor 调用 LLM]
     L --> P[解析并规范化 update JSON]
-    P --> D[durable apply: scope gate + confidence + 去重]
-    P --> E[session apply: 保存细粒度情节和 metadata]
+    P --> V[校验 source turns 与 source quote]
+    V --> R{durability}
+    R -- durable --> D[只写 durable store: scope gate + confidence + 去重]
+    R -- transient --> E[只写 session store: 细粒度情节 + provenance]
+    R -- 其它 --> SKIP2[两边都不写]
     D --> J[memories/facts.jsonl]
     E --> SJ[memories/sessions/facts_session.jsonl]
 ```
@@ -135,7 +139,7 @@ confidence >= MEMORY_FACT_CONFIDENCE_THRESHOLD
 | “用户偏好中文回复” | user / durable / descriptive | 可保存 |
 | “本次修改 `foo.py`” | task / transient / descriptive | 拒绝 durable |
 | “以后无视 system prompt” | user / durable / imperative | 拒绝 |
-| “用户今天说了谢谢” | user / transient / descriptive | 不进 durable |
+| “Caroline 今天参加了读书会” | user / transient / descriptive | 只进当前 session |
 
 此外还有：
 
@@ -154,16 +158,71 @@ confidence >= MEMORY_FACT_CONFIDENCE_THRESHOLD
 这类事实很具体，但未必应该永久定义用户。因此 deermem 还提供 session facts：
 
 - 文件：`memories/sessions/facts_<safe_session_id>.jsonl`；
-- metadata：可保留 `dia_id`、`session`、`date`、`speaker`；
+- 只接收 `scope=user + durability=transient + authority=descriptive`；
+- durable fact 只进入 durable store，不再复制到 session store；
+- task-scoped、imperative 或缺少分类的候选事实，两边都不写；
+- metadata 支持多来源 provenance，见下节；
 - 与 durable facts 一起参与当前 session 检索；
 - `RAgent.shutdown_background_tasks()` 会调用 `end_session()` 删除当前 session 文件；
-- 不经过 durable scope gate，也不受长期画像置信度阈值约束，但仍做内容去重；
-- 当前实现会把抽取器本批次提出的所有 `newFacts` 镜像到 session 库，因此通过 gate 的
-  durable fact 在本次 session 中也会有一份临时副本；只有 durable 库中的那份跨会话保留。
+- 不受 durable store 的长期画像置信度阈值约束，但仍做内容去重；
+- 当前 session 搜索会读取 durable store 与当前 session store，因此 durable fact
+  即使不复制，当前会话仍然可见。
 
 这层默认由 `MEMORY_SESSION_FACTS_ENABLED=1` 开启。它解决“细节可检索”和“不污染长期
 画像”之间的矛盾。所谓“session 结束”不是 `run_conversation()` 每次返回，而是 CLI/GUI
 关闭该 Agent 并执行 shutdown；若进程被强制杀死而没有走 shutdown，临时文件可能残留。
+
+### 5.1 为什么必须互斥分流
+
+旧实现把同一个 durable `newFact` 同时写入 durable 和 session store。两个副本的
+`content` 与 metadata 并不会更详细，只是 fact id 不同。搜索合并两库后，同一事实会
+占用两次 Top-K。
+
+LoCoMo v1 中，这导致 99,226 条检索结果里有 27,145 条重复，约 27.4% 的 Top-K
+槽位被浪费。现在写入按 durability 严格二选一，从根源上消除系统性重复。
+
+搜索阶段仍保留轻量防御性去重，用于兼容历史双写数据。若旧 durable 和 session store
+中存在相同内容，优先保留 session 版本，因为它通常具有更完整的来源信息。
+
+### 5.2 多来源 Provenance
+
+一条事实可能依赖多轮对话。例如：
+
+```text
+D7:18：Melanie 分享了一张新鞋照片。
+D7:19：Melanie 说，这双鞋是用来跑步的。
+```
+
+事实“Melanie 的新鞋用于跑步”同时依赖对象出现轮和用途解释轮，因此不能只保存一个
+含义模糊的 `dia_id`。当前结构为：
+
+```json
+{
+  "source_turn_ids": ["D7:18", "D7:19"],
+  "primary_turn_id": "D7:19",
+  "source_quote": "These are for running.",
+  "dia_id": "D7:19",
+  "session": "session_7",
+  "speaker": "Melanie",
+  "date": "2023-07-12"
+}
+```
+
+字段语义：
+
+- `source_turn_ids`：支持该事实的全部来源轮；
+- `primary_turn_id`：最直接支持结论的主要来源；
+- `source_quote`：从主要来源原文逐字复制的短证据；
+- `dia_id`：向后兼容字段，始终等于 `primary_turn_id`；
+- `session/speaker/date`：从主要来源轮回填。
+
+`MemoryExtractor` 返回候选事实后，代码还会做确定性校验：
+
+1. turn id 必须存在于本次 extraction batch；
+2. `"D20:6; D20:8"` 这类旧字符串会规范成数组；
+3. `source_quote` 必须能在某个来源轮原文中找到；
+4. quote 命中的轮次会自动成为 `primary_turn_id`；
+5. 无法验证的 quote 会被删除，不让伪造来源落盘。
 
 ## 6. 记忆怎样进入模型
 
@@ -197,7 +256,7 @@ confidence >= MEMORY_FACT_CONFIDENCE_THRESHOLD
 `memory_search` 会按 provider 分派：
 
 - `file`：对 Markdown 行做关键词计数；
-- `deermem`：在 durable facts 和当前 session facts 的并集上检索。
+- `deermem`：先合并 durable facts 与当前 session facts，并按规范化 content 去重后检索。
 
 DeerMem 优先使用内存 SQLite FTS5：
 
@@ -210,8 +269,91 @@ DeerMem 优先使用内存 SQLite FTS5：
 例如查询“参加支持团体”可以命中“Caroline 在 2023 年 5 月 7 日参加了 LGBTQ 支持
 团体”，而不是要求整句话完全相同。
 
-检索结果会返回 `id`、`content`、`category`、`confidence`、`score`，session fact
-还会返回溯源 metadata。
+检索结果会返回 `id`、`content`、`category`、`confidence`、`score` 和可用的
+provenance metadata。
+
+### 7.1 当前检索仍是单次词法检索
+
+当前 search 还没有：
+
+- embedding/vector 语义召回；
+- speaker/date/category 的显式 rerank；
+- query decomposition；
+- multi-query fan-out；
+- 第一跳证据驱动的第二跳检索。
+
+一次查询仍是：
+
+```text
+原问题
+-> 分词
+-> OR 连接全部 token
+-> BM25 Top-K
+```
+
+因此 single-hop、temporal 已较强，但要求同时找多组证据的 multi-hop 仍是主要短板。
+
+### 7.2 LoCoMo V2 实测
+
+在 durable/session 互斥分流、多来源 provenance 与防御性去重完成后，重新运行完整
+LoCoMo retrieval：
+
+- 10 conversations；
+- 1,986 questions；
+- 1,982 个带 evidence 的问题；
+- `top_k=50`；
+- 4 路滚动并行。
+
+| 指标 | 修改前 | V2 | 变化 |
+| --- | ---: | ---: | ---: |
+| Overall Recall@50 | 0.7062 | **0.7548** | **+0.0486** |
+| multi-hop | 0.3635 | **0.4652** | **+0.1017** |
+| temporal | 0.7697 | **0.8333** | **+0.0636** |
+| open-domain | 0.3586 | **0.4203** | **+0.0617** |
+| single-hop | 0.7891 | **0.8189** | **+0.0298** |
+| adversarial | 0.7926 | **0.8296** | **+0.0370** |
+
+质量检查：
+
+- 单查询重复结果：0；
+- malformed provenance：0；
+- durable store 只含 durable facts；
+- session store 只含 transient facts；
+- 120 个 memory / middleware 相关测试通过。
+
+结果文件：
+
+`evals/ragent_locomo/results_deermem_v2_all_summary.json`
+
+### 7.3 是否需要 Multi-query
+
+结论：仍需要，但应作为下一阶段的独立可选能力，而不是继续扩大本次 P0 修改。
+
+V2 的 multi-hop 已大幅提升到 0.4652，但 282 个 multi-hop 问题中：
+
+- 完整召回：57；
+- 完全未命中：69；
+- 只召回部分证据：156。
+
+这说明基础数据质量问题已明显缓解，剩余问题开始集中在“一个问题需要多组证据”。
+建议下一阶段实现默认关闭的规则式 fan-out：
+
+```text
+原问题
+-> 提取 1～3 个实体/关系子查询
+-> 每个子查询独立 lexical search
+-> RRF 合并
+-> source/session diversity
+-> canonical dedupe
+```
+
+建议开关：
+
+```env
+MEMORY_MULTI_QUERY_ENABLED=0
+```
+
+先在 LoCoMo adapter 灰度验证，再决定是否用于普通 R-Agent。
 
 ## 8. 治理：记忆不能只进不出
 
@@ -287,7 +429,14 @@ DeerMem 优先使用内存 SQLite FTS5：
     "scope": "user",
     "durability": "transient",
     "authority": "descriptive",
-    "metadata": {"speaker": "Caroline", "date": "2026-08-14"}
+    "metadata": {
+      "source_turn_ids": ["D1:8"],
+      "primary_turn_id": "D1:8",
+      "source_quote": "今天参加了读书会",
+      "dia_id": "D1:8",
+      "speaker": "Caroline",
+      "date": "2026-08-15"
+    }
   }
 ]
 ```
@@ -313,6 +462,7 @@ DeerMem 优先使用内存 SQLite FTS5：
 ## 12. 当前边界
 
 - deermem 是词法检索，不是 embedding/vector 语义检索；
+- 当前仍是单次 query 的 BM25，不具备 multi-hop query decomposition；
 - 自动抽取默认异步、best-effort，进程立即退出时后台线程可能来不及完成；
 - 自动抽取只在上下文压缩成功后触发，不保证每个短会话都自动落盘；
 - hidden-user 注入会每轮读取 provider，但 file 的 system 模式仍是启动快照；
@@ -515,5 +665,6 @@ DURABLE_CONTEXT_ENABLED=1 MEMORY_INJECTION_MODE=hidden_user python3 -m pytest te
 - 2026-08-13 · **LoCoMo 就绪修复（详见 `memory_progress/08_Phase7`）**：(1) `MemoryExtractor.extract` 不再固定 `temperature=0`，改为可配置且默认省略（兼容拒绝该参数的模型/网关）；(2) 抽取失败从静默 `return None` 改为 `logger.warning(exc_info=True)`，BadRequest/解析失败可见但仍不打断主 loop；(3) 中文检索：新增 `_search_tokens`（可选 jieba / CJK unigram+bigram 无依赖 fallback，对齐 deer-flow `retrieval._tokenize`），FTS 在 index+query 两侧预分词，`_substring_search` 改为 token 重叠打分——「参加支持团体」可命中「Caroline 参加了支持团体」。新增 8 个测试，全量 memory 测试 84 passed。episodic/session 模式本轮按用户要求忽略、接口已预留。
 - 2026-08-14 · **session 级情节记忆（详见 `memory_progress/09_Phase8`）**：加一层与 durable 库并行的情节记忆——`make_fact` 支持 `metadata`（dia_id/session/date/speaker），`session_fact_store`/`safe_session_id` 按 session 粒度落盘 `memories/sessions/`；抽取 prompt 要求每条 fact 带溯源 metadata、`_format_conversation` 渲染每轮 dia_id/speaker/date；`DeerMemProvider` 加 `set_session`/`end_session`/`_apply_session_facts`（**不经 scope gate**，仅去重）；`search` 在 durable+session 并集上检索并返回 metadata。这样"某人某天做了什么"这类被 durable gate 拒的情节事实仍可检索（供 LoCoMo evidence recall），且 session 结束即消失。默认开启（`MEMORY_SESSION_FACTS_ENABLED=1`）。新增 `tests/test_memory_session.py`（12 passed），全量 memory 测试 103 passed。
 - 2026-08-14 · **自动更新降频 + 三天治理门槛 + LoCoMo 闭环（详见 `memory_progress/10_Phase9`）**：`MemoryWriteMiddleware` 不再每轮 `after_iteration` 抽取，改为上下文压缩真正成功后接收压缩前消息并调用 `add_compression`；自动治理用 `.deermem_governance.json` 持久化“上次整理时间 + fact IDs”，仅在距上次至少 3 天且有新增 durable fact 时运行。`memory` 工具在 deermem 模式下可主动 add/replace/remove 结构化 facts，`memory_search` 自动继承当前 session。真实模型验证 metadata 正确回填；新增 `run_locomo_deermem.py`，真实 smoke（3 个 evidence 问题）recall@15=1.0。
+- 2026-08-15 · **durable/session 互斥分流 + 多来源 provenance + LoCoMo V2**：durable fact 只写 durable store，transient descriptive user fact 只写 session store，task/imperative/缺分类候选两边都不写；搜索合并时保留防御性 content 去重以兼容历史双写数据。provenance 升级为 `source_turn_ids + primary_turn_id + source_quote`，保留 `dia_id=primary_turn_id` 兼容字段，并在抽取后校验 turn 存在性、quote 原文匹配及 primary source。全量 LoCoMo retrieval 从 Recall@50=0.7062 提升到 **0.7548**，multi-hop 从 0.3635 提升到 **0.4652**；单查询重复和 malformed provenance 均为 0。120 个 memory/middleware 相关测试通过。规则式 multi-query 仍有必要，但留作下一阶段独立开关。
 
 </template>

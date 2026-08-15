@@ -48,6 +48,12 @@ def test_provider_name_resolution():
 def test_durable_context_assembles_all_sections():
     state = ThreadState()
     state.summary_text = "用户目标：升级 R-Agent"
+    state.artifact_index = [{
+        "path": "sandbox/tool_outputs/report.txt",
+        "tool": "web_extract",
+        "original_chars": 120000,
+        "detected_format": "text",
+    }]
     state.delegation_ledger = [{"task_id": "t1", "status": "completed"}]
     state.skill_context = [{"skill": "github", "summary": "PR flow"}]
     text = build_durable_context(state, memory_text="用户偏好中文回复")
@@ -61,8 +67,26 @@ def test_durable_context_assembles_all_sections():
     # 分区标签
     assert "<durable_summary>" in text
     assert "<durable_delegations>" in text
+    assert "<durable_artifacts>" in text
+    assert "sandbox/tool_outputs/report.txt" in text
+    assert "artifact_inspect" in text
     assert "<durable_skills>" in text
     assert "<durable_memory>" in text
+
+
+def test_durable_context_limits_artifact_index():
+    state = ThreadState()
+    state.artifact_index = [
+        {"path": f"sandbox/tool_outputs/{index}.txt", "tool": "demo"}
+        for index in range(30)
+    ]
+
+    text = build_durable_context(state)
+
+    assert "<durable_artifacts>" in text
+    assert "sandbox/tool_outputs/29.txt" in text
+    assert "sandbox/tool_outputs/0.txt" not in text
+    assert "较旧 artifact 未注入" in text
 
 
 def test_durable_context_empty_when_no_channels():

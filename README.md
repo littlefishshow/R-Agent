@@ -2,9 +2,9 @@
 
 > 一个面向个人研究与工程工作的本地 AI Agent 工作台：能帮你**调研论文、精读论文、阅读论文仓库/代码仓库，并运行正在迭代中的 AutoResearch 自动实验框架**。
 
-R-Agent 不是只会聊天的问答壳子。它更像一个“可控的研究助理”：能调用工具、读写文件、检索网页、维护长期记忆、复用技能包，把复杂任务拆成父子 Agent 协作执行，并在需要时启动 autoresearch 循环去尝试改代码、跑验证、总结经验。
+R-Agent 不是只会聊天的问答壳子。它更像一个“可控的研究助理”：能调用工具、读写文件、检索网页、维护结构化运行状态和长期记忆、复用技能包，把复杂任务拆成父子 Agent 协作执行，并在需要时启动 autoresearch 循环去尝试改代码、跑验证、总结经验。
 
-它也支持用户按自己的工作流 **DIY tools 和 skills**：你可以直接在终端告诉 Agent“我想加入一个什么样的功能 / 希望以后怎么处理某类任务”，Agent 会在可控范围内交互式地帮你设计、编写、注册和验证新工具，或把稳定流程沉淀成 `skills/**/SKILL.md`。同时，R-Agent 通过 `memories/USER.md` 与 `memories/MEMORY.md` 保存长期偏好和稳定项目事实，会逐渐记住你的使用习惯、目录约定和常用工作流。
+它也支持用户按自己的工作流 **DIY tools 和 skills**：你可以直接在终端告诉 Agent“我想加入一个什么样的功能 / 希望以后怎么处理某类任务”，Agent 会在可控范围内交互式地帮你设计、编写、注册和验证新工具，或把稳定流程沉淀成 `skills/**/SKILL.md`。Memory 支持默认文件型后端和结构化 `deermem` 后端；后者用 JSONL facts 区分跨会话事实与 session 情节记忆，并提供准入闸门、预算化注入、检索和治理。
 
 <p align="center">
   <b>Research Scout</b> · <b>Paper Reader</b> · <b>Repo Reader</b> · <b>AutoResearch</b> · <b>Tool-using Local Agent</b>
@@ -19,6 +19,7 @@ R-Agent 不是只会聊天的问答壳子。它更像一个“可控的研究助
 - [1. 快速开始](#1-快速开始)
 - [2. 这个项目想解决什么问题](#2-这个项目想解决什么问题)
 - [3. 核心能力总览](#3-核心能力总览)
+- [3.1 当前 Runtime 实现与学习文档](#31-当前-runtime-实现与学习文档)
 - [4. 论文调研：paper_research_scout](#4-论文调研paper_research_scout)
 - [5. 论文阅读：read_paper](#5-论文阅读read_paper)
 - [6. 仓库阅读与论文代码定位](#6-仓库阅读与论文代码定位)
@@ -80,6 +81,35 @@ AZURE_OPENAI_ENDPOINT="https://xxx.openai.azure.com/"
 AZURE_OPENAI_API_VERSION="2024-02-01"
 LLM_MODEL="你的 Azure deployment / endpoint 名称"
 ```
+
+`.env.example` 还给出了一组适合当前本地工作台的 Runtime 配置：
+
+```env
+DEFERRED_TOOLS_ENABLED=1
+SESSION_SANDBOX_ENABLED=1
+TOOL_SANITIZATION_MODE="audit"
+
+DURABLE_CONTEXT_ENABLED=1
+MEMORY_INJECTION_MODE="hidden_user"
+MEMORY_PROVIDER="deermem"
+MEMORY_WRITE_MIDDLEWARE_ENABLED=1
+MEMORY_SESSION_FACTS_ENABLED=1
+```
+
+这组配置表示：
+
+- 专用工具先只出现在精简目录中，模型通过 `tool_search` 按需提升完整 schema；
+- 每个 CLI/GUI session 使用独立 workspace、Todo、RunEvent 和 artifact 路径；
+- 工具结果注入检测采用 `audit`，只记录命中，不改写结果；
+- summary、delegation、Skill 和 Memory 在请求时临时投影，不写入聊天历史；
+- Memory 使用结构化 JSONL facts，并在上下文压缩成功后自动抽取候选事实。
+
+需要区分 **代码默认** 与 **示例配置**：代码在没有这些环境变量时仍以 `file` Memory、
+关闭 durable context、关闭延迟工具暴露和关闭 session sandbox 运行；复制
+`.env.example` 后才会采用上面的推荐组合。完整语义见
+[`docs/03_上下文管理.md`](docs/03_上下文管理.md)、
+[`docs/04_Memory系统.md`](docs/04_Memory系统.md) 和
+[`docs/06_工具系统与沙箱.md`](docs/06_工具系统与沙箱.md)。
 
 ### 1.3 启动命令行 Agent
 
@@ -164,13 +194,13 @@ R-Agent 的目标就是把这些过程放进一个本地可控的 Agent 工作�
 ```text
 用户目标
   ↓
-构造上下文 / 读取 memory / 选择 skill
+写入 ThreadState / 构建请求级上下文 / 选择 skill
   ↓
 LLM 决策
   ↓
 调用真实工具：文件、Shell、Python、Web、Skill、Todo、Delegate、AutoResearch
   ↓
-工具结果回填与压缩
+工具结果回填 / artifact 外置 / 运行事件落盘 / 按需压缩
   ↓
 继续推理、验证、总结
 ```
@@ -185,16 +215,38 @@ LLM 决策
 
 | 能力 | 说明 | 典型用途 |
 |---|---|---|
-| Tool 系统 | 通过 `tools/registry.py` 动态注册工具，支持文件、Shell、Python、Web、Memory、Skill、Todo、Delegate、语音等，也支持按用户需求新增自定义工具 | 让模型不只“说”，还能执行真实操作 |
-| Skill 系统 | `skills/**/SKILL.md` 保存稳定工作流，用户也可以让 Agent 把反复使用的流程沉淀为自定义 skill | 论文调研、论文阅读、仓库阅读、项目进度恢复、创意生成、GitHub 工作流 |
-| Memory 系统 | `memories/USER.md` 与 `memories/MEMORY.md` 区分用户偏好和项目稳定事实 | 记住长期偏好、项目约定、环境事实 |
-| 上下文控制 | 自动估算上下文、压缩历史、大工具输出外置到 artifact | 避免长任务把模型上下文撑爆 |
-| Todo / Delegate | 父 Agent 维护树状任务与依赖，子 Agent 执行独立叶子任务 | 并行调研、复杂工程维护、降低父上下文压力 |
+| Agent Runtime | `core/agent.py` 保留模型—工具控制流，`core/middleware/` 承担压缩、延迟工具、输出预算、状态追踪和安全治理 | 控制思考、工具调用、中断、重试和强制收尾 |
+| ThreadState | `core/state.py` 将 messages、summary、artifact、delegation、skill、sandbox 和 token 计量拆成独立 channel | 避免把全部状态伪装成聊天消息 |
+| Tool 系统 | `tools/registry.py` 动态注册工具；支持 schema 过滤、延迟暴露、执行期 guard、隔离子进程和超时 | 让模型不只“说”，还能在明确边界内执行操作 |
+| Skill 系统 | `skills/**/SKILL.md` 保存稳定工作流；`skill_view` 按需加载，`skill_activate` 可应用工具白名单 | 论文调研、论文阅读、仓库阅读、创意生成、GitHub 工作流 |
+| Memory 系统 | 默认 `file` 后端使用 `USER.md` / `MEMORY.md`；可选 `deermem` 使用 `facts.jsonl` 和 session facts | 保存跨会话偏好与稳定事实，也支持当前 session 的细节检索 |
+| 上下文控制 | 构建请求级临时视图，支持 trigger/keep、滚动 LLM 摘要、durable context 和大工具输出 artifact | 避免长任务撑爆上下文，又不污染持久聊天历史 |
+| Todo / Delegate | Todo 文件保存树状任务和依赖；子 Agent 使用独立 `ThreadState`，只通过任务状态、摘要和 artifact 与父 Agent 协调 | 并行调研、复杂工程维护、降低父上下文压力 |
+| Session Sandbox | 为 file tools、Todo、run events、tool outputs 和 delegate contexts 提供 session 路径路由 | 隔离不同 CLI/GUI 会话的工作文件和运行产物 |
+| Run Event Stream | `core/events.py` 将 run、LLM、tool、context、delegate、artifact 事件追加为 JSONL | 回放一次运行，定位工具循环、压缩和产物路径 |
 | Paper Research | `paper_research_scout` 负责发现、筛选、排序论文 | 找最新/高引/热门/有代码的论文 |
 | Paper Reading | `read_paper` 负责 PDF 精读、图表截图、中文研究笔记 | 读懂方法、实验、局限与后续研究价值 |
 | Repo Reading | `paper_repo_code_research` 等 skill 负责源码定位 | 把论文方法映射到代码实现 |
 | AutoResearch | `autoresearch/` 提供 plan → attempt → conclude 小型研究闭环 | 自动改进小项目、跑 eval、记录指标和经验 |
 | Cockpit GUI | 浏览器可视化界面，管理树状对话、文件系统、PDF/Markdown 阅读、选中文本分支和工具上下文开关 | 非终端学习、论文阅读与上下文审计 |
+
+### 3.1 当前 Runtime 实现与学习文档
+
+`docs/` 是一组按当前源码编写的 R-Agent 实现教程。可以先阅读下面的能力地图，再按主题
+进入对应章节：
+
+| 教程 | 主要回答的问题 |
+|---|---|
+| [`01_Agent循环中间件化.md`](docs/01_Agent循环中间件化.md) | 一轮模型决策、工具调用、Middleware hook 和强制收尾如何运行 |
+| [`02_ThreadState结构化状态.md`](docs/02_ThreadState结构化状态.md) | 当前状态有哪些 channel，artifact/delegation/skill 如何合并 |
+| [`03_上下文管理.md`](docs/03_上下文管理.md) | 请求视图、trigger/keep、滚动摘要、durable context 如何协作 |
+| [`04_Memory系统.md`](docs/04_Memory系统.md) | file/deermem 双后端、事实抽取、gate、session facts、检索和治理如何实现 |
+| [`05_子Agent委派契约.md`](docs/05_子Agent委派契约.md) | Todo 拓扑、子 Agent 隔离、预算、结果契约和上下文 artifact 如何工作 |
+| [`06_工具系统与沙箱.md`](docs/06_工具系统与沙箱.md) | 工具注册、权限过滤、进程隔离、大结果预算和 session 路径如何实现 |
+| [`07_Skills与自定义Agent.md`](docs/07_Skills与自定义Agent.md) | Skill 发现、激活、治理，以及 SOUL/Skill/Sub-agent 如何组合自定义行为 |
+| [`08_运行事件流.md`](docs/08_运行事件流.md) | RunEvent JSONL 与 GUI 实时事件如何分工和回放 |
+
+这些教程以真实类、函数、配置和测试为锚点；README 只保留项目入口和能力地图。
 
 ---
 
@@ -440,21 +492,30 @@ prepare.py → train/train.sh → eval.sh → metrics.json
 
 R-Agent 做了几层治理：
 
-- 自动估算 `messages + tools` 的上下文占用；
-- 接近阈值时压缩历史；
-- 保留最近完整 message，不从中间截断；
+- `ThreadState.messages` 保存最近完整对话，`summary_text` 保存滚动压缩摘要；
+- 每次模型请求前估算 messages、durable context、summary 和 tools schema 的占用；
+- trigger 支持 tokens / messages / 窗口 fraction，任一条件满足即可压缩；
+- keep 支持 messages / tokens / fraction，并把 assistant tool call 与对应 tool results 视为一个不可拆分单元；
+- 默认复用当前模型，将“上一版摘要 + 新淘汰历史”压成结构化滚动摘要；
+- 摘要失败时保留原历史，下一轮重试，不用空摘要覆盖状态；
+- summary、delegation、skill 和 hidden-user memory 在请求时临时投影，不写回 `messages`；
 - 大工具输出落盘为 artifact；
-- 需要时用 `artifact_inspect` / `artifact_search` / `artifact_slice` 二次检索；
+- 同一轮多个工具结果还会受整轮字符预算约束；
+- 需要时用 `artifact_inspect` / `artifact_search` / `artifact_slice` 二次检索。
 
 ### 9.2 父子进程 / 父子 Agent 管理
 
 复杂任务不适合一个 Agent 从头记到尾。R-Agent 支持：
 
-- 父 Agent 维护动态 todo list；
-- 子 Agent 只领取可执行叶子任务；
-- 子 Agent 需要拆分时只提交 split proposal；
+- 父 Agent 在 session 独立的 Todo 文件中维护树状任务、依赖和 ready 状态；
+- 每个子 Agent 创建独立 `RAgent`、`ThreadState` 和消息历史，但继承父 session id；
+- 子 Agent 只能领取依赖满足的叶子任务；
+- 子 Agent 需要拆分时只提交 split proposal，由父 Agent approve/reject；
 - 父 Agent 决定依赖、并发数和是否批准拆分；
-- 子 Agent 完整上下文保存为 sandbox artifact，不默认回灌给父进程。
+- 每个任务同时受 `max_iterations` 和 wall timeout 约束，并有 loop detection；
+- 子 Agent 返回 compact 状态、`stop_reason`、有界 step events 和 token 统计；
+- 子 Agent 完整上下文保存为 sandbox artifact，不默认回灌给父进程；
+- 整棵 Todo 树成功后统一清理 context artifacts。
 
 这能显著减少父上下文压力，也让复杂任务更可控。
 
@@ -479,7 +540,9 @@ R-Agent 不是黑盒：
 
 - 工具都在 `tools/` 下注册；
 - skill 都是 Markdown 工作流；
-- memory 是可读文本文件；
+- file memory 是可读 Markdown；deermem 是一行一个事实的 JSONL；
+- `ThreadState` 明确区分当前状态、聊天历史和 durable context；
+- 每次 run 的 LLM/tool/context/delegate/artifact 事件可追加到 JSONL 并回放；
 - AutoResearch 产物保存在目标项目目录；
 - 大输出、trace、debug 都有 artifact；
 - 高风险命令、工作区外访问、危险 Python 代码都有审批边界。
@@ -571,17 +634,28 @@ docker-compose.gateway.yml
 ```text
 R-Agent/
 ├── main.py                         # CLI 入口
-├── core/                           # Agent loop、配置、memory、prompt、上下文控制
-├── tools/                          # 全局工具注册与实现
+├── core/
+│   ├── agent.py                    # Agent Loop、迭代预算、中断与工具生命周期
+│   ├── state.py                    # ThreadState 与 durable context 投影
+│   ├── context_control.py          # 上下文估算、trigger/keep、滚动摘要
+│   ├── memory_provider.py          # file/deermem MemoryProvider
+│   ├── memory_facts.py             # JSONL FactStore 与 session fact store
+│   ├── memory_extractor.py         # 对话到结构化事实的 LLM 抽取
+│   ├── events.py                   # append-only RunEventStore
+│   ├── middleware/                 # 生命周期 hook 与内置中间件
+│   └── context/                    # 大工具结果与整轮输出预算
+├── tools/                          # 工具注册、文件/命令/Memory/Skill/Todo/Delegate
 ├── skills/                         # 可复用工作流：论文调研、论文阅读、仓库阅读等
 ├── autoresearch/                   # AutoResearch runtime package
 │   └── benchmarks/atr_playground/   # 内置 AutoResearch 示例 benchmark
 ├── app_gui/                        # Cockpit 后端 runtime / event / snapshot
 ├── app_gui_frontend/               # Cockpit 前端
 ├── gateway/                        # HTTP/Gateway/外部平台接入
-├── memories/                       # USER.md / MEMORY.md 长期记忆
+├── memories/                       # Markdown memory、facts.jsonl、session facts
+├── docs/                           # 当前 R-Agent Runtime 实现教程
 ├── outputs/                        # 论文、笔记、研究输出等本地产物（通常不进 Git）
-├── sandbox/                        # 临时运行文件、todo、tool artifact（不进 Git）
+├── sandbox/                        # session workspace、Todo、RunEvent、tool/delegate artifact
+├── scripts/replay_events.py        # 回放全局或 session RunEvent JSONL
 ├── tests/                          # 自动化测试
 ├── requirements.txt
 ├── .env.example
@@ -596,7 +670,7 @@ R-Agent/
 运行测试：
 
 ```bash
-python -m pytest
+PYTHONPATH=. python -m pytest
 ```
 
 如果当前 Python 环境缺少 pytest：
@@ -609,9 +683,12 @@ pip install -r requirements.txt
 
 - `README.md`：项目入口、能力介绍、使用说明；
 - `CHANGELOG.md`：按日期记录维护更新；
+- `docs/`：按当前源码讲解 Runtime 的正式教程；
 - `skills/**/SKILL.md`：稳定可复用流程；
-- `memories/`：长期偏好和稳定事实，不保存临时任务日志；
-- `sandbox/`：临时运行产物，可清理，不应被 Git 跟踪；
+- `memories/USER.md` / `MEMORY.md`：file backend 的长期偏好与稳定事实；
+- `memories/facts.jsonl`：deermem 的跨会话结构化事实；
+- `memories/sessions/`：当前 session 的临时情节事实，正常 shutdown 时清理；
+- `sandbox/`：session workspace、Todo、事件和 artifact，不应被 Git 跟踪；
 - `outputs/`：论文、笔记、研究输出等本地产物，默认不进入版本库。
 
 ---
@@ -619,11 +696,3 @@ pip install -r requirements.txt
 ## 13. 更新日志
 
 更新日志已从 README 中拆分到独立文件：[`CHANGELOG.md`](CHANGELOG.md)。
-
-最近一次文档维护：
-
-- 将 `atr_playground` 移入 `autoresearch/benchmarks/atr_playground`，作为内置 AutoResearch 示例 benchmark；
-- 将 README 改为项目入口文档，重点介绍环境配置、论文调研、论文阅读、仓库阅读、AutoResearch 与 atr_playground 测试项目；
-- 补充 tools / skills DIY、长期记忆与整体 Skill 系统说明；
-- 记录上下文主动压缩规则与 delegate 子 Agent timeout 默认值/提示文案优化；
-- 历史更新记录迁移到 `CHANGELOG.md`，避免 README 过长。

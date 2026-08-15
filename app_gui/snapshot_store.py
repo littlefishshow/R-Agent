@@ -28,6 +28,7 @@ class ContextSnapshotStore:
         self.events: List[Dict[str, Any]] = []
         self.payloads: Dict[str, Dict[str, Any]] = {}
         self.metadata: Dict[str, Any] = {}
+        self.thread_state: Dict[str, Any] = {}
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._load()
 
@@ -39,11 +40,13 @@ class ContextSnapshotStore:
                     self.events = list(data.get("events") or [])
                     self.payloads = dict(data.get("payloads") or {})
                     self.metadata = dict(data.get("metadata") or {})
+                    self.thread_state = dict(data.get("thread_state") or {})
                     return
                 except Exception:
                     self.events = []
                     self.payloads = {}
                     self.metadata = {}
+                    self.thread_state = {}
             # Backward-compatible one-time read for stores written by older builds.
             if self.events_path.exists():
                 try:
@@ -78,6 +81,7 @@ class ContextSnapshotStore:
                 # Backward-compatible views used by existing GUI endpoints.
                 "events": self.events,
                 "payloads": self.payloads,
+                "thread_state": self.thread_state,
             }
             tmp_path = self.context_path.with_suffix(".json.tmp")
             tmp_path.write_text(json.dumps(data, ensure_ascii=False, default=str), encoding="utf-8")
@@ -87,6 +91,12 @@ class ContextSnapshotStore:
         with self._lock:
             self.metadata.update(dict(values or {}))
             self._save()
+
+    def update_thread_state(self, values: Dict[str, Any], *, save: bool = True) -> None:
+        with self._lock:
+            self.thread_state = dict(values or {})
+            if save:
+                self._save()
 
     def _build_modules(self) -> Dict[str, Any]:
         with self._lock:

@@ -1,10 +1,11 @@
-"""内置中间件测试（Improve_progress/01 落地 + 03 步骤6 + 04 自动写入）。
+"""内置中间件测试。
 
 覆盖：
 1. ToolResultSanitizationMiddleware：中和工具结果里的 prompt injection；干净结果不改；
    持久化占位块跳过；主循环里能真正改写进入模型的工具消息。
-2. MemoryWriteMiddleware：after_iteration 调用 provider.add(...)；默认文件型 add 为 no-op。
-3. 默认链为空（两个开关默认关）；开关打开后进入链。
+2. MemoryWriteMiddleware：只在上下文压缩成功后调用 provider.add_compression(...)。
+3. 可选配置链的开关组装。
+4. 软预算提醒和 delegation ledger 追踪。
 """
 
 import json
@@ -14,8 +15,10 @@ import core.config as cfg
 from core.agent import RAgent
 from core.middleware import AgentContext, ToolCallView, build_default_middlewares
 from core.middleware.builtins import (
+    SoftIterationBudgetMiddleware,
     MemoryWriteMiddleware,
     ToolResultSanitizationMiddleware,
+    ToolResultTrackingMiddleware,
 )
 from tools.registry import registry
 
@@ -170,6 +173,57 @@ def test_file_provider_add_is_noop():
 
     # 默认文件型 add 不抛异常、不做事
     assert FileMemoryProvider().add(thread_id="t", messages=[{"role": "user", "content": "x"}]) is None
+
+
+def test_soft_iteration_budget_injects_once():
+    class _Agent:
+        max_iterations = 10
+        _soft_warned = False
+
+        def __init__(self):
+            self.calls = []
+
+        def _inject_soft_warning(self, used, total):
+            self.calls.append((used, total))
+
+    agent = _Agent()
+    middleware = SoftIterationBudgetMiddleware()
+    middleware.before_iteration(AgentContext(agent=agent, iteration=8))
+    middleware.before_iteration(AgentContext(agent=agent, iteration=9))
+    assert agent.calls == [(8, 10)]
+
+
+def test_tool_result_tracking_updates_delegation_ledger():
+    from core.state import ThreadState
+
+    class _Agent:
+        session_id = "session-x"
+
+        def __init__(self):
+            self.state = ThreadState()
+            self.events = []
+
+        def _emit_run_event(self, event_type, content=None, **metadata):
+            self.events.append((event_type, content, metadata))
+
+    agent = _Agent()
+    result = json.dumps({
+        "tasks": [{
+            "task_id": "t1",
+            "status": "success",
+            "stop_reason": "completed",
+        }]
+    })
+    ToolResultTrackingMiddleware().before_tool_message(
+        AgentContext(agent=agent, iteration=2),
+        ToolCallView("delegate_task", "{}", "call-delegate"),
+        result,
+    )
+    assert agent.state.delegation_ledger == [{
+        "task_id": "t1",
+        "status": "success",
+        "stop_reason": "completed",
+    }]
 
 
 # --------------------------------------------------------------------------- #
