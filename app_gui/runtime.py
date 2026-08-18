@@ -284,6 +284,7 @@ class GuiSession:
         self.cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._disposed = False
         self._active_run_id = ""
         self._active_run_baseline = []
         self.last_response: Optional[str] = None
@@ -370,6 +371,8 @@ class GuiSession:
         }
 
     def _persist_thread_state(self, agent: Optional[RAgent] = None, *, save: bool = True) -> None:
+        if self._disposed:
+            return
         try:
             self.store.update_thread_state(self._thread_state_snapshot(agent), save=save)
         except Exception:
@@ -528,7 +531,7 @@ class GuiSession:
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
-            if not run_id or self._is_current_run(run_id):
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
                 self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
@@ -589,7 +592,7 @@ class GuiSession:
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
-            if not run_id or self._is_current_run(run_id):
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
                 self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
@@ -615,6 +618,11 @@ class GuiSession:
         alive_background = self.agent.shutdown_background_tasks(timeout=join_timeout)
         interrupt_result["alive_background_tasks"] = alive_background
         return interrupt_result
+
+    def dispose(self, *, join_timeout: float = 1.0) -> Dict[str, Any]:
+        """Stop the session and prevent background saves from recreating it."""
+        self._disposed = True
+        return self.shutdown(join_timeout=join_timeout)
 
 
 
@@ -844,7 +852,7 @@ class LearningSession(GuiSession):
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
-            if not run_id or self._is_current_run(run_id):
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
                 self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
@@ -876,7 +884,7 @@ class LearningSession(GuiSession):
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
-            if not run_id or self._is_current_run(run_id):
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
                 self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
@@ -1503,11 +1511,17 @@ class LearningRuntimeService(AgentRuntimeService):
         if source_context:
             source_kind = str(source_context.get("kind") or "").strip()
             source_path = str(source_context.get("path") or "").strip()
+            workspace_path = str(source_context.get("workspace_path") or "").strip()
+            absolute_path = str(source_context.get("absolute_path") or "").strip()
             source_location = str(source_context.get("location") or "").strip()
             if source_kind:
                 context_lines.append(f"【来源类型】{source_kind}")
+            if workspace_path and workspace_path != source_path:
+                context_lines.append(f"【文档库路径】{workspace_path}")
             if source_path:
                 context_lines.append(f"【来源文件】{source_path}")
+            if absolute_path:
+                context_lines.append(f"【本地绝对路径】{absolute_path}")
             if source_location:
                 context_lines.append(f"【来源位置】{source_location}")
         context_block = ("\n".join(context_lines) + "\n\n") if context_lines else ""
@@ -1620,20 +1634,38 @@ class LearningRuntimeService(AgentRuntimeService):
             and 0 <= line_start <= line_end <= len(content)
             and isinstance(original_lines, str)
         ):
-            if content[line_start:line_end] != original_lines:
-                raise ValueError("the original markdown lines have changed; reopen the file and select them again")
-            start, end = line_start, line_end
+            if content[line_start:line_end] == original_lines:
+                start, end = line_start, line_end
+            else:
+                relocated = self._resolve_original_markdown_range(
+                    content,
+                    selected_text=selected_text,
+                    original_lines=original_lines,
+                    text_offset=source_context.get("source_text_offset"),
+                    occurrence=source_context.get("occurrence"),
+                    preferred_offset=line_start,
+                )
+                if relocated is None:
+                    raise ValueError(
+                        "the original markdown lines have changed and could not be located safely; "
+                        "close this modification window and select the current text again"
+                    )
+                start, end = relocated
         else:
-            text_offset = source_context.get("source_text_offset")
-            occurrence = source_context.get("occurrence")
-            selected_start = self._resolve_selection_offset(content, selected_text, text_offset, occurrence)
-            if selected_start < 0:
-                raise ValueError("the original selected text has changed; reopen the file and select it again")
-            start, end = self._line_span_for_selection(
+            relocated = self._resolve_original_markdown_range(
                 content,
-                selected_start,
-                selected_start + len(selected_text),
+                selected_text=selected_text,
+                original_lines=original_lines if isinstance(original_lines, str) else "",
+                text_offset=source_context.get("source_text_offset"),
+                occurrence=source_context.get("occurrence"),
+                preferred_offset=source_context.get("source_text_offset"),
             )
+            if relocated is None:
+                raise ValueError(
+                    "the original selected text has changed and could not be located safely; "
+                    "close this modification window and select the current text again"
+                )
+            start, end = relocated
 
         updated = content[:start] + replacement + content[end:]
         item = workspace.write_text_file(path, updated)
@@ -1711,6 +1743,150 @@ class LearningRuntimeService(AgentRuntimeService):
                 return -1
             start = found + len(selected_text)
         return found
+
+    @classmethod
+    def _resolve_original_markdown_range(
+        cls,
+        content: str,
+        *,
+        selected_text: str,
+        original_lines: str,
+        text_offset: Any,
+        occurrence: Any,
+        preferred_offset: Any,
+    ) -> Optional[tuple[int, int]]:
+        """Relocate a saved Markdown selection after offsets become stale.
+
+        Existing modify windows can outlive a file reopen or an edit elsewhere
+        in the document. Prefer the exact original line block when it still
+        exists, then fall back to the exact selected text, and finally compare
+        Markdown-visible text (for example `` `G` `` in source versus ``G`` in
+        the rendered selection). Ambiguous matches are rejected unless the
+        saved occurrence or old offset identifies one deterministically.
+        """
+        preferred = preferred_offset if isinstance(preferred_offset, int) and preferred_offset >= 0 else None
+        if original_lines:
+            matches = cls._all_text_ranges(content, original_lines)
+            chosen = cls._choose_relocated_range(matches, preferred_offset=preferred, occurrence=occurrence)
+            if chosen is not None:
+                return chosen
+
+        selected_start = cls._resolve_selection_offset(content, selected_text, text_offset, occurrence)
+        if selected_start >= 0:
+            return cls._line_span_for_selection(
+                content,
+                selected_start,
+                selected_start + len(selected_text),
+            )
+
+        matches = cls._markdown_visible_ranges(content, selected_text)
+        chosen = cls._choose_relocated_range(matches, preferred_offset=preferred, occurrence=occurrence)
+        if chosen is None:
+            return None
+        return cls._line_span_for_selection(content, chosen[0], chosen[1])
+
+    @staticmethod
+    def _all_text_ranges(content: str, needle: str) -> list[tuple[int, int]]:
+        if not needle:
+            return []
+        ranges = []
+        start = 0
+        while True:
+            found = content.find(needle, start)
+            if found < 0:
+                break
+            ranges.append((found, found + len(needle)))
+            start = found + max(1, len(needle))
+        return ranges
+
+    @staticmethod
+    def _choose_relocated_range(
+        matches: list[tuple[int, int]],
+        *,
+        preferred_offset: Optional[int],
+        occurrence: Any,
+    ) -> Optional[tuple[int, int]]:
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        if preferred_offset is not None:
+            distances = sorted(
+                (abs(start - preferred_offset), index, (start, end))
+                for index, (start, end) in enumerate(matches)
+            )
+            if len(distances) == 1 or distances[0][0] < distances[1][0]:
+                return distances[0][2]
+        if isinstance(occurrence, int) and 0 <= occurrence < len(matches):
+            return matches[occurrence]
+        return None
+
+    @classmethod
+    def _markdown_visible_ranges(cls, content: str, selected_text: str) -> list[tuple[int, int]]:
+        source_text, source_map = cls._markdown_visible_text_with_map(content)
+        needle_text, _ = cls._markdown_visible_text_with_map(selected_text)
+        if not source_text or not needle_text:
+            return []
+        ranges = []
+        normalized_start = 0
+        while True:
+            found = source_text.find(needle_text, normalized_start)
+            if found < 0:
+                break
+            normalized_end = found + len(needle_text)
+            start = source_map[found]
+            end = source_map[normalized_end - 1] + 1
+            ranges.append((start, end))
+            normalized_start = found + max(1, len(needle_text))
+        return ranges
+
+    @staticmethod
+    def _markdown_visible_text_with_map(value: str) -> tuple[str, list[int]]:
+        """Normalize common Markdown-only syntax while preserving source offsets."""
+        raw = str(value or "")
+        ignored = [False] * len(raw)
+
+        # Renderers hide structural prefixes and emphasis/code delimiters. Mark
+        # them as non-visible so selections copied from the rendered DOM can be
+        # mapped back to the original Markdown source.
+        prefix_pattern = re.compile(
+            r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)"
+        )
+        delimiter_pattern = re.compile(r"(?<!\\)(?:\*\*|__|`+)")
+        for pattern in (prefix_pattern, delimiter_pattern):
+            for match in pattern.finditer(raw):
+                for index in range(match.start(), match.end()):
+                    ignored[index] = True
+
+        text = ""
+        offsets: list[int] = []
+        pending_space = False
+        escaped = False
+        for index, char in enumerate(raw):
+            if ignored[index]:
+                continue
+            if escaped:
+                if pending_space and text:
+                    text += " "
+                    offsets.append(index)
+                    pending_space = False
+                text += char
+                offsets.append(index)
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char.isspace():
+                pending_space = bool(text)
+                continue
+            if pending_space:
+                text += " "
+                offsets.append(index)
+                pending_space = False
+            text += char
+            offsets.append(index)
+        return text, offsets
 
     def save_selection_note(
         self,
@@ -1901,7 +2077,7 @@ class LearningRuntimeService(AgentRuntimeService):
                 if session is None:
                     continue
                 try:
-                    session.shutdown(join_timeout=0.2)
+                    session.dispose(join_timeout=0.2)
                 except Exception:
                     pass
                 deleted.append(sid)

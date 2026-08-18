@@ -1,0 +1,23 @@
+[
+  {
+    "title": "AgentX: Towards Agent-Driven Self-Iteration of Industrial Recommender Systems",
+    "path": "outputs/papers/Autoresearch/2026-06-26_AgentX.pdf",
+    "output_path": "outputs/papers_output/Autoresearch/2026-06-26_AgentX_阅读笔记.md",
+    "arxiv_id": "2606.26859",
+    "doi": "",
+    "url": "https://arxiv.org/abs/2606.26859",
+    "pdf_url": "https://arxiv.org/pdf/2606.26859",
+    "category": "Autoresearch",
+    "source": "read_paper",
+    "read_date": "2026-07-24"
+  },
+  {
+    "title": "Group-in-Group Policy Optimization for LLM Agent Training",
+    "path": "outputs/papers/agent_RL/2026-08-11_GiGPO.pdf",
+    "arxiv_id": "2505.10978",
+    "url": "https://arxiv.org/abs/2505.10978",
+    "category": "agent_RL",
+    "source": "read_paper",
+    "date": "2026-08-11"
+  }
+]

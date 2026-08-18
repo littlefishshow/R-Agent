@@ -145,6 +145,8 @@ def test_large_tool_result_migrates_to_per_session_sandbox(monkeypatch, tmp_path
     assert PERSISTED_OUTPUT_TAG in persisted
     saved_line = next(line for line in persisted.splitlines() if "Full output saved to:" in line)
     saved_path = saved_line.split("Full output saved to:", 1)[1].strip()
+    assert Path(saved_path).is_absolute()
+    assert "/sandbox/sessions/gui_a/tool_outputs/" in saved_path
     from tools.artifact_tools import artifact_slice_tool
 
     sliced = json.loads(artifact_slice_tool(saved_path, offset=1, limit=1))

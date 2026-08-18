@@ -9,6 +9,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 
+def _load_pymupdf():
+    """Import PyMuPDF through its canonical name, with the legacy alias fallback."""
+    try:
+        import pymupdf
+
+        return pymupdf
+    except Exception as canonical_exc:
+        try:
+            import fitz
+
+            return fitz
+        except Exception as legacy_exc:
+            raise RuntimeError(
+                "PyMuPDF is not available. Install the Cockpit backend dependencies "
+                "with `python3 -m pip install -r requirements.txt`. "
+                f"pymupdf import failed: {canonical_exc}; fitz import failed: {legacy_exc}"
+            ) from legacy_exc
+
+
 class FileWorkspace:
     """A small, path-confined file workspace for the learning GUI."""
 
@@ -183,10 +202,7 @@ class FileWorkspace:
         path = self.get_file(relative_path)
         if path.suffix.lower() != ".pdf":
             raise ValueError("file is not a PDF")
-        try:
-            import fitz  # PyMuPDF
-        except Exception as exc:  # pragma: no cover - depends on optional environment
-            raise RuntimeError(f"PyMuPDF is not available: {exc}") from exc
+        fitz = _load_pymupdf()
         pages = []
         with fitz.open(str(path)) as doc:
             for index, page in enumerate(doc):
@@ -253,10 +269,7 @@ class FileWorkspace:
         path = self.get_file(relative_path)
         if path.suffix.lower() != ".pdf":
             raise ValueError("file is not a PDF")
-        try:
-            import fitz  # PyMuPDF
-        except Exception as exc:  # pragma: no cover - depends on optional environment
-            raise RuntimeError(f"PyMuPDF is not available: {exc}") from exc
+        fitz = _load_pymupdf()
         stat = path.stat()
         cache_key = hashlib.sha256(
             f"{self._rel(path)}:{stat.st_mtime_ns}:{stat.st_size}:{page_number}:{float(zoom):.2f}".encode("utf-8")

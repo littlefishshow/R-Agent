@@ -7,6 +7,16 @@ export type ContextEvent = {
   payload: Record<string, any>
 }
 
+export class ApiRequestError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+  }
+}
+
 export type SessionState = {
   session_id: string
   model: string
@@ -260,7 +270,7 @@ export async function fetchLearningChildren(sessionId: string): Promise<{ sessio
 
 export async function fetchLearningSession(sessionId: string): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}`)
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) throw new ApiRequestError(res.status, await res.text())
   return res.json()
 }
 
@@ -333,6 +343,7 @@ export async function selectionBranchLearningSession(sessionId: string, payload:
   modification_instruction?: string
   title?: string
   source_context?: Record<string, any>
+  workspace_session_id?: string
   background?: boolean
   session_id?: string
 }): Promise<LearningSessionState> {
@@ -356,7 +367,7 @@ export async function acceptSelectionModification(sessionId: string): Promise<{
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/accept-modification`, {
     method: 'POST',
   })
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) throw new ApiRequestError(res.status, await res.text())
   return res.json()
 }
 
@@ -365,6 +376,7 @@ export async function saveSelectionNoteLearningSession(sessionId: string, payloa
   note_text: string
   title?: string
   source_context?: Record<string, any>
+  workspace_session_id?: string
   session_id?: string
 }): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/selection-note`, {

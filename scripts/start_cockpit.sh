@@ -7,10 +7,11 @@ BACKEND_HOST="${R_AGENT_COCKPIT_HOST:-127.0.0.1}"
 BACKEND_PORT="${R_AGENT_COCKPIT_PORT:-8765}"
 FRONTEND_PORT="${R_AGENT_COCKPIT_FRONTEND_PORT:-5173}"
 BACKEND_READY_TIMEOUT="${R_AGENT_COCKPIT_READY_TIMEOUT:-30}"
+BACKEND_PYTHON="${R_AGENT_COCKPIT_PYTHON:-$(command -v python3 || true)}"
 
 cd "$ROOT_DIR"
 
-if ! command -v python3 >/dev/null 2>&1; then
+if [ -z "$BACKEND_PYTHON" ] || [ ! -x "$BACKEND_PYTHON" ]; then
   echo "❌ 未找到 python3，请先安装 Python。" >&2
   exit 1
 fi
@@ -38,6 +39,67 @@ ensure_frontend_dependencies() {
   fi
 }
 
+ensure_backend_dependencies() {
+  backend_dependencies_available() {
+    local python_bin="$1"
+    "$python_bin" - <<'PY'
+import importlib
+
+required = ("fastapi", "uvicorn", "websockets", "pymupdf", "PIL")
+missing = []
+for name in required:
+    try:
+        importlib.import_module(name)
+    except Exception as exc:
+        missing.append(f"{name}: {exc}")
+if missing:
+    raise SystemExit("\n".join(missing))
+PY
+  }
+
+  if backend_dependencies_available "$BACKEND_PYTHON"; then
+    return
+  fi
+
+  # An unrelated activated venv (for example deer-flow) may intentionally omit
+  # pip/PyMuPDF. Prefer an already-working host Python over mutating that venv.
+  local candidate
+  for candidate in /usr/bin/python3 /opt/homebrew/bin/python3; do
+    if [ "$candidate" != "$BACKEND_PYTHON" ] && [ -x "$candidate" ] \
+      && backend_dependencies_available "$candidate"; then
+      echo "ℹ️ 当前 Python 缺少 Cockpit 依赖：$BACKEND_PYTHON" >&2
+      echo "   改用已就绪的 Python：$candidate" >&2
+      BACKEND_PYTHON="$candidate"
+      return
+    fi
+  done
+
+  echo "📦 Cockpit 后端依赖缺失，正在安装到当前 Python：$BACKEND_PYTHON" >&2
+  if "$BACKEND_PYTHON" -m pip --version >/dev/null 2>&1; then
+      "$BACKEND_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
+    elif command -v uv >/dev/null 2>&1; then
+      uv pip install --python "$BACKEND_PYTHON" -r "$ROOT_DIR/requirements.txt"
+    elif "$BACKEND_PYTHON" -m ensurepip --version >/dev/null 2>&1; then
+      echo "   当前虚拟环境没有 pip，先通过 ensurepip 补齐。" >&2
+      "$BACKEND_PYTHON" -m ensurepip
+      "$BACKEND_PYTHON" -m pip install -r "$ROOT_DIR/requirements.txt"
+    else
+      echo "❌ 当前 Python 没有 pip，也找不到 uv/ensurepip，无法安装 Cockpit 后端依赖。" >&2
+      echo "   请先安装 uv，再执行：" >&2
+      echo "   uv pip install --python $BACKEND_PYTHON -r $ROOT_DIR/requirements.txt" >&2
+      return 1
+    fi
+  backend_dependencies_available "$BACKEND_PYTHON"
+  "$BACKEND_PYTHON" - <<'PY'
+import fastapi
+import uvicorn
+import websockets
+import pymupdf
+from PIL import Image
+PY
+}
+
+ensure_backend_dependencies
 ensure_frontend_dependencies
 
 cleanup() {
@@ -56,7 +118,7 @@ wait_for_backend() {
   BACKEND_PORT="$BACKEND_PORT" \
   BACKEND_READY_TIMEOUT="$BACKEND_READY_TIMEOUT" \
   BACKEND_PID="$BACKEND_PID" \
-  python3 - <<'PY'
+  "$BACKEND_PYTHON" - <<'PY'
 import os
 import sys
 import time
@@ -96,7 +158,7 @@ PY
 }
 
 echo "🚀 启动 R-Agent Cockpit 后端 http://$BACKEND_HOST:$BACKEND_PORT"
-PYTHONPATH="$ROOT_DIR" R_AGENT_COCKPIT_HOST="$BACKEND_HOST" R_AGENT_COCKPIT_PORT="$BACKEND_PORT" python3 -m app_gui.server &
+PYTHONPATH="$ROOT_DIR" R_AGENT_COCKPIT_HOST="$BACKEND_HOST" R_AGENT_COCKPIT_PORT="$BACKEND_PORT" "$BACKEND_PYTHON" -m app_gui.server &
 BACKEND_PID=$!
 
 wait_for_backend
@@ -104,7 +166,7 @@ wait_for_backend
 echo "🧭 启动 R-Agent Cockpit 前端 http://127.0.0.1:$FRONTEND_PORT"
 (
   cd "$FRONTEND_DIR"
-  npm run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT"
+  R_AGENT_COCKPIT_PORT="$BACKEND_PORT" npm run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT"
 ) &
 FRONTEND_PID=$!
 

@@ -8,6 +8,7 @@ import pytest
 
 from app_gui.runtime import AgentRuntimeService
 from app_gui.runtime import LEARNING_ALLOWED_TOOLS, LearningRuntimeService
+from app_gui.server import _source_context_with_absolute_path
 from app_gui.schemas import (
     EVENT_ERROR,
     EVENT_LLM_REQUEST_SNAPSHOT,
@@ -520,6 +521,42 @@ def test_learning_selection_branch_includes_file_source_context(monkeypatch, tmp
     assert "【来源位置】page 3" in seen[-1]
 
 
+def test_learning_selection_branch_prefers_absolute_file_path_in_prompt(monkeypatch, tmp_path):
+    seen = []
+
+    def fake_run(self, user_message, **kwargs):
+        seen.append(user_message)
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "answer"})
+        return "answer"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    workspace = FileWorkspace(tmp_path / "outputs")
+    source = workspace.root / "papers" / "a.md"
+    source.write_text("selected text", encoding="utf-8")
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    parent = service.create_session(session_id="absolute-source", agent=RAgent(model="test", max_iterations=1, enable_self_review=False))
+    context = _source_context_with_absolute_path(
+        workspace,
+        {"kind": "markdown", "path": "papers/a.md", "location": "line 1"},
+    )
+
+    result = service.branch_from_selection(
+        "absolute-source",
+        selected_text="selected text",
+        action="explain",
+        source_context=context,
+        background=False,
+    )
+
+    assert result["selection"]["source_context"]["path"] == "papers/a.md"
+    assert result["selection"]["source_context"]["workspace_path"] == "papers/a.md"
+    assert result["selection"]["source_context"]["absolute_path"] == str(source)
+    assert f"【本地绝对路径】{source}" in seen[-1]
+    assert "【来源文件】papers/a.md" in seen[-1]
+
+
 def test_learning_translate_branch_uses_only_selected_text(monkeypatch, tmp_path):
     seen = []
 
@@ -748,6 +785,130 @@ def test_learning_markdown_modification_rejects_changed_source(monkeypatch, tmp_
     assert path.read_text(encoding="utf-8") == "用户已经手动改过"
 
 
+def test_learning_markdown_modification_relocates_stale_line_offsets(monkeypatch, tmp_path):
+    def fake_run(self, user_message, **kwargs):
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "替换后的正文"})
+        return "替换后的正文"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    workspace = FileWorkspace(tmp_path / "files")
+    path = workspace.root / "papers" / "note.md"
+    original = "# 标题\n原来的正文\n结尾\n"
+    path.write_text(original, encoding="utf-8")
+    parent = service.create_session(session_id="modify-relocate")
+    line_start = original.index("原来的正文")
+    line_end = line_start + len("原来的正文")
+    branch = service.branch_from_selection(
+        parent.session_id,
+        selected_text="原来的正文",
+        action="modify",
+        modification_instruction="润色",
+        source_context={
+            "kind": "markdown",
+            "path": "papers/note.md",
+            "source_text_offset": line_start,
+            "source_line_start_offset": line_start,
+            "source_line_end_offset": line_end,
+            "source_line_text": "原来的正文",
+            "occurrence": 0,
+        },
+        background=False,
+    )
+    path.write_text("新增前言\n" + original, encoding="utf-8")
+
+    accepted = service.accept_selection_modification(branch["session_id"], workspace=workspace)
+
+    assert accepted["content"] == "新增前言\n# 标题\n替换后的正文\n结尾\n"
+    assert accepted["deleted"] == [branch["session_id"]]
+
+
+def test_learning_markdown_modification_matches_rendered_text_with_inline_code(monkeypatch, tmp_path):
+    selected = (
+        "Multi-Conv DAPO 的核心改动是：一个样本不再是一条普通回答，而是一串 "
+        "context-independent conversations。对同一 query 采样 G 条轨迹，每条轨迹包含多个 "
+        "memory conversations 和最后 answer conversation。"
+    )
+
+    def fake_run(self, user_message, **kwargs):
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "更具体的解释"})
+        return "更具体的解释"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    workspace = FileWorkspace(tmp_path / "files")
+    path = workspace.root / "papers" / "note.md"
+    source_line = selected.replace("采样 G 条轨迹", "采样 `G` 条轨迹")
+    path.write_text(f"# 标题\n\n{source_line}\n\n结尾\n", encoding="utf-8")
+    parent = service.create_session(session_id="modify-inline-code")
+    branch = service.branch_from_selection(
+        parent.session_id,
+        selected_text=selected,
+        action="modify",
+        modification_instruction="写得具体一些",
+        source_context={
+            "kind": "markdown",
+            "path": "papers/note.md",
+            "text_offset": 0,
+            "occurrence": 0,
+        },
+        background=False,
+    )
+
+    accepted = service.accept_selection_modification(branch["session_id"], workspace=workspace)
+
+    assert accepted["content"] == "# 标题\n\n更具体的解释\n\n结尾\n"
+    assert accepted["deleted"] == [branch["session_id"]]
+
+
+def test_learning_markdown_modification_matches_numbered_bold_list(monkeypatch, tmp_path):
+    selected = (
+        "SL-CAI：模型先回答，再自我批评和修订。\n"
+        "RL-CAI / RLAIF：模型比较回答并生成训练偏好。"
+    )
+
+    def fake_run(self, user_message, **kwargs):
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "更通俗的两阶段说明"})
+        return "更通俗的两阶段说明"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    workspace = FileWorkspace(tmp_path / "files")
+    path = workspace.root / "papers" / "note.md"
+    path.write_text(
+        "# 方法\n\n"
+        "1. **SL-CAI**：模型先回答，再自我批评和修订。\n"
+        "2. **RL-CAI / RLAIF**：模型比较回答并生成训练偏好。\n\n"
+        "结尾\n",
+        encoding="utf-8",
+    )
+    parent = service.create_session(session_id="modify-numbered-list")
+    branch = service.branch_from_selection(
+        parent.session_id,
+        selected_text=selected,
+        action="modify",
+        modification_instruction="写得更通俗",
+        source_context={
+            "kind": "markdown",
+            "path": "papers/note.md",
+            "text_offset": 0,
+            "occurrence": 0,
+        },
+        background=False,
+    )
+
+    accepted = service.accept_selection_modification(branch["session_id"], workspace=workspace)
+
+    assert accepted["content"] == "# 方法\n\n更通俗的两阶段说明\n\n结尾\n"
+    assert accepted["deleted"] == [branch["session_id"]]
+
+
 def test_learning_markdown_modification_replaces_full_selected_line(monkeypatch, tmp_path):
     def fake_run(self, user_message, **kwargs):
         self.messages.append({"role": "user", "content": user_message})
@@ -944,6 +1105,23 @@ def test_learning_delete_subtree_removes_descendants(monkeypatch, tmp_path):
         service.get_session(child.session_id)
     with pytest.raises(KeyError):
         service.get_session(grand.session_id)
+
+
+def test_deleted_session_cannot_be_resurrected_by_late_persistence(monkeypatch, tmp_path):
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    service = LearningRuntimeService(store_root=tmp_path)
+    child = service.create_session(
+        session_id="late-save-child",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+    context_dir = Path(child.store.base_dir)
+
+    result = service.delete_subtree(child.session_id)
+    child._persist_thread_state()
+
+    assert result["deleted"] == [child.session_id]
+    assert child._disposed is True
+    assert not context_dir.exists()
 
 
 def test_learning_delete_sessions_for_workspace_path_prunes_minimal_roots(monkeypatch, tmp_path):

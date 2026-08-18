@@ -126,6 +126,27 @@ def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeo
     return data
 
 
+def _get_json(url: str, timeout: int = 30) -> Dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={"Accept": "application/json", "User-Agent": _USER_AGENT},
+        method="GET",
+    )
+    try:
+        with _OPENER.open(request, timeout=timeout) as response:
+            raw = response.read()
+            text = raw.decode("utf-8", errors="replace")
+            data = json.loads(text)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:500]
+        raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"invalid JSON response: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RuntimeError(f"unexpected JSON response type: {type(data).__name__}")
+    return data
+
+
 def _strip_html(source: str) -> str:
     source = re.sub(r"(?is)<(script|style|noscript|svg|iframe)\b.*?</\1>", " ", source)
     source = re.sub(r"(?is)<br\s*/?>", "\n", source)
@@ -344,6 +365,72 @@ def _search_serper(query: str, limit: int) -> Dict[str, Any]:
     }
 
 
+def _search_google_cse(query: str, limit: int) -> Dict[str, Any]:
+    api_key = os.getenv("GOOGLE_SEARCH_API_KEY", "").strip()
+    engine_id = os.getenv("GOOGLE_SEARCH_ENGINE_ID", "").strip()
+    missing = [
+        name
+        for name, value in (
+            ("GOOGLE_SEARCH_API_KEY", api_key),
+            ("GOOGLE_SEARCH_ENGINE_ID", engine_id),
+        )
+        if not value
+    ]
+    if missing:
+        return {
+            "success": False,
+            "status": "missing_api_key",
+            "provider": "google_cse",
+            "query": query,
+            "error": f"{', '.join(missing)} is not configured",
+        }
+
+    cleaned_query = query.strip()[:2048]
+    count = max(1, min(limit, 10))
+    params = urllib.parse.urlencode({
+        "key": api_key,
+        "cx": engine_id,
+        "q": cleaned_query,
+        "num": count,
+    })
+    data = _get_json(
+        f"https://www.googleapis.com/customsearch/v1?{params}",
+        timeout=_env_int("WEB_SEARCH_API_TIMEOUT", _DEFAULT_API_TIMEOUT_SECONDS),
+    )
+    items = data.get("items") or []
+    if not isinstance(items, list):
+        return {
+            "success": False,
+            "status": "bad_response",
+            "provider": "google_cse",
+            "query": cleaned_query,
+            "error": "Google Programmable Search returned an unexpected response format",
+        }
+
+    normalized = [
+        _normalize_result(
+            {
+                "title": item.get("title", ""),
+                "url": item.get("link", ""),
+                "snippet": item.get("snippet", ""),
+            },
+            "google_cse",
+        )
+        for item in items[:count]
+        if isinstance(item, dict)
+    ]
+    return {
+        "success": True,
+        "status": "ok" if normalized else "no_results",
+        "query": cleaned_query,
+        "provider": "google_cse",
+        "source_provider": "google",
+        "total_results": len(normalized),
+        "results": normalized,
+        "warnings": [],
+    }
+
+
 def _search_groundroute(query: str, limit: int) -> Dict[str, Any]:
     api_key = os.getenv("GROUNDROUTE_API_KEY", "").strip()
     if not api_key:
@@ -400,28 +487,52 @@ def _provider_order(provider: str) -> List[str]:
     normalized = (provider or "auto").strip().lower().replace("-", "_")
     if normalized in {"auto", "best"}:
         configured_order = _split_provider_list(os.getenv("WEB_SEARCH_PROVIDER_ORDER", ""))
-        base_order = configured_order or ["groundroute", "serper", "local_html"]
+        base_order = configured_order or [
+            "bing",
+            "google_cse",
+            "groundroute",
+            "serper",
+            "yahoo",
+            "duckduckgo",
+        ]
         order = []
         for candidate in base_order:
             if candidate in {"ground_route", "groundroute"}:
                 candidate = "groundroute"
+            elif candidate in {"google_cse", "google_custom_search", "google_official"}:
+                candidate = "google_cse"
             elif candidate in {"google", "serper"}:
                 candidate = "serper"
-            elif candidate in {"local", "html", "local_html", "duckduckgo", "bing", "yahoo"}:
+            elif candidate in {"local", "html", "local_html"}:
                 candidate = "local_html"
+            if candidate == "google_cse" and not (
+                os.getenv("GOOGLE_SEARCH_API_KEY", "").strip()
+                and os.getenv("GOOGLE_SEARCH_ENGINE_ID", "").strip()
+            ):
+                continue
             if candidate == "groundroute" and not os.getenv("GROUNDROUTE_API_KEY", "").strip():
                 continue
             if candidate == "serper" and not os.getenv("SERPER_API_KEY", "").strip():
                 continue
-            if candidate in {"groundroute", "serper", "local_html"} and candidate not in order:
+            if candidate in {
+                "bing",
+                "google_cse",
+                "groundroute",
+                "serper",
+                "yahoo",
+                "duckduckgo",
+                "local_html",
+            } and candidate not in order:
                 order.append(candidate)
-        if "local_html" not in order:
-            order.append("local_html")
         return order
-    if normalized in {"local", "html", "local_html", "duckduckgo"}:
+    if normalized in {"local", "html", "local_html"}:
         return ["local_html"]
+    if normalized in {"duckduckgo", "bing", "yahoo"}:
+        return [normalized]
     if normalized in {"serper", "google"}:
         return ["serper"]
+    if normalized in {"google_cse", "google_custom_search", "google_official"}:
+        return ["google_cse"]
     if normalized in {"groundroute", "ground_route"}:
         return ["groundroute"]
     return [normalized]
@@ -430,8 +541,23 @@ def _provider_order(provider: str) -> List[str]:
 def _search_provider(provider: str, query: str, limit: int) -> Dict[str, Any]:
     if provider == "local_html":
         return _search_local_html(query, limit)
+    if provider in {"bing", "yahoo", "duckduckgo"}:
+        results = _search_with_provider(provider, query, limit)
+        normalized = [_normalize_result(result, provider) for result in results]
+        return {
+            "success": True,
+            "status": "ok" if normalized else "no_results",
+            "query": query,
+            "provider": provider,
+            "source_provider": provider,
+            "total_results": len(normalized),
+            "results": normalized,
+            "warnings": [],
+        }
     if provider == "serper":
         return _search_serper(query, limit)
+    if provider == "google_cse":
+        return _search_google_cse(query, limit)
     if provider == "groundroute":
         return _search_groundroute(query, limit)
     return {
@@ -440,7 +566,16 @@ def _search_provider(provider: str, query: str, limit: int) -> Dict[str, Any]:
         "provider": provider,
         "query": query,
         "error": f"Unknown web_search provider: {provider}",
-        "available_providers": ["local_html", "serper", "groundroute", "auto"],
+        "available_providers": [
+            "auto",
+            "bing",
+            "google_cse",
+            "groundroute",
+            "serper",
+            "yahoo",
+            "duckduckgo",
+            "local_html",
+        ],
     }
 
 
@@ -464,13 +599,14 @@ def web_search_tool(query: str, limit: int = 5, provider: str = "auto") -> str:
     """Search the web using a selectable provider.
 
     Providers:
-    - auto: use configured API providers first, then local_html.
+    - auto: Bing -> configured Google CSE -> configured API providers -> Yahoo -> DuckDuckGo.
     - local_html: zero-key Bing -> Yahoo -> DuckDuckGo fallback by default.
+    - google_cse: Google Programmable Search via GOOGLE_SEARCH_API_KEY and GOOGLE_SEARCH_ENGINE_ID.
     - serper: Google Search via SERPER_API_KEY.
     - groundroute: meta search via GROUNDROUTE_API_KEY.
 
     Environment knobs:
-    - WEB_SEARCH_PROVIDER_ORDER=groundroute,serper,local_html
+    - WEB_SEARCH_PROVIDER_ORDER=bing,google_cse,groundroute,serper,yahoo,duckduckgo
     - WEB_SEARCH_LOCAL_HTML_ORDER=bing,yahoo,duckduckgo
     - WEB_SEARCH_LOCAL_HTML_TIMEOUT=5
     - WEB_SEARCH_API_TIMEOUT=20
@@ -533,7 +669,7 @@ def web_extract_tool(urls: list) -> str:
 
 registry.register(
     name="web_search",
-    description="在互联网上搜索信息。默认 auto：优先使用已配置 API provider，再回退到零配置本地 HTML 搜索。",
+    description="在互联网上搜索信息。默认 auto：先 Bing，再按配置尝试 Google CSE/其它 API provider，最后回退 Yahoo/DuckDuckGo。",
     parameters={
         "type": "object",
         "properties": {
@@ -541,7 +677,7 @@ registry.register(
             "limit": {"type": "integer", "description": "最大返回结果数 (默认 5)", "default": 5},
             "provider": {
                 "type": "string",
-                "description": "搜索提供方：auto（默认；已配置 API provider 优先，否则 local_html）、local_html（默认 Bing/Yahoo/DuckDuckGo fallback，可用 WEB_SEARCH_LOCAL_HTML_ORDER 调整）、serper、groundroute",
+                "description": "搜索提供方：auto（默认顺序 Bing→Google CSE→其它 API→Yahoo→DuckDuckGo）、google_cse、bing、yahoo、duckduckgo、local_html、serper、groundroute",
                 "default": "auto",
             },
         },

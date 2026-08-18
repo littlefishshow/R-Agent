@@ -34,6 +34,7 @@ import {
   uploadWorkspaceFile,
   workspacePdfPageImageUrl,
   workspaceOpenUrl,
+  ApiRequestError,
   type ContextEvent,
   type LearningSessionState,
   type TodoBoardState,
@@ -303,13 +304,19 @@ export function App() {
   async function boot() {
     setError(null)
     try {
-      const roots = await fetchLearningAccountRoots(accountId)
+      const [roots, allSessions] = await Promise.all([
+        fetchLearningAccountRoots(accountId),
+        listLearningSessions(accountId),
+      ])
       const first = roots.nodes.find(item => item.node_kind !== 'file_root') || roots.nodes[0]
       const s = first || await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
-      setSessions(Object.fromEntries((first ? roots.nodes : [s]).map(item => [item.session_id, item])))
+      const initialSessions = first ? allSessions : { [s.session_id]: s }
+      setSessions(initialSessions)
       setAccountRootIds(first ? roots.nodes.map(item => item.session_id) : [s.session_id])
+      setConversationChildren(buildConversationChildren(initialSessions))
       await activateSession(s.session_id)
       await refreshWorkspace('', s.session_id)
+      await restoreRunningSessionWindows(initialSessions, s.session_id)
     } catch (err: any) {
       setError(err.message || String(err))
     }
@@ -491,7 +498,11 @@ export function App() {
         await syncActiveEvents(sessionId, state, false)
       }
     } catch (err: any) {
-      await recoverActiveSession()
+      if (err instanceof ApiRequestError && err.status === 404) {
+        await recoverActiveSession()
+      } else {
+        setError(err.message || String(err))
+      }
     }
   }
 
@@ -525,13 +536,18 @@ export function App() {
   }
 
   async function recoverActiveSession() {
-    const roots = await fetchLearningAccountRoots(accountId)
+    const [roots, allSessions] = await Promise.all([
+      fetchLearningAccountRoots(accountId),
+      listLearningSessions(accountId),
+    ])
     const next = roots.nodes.find(item => item.node_kind !== 'file_root') || roots.nodes[0]
     if (next) {
-      setSessions(Object.fromEntries(roots.nodes.map(item => [item.session_id, item])))
+      setSessions(allSessions)
       setAccountRootIds(roots.nodes.map(item => item.session_id))
+      setConversationChildren(buildConversationChildren(allSessions))
       setSession(next)
       setEvents(await fetchLearningEvents(next.session_id))
+      await restoreRunningSessionWindows(allSessions, next.session_id)
       return
     }
     const created = await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
@@ -548,8 +564,13 @@ export function App() {
       try {
         const state = await fetchLearningSession(win.sessionId)
         return { win, state, missing: false }
-      } catch {
-        return { win, state: null, missing: true }
+      } catch (error) {
+        return {
+          win,
+          state: null,
+          missing: error instanceof ApiRequestError && error.status === 404,
+          transientError: !(error instanceof ApiRequestError) || error.status !== 404,
+        }
       }
     }))
     const missing = updates
@@ -587,6 +608,41 @@ export function App() {
       return changed ? next : prev
     })
     await Promise.all(valid.map(item => syncWindowEvents(item.win, item.state)))
+  }
+
+  async function restoreRunningSessionWindows(
+    knownSessions: Record<string, LearningSessionState>,
+    activeSessionId: string,
+  ) {
+    const running = Object.values(knownSessions).filter(item =>
+      item.running &&
+      !!item.selection &&
+      (item.node_kind === 'selection' || item.node_kind === 'note'),
+    )
+    for (const state of running) {
+      markPendingRun(state.session_id)
+      if (state.session_id === activeSessionId) continue
+      const sourceSessionId = state.parent_session_id || state.selection?.source_session_id || ''
+      const color = branchColors[state.session_id] || deriveChildColor(sourceSessionId, Object.values(knownSessions), branchColors)
+      let initialEvents: ContextEvent[] = []
+      try {
+        initialEvents = await fetchLearningEvents(state.session_id)
+      } catch {
+        initialEvents = []
+      }
+      await openFloatingSession(state, {
+        sourceSessionId,
+        title: state.title || state.root_question || '运行中的任务',
+        action: state.selection?.action as SelectionAction | undefined,
+        selectedText: state.selection?.selected_text,
+        displayQuestion: state.selection?.custom_question,
+        targetLanguage: state.selection?.target_language,
+        noteText: state.selection?.note_text,
+        modificationInstruction: state.selection?.modification_instruction,
+        color,
+        initialEvents,
+      })
+    }
   }
 
   async function syncWindowEvents(win: FloatingWindowState, state: LearningSessionState) {
@@ -681,6 +737,13 @@ export function App() {
   async function activateSession(sessionId: string) {
     setError(null)
     setActiveMode('chat')
+    setWindows(prev => {
+      const next = { ...prev }
+      for (const [windowId, win] of Object.entries(next)) {
+        if (win.sessionId === sessionId) delete next[windowId]
+      }
+      return next
+    })
     // Optimistic switch: show the target conversation immediately from the
     // sidebar cache and clear stale bubbles so switching feels instant, then
     // reconcile against the server. The explicit loading flag is cleared after
@@ -1090,6 +1153,7 @@ export function App() {
         note_text: options.noteText,
         modification_instruction: options.modificationInstruction,
         source_context: menu.sourceContext,
+        workspace_session_id: session?.session_id || '',
       })
       const color = branchColors[branch.session_id] || provisionalColor
       if (menu.pdfContext) {
@@ -1251,6 +1315,7 @@ export function App() {
         selected_text: action.text,
         note_text: note,
         source_context: action.sourceContext,
+        workspace_session_id: session?.session_id || '',
       })
       const color = branchColors[branch.session_id] || provisionalColor
       if (action.pdfContext) {
@@ -1454,7 +1519,31 @@ export function App() {
       removeDeletedSessions(new Set(result.deleted?.length ? result.deleted : [win.sessionId]))
       await refreshWorkspace(workspace?.cwd || '')
     } catch (err: any) {
-      setError(err.message || String(err))
+      if (err instanceof ApiRequestError && err.status === 404) {
+        const path = String(branch?.selection?.source_context?.path || '')
+        if (path) {
+          try {
+            const text = await fetchWorkspaceText(path, session?.session_id || '')
+            setOpenFiles(prev => prev[path] ? {
+              ...prev,
+              [path]: {
+                ...prev[path],
+                textContent: text.content,
+                dirty: false,
+                error: undefined,
+              },
+            } : prev)
+          } catch {
+            // The branch is already gone; close the stale window even if the
+            // source file cannot be refreshed right now.
+          }
+        }
+        removeDeletedSessions(new Set([win.sessionId]))
+        await refreshWorkspace(workspace?.cwd || '')
+        setError(null)
+      } else {
+        setError(err.message || String(err))
+      }
     }
   }
 
@@ -2443,7 +2532,21 @@ function locateMarkdownSourceSelection(content: string, selectedText: string, oc
   if (!source || !selected) return null
   const start = nthIndexOf(source, selected, Math.max(0, occurrence || 0))
   if (start >= 0) return { start, end: start + selected.length }
-  return findNormalizedTextRange(source, selected, Math.max(0, occurrence || 0))
+  const normalized = findNormalizedTextRange(source, selected, Math.max(0, occurrence || 0))
+  if (normalized) return normalized
+  return findMarkdownVisibleTextRange(source, selected, Math.max(0, occurrence || 0))
+}
+
+function findMarkdownVisibleTextRange(source: string, selectedText: string, occurrence: number): { start: number, end: number } | null {
+  const sourceMap = normalizeMarkdownVisibleTextWithMap(source)
+  const needleText = normalizeMarkdownVisibleTextWithMap(selectedText).text
+  if (!sourceMap.text || !needleText) return null
+  const normalizedStart = nthIndexOf(sourceMap.text, needleText, occurrence)
+  if (normalizedStart < 0) return null
+  const normalizedEnd = normalizedStart + needleText.length
+  const start = sourceMap.map[normalizedStart]
+  const end = (sourceMap.map[normalizedEnd - 1] ?? start) + 1
+  return { start, end }
 }
 
 function markdownLineRange(content: string, selectionStart: number, selectionEnd: number): {
@@ -4219,6 +4322,55 @@ function normalizeTextWithMap(value: string): { text: string, map: number[] } {
   return { text, map }
 }
 
+function normalizeMarkdownVisibleTextWithMap(value: string): { text: string, map: number[] } {
+  const ignored = new Array(value.length).fill(false)
+  const patterns = [
+    /^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)/gm,
+    /(?<!\\)(?:\*\*|__|`+)/g,
+  ]
+  for (const pattern of patterns) {
+    for (const match of value.matchAll(pattern)) {
+      const start = match.index || 0
+      for (let index = start; index < start + match[0].length; index += 1) ignored[index] = true
+    }
+  }
+  let text = ''
+  const map: number[] = []
+  let pendingSpace = false
+  let escaped = false
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]
+    if (ignored[index]) continue
+    if (escaped) {
+      if (pendingSpace && text.length > 0) {
+        text += ' '
+        map.push(index)
+        pendingSpace = false
+      }
+      text += char
+      map.push(index)
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+    if (/\s/.test(char)) {
+      pendingSpace = text.length > 0
+      continue
+    }
+    if (pendingSpace) {
+      text += ' '
+      map.push(index)
+      pendingSpace = false
+    }
+    text += char
+    map.push(index)
+  }
+  return { text, map }
+}
+
 function applyHighlightRangesToTextNodes(doc: Document, textNodes: Text[], ranges: ResolvedHighlightRange[]): void {
   const normalizedRanges = normalizeHighlightRanges(ranges)
   if (!normalizedRanges.length) return
@@ -4362,6 +4514,23 @@ function buildSessionTree(items: LearningSessionState[]) {
     byParent[parent] = [...(byParent[parent] || []), item]
   }
   return byParent
+}
+
+function buildConversationChildren(items: Record<string, LearningSessionState>): Record<string, string[]> {
+  const children: Record<string, string[]> = {}
+  for (const item of Object.values(items)) {
+    if (!item.parent_session_id) continue
+    children[item.parent_session_id] = [...(children[item.parent_session_id] || []), item.session_id]
+  }
+  for (const parentId of Object.keys(children)) {
+    children[parentId].sort((left, right) => {
+      const leftState = items[left]
+      const rightState = items[right]
+      return Number(rightState?.last_activity_at || rightState?.updated_at || 0) -
+        Number(leftState?.last_activity_at || leftState?.updated_at || 0)
+    })
+  }
+  return children
 }
 
 function isBlankRoot(item: LearningSessionState): boolean {

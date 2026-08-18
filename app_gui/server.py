@@ -54,6 +54,25 @@ def _workspace_for_session(default_workspace: FileWorkspace, session_id: str = "
     return default_workspace
 
 
+def _source_context_with_absolute_path(workspace: FileWorkspace, source_context: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(source_context, dict):
+        return None
+    context = dict(source_context)
+    kind = str(context.get("kind") or "").strip().lower()
+    if kind not in {"pdf", "markdown"}:
+        return context
+    workspace_path = str(context.get("workspace_path") or context.get("path") or "").strip()
+    if not workspace_path:
+        return context
+    try:
+        resolved = workspace.get_file(workspace_path)
+    except Exception:
+        return context
+    context.setdefault("workspace_path", workspace._rel(resolved))
+    context["absolute_path"] = str(resolved)
+    return context
+
+
 def create_app(
     runtime_service: Optional[AgentRuntimeService] = None,
     learning_service: Optional[LearningRuntimeService] = None,
@@ -311,7 +330,10 @@ def create_app(
                 note_text=str(request.get("note_text") or ""),
                 modification_instruction=str(request.get("modification_instruction") or ""),
                 title=str(request.get("title") or ""),
-                source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
+                source_context=_source_context_with_absolute_path(
+                    _workspace_for_session(workspace, str(request.get("workspace_session_id") or "")),
+                    request.get("source_context"),
+                ),
                 background=bool(request.get("background", True)),
                 child_session_id=request.get("session_id"),
             )
@@ -328,7 +350,10 @@ def create_app(
                 selected_text=str(request.get("selected_text") or ""),
                 note_text=str(request.get("note_text") or ""),
                 title=str(request.get("title") or ""),
-                source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
+                source_context=_source_context_with_absolute_path(
+                    _workspace_for_session(workspace, str(request.get("workspace_session_id") or "")),
+                    request.get("source_context"),
+                ),
                 child_session_id=request.get("session_id"),
             )
         except KeyError as exc:

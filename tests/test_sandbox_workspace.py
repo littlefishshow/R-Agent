@@ -110,6 +110,53 @@ def test_file_tools_share_isolated_session_workspace(monkeypatch, tmp_path):
     assert read["resolved_path"] == str(s1.workspace / "note.md")
 
 
+def test_read_tools_fallback_to_repo_relative_path_when_session_file_missing(monkeypatch, tmp_path):
+    root = tmp_path / "session_sandboxes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "README.md").write_text("repo marker\n", encoding="utf-8")
+    monkeypatch.setenv("SESSION_SANDBOX_ENABLED", "1")
+    monkeypatch.setenv("SESSION_SANDBOX_ROOT", str(root))
+    monkeypatch.setattr(file_tools, "WORKSPACE_DIR", str(repo))
+    monkeypatch.setattr(file_tools, "SANDBOX_DIR", str(repo / "sandbox"))
+
+    read = json.loads(file_tools.read_file_tool("README.md", session_id="learn/a"))
+    assert read["resolved_path"] == str(repo / "README.md")
+    assert read["resolved_root"] == "r_agent_workspace"
+    assert "repo marker" in read["content"]
+
+    found = json.loads(file_tools.search_files_tool("repo marker", path=".", session_id="learn/a"))
+    assert {"path": str(repo), "root": "r_agent_workspace"} in found["searched_roots"]
+    assert any("README.md" in item for item in found["results"])
+
+    written = json.loads(file_tools.write_file_tool("README.md", "session marker", session_id="learn/a"))
+    scoped = SandboxWorkspace("learn_a", root=root)
+    assert written["resolved_path"] == str(scoped.workspace / "README.md")
+    assert (scoped.workspace / "README.md").read_text(encoding="utf-8") == "session marker"
+    assert (repo / "README.md").read_text(encoding="utf-8") == "repo marker\n"
+
+
+def test_read_tools_prefer_session_workspace_when_file_exists(monkeypatch, tmp_path):
+    root = tmp_path / "session_sandboxes"
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "note.md").write_text("repo copy\n", encoding="utf-8")
+    monkeypatch.setenv("SESSION_SANDBOX_ENABLED", "1")
+    monkeypatch.setenv("SESSION_SANDBOX_ROOT", str(root))
+    monkeypatch.setattr(file_tools, "WORKSPACE_DIR", str(repo))
+    monkeypatch.setattr(file_tools, "SANDBOX_DIR", str(repo / "sandbox"))
+    scoped = SandboxWorkspace("learn_b", root=root)
+    scoped.ensure()
+    (scoped.workspace / "note.md").write_text("session copy\n", encoding="utf-8")
+
+    read = json.loads(file_tools.read_file_tool("note.md", session_id="learn/b"))
+
+    assert read["resolved_path"] == str(scoped.workspace / "note.md")
+    assert read["resolved_root"] == "session_workspace"
+    assert "session copy" in read["content"]
+    assert "repo copy" not in read["content"]
+
+
 def test_file_tools_resolve_virtual_paths_and_preserve_legacy_mode(monkeypatch, tmp_path):
     root = tmp_path / "session_sandboxes"
     monkeypatch.chdir(tmp_path)

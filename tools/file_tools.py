@@ -3,6 +3,7 @@ import json
 import glob
 import difflib
 import threading
+from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -32,6 +33,26 @@ def is_in_sandbox(path: str) -> bool:
         return os.path.commonpath([abs_path, abs_sandbox]) == abs_sandbox
     except ValueError:
         return False
+
+
+def _is_repo_workspace_path(abs_path: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(abs_path), os.path.abspath(WORKSPACE_DIR)]) == os.path.abspath(WORKSPACE_DIR)
+    except ValueError:
+        return False
+
+
+def _is_relative_host_path(path: str) -> bool:
+    raw = str(path or "").strip().replace("\\", "/")
+    expanded = os.path.expanduser(raw)
+    return bool(raw) and not raw.startswith("/mnt/") and not os.path.isabs(expanded)
+
+
+def _resolve_repo_relative_path(path: str) -> str:
+    candidate = os.path.abspath(os.path.join(WORKSPACE_DIR, os.path.expanduser(str(path or "").strip())))
+    if not _is_repo_workspace_path(candidate):
+        raise ValueError("path escapes R-Agent workspace")
+    return candidate
 
 
 def _session_workspace(session_id: str = ""):
@@ -75,6 +96,35 @@ def _resolve_tool_path(path: str, session_id: str = "") -> tuple[str, object]:
     if candidate != root and root not in candidate.parents:
         raise ValueError("path escapes session workspace")
     return str(candidate), workspace
+
+
+def _resolve_read_path(path: str, session_id: str = "") -> tuple[str, object, str]:
+    """Resolve read/search paths with two relative roots.
+
+    With session sandbox enabled, relative read paths first target the session
+    workspace. If absent, the same relative path is tried under the R-Agent repo
+    root so learning-mode questions can inspect shared project/output files.
+    """
+    resolved_path, workspace = _resolve_tool_path(path, session_id)
+    if (
+        workspace is not None
+        and _is_relative_host_path(path)
+        and not os.path.exists(resolved_path)
+    ):
+        repo_path = _resolve_repo_relative_path(path)
+        if os.path.exists(repo_path):
+            return repo_path, workspace, "r_agent_workspace"
+    return resolved_path, workspace, "session_workspace" if workspace is not None else "r_agent_workspace"
+
+
+def _resolve_search_roots(path: str, session_id: str = "") -> tuple[list[tuple[str, str]], object]:
+    resolved_path, workspace, resolved_root = _resolve_read_path(path, session_id)
+    roots = [(resolved_path, resolved_root)]
+    if workspace is not None and _is_relative_host_path(path):
+        repo_path = _resolve_repo_relative_path(path)
+        if os.path.exists(repo_path) and repo_path != resolved_path:
+            roots.append((repo_path, "r_agent_workspace"))
+    return roots, workspace
 
 
 def is_in_workspace(path: str, session_id: str = "") -> bool:
@@ -148,12 +198,15 @@ def check_outside_workspace_auth(
     allow_outside_workspace: bool = False,
     tool_name: str = "file_operation",
     session_id: str = "",
+    resolved_path: Optional[str] = None,
 ) -> object:
     """Check outside-workspace access without blocking for terminal input.
 
     Returns None when the operation may continue; otherwise returns a JSON
     string containing ``permission_required=true``.
     """
+    if resolved_path is not None and _is_repo_workspace_path(resolved_path):
+        return None
     if (
         not is_in_workspace(path, session_id)
         and not _is_in_active_sandbox(path, session_id)
@@ -165,8 +218,8 @@ def check_outside_workspace_auth(
 def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_workspace: bool = False, session_id: str = "") -> str:
     """Read a file with pagination and line numbers."""
     try:
-        resolved_path, _workspace = _resolve_tool_path(path, session_id)
-        permission_response = check_outside_workspace_auth(path, "读取", allow_outside_workspace, "read_file", session_id)
+        resolved_path, _workspace, resolved_root = _resolve_read_path(path, session_id)
+        permission_response = check_outside_workspace_auth(path, "读取", allow_outside_workspace, "read_file", session_id, resolved_path=resolved_path)
         if permission_response:
             return permission_response
         if not os.path.exists(resolved_path):
@@ -218,6 +271,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_w
         result_dict = {
             "path": path,
             "resolved_path": resolved_path,
+            "resolved_root": resolved_root,
             "content": content,
             "total_lines": len(lines),
             "offset": offset,
@@ -281,29 +335,44 @@ def write_file_tool(path: str, content: str, allow_outside_workspace: bool = Fal
 def search_files_tool(pattern: str, target: str = "content", path: str = ".", allow_outside_workspace: bool = False, session_id: str = "") -> str:
     """Search for content or files."""
     try:
-        resolved_path, _workspace = _resolve_tool_path(path, session_id)
-        permission_response = check_outside_workspace_auth(path, "搜索", allow_outside_workspace, "search_files", session_id)
-        if permission_response:
-            return permission_response
+        search_roots, _workspace = _resolve_search_roots(path, session_id)
+        for resolved_path, _resolved_root in search_roots:
+            permission_response = check_outside_workspace_auth(path, "搜索", allow_outside_workspace, "search_files", session_id, resolved_path=resolved_path)
+            if permission_response:
+                return permission_response
         import re
         results = []
-        if target == "files":
-            for root, _, files in os.walk(resolved_path):
-                for file in files:
-                    if re.search(pattern, file):
-                        results.append(os.path.join(root, file))
-        else:
-            for root, _, files in os.walk(resolved_path):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    try:
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            for i, line in enumerate(f):
-                                if re.search(pattern, line):
-                                    results.append(f"{filepath}:{i+1}:{line.strip()}")
-                    except Exception:
-                        pass
-        return json.dumps({"results": results[:100], "truncated": len(results) > 100, "resolved_path": resolved_path}, ensure_ascii=False)
+        seen = set()
+        for resolved_path, _resolved_root in search_roots:
+            if target == "files":
+                for root, _, files in os.walk(resolved_path):
+                    for file in files:
+                        if re.search(pattern, file):
+                            item = os.path.join(root, file)
+                            if item not in seen:
+                                seen.add(item)
+                                results.append(item)
+            else:
+                for root, _, files in os.walk(resolved_path):
+                    for file in files:
+                        filepath = os.path.join(root, file)
+                        try:
+                            with open(filepath, 'r', encoding='utf-8') as f:
+                                for i, line in enumerate(f):
+                                    if re.search(pattern, line):
+                                        item = f"{filepath}:{i+1}:{line.strip()}"
+                                        if item not in seen:
+                                            seen.add(item)
+                                            results.append(item)
+                        except Exception:
+                            pass
+        return json.dumps({
+            "results": results[:100],
+            "truncated": len(results) > 100,
+            "resolved_path": search_roots[0][0] if search_roots else "",
+            "resolved_root": search_roots[0][1] if search_roots else "",
+            "searched_roots": [{"path": root, "root": name} for root, name in search_roots],
+        }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 

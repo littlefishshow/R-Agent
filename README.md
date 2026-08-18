@@ -111,6 +111,22 @@ MEMORY_SESSION_FACTS_ENABLED=1
 [`docs/04_Memory系统.md`](docs/04_Memory系统.md) 和
 [`docs/06_工具系统与沙箱.md`](docs/06_工具系统与沙箱.md)。
 
+如需使用 Google 官方搜索，在 `.env` 中配置：
+
+```env
+GOOGLE_SEARCH_API_KEY="YOUR_GOOGLE_API_KEY"
+GOOGLE_SEARCH_ENGINE_ID="YOUR_PROGRAMMABLE_SEARCH_ENGINE_ID"
+```
+
+然后调用 `web_search(provider="google_cse")`。默认 `provider="auto"` 的顺序是：
+
+```text
+Bing → Google Programmable Search（已配置时）→ GroundRoute/Serper（已配置时）
+→ Yahoo → DuckDuckGo
+```
+
+现有 `provider="google"` 仍表示 Serper 兼容别名。
+
 ### 1.3 启动命令行 Agent
 
 ```bash
