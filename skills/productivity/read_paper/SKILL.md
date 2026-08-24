@@ -120,9 +120,9 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
    - Claim-Evidence Matrix 必须含字段：`Claim` / `原文位置` / `图表公式` / `机制步骤` / `证据强度` / `未说明` / `汇总去向` / `跨章节依赖`。证据强度可用 强/中/弱/仅作者声称/未验证，但必须说明原因。
 5. **第二层：证据/图表任务（Evidence & Figure/Table Tasks）**：图表任务独立设置且是硬门槛。必须提取关键 Figure/Table/Algorithm/案例图，调用 `pdf_snapshot.py` 或手工 crops 完成截图，检查裁剪质量（主体完整、非整页冒充、caption/必要标题清楚、路径可访问），逐项解释，并维护 `figure_table_ledger.md/json`。评测子任务必须截图主结果表、消融表、成本/效率表或等价证据；关键图表缺失时最终验收不得通过，除非在 ledger 和重检查记录中明确写明无法截取原因与替代证据（如原文表格转写、页码、数值回查）。`figure_table_index.md/json` 只是候选清单；只有 `figure_table_ledger.md/json` 才是最终合成和验收的图表账本。ledger 每项至少记录：图/表/算法编号、原文页码/章节、截图相对路径、裁剪质量状态、是否关键图表、解释摘要、最终 Markdown 插入章节/行文位置、缺失原因或替代证据。
 6. **第三层：机制复原/审稿任务（Mechanism Reconstruction & Review Tasks）**：机制复原任务按问题横跨章节读取，而不是按章节摘要拼接。每个关键机制/实验结论必须复原：输入、输出、步骤、训练/推理差异、监督信号或 evaluator 来源、成本、失败模式、适用边界、依赖的图表/公式/附录证据；必要时生成 `mechanism_<topic>.md`。
-7. **阶段性交接要可合并**：每个阶段应生成 `stage_summary.md`、`section_index.md/json`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`、`figure_table_ledger.md/json`、`mechanism_*.md` 或等价摘要，记录已读范围、关键结论、证据锚点、未解决问题、章节间冲突、需要父任务统一口径的地方。长论文/多子任务交接必须额外生成固定机器可读的 `handoff_manifest.json`，放在 `sandbox/read_paper/<paper_stem>/` 或阶段输出根目录；它是汇总/机制/验收任务寻找材料的第一入口，不替代原始文件。manifest 至少包含：`final_note_path`、`asset_dir`、`figure_table_ledger_md`、`figure_table_ledger_json`、`section_index`、`claims_files`、`details_files`、`mechanism_files`、`ledger_item_count`、`image_count`、`missing_required_figures`、`validation_status`。`validation_status` 建议取 `draft` / `ready_for_synthesis` / `blocked` / `validated`，并在 `missing_required_figures` 非空或关键文件缺失时不得标为 `validated`。
-8. **汇总子进程统一合成最终 Markdown**：汇总阶段**不得只读 `summary` 拼接**；必须先读取 `handoff_manifest.json`（若存在）定位 Claim-Evidence Matrix、figure/table ledger、关键 `details`、公式/算法记录和机制复原文件，并按 `claim → evidence → mechanism` 写最终笔记。若图表任务已完成，但汇总/机制阶段找不到 `figure_table_ledger.md/json`，必须依次回查 `handoff_manifest.json`、阶段 outputs、todo 摘要/result 中记录的路径；仍找不到则把任务标为 blocked/请求补交，不得静默跳过或用 `figure_table_index` 冒充 ledger。最终合成必须按 ledger 在正文对应论证位置就地插入关键图片（Markdown `![...](assets/<pdf_stem>/...)`），不能只写“见 Figure/Table x”或只保留文字引用；对于 ledger 中标为关键但未插图的项目，必须写明无法插入原因和替代证据。必须满足 `## 1 小白友好版论文解释` 的 1.1-1.6 要求，以及 `## 3 论文主线串读` 按行文顺序串联主文与附录的要求；同时统一术语、消除重复、检查章节结论冲突、补齐遗漏。
-9. **最终审稿与内容级二次对照**：最终审稿任务必须逐条关键 claim 回查原文 section/页码/图表/公式/数值，检查作者声称 vs 事实证据、负结果、附录细节、空泛概括、数值/设置混淆和未说明处。父进程应抽查关键章节原文；若抽查发现关键证据缺失或 claim 与原文不符，必须退回补读/修正，不能最终验收。
+7. **阶段性交接要可合并**：每个阶段应生成 `stage_summary.md`、`section_index.md/json`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`、`figure_table_ledger.md/json`、`mechanism_*.md` 或等价摘要，记录已读范围、关键结论、证据锚点、未解决问题、章节间冲突、需要父任务统一口径的地方。长论文/多子任务交接必须额外生成固定机器可读的 `handoff_manifest.json`，放在 `sandbox/read_paper/<paper_stem>/` 或阶段输出根目录；它是汇总/机制/验收任务寻找材料的第一入口，不替代原始文件。manifest 至少包含：`final_note_path`、`asset_dir`、`figure_table_ledger_md`、`figure_table_ledger_json`、`section_index`、`claims_files`、`details_files`、`mechanism_files`、`ledger_item_count`、`image_count`、`missing_required_figures`、`validation_status`；进入最终写作前还必须扩展包含：`ordered_section_queue`（按最终 Markdown 章节顺序排列的写作队列）、`final_markdown_write_plan`（每章写入范围、输入材料、预计插图/公式/claim 去向）、`write_lock`（当前被授权写同一 final Markdown 的章节/worker/开始时间/释放状态）、`section_status`（queued/in_progress/done/blocked/reviewed）、`previous_section_summaries` 或等价前序章节摘要、`final_markdown_write_log`（每章写后记录）。`validation_status` 建议取 `draft` / `ready_for_synthesis` / `writing_in_progress` / `blocked` / `validated`，并在 `missing_required_figures` 非空、关键文件缺失、写作队列未完成或锁状态异常时不得标为 `validated`。
+8. **顺序章节写作合成阶段（扩展“汇总子进程统一合成最终 Markdown”）**：汇总阶段**不得只读 `summary` 拼接**；必须先读取 `handoff_manifest.json`（若存在）定位 Claim-Evidence Matrix、figure/table ledger、关键 `details`、公式/算法记录和机制复原文件，并按 `claim → evidence → mechanism` 写最终笔记。父进程必须先生成 `ordered_section_queue` 和 `final_markdown_write_plan`，把最终 Markdown 拆成有序章节/节点写作任务；同一 `final_note_path` 一次只能授权一个章节写作子 agent 持有 `write_lock` 并写入，其他子 agent 可以读取前序产物但**不得并行写同一个 final Markdown 文件**。每个章节写作子 agent 在动笔前必须读取当前 final Markdown、`handoff_manifest.json`、前序章节摘要/写作记录和本章所需 evidence/details/ledger；写作时只修改被授权章节或计划范围，保持章节顺序、术语和过渡；写完后必须更新 `section_status`、`final_markdown_write_log`、本章摘要、插图/claim 去向和锁释放状态，后续子 agent 以此为输入继续写。若图表任务已完成，但汇总/机制阶段找不到 `figure_table_ledger.md/json`，必须依次回查 `handoff_manifest.json`、阶段 outputs、todo 摘要/result 中记录的路径；仍找不到则把任务标为 blocked/请求补交，不得静默跳过或用 `figure_table_index` 冒充 ledger。最终合成必须按 ledger 在正文对应论证位置就地插入关键图片（Markdown `![...](assets/<pdf_stem>/...)`），不能只写“见 Figure/Table x”或只保留文字引用；对于 ledger 中标为关键但未插图的项目，必须写明无法插入原因和替代证据。必须满足 `## 1 小白友好版论文解释` 的 1.1-1.6 要求，以及 `## 3 论文主线串读` 按行文顺序串联主文与附录的要求；同时统一术语、消除重复、检查章节结论冲突、补齐遗漏。
+9. **最终审稿与内容级二次对照**：最终审稿任务必须逐条关键 claim 回查原文 section/页码/图表/公式/数值，检查作者声称 vs 事实证据、负结果、附录细节、空泛概括、数值/设置混淆和未说明处。长论文还必须检查 `ordered_section_queue` 是否覆盖最终模板与论文关键材料，是否存在章节乱序、重复、遗漏、越权改写同一范围、写作锁未释放或并行写同一文件痕迹；检查跨章节术语是否统一、前后过渡是否自然、图表/公式是否重复插入或遗漏插入。父进程应抽查关键章节原文；若抽查发现关键证据缺失、claim 与原文不符、队列覆盖不完整或写作记录异常，必须退回补读/修正，不能最终验收。
 10. **上下文预算优先**：当抽取文本或中间材料过长时，先写入 sandbox/artifact 并建立索引；当前对话只保留摘要、证据定位和下一步任务。禁止把整篇长论文全文、大段附录、整批 OCR 文本或所有子任务完整上下文复制到主对话。
 11. **拆解不能降低质量门槛**：即使采用多阶段或多子任务阅读，也必须满足第 1 章小白解释、第 3 章主线串读、Appendix/Limitations 覆盖、图表/公式就地解释、强制重检查和最终验收要求。最终 Markdown 应保留“重检查记录/内容审稿记录”，必要时说明分块阅读范围、章节笔记来源与补漏情况。
 
@@ -334,7 +334,7 @@ PY
 - 重新读取论文原文或抽取文本，至少覆盖：Abstract、Introduction、Conclusion、Method 全章、Experiments 主文、图表标题/图注/表格/算法框、Limitations、Appendix 中与实验设置/prompt/超参/额外消融/案例分析/限制相关的部分。
 
 #### 9.2 对照检查清单
-逐项检查 Markdown 是否遗漏或需要修正；长论文必须同时读取章节 Claim-Evidence Matrix、figure/table ledger、关键 `details` 和机制复原文件，不能只读 summary：
+逐项检查 Markdown 是否遗漏或需要修正；长论文必须同时读取章节 Claim-Evidence Matrix、figure/table ledger、关键 `details`、机制复原文件、`ordered_section_queue`、`final_markdown_write_plan`、`section_status` 和写作记录，不能只读 summary：
 - 标题、作者、年份/会议、arXiv 版本、文件路径、类别目录、输出路径是否准确。
 - 是否建立术语与简称表；重要简称首次出现是否给出完整英文名和中文解释；原文未展开的简称是否明确标注“原文未展开”。
 - 阅读动机、预读预测、读后校正是否存在，是否能训练自己的研究判断。
@@ -347,7 +347,8 @@ PY
 - 第 1 章是否包含 1.1-1.6，且把旧“一句话结论”和旧“全局扫描”职责合并为小白友好解释；是否在相关位置就地插入/列出关键图片、公式、表格或代码解释。
 - 第 3 章主线、图表和公式是否按论文行文顺序完整串联（含附录），而不是分裂成“主线清单 / 图表清单 / 公式清单”三块，或残留独立扫描式概览章节。
 - 每条关键 claim 是否能在 Claim-Evidence Matrix 中找到原文位置、图表/公式、机制步骤、证据强度、未说明项、汇总去向和跨章节依赖。
-- 图表是否覆盖主文所有关键 Figure/Table/Algorithm/案例；表格数值是否抄错；提升幅度是否算错。长论文必须核对 `handoff_manifest.json` 中的 `ledger_item_count`、`image_count`、`missing_required_figures`、`validation_status` 与实际 ledger/final Markdown 是否一致。
+- 图表是否覆盖主文所有关键 Figure/Table/Algorithm/案例；表格数值是否抄错；提升幅度是否算错。长论文必须核对 `handoff_manifest.json` 中的 `ledger_item_count`、`image_count`、`missing_required_figures`、`ordered_section_queue`、`final_markdown_write_plan`、`write_lock`、`section_status`、`validation_status` 与实际 ledger/final Markdown 是否一致。
+- 顺序章节写作记录是否证明队列覆盖完整、每章按顺序完成、没有章节乱序/重复/遗漏、没有多个子 agent 并行写同一 final Markdown、后续章节已读取当前 final Markdown 和前序章节摘要。
 - 关键 Figure/Table/Algorithm 是否已通过 `pdf_snapshot.py` 截图并就地插入到对应解释附近；截图路径是否存在，Markdown 链接是否相对当前笔记可访问（通常应为 `assets/<pdf_stem>/xxx.png`）；自动裁剪是否截到主体，必要时是否用 crops 精裁。评测类论文的主结果表、消融表、成本/效率表缺失时不得通过，除非 ledger 记录无法截取原因与替代证据。
 - 关键公式是否就地出现在相关方法/实验/理论段落，而不是集中堆在公式表里；公式是否解释了它如何服务当前论证。
 - Appendix 中是否有重要细节未纳入：数据统计、prompt 模板、训练超参、额外实验、更多消融、案例、限制；尤其是主文只抽象描述的标签/critique/proxy/reward 构造细节。
@@ -363,7 +364,7 @@ PY
 - 数学公式是否可被 KaTeX/Markdown 正常渲染：double-dollar 分隔符是否成对，公式块内是否残留 `<`/`>` 历史下标，`\left/\right` 是否配对，是否存在 Python 转义产生的控制字符。
 
 #### 9.3 重检查输出方式
-- 长论文重检查必须列出读取过的 evidence matrix、figure/table ledger、关键 details 和机制复原文件；若只读 summary，则重检查无效。
+- 长论文重检查必须列出读取过的 evidence matrix、figure/table ledger、关键 details、机制复原文件、顺序写作队列和写作记录；若只读 summary，则重检查无效。
 - 如果发现遗漏或错误：直接修改原 Markdown，总结文件应成为“重检查后最终版”。
 - 在最终 Markdown 末尾追加 `## 重检查记录`，包含：重检查日期；对照范围；发现并补充/修正的要点；仍不确定或论文未明确说明的信息。
 - 如果没有发现实质问题，也要追加记录：`未发现需要修改的关键遗漏；仅做格式/措辞检查`。
@@ -373,7 +374,7 @@ PY
 当阅读任务由多步/子任务完成，或已经生成初版/重检查版 Markdown 后，必须把最终验收并入 `read_paper` 流程，而不是另建独立论文检查技能：
 
 1. 定位最终 Markdown、sandbox 中的抽取文本/索引和原 PDF。
-2. 读取最终 Markdown 全文或关键章节，确认包含 `## 重检查记录`，并检查是否存在空章节、重复章节、未闭合代码块、表格错位、图片链接缺失、数学公式渲染风险。
+2. 读取最终 Markdown 全文或关键章节，确认包含 `## 重检查记录`，并检查是否存在空章节、重复章节、章节乱序/遗漏、未闭合代码块、表格错位、图片链接缺失、数学公式渲染风险。
 3. 针对论文类型抽查关键证据，并做内容级二次对照：
    - 逐条关键 claim 回查原文 section/页码/图表/公式/数值，确认 Claim-Evidence Matrix 中证据强度与最终表述一致。
    - 主结果表格与附录表格的数值、设置差异，例如 strict/loose、ID/OOD、不同模型/数据集。
@@ -381,7 +382,7 @@ PY
    - 作者声称 vs 事实证据是否区分；是否遗漏负结果、附录限制或把空泛概括写成已证事实。
 4. 父进程应抽查关键章节原文；若发现关键 claim 无法定位到原文/图表/公式/数值，或关键图表 ledger 缺失且无替代证据，最终验收不得通过。若图表任务完成但验收阶段找不到 ledger，必须回查 `handoff_manifest.json`、outputs 和 todo 摘要；仍找不到则标记 blocked，不得静默继续。
 5. 若发现遗漏、误读或可加强处，直接修改最终 Markdown；不要只在对话中说明。
-6. 最终验证至少包括：文件存在、行数合理、字符数、Markdown 代码围栏闭合、double-dollar 数学分隔符成对、关键截图路径存在、figure/table ledger 完整、`image_count` 与 ledger coverage 硬门槛、内容审稿记录存在。只要 ledger 中存在截图路径或关键图表，`final_note_image_count` 不得为 0；关键图表覆盖率（已在正文就地插入或有明确替代证据的关键项 / ledger 关键项）必须达到 100%，否则不得通过。
+6. 最终验证至少包括：文件存在、行数合理、字符数、Markdown 代码围栏闭合、double-dollar 数学分隔符成对、关键截图路径存在、figure/table ledger 完整、`image_count` 与 ledger coverage 硬门槛、队列覆盖与 `section_status` 全部完成、无并行写同一文件记录、内容审稿记录存在。只要 ledger 中存在截图路径或关键图表，`final_note_image_count` 不得为 0；关键图表覆盖率（已在正文就地插入或有明确替代证据的关键项 / ledger 关键项）必须达到 100%，否则不得通过。
 7. 在最终答复中给出：最终文件路径、验证结果、最关键的二次确认点。
 
 推荐最终验收命令：
@@ -474,8 +475,9 @@ PY
 - 章节/机制任务来源：`section_index.md`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`
 - 图表账本：`figure_table_ledger.md/json`（`figure_table_index` 仅为候选索引，不能替代 ledger）
 - 机制复原文件：`mechanism_*.md`
-- 机器可读交接：`handoff_manifest.json`（含 final_note_path、asset_dir、ledger 路径、section_index、claims/details/mechanism 文件、ledger_item_count、image_count、missing_required_figures、validation_status）
-- 汇总原则：本笔记按 `claim → evidence → mechanism` 合成，不只拼接 summary；关键图片按 ledger 在正文就地插入。
+- 机器可读交接：`handoff_manifest.json`（含 final_note_path、asset_dir、ledger 路径、section_index、claims/details/mechanism 文件、ledger_item_count、image_count、missing_required_figures、ordered_section_queue、final_markdown_write_plan、write_lock、section_status、validation_status）
+- 顺序写作记录：`ordered_section_queue` 覆盖章节：；当前/最终 `write_lock` 状态：；已完成 `section_status`：；前序章节摘要/写作记录路径：
+- 汇总原则：本笔记按 `claim → evidence → mechanism` 合成，不只拼接 summary；关键图片按 ledger 在正文就地插入；同一 final Markdown 只允许一个章节写作子 agent 持锁写入，后续章节必须读取当前文件和前序摘要后再写。
 
 ## 1. 小白友好版论文解释
 > 本章合并旧版一句话结论与扫描式概览的职责。目标是让不熟悉该方向的读者先知道：论文研究什么问题、核心方法是什么、细节如何运作、结果大概怎样、为什么比已有方法好、代价和局限是什么。关键图片、表格、公式、代码片段必须在本章对应位置就地插入/列出并解释。
@@ -583,13 +585,18 @@ $$
 
 ## 重检查记录
 - 重检查日期：
-- 对照范围：原文 section/页码/图表/公式、章节 details、Claim-Evidence Matrix、figure/table ledger、机制复原文件（短论文按实际情况填写）
+- 对照范围：原文 section/页码/图表/公式、章节 details、Claim-Evidence Matrix、figure/table ledger、机制复原文件、顺序写作队列/写作记录（短论文按实际情况填写）
+- 顺序写作复核：队列覆盖完整 / 无乱序 / 无重复 / 无遗漏 / 无并行写同一 final Markdown / 跨章节术语与过渡已统一（按实际填写）
 - 补充/修正：
 - 仍不确定：
 
 ## 内容审稿记录（长论文必填）
 | 关键 claim | 回查原文位置 | 图表/公式/数值 | 作者声称 vs 事实 | 负结果/附录/未说明 | 处理结果 |
 |---|---|---|---|---|---|
+
+### 顺序章节写作记录（长论文必填）
+| 队列序号/章节 | 写作子 agent | 读取的当前 final Markdown 版本 | 前序章节摘要 | 写入范围 | 图表/claim 去向 | section_status | write_lock 释放 |
+|---|---|---|---|---|---|---|---|
 
 - 父进程抽查关键章节原文：已完成 / 未完成 / 不适用；抽查结论：
 ````
@@ -607,6 +614,8 @@ $$
 - 评测子任务是否截图主结果表、消融表、成本/效率表；关键图表缺失时是否已明确记录无法截取原因与替代证据？
 - 是否设置跨章节机制复原任务，复原输入、输出、步骤、训练/推理差异、监督信号、成本、失败模式和依赖证据？
 - 最终汇总是否先读取 `handoff_manifest.json` 定位 evidence matrix、figure/table ledger、关键 details 和机制复原文件，并按 `claim → evidence → mechanism` 写作，而不是只拼接 summary？
+- 父进程是否生成 `ordered_section_queue` 与 `final_markdown_write_plan`；同一 final Markdown 是否一次只授权一个章节写作子 agent 持有 `write_lock` 写入，且未并行写同一文件？
+- 后续章节写作子 agent 是否先读取当前 final Markdown、前序章节摘要和写作记录，再按队列顺序写入并更新 `section_status` / `final_markdown_write_log`？
 - 是否写下阅读动机、预读预测和读后校正，而不是只总结作者结论？
 - 是否避免残留独立扫描式概览章节；新 `## 3` 必须是论文主线串读？
 - 第 1 章是否完整包含 `### 1.1`-`### 1.6`，并明确问题、现有不足、作者方案、实验结果、相比已有方法的提升幅度/原因和代价局限？
@@ -633,7 +642,7 @@ $$
 - 是否给出最小复现实验、低成本 sanity check、下一步研究问题和下一篇应读资料？
 - 是否在初版生成后执行“总结文件 × 论文原文”的重检查；长论文是否同时读取 evidence matrix、figure/table ledger、关键 details 和机制复原文件？
 - 是否把重检查发现的遗漏/错误整合进最终 Markdown？
-- 是否追加 `## 重检查记录`；长论文是否追加 `## 内容审稿记录`？
+- 是否追加 `## 重检查记录`；长论文是否追加 `## 内容审稿记录` 与顺序章节写作记录？
 - 最终审稿是否逐条关键 claim 回查原文 section/图表/公式/数值，检查作者声称 vs 事实、负结果、附录、空泛概括和未说明项？
 - 父进程是否抽查关键章节原文；抽查发现关键证据缺失时是否退回补读/修正？
-- 是否完成最终验收：文件存在、行数/字符数合理、代码围栏闭合、数学分隔符成对、关键截图存在、figure/table ledger 完整、`image_count` 与 ledger coverage 达到硬门槛、主表/附录设置没有混淆？ledger 有截图时 `final_note_image_count` 是否不为 0，关键图表覆盖率是否为 100%（或逐项有替代证据）？
+- 是否完成最终验收：文件存在、行数/字符数合理、代码围栏闭合、数学分隔符成对、关键截图存在、figure/table ledger 完整、`image_count` 与 ledger coverage 达到硬门槛、顺序写作队列覆盖完整且无乱序/重复/遗漏/并行写同一文件、跨章节术语和过渡一致、图表无重复/遗漏、主表/附录设置没有混淆？ledger 有截图时 `final_note_image_count` 是否不为 0，关键图表覆盖率是否为 100%（或逐项有替代证据）？

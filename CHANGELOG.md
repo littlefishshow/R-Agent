@@ -2,6 +2,40 @@
 
 这里保存 R-Agent 的历史维护记录。README.md 只保留项目入口、核心能力和使用说明，避免随着迭代不断膨胀。
 
+### 2026-08-17
+
+#### read_paper 顺序章节写作合成机制
+
+- **新增顺序章节写作合成机制**：`read_paper` skill 支持按章节顺序合成最终阅读笔记，避免长论文多章节产出在最终 Markdown 中乱序、重复或遗漏。
+- **串行调度章节写作子 Agent**：通过 `ordered_section_queue`、`final_markdown_write_plan`、`section_status` 与 `write_lock` 管理章节队列和写入锁，按计划串行调度章节写作子 Agent。
+- **同一最终 Markdown 的上下文续写**：每个章节写作子 Agent 必须先读取前序最终 Markdown 与前序摘要，再写入同一个 final Markdown 文件，保证术语、叙事主线和章节过渡连续。
+- **禁止并行写同一最终文件**：明确禁止多个子 Agent 并行写入同一个 final Markdown，必须通过 `write_lock` 串行化写入，降低覆盖、交错写和内容丢失风险。
+- **强化顺序合成验收**：验收清单新增队列覆盖、乱序/重复/遗漏、跨章节术语一致性与过渡、图表/公式重复或遗漏检查，确保最终笔记结构完整且连贯。
+- **模板新增顺序写作记录**：`read_paper` 模板新增顺序写作记录，用于记录章节队列、写入计划、章节状态、锁状态与前序上下文交接情况。
+
+### 2026-08-14
+
+#### Web Search 默认搜索加速与可配置化
+
+- **避免默认搜索先卡 DuckDuckGo**：`web_search` 默认 provider 改为 `auto`，零配置回退的 `local_html` 默认顺序调整为 Bing → Yahoo → DuckDuckGo，避免 DuckDuckGo 不可达时每次先等待约 10 秒超时。
+- **增加搜索 provider 顺序配置**：新增 `WEB_SEARCH_PROVIDER_ORDER`，可自定义 `auto` 下的 API/provider 顺序；有 `GROUNDROUTE_API_KEY` / `SERPER_API_KEY` 时仍会优先对应 API provider，无 key 时自动跳过并回退本地 HTML 搜索。
+- **增加本地搜索与超时配置**：新增 `WEB_SEARCH_LOCAL_HTML_ORDER`、`WEB_SEARCH_LOCAL_HTML_TIMEOUT`、`WEB_SEARCH_API_TIMEOUT`，默认本地 HTML 单源超时缩短为 5 秒，API provider 超时默认 20 秒。
+- **补齐回归测试与实测验证**：更新 `tests/test_web_search_providers.py` 覆盖新默认值、可配置顺序和 fallback；实测 `auto`/`local_html` 查询均走 Bing，耗时约 1 秒内且无 DuckDuckGo timeout warning。
+
+### 2026-08-12
+
+#### Cockpit GUI 思考轮数限制放开与截断续跑
+
+- **放开 GUI 默认思考预算**：Cockpit GUI 会通过 `get_gui_max_iterations()` 读取独立预算，默认提升到 200 轮，并可用 `R_AGENT_GUI_MAX_ITERATIONS` / `GUI_MAX_ITERATIONS` / `COCKPIT_MAX_ITERATIONS` 环境变量覆盖，避免沿用较低的 CLI/Agent 默认轮数。
+- **补充后端截断续跑 API**：新增会话 `continue` 路由与 runtime/service 续跑入口，支持在任务因轮数预算截断后继续追加思考轮数，并兼容学习会话续跑。
+- **增加前端继续思考按钮**：前端 API 封装 continue 请求，并在会话被截断且未运行时显示“继续思考”按钮，便于从 Cockpit 直接续跑被截断的回答。
+
+#### Cockpit 左侧问题链最近优先排序
+
+- **问题链按最近活动排序**：学习模式左侧问题对话框/问题链根节点改为按 `last_activity_at` 由近到远排序，刷新或重启后不再依赖目录恢复/字典插入顺序。
+- **子问题同样最近优先**：展开问题链子节点时也按最近活动时间倒序返回，保证分支列表中新近对话靠前。
+- **补充会话时间字段**：会话状态与树节点新增 `created_at`、`updated_at`、`last_activity_at`，优先从事件时间计算，旧空会话回退到 `context.json` 修改时间。
+
 ### 2026-08-06
 
 #### read_paper 长论文图表 ledger 交接与验收强化

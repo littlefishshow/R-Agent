@@ -5,7 +5,13 @@ import time
 
 import pytest
 
-from tools.registry import ToolExecutionInterrupted, ToolRegistry
+from tools.registry import ToolExecutionInterrupted, ToolRegistry, _tool_process_start_method
+
+
+def test_tool_process_start_method_avoids_fork_on_macos():
+    assert _tool_process_start_method("darwin") == "spawn"
+    assert _tool_process_start_method("win32") == "spawn"
+    assert _tool_process_start_method("linux") == "fork"
 
 
 def test_execute_tool_isolated_runs_in_child_process():

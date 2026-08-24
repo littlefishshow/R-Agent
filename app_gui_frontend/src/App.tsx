@@ -4,8 +4,10 @@ import { renderToString } from 'katex'
 import { BookOpen, Check, Copy, Edit3, Ellipsis, Eye, File, FileText, Folder, Languages, Lightbulb, ListTree, Maximize2, MessageCircle, Minimize2, Plus, Search, Save, Send, Square, Trash2, Workflow, X, ZoomIn, ZoomOut } from 'lucide-react'
 import 'katex/dist/katex.min.css'
 import {
+  acceptSelectionModification,
   copyWorkspaceItem,
   createLearningSession,
+  continueLearningSession,
   createWorkspaceFolder,
   deleteLearningSession,
   deleteWorkspaceItem,
@@ -32,6 +34,7 @@ import {
   uploadWorkspaceFile,
   workspacePdfPageImageUrl,
   workspaceOpenUrl,
+  ApiRequestError,
   type ContextEvent,
   type LearningSessionState,
   type TodoBoardState,
@@ -49,7 +52,7 @@ type ChatItem = {
   messageIndex?: number
 }
 
-type SelectionAction = 'question' | 'translate' | 'explain' | 'summarize' | 'note'
+type SelectionAction = 'question' | 'translate' | 'explain' | 'summarize' | 'note' | 'modify'
 
 type SelectionMenuState = {
   sourceSessionId: string
@@ -122,6 +125,7 @@ type FloatingWindowState = {
   displayQuestion?: string
   targetLanguage?: string
   noteText?: string
+  modificationInstruction?: string
   x: number
   y: number
   width: number
@@ -187,6 +191,7 @@ const SELECTION_ACTIONS: Array<{ action: SelectionAction, label: string, icon: a
   { action: 'explain', label: '解释', icon: Lightbulb },
   { action: 'summarize', label: '总结', icon: FileText },
   { action: 'note', label: '笔记', icon: Edit3 },
+  { action: 'modify', label: '修改', icon: Save },
 ]
 
 const ROOT_BRANCH_COLOR = makeBranchColor(212, 0)
@@ -216,6 +221,7 @@ export function App() {
   const [pendingAction, setPendingAction] = useState<PendingSelectionAction | null>(null)
   const [questionDraft, setQuestionDraft] = useState('')
   const [noteDraft, setNoteDraft] = useState('')
+  const [modificationDraft, setModificationDraft] = useState('')
   const [translationChoice, setTranslationChoice] = useState<'英语' | '中文' | '其他'>('英语')
   const [customLanguage, setCustomLanguage] = useState('')
   const [highlights, setHighlights] = useState<Record<string, HighlightRecord>>({})
@@ -298,13 +304,19 @@ export function App() {
   async function boot() {
     setError(null)
     try {
-      const roots = await fetchLearningAccountRoots(accountId)
+      const [roots, allSessions] = await Promise.all([
+        fetchLearningAccountRoots(accountId),
+        listLearningSessions(accountId),
+      ])
       const first = roots.nodes.find(item => item.node_kind !== 'file_root') || roots.nodes[0]
       const s = first || await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
-      setSessions(Object.fromEntries((first ? roots.nodes : [s]).map(item => [item.session_id, item])))
+      const initialSessions = first ? allSessions : { [s.session_id]: s }
+      setSessions(initialSessions)
       setAccountRootIds(first ? roots.nodes.map(item => item.session_id) : [s.session_id])
+      setConversationChildren(buildConversationChildren(initialSessions))
       await activateSession(s.session_id)
-      await refreshWorkspace('')
+      await refreshWorkspace('', s.session_id)
+      await restoreRunningSessionWindows(initialSessions, s.session_id)
     } catch (err: any) {
       setError(err.message || String(err))
     }
@@ -441,6 +453,7 @@ export function App() {
     customQuestion?: string
     targetLanguage?: string
     noteText?: string
+    modificationInstruction?: string
     sourceContext?: Record<string, any>
   }): LearningSessionState {
     return {
@@ -461,6 +474,7 @@ export function App() {
         custom_question: data.customQuestion,
         target_language: data.targetLanguage,
         note_text: data.noteText,
+        modification_instruction: data.modificationInstruction,
         source_context: data.sourceContext,
       } : undefined,
     }
@@ -484,7 +498,11 @@ export function App() {
         await syncActiveEvents(sessionId, state, false)
       }
     } catch (err: any) {
-      await recoverActiveSession()
+      if (err instanceof ApiRequestError && err.status === 404) {
+        await recoverActiveSession()
+      } else {
+        setError(err.message || String(err))
+      }
     }
   }
 
@@ -518,13 +536,18 @@ export function App() {
   }
 
   async function recoverActiveSession() {
-    const roots = await fetchLearningAccountRoots(accountId)
+    const [roots, allSessions] = await Promise.all([
+      fetchLearningAccountRoots(accountId),
+      listLearningSessions(accountId),
+    ])
     const next = roots.nodes.find(item => item.node_kind !== 'file_root') || roots.nodes[0]
     if (next) {
-      setSessions(Object.fromEntries(roots.nodes.map(item => [item.session_id, item])))
+      setSessions(allSessions)
       setAccountRootIds(roots.nodes.map(item => item.session_id))
+      setConversationChildren(buildConversationChildren(allSessions))
       setSession(next)
       setEvents(await fetchLearningEvents(next.session_id))
+      await restoreRunningSessionWindows(allSessions, next.session_id)
       return
     }
     const created = await createLearningSession({ session_id: makeGuiSessionId(), title: '新的学习问题', account_id: accountId })
@@ -541,8 +564,13 @@ export function App() {
       try {
         const state = await fetchLearningSession(win.sessionId)
         return { win, state, missing: false }
-      } catch {
-        return { win, state: null, missing: true }
+      } catch (error) {
+        return {
+          win,
+          state: null,
+          missing: error instanceof ApiRequestError && error.status === 404,
+          transientError: !(error instanceof ApiRequestError) || error.status !== 404,
+        }
       }
     }))
     const missing = updates
@@ -582,6 +610,41 @@ export function App() {
     await Promise.all(valid.map(item => syncWindowEvents(item.win, item.state)))
   }
 
+  async function restoreRunningSessionWindows(
+    knownSessions: Record<string, LearningSessionState>,
+    activeSessionId: string,
+  ) {
+    const running = Object.values(knownSessions).filter(item =>
+      item.running &&
+      !!item.selection &&
+      (item.node_kind === 'selection' || item.node_kind === 'note'),
+    )
+    for (const state of running) {
+      markPendingRun(state.session_id)
+      if (state.session_id === activeSessionId) continue
+      const sourceSessionId = state.parent_session_id || state.selection?.source_session_id || ''
+      const color = branchColors[state.session_id] || deriveChildColor(sourceSessionId, Object.values(knownSessions), branchColors)
+      let initialEvents: ContextEvent[] = []
+      try {
+        initialEvents = await fetchLearningEvents(state.session_id)
+      } catch {
+        initialEvents = []
+      }
+      await openFloatingSession(state, {
+        sourceSessionId,
+        title: state.title || state.root_question || '运行中的任务',
+        action: state.selection?.action as SelectionAction | undefined,
+        selectedText: state.selection?.selected_text,
+        displayQuestion: state.selection?.custom_question,
+        targetLanguage: state.selection?.target_language,
+        noteText: state.selection?.note_text,
+        modificationInstruction: state.selection?.modification_instruction,
+        color,
+        initialEvents,
+      })
+    }
+  }
+
   async function syncWindowEvents(win: FloatingWindowState, state: LearningSessionState) {
     const expected = state.event_count || 0
     const current = windowEventsRef.current[win.id] || []
@@ -607,13 +670,13 @@ export function App() {
     }
   }
 
-  async function refreshWorkspace(path = workspace?.cwd || '') {
+  async function refreshWorkspace(path = workspace?.cwd || '', sessionId = session?.session_id || '') {
     const expandedPaths = Object.entries(expandedFolders)
       .filter(([, value]) => value)
       .map(([key]) => key)
     const [listing, tree] = await Promise.all([
-      listWorkspaceFiles(path),
-      fetchWorkspaceTree(expandedPaths),
+      listWorkspaceFiles(path, sessionId),
+      fetchWorkspaceTree(expandedPaths, sessionId),
     ])
     setWorkspace(listing)
     setWorkspaceTree(tree.root)
@@ -623,7 +686,7 @@ export function App() {
     setExpandedFolders(prev => {
       const next = { ...prev, [path]: !prev[path] }
       const expandedPaths = Object.entries(next).filter(([, value]) => value).map(([key]) => key)
-      fetchWorkspaceTree(expandedPaths)
+      fetchWorkspaceTree(expandedPaths, session?.session_id || '')
         .then(tree => setWorkspaceTree(tree.root))
         .catch((err: any) => setError(err.message || String(err)))
       return next
@@ -674,6 +737,13 @@ export function App() {
   async function activateSession(sessionId: string) {
     setError(null)
     setActiveMode('chat')
+    setWindows(prev => {
+      const next = { ...prev }
+      for (const [windowId, win] of Object.entries(next)) {
+        if (win.sessionId === sessionId) delete next[windowId]
+      }
+      return next
+    })
     // Optimistic switch: show the target conversation immediately from the
     // sidebar cache and clear stale bubbles so switching feels instant, then
     // reconcile against the server. The explicit loading flag is cleared after
@@ -688,6 +758,7 @@ export function App() {
     }
     try {
       await refreshActive(sessionId)
+      await refreshWorkspace('', sessionId)
     } finally {
       if (switchingSession) setEventsLoading(false)
     }
@@ -745,6 +816,24 @@ export function App() {
     if (!session) return
     await interruptLearning(session.session_id)
     await refreshActive(session.session_id)
+  }
+
+  async function continueActiveAfterTruncation() {
+    if (!session || session.running || !session.truncated) return
+    const sessionId = session.session_id
+    setError(null)
+    markPendingRun(sessionId)
+    setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: true } : prev)
+    setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: true } } : prev)
+    try {
+      await continueLearningSession(sessionId)
+      await refreshActive(sessionId)
+    } catch (err: any) {
+      delete pendingRunsRef.current[sessionId]
+      setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: false } : prev)
+      setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: false } } : prev)
+      setError(err.message || String(err))
+    }
   }
 
   async function toggleActiveSessionTools(enabled: boolean) {
@@ -872,6 +961,19 @@ export function App() {
       setPendingAction({ ...menu, action })
       return
     }
+    if (action === 'modify') {
+      if (menu.sourceContext?.kind !== 'markdown' || !menu.sourceContext?.path) {
+        setError('修改功能目前只支持 Markdown 文件中的选中文本。')
+        return
+      }
+      if (menu.sourceContext?.unsaved_changes) {
+        setError('当前 Markdown 有未保存修改，请先保存文件，再选中文本让 AI 修改。')
+        return
+      }
+      setModificationDraft('')
+      setPendingAction({ ...menu, action })
+      return
+    }
     createSelectionBranch({ ...menu, action })
   }
 
@@ -884,6 +986,7 @@ export function App() {
     displayQuestion?: string
     targetLanguage?: string
     noteText?: string
+    modificationInstruction?: string
     color?: BranchColor
     fullscreen?: boolean
     initialEvents?: ContextEvent[]
@@ -911,6 +1014,7 @@ export function App() {
               displayQuestion: options.displayQuestion ?? existing.displayQuestion,
               targetLanguage: options.targetLanguage ?? existing.targetLanguage,
               noteText: options.noteText ?? existing.noteText,
+              modificationInstruction: options.modificationInstruction ?? existing.modificationInstruction,
               minimized: false,
               zIndex: nextZ,
             },
@@ -931,6 +1035,7 @@ export function App() {
             displayQuestion: options.displayQuestion,
             targetLanguage: options.targetLanguage,
             noteText: options.noteText,
+            modificationInstruction: options.modificationInstruction,
             x: placement.x,
             y: placement.y,
             width: placement.width,
@@ -966,7 +1071,7 @@ export function App() {
     }
   }
 
-  async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string, noteText?: string } = {}) {
+  async function createSelectionBranch(actionState: PendingSelectionAction, options: { customQuestion?: string, targetLanguage?: string, noteText?: string, modificationInstruction?: string } = {}) {
     const menu = actionState
     const actionMeta = SELECTION_ACTIONS.find(item => item.action === menu.action)
     const requestedSourceSessionId = menu.sourceSessionId
@@ -1008,6 +1113,7 @@ export function App() {
       customQuestion: options.customQuestion,
       targetLanguage: options.targetLanguage,
       noteText: options.noteText,
+      modificationInstruction: options.modificationInstruction,
       sourceContext: menu.sourceContext,
     })
     await openFloatingSession(optimisticBranch, {
@@ -1019,6 +1125,7 @@ export function App() {
       displayQuestion: options.customQuestion,
       targetLanguage: options.targetLanguage,
       noteText: options.noteText,
+      modificationInstruction: options.modificationInstruction,
       color: provisionalColor,
       skipInitialFetch: true,
     })
@@ -1044,7 +1151,9 @@ export function App() {
         custom_question: options.customQuestion,
         target_language: options.targetLanguage,
         note_text: options.noteText,
+        modification_instruction: options.modificationInstruction,
         source_context: menu.sourceContext,
+        workspace_session_id: session?.session_id || '',
       })
       const color = branchColors[branch.session_id] || provisionalColor
       if (menu.pdfContext) {
@@ -1073,6 +1182,7 @@ export function App() {
         displayQuestion: options.customQuestion,
         targetLanguage: options.targetLanguage,
         noteText: options.noteText,
+        modificationInstruction: options.modificationInstruction,
         color,
         skipInitialFetch: true,
       })
@@ -1108,6 +1218,15 @@ export function App() {
     const action = pendingAction
     setPendingAction(null)
     createSelectionBranch(action, { customQuestion: questionDraft.trim() })
+  }
+
+  function submitModificationDialog() {
+    if (!pendingAction || !modificationDraft.trim()) return
+    const action = pendingAction
+    const instruction = modificationDraft.trim()
+    setPendingAction(null)
+    setModificationDraft('')
+    createSelectionBranch(action, { modificationInstruction: instruction })
   }
 
   function submitTranslationDialog() {
@@ -1196,6 +1315,7 @@ export function App() {
         selected_text: action.text,
         note_text: note,
         source_context: action.sourceContext,
+        workspace_session_id: session?.session_id || '',
       })
       const color = branchColors[branch.session_id] || provisionalColor
       if (action.pdfContext) {
@@ -1380,6 +1500,53 @@ export function App() {
     }
   }
 
+  async function acceptWindowModification(windowId: string) {
+    const win = windows[windowId]
+    const branch = win ? sessions[win.sessionId] : null
+    if (!win || win.action !== 'modify' || branch?.running) return
+    if (!window.confirm('接受当前最终修改，并替换 Markdown 中原来选中的文本？')) return
+    try {
+      const result = await acceptSelectionModification(win.sessionId)
+      setOpenFiles(prev => prev[result.path] ? {
+        ...prev,
+        [result.path]: {
+          ...prev[result.path],
+          textContent: result.content,
+          dirty: false,
+          error: undefined,
+        },
+      } : prev)
+      removeDeletedSessions(new Set(result.deleted?.length ? result.deleted : [win.sessionId]))
+      await refreshWorkspace(workspace?.cwd || '')
+    } catch (err: any) {
+      if (err instanceof ApiRequestError && err.status === 404) {
+        const path = String(branch?.selection?.source_context?.path || '')
+        if (path) {
+          try {
+            const text = await fetchWorkspaceText(path, session?.session_id || '')
+            setOpenFiles(prev => prev[path] ? {
+              ...prev,
+              [path]: {
+                ...prev[path],
+                textContent: text.content,
+                dirty: false,
+                error: undefined,
+              },
+            } : prev)
+          } catch {
+            // The branch is already gone; close the stale window even if the
+            // source file cannot be refreshed right now.
+          }
+        }
+        removeDeletedSessions(new Set([win.sessionId]))
+        await refreshWorkspace(workspace?.cwd || '')
+        setError(null)
+      } else {
+        setError(err.message || String(err))
+      }
+    }
+  }
+
   async function deleteRootSession(sessionId: string) {
     try {
       let result: { deleted: string[] }
@@ -1499,6 +1666,7 @@ export function App() {
         displayQuestion: branch.selection?.custom_question,
         targetLanguage: branch.selection?.target_language,
         noteText: branch.selection?.note_text,
+        modificationInstruction: branch.selection?.modification_instruction,
       })
     } catch (err: any) {
       setError(err.message || String(err))
@@ -1513,6 +1681,7 @@ export function App() {
       for (const child of children.nodes) {
         const selection = child.selection || {}
         const source = selection.source_context || {}
+        if (selection.accepted) continue
         if (source.kind !== 'chat' || !selection.selected_text) continue
         const chatId = typeof source.chat_id === 'string'
           ? source.chat_id
@@ -1557,6 +1726,7 @@ export function App() {
       for (const child of children.nodes) {
         const selection = child.selection || {}
         const source = selection.source_context || {}
+        if (selection.accepted) continue
         if (source.path !== path || !selection.selected_text) continue
         const highlightId = `persist_${child.session_id}`
         const color = branchColors[child.session_id] || deriveChildColor(fileRoot.session_id, [...Object.values(sessions), fileRoot, ...children.nodes], branchColors)
@@ -1602,13 +1772,13 @@ export function App() {
       return
     }
     if (item.is_pdf) {
-      const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path), type: 'pdf', loading: true }
+      const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path, false, session?.session_id || ''), type: 'pdf', loading: true }
       setOpenFiles(prev => ({ ...prev, [item.path]: tab }))
       setActiveFilePath(item.path)
       setActiveMode('files')
       await restoreFileHighlights(item.path)
       try {
-        const pdfText = await fetchWorkspacePdfText(item.path)
+        const pdfText = await fetchWorkspacePdfText(item.path, session?.session_id || '')
         setOpenFiles(prev => ({
           ...prev,
           [item.path]: {
@@ -1631,13 +1801,13 @@ export function App() {
       return
     }
     if (item.is_markdown) {
-      const markdownTab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path), type: 'markdown', loading: true, viewMode: 'preview' }
+      const markdownTab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path, false, session?.session_id || ''), type: 'markdown', loading: true, viewMode: 'preview' }
       setOpenFiles(prev => ({ ...prev, [item.path]: markdownTab }))
       setActiveFilePath(item.path)
       setActiveMode('files')
       await restoreFileHighlights(item.path)
       try {
-        const text = await fetchWorkspaceText(item.path)
+        const text = await fetchWorkspaceText(item.path, session?.session_id || '')
         setOpenFiles(prev => ({
           ...prev,
           [item.path]: {
@@ -1659,7 +1829,7 @@ export function App() {
       }
       return
     }
-    const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path), type: 'file' }
+    const tab: OpenFileTab = { path: item.path, name: item.name, url: workspaceOpenUrl(item.path, false, session?.session_id || ''), type: 'file' }
     setOpenFiles(prev => ({ ...prev, [item.path]: tab }))
     setActiveFilePath(item.path)
     setActiveMode('files')
@@ -1669,7 +1839,7 @@ export function App() {
     if (!files || !workspace) return
     try {
       for (const file of Array.from(files)) {
-        await uploadWorkspaceFile(targetPath, file)
+        await uploadWorkspaceFile(targetPath, file, session?.session_id || '')
       }
       await refreshWorkspace(targetPath)
     } catch (err: any) {
@@ -1682,7 +1852,7 @@ export function App() {
     const name = window.prompt('新文件夹名称')
     if (!name) return
     try {
-      await createWorkspaceFolder(targetPath, name)
+      await createWorkspaceFolder(targetPath, name, session?.session_id || '')
       await refreshWorkspace(targetPath)
     } catch (err: any) {
       setError(err.message || String(err))
@@ -1692,7 +1862,7 @@ export function App() {
   async function pasteClipboard() {
     if (!workspace || !clipboardPath) return
     try {
-      await copyWorkspaceItem(clipboardPath, workspace.cwd)
+      await copyWorkspaceItem(clipboardPath, workspace.cwd, undefined, session?.session_id || '')
       setClipboardPath(null)
       await refreshWorkspace(workspace.cwd)
     } catch (err: any) {
@@ -1703,7 +1873,7 @@ export function App() {
   async function removeWorkspaceItem(item: WorkspaceItem) {
     if (!window.confirm(`删除 ${item.name}？`)) return
     try {
-      await deleteWorkspaceItem(item.path)
+      await deleteWorkspaceItem(item.path, session?.session_id || '')
       setOpenFiles(prev => {
         const next = { ...prev }
         delete next[item.path]
@@ -1749,7 +1919,7 @@ export function App() {
     if (action === 'paste') {
       const target = contextTargetDir(item)
       if (!clipboardPath) return
-      copyWorkspaceItem(clipboardPath, target)
+      copyWorkspaceItem(clipboardPath, target, undefined, session?.session_id || '')
         .then(() => {
           setClipboardPath(null)
           return refreshWorkspace(target)
@@ -1762,7 +1932,7 @@ export function App() {
       return
     }
     if (action === 'download' && item?.type === 'file') {
-      window.open(workspaceOpenUrl(item.path, true), '_blank', 'noreferrer')
+      window.open(workspaceOpenUrl(item.path, true, session?.session_id || ''), '_blank', 'noreferrer')
       return
     }
     if (action === 'open' && item) {
@@ -1802,6 +1972,7 @@ export function App() {
 
     <main className={activeMode === 'files' ? 'learning-main file-mode' : 'learning-main'}>
       {activeMode === 'files' ? <FileWorkspacePanel
+        sessionId={session?.session_id || ''}
         openFiles={openFiles}
         activeFile={activeFile}
         activeFilePath={activeFilePath}
@@ -1851,7 +2022,7 @@ export function App() {
           const tab = openFiles[path]
           if (!tab) return
           try {
-            await saveWorkspaceText(path, tab.textContent || '')
+            await saveWorkspaceText(path, tab.textContent || '', session?.session_id || '')
             setOpenFiles(prev => ({
               ...prev,
               [path]: {
@@ -1865,7 +2036,12 @@ export function App() {
           }
         }}
         onMarkdownSelection={(result, path) => {
-          const location = describeMarkdownSelectionLocation(openFiles[path]?.textContent || '', result.text)
+          const sourceContent = openFiles[path]?.textContent || ''
+          const sourceRange = locateMarkdownSourceSelection(sourceContent, result.text, result.occurrence)
+          const lineRange = sourceRange ? markdownLineRange(sourceContent, sourceRange.start, sourceRange.end) : null
+          const location = lineRange
+            ? (lineRange.startLine === lineRange.endLine ? `line ${lineRange.startLine}` : `lines ${lineRange.startLine}-${lineRange.endLine}`)
+            : describeMarkdownSelectionLocation(sourceContent, result.text)
           showSelectionMenu({
             sourceSessionId: session?.session_id || '',
             chatId: `markdown:${path}`,
@@ -1874,7 +2050,20 @@ export function App() {
             occurrence: result.occurrence,
             x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
             y: Math.max(12, result.rect.top - 46),
-            sourceContext: { kind: 'markdown', path, location, text_offset: result.textOffset, occurrence: result.occurrence },
+            sourceContext: {
+              kind: 'markdown',
+              path,
+              location,
+              text_offset: result.textOffset,
+              occurrence: result.occurrence,
+              source_text_offset: sourceRange?.start,
+              source_line_start: lineRange?.startLine,
+              source_line_end: lineRange?.endLine,
+              source_line_start_offset: lineRange?.start,
+              source_line_end_offset: lineRange?.end,
+              source_line_text: lineRange?.text,
+              unsaved_changes: !!openFiles[path]?.dirty,
+            },
           }, result.range)
         }}
         onPdfSelection={(text, page, rect, rects) => {
@@ -1945,6 +2134,10 @@ export function App() {
         </section>}
 
       {activeMode === 'chat' && <section className="learning-composer">
+        {session?.truncated && !session.running && <div className="truncation-continue">
+          <span>本次回答已达到思考轮数上限（{session.max_iterations || '当前预算'}）。</span>
+          <button className="secondary" onClick={continueActiveAfterTruncation}>继续思考</button>
+        </div>}
         <div className="composer-row">
           <ComposerInput
             value={input}
@@ -2023,6 +2216,13 @@ export function App() {
       onSave={() => saveNoteDialog(false)}
       onSend={() => saveNoteDialog(true)}
     />}
+    {pendingAction?.action === 'modify' && <ModificationDialog
+      selectedText={pendingAction.text}
+      value={modificationDraft}
+      onChange={setModificationDraft}
+      onCancel={() => setPendingAction(null)}
+      onSubmit={submitModificationDialog}
+    />}
     <FloatingWindows
       windows={windows}
       sessions={sessions}
@@ -2039,6 +2239,7 @@ export function App() {
       onMinimize={minimizeWindow}
       onMaximize={maximizeWindow}
       onClose={closeWindowAndDeleteSubtree}
+      onAcceptModification={acceptWindowModification}
       onRaise={raiseWindow}
       onMove={moveWindow}
       onResize={resizeWindow}
@@ -2264,6 +2465,13 @@ function todoStatusIcon(status: string): string {
 
 function buildCleanSelectionDisplay(win: FloatingWindowState): string {
   const selected = win.selectedText || ''
+  if (win.action === 'modify') {
+    return `修改要求：
+${win.modificationInstruction || ''}
+
+原选中文本：
+${selected}`
+  }
   if (win.action === 'note') {
     return `笔记：\n${win.noteText || ''}\n\n关联文本：\n${selected}`
   }
@@ -2318,6 +2526,48 @@ function describeMarkdownSelectionLocation(content: string, selectedText: string
   return startLine === endLine ? `line ${startLine}` : `lines ${startLine}-${endLine}`
 }
 
+function locateMarkdownSourceSelection(content: string, selectedText: string, occurrence = 0): { start: number, end: number } | null {
+  const source = String(content || '')
+  const selected = String(selectedText || '').trim()
+  if (!source || !selected) return null
+  const start = nthIndexOf(source, selected, Math.max(0, occurrence || 0))
+  if (start >= 0) return { start, end: start + selected.length }
+  const normalized = findNormalizedTextRange(source, selected, Math.max(0, occurrence || 0))
+  if (normalized) return normalized
+  return findMarkdownVisibleTextRange(source, selected, Math.max(0, occurrence || 0))
+}
+
+function findMarkdownVisibleTextRange(source: string, selectedText: string, occurrence: number): { start: number, end: number } | null {
+  const sourceMap = normalizeMarkdownVisibleTextWithMap(source)
+  const needleText = normalizeMarkdownVisibleTextWithMap(selectedText).text
+  if (!sourceMap.text || !needleText) return null
+  const normalizedStart = nthIndexOf(sourceMap.text, needleText, occurrence)
+  if (normalizedStart < 0) return null
+  const normalizedEnd = normalizedStart + needleText.length
+  const start = sourceMap.map[normalizedStart]
+  const end = (sourceMap.map[normalizedEnd - 1] ?? start) + 1
+  return { start, end }
+}
+
+function markdownLineRange(content: string, selectionStart: number, selectionEnd: number): {
+  start: number
+  end: number
+  startLine: number
+  endLine: number
+  text: string
+} {
+  const source = String(content || '')
+  const safeStart = Math.max(0, Math.min(selectionStart, source.length))
+  const safeEnd = Math.max(safeStart, Math.min(selectionEnd, source.length))
+  const start = source.lastIndexOf('\n', Math.max(0, safeStart - 1)) + 1
+  const probe = Math.max(safeStart, safeEnd - 1)
+  const nextNewline = source.indexOf('\n', probe)
+  const end = nextNewline < 0 ? source.length : nextNewline
+  const startLine = source.slice(0, start).split('\n').length
+  const endLine = startLine + source.slice(start, end).split('\n').length - 1
+  return { start, end, startLine, endLine, text: source.slice(start, end) }
+}
+
 function parentPath(path: string): string {
   const parts = String(path || '').split('/').filter(Boolean)
   parts.pop()
@@ -2331,7 +2581,7 @@ function shouldSubmitFromKey(event: any): boolean {
 
 function SelectionMenu({ menu, onAction }: { menu: SelectionMenuState, onAction: (action: SelectionAction) => void }) {
   return <div className="selection-menu" style={{ left: menu.x, top: menu.y }} onPointerDown={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()}>
-    {SELECTION_ACTIONS.map(item => {
+    {SELECTION_ACTIONS.filter(item => item.action !== 'modify' || menu.sourceContext?.kind === 'markdown').map(item => {
       const Icon = item.icon
       return <button key={item.action} onClick={() => onAction(item.action)}><Icon size={14}/>{item.label}</button>
     })}
@@ -2460,6 +2710,26 @@ function NoteDialog({ selectedText, value, onChange, onCancel, onSave, onSend }:
         <button className="secondary" onClick={onCancel}>取消</button>
         <button className="secondary" disabled={!value.trim()} onClick={onSave}>保存笔记</button>
         <button className="primary" disabled={!value.trim()} onClick={onSend}>发送给模型</button>
+      </footer>
+    </section>
+  </div>
+}
+
+function ModificationDialog({ selectedText, value, onChange, onCancel, onSubmit }: {
+  selectedText: string
+  value: string
+  onChange: (value: string) => void
+  onCancel: () => void
+  onSubmit: () => void
+}) {
+  return <div className="modal-backdrop">
+    <section className="action-dialog">
+      <header>修改选中的 Markdown</header>
+      <div className="selected-preview">{selectedText}</div>
+      <textarea value={value} onChange={event => onChange(event.target.value)} placeholder="输入修改要求，例如：改得更简洁、补充一个例子、修正这段表述..."/>
+      <footer>
+        <button className="secondary" onClick={onCancel}>取消</button>
+        <button className="primary" disabled={!value.trim()} onClick={onSubmit}>生成修改建议</button>
       </footer>
     </section>
   </div>
@@ -2630,8 +2900,9 @@ function FileContextMenu({ menu, clipboardPath, onAction }: {
   </div>
 }
 
-function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, onToggleMode, onSave, onSelection, onOpenHighlight }: {
+function MarkdownFileEditor({ tab, sessionId, highlights, scrollTop, onScroll, onUpdate, onToggleMode, onSave, onSelection, onOpenHighlight }: {
   tab: OpenFileTab
+  sessionId: string
   highlights: Record<string, HighlightRecord>
   scrollTop: number
   onScroll: (scrollTop: number) => void
@@ -2699,12 +2970,13 @@ function MarkdownFileEditor({ tab, highlights, scrollTop, onScroll, onUpdate, on
           }
           window.setTimeout(() => handleResult(readTextSelectionWithin(container)), 0)
         }}>
-          <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
+          <MarkdownText text={content || '空 Markdown 文件。'} chatId={`markdown:${tab.path}`} assetSessionId={sessionId} highlights={highlights} onOpenHighlight={onOpenHighlight} basePath={tab.path}/>
         </div>}
   </section>
 }
 
-function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighlights, textHighlights, pdfZoom, scrollPositions, onFileScroll, onZoomOut, onZoomIn, onActivate, onClose, onUpdateMarkdown, onToggleMarkdownMode, onSaveMarkdown, onMarkdownSelection, onPdfSelection, onOpenHighlight }: {
+function FileWorkspacePanel({ sessionId, openFiles, activeFile, activeFilePath, pdfHighlights, textHighlights, pdfZoom, scrollPositions, onFileScroll, onZoomOut, onZoomIn, onActivate, onClose, onUpdateMarkdown, onToggleMarkdownMode, onSaveMarkdown, onMarkdownSelection, onPdfSelection, onOpenHighlight }: {
+  sessionId: string
   openFiles: Record<string, OpenFileTab>
   activeFile: OpenFileTab | null
   activeFilePath: string | null
@@ -2750,6 +3022,7 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
       {activeFile.type === 'pdf'
         ? <PdfTextReader
             tab={activeFile}
+            sessionId={sessionId}
             highlights={pdfHighlights}
             zoom={pdfZoom}
             scrollTop={scrollPositions[activeFile.path] || 0}
@@ -2760,6 +3033,7 @@ function FileWorkspacePanel({ openFiles, activeFile, activeFilePath, pdfHighligh
         : activeFile.type === 'markdown'
           ? <MarkdownFileEditor
               tab={activeFile}
+              sessionId={sessionId}
               highlights={Object.fromEntries(Object.entries(textHighlights).filter(([, item]) => item.chatId === `markdown:${activeFile.path}`))}
               scrollTop={scrollPositions[activeFile.path] || 0}
               onScroll={scrollTop => onFileScroll(activeFile.path, scrollTop)}
@@ -2817,8 +3091,9 @@ function WorkspaceFileFrame({ tab, scrollTop, onScroll }: {
   return <iframe ref={frameRef} className="pdf-frame" title={tab.name} src={tab.url} onLoad={restoreAndBind}/>
 }
 
-function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection, onOpenHighlight }: {
+function PdfTextReader({ tab, sessionId, highlights, zoom, scrollTop, onScroll, onSelection, onOpenHighlight }: {
   tab: OpenFileTab
+  sessionId: string
   highlights: Record<string, PdfHighlightRecord>
   zoom: number
   scrollTop: number
@@ -2846,6 +3121,7 @@ function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection
     {tab.pdfText.pages.map(page => <PdfPageView
       key={page.page}
       pdfPath={tab.path}
+      sessionId={sessionId}
       page={page}
       highlights={Object.values(highlights).filter(item => item.path === tab.path && item.page === page.page)}
       zoom={zoom}
@@ -2855,8 +3131,9 @@ function PdfTextReader({ tab, highlights, zoom, scrollTop, onScroll, onSelection
   </div>
 }
 
-function PdfPageView({ pdfPath, page, highlights, zoom, onSelection, onOpenHighlight }: {
+function PdfPageView({ pdfPath, sessionId, page, highlights, zoom, onSelection, onOpenHighlight }: {
   pdfPath: string
+  sessionId: string
   page: NonNullable<OpenFileTab['pdfText']>['pages'][number]
   highlights: PdfHighlightRecord[]
   zoom: number
@@ -2926,7 +3203,7 @@ function PdfPageView({ pdfPath, page, highlights, zoom, onSelection, onOpenHighl
       onSelection(selected.text, page.page, rect, selected.rects)
     }}
   >
-    <img className="pdf-page-image" src={workspacePdfPageImageUrl(pdfPath, page.page, zoom)} alt={`Page ${page.page}`}/>
+    <img className="pdf-page-image" src={workspacePdfPageImageUrl(pdfPath, page.page, zoom, sessionId)} alt={`Page ${page.page}`}/>
     <div className="pdf-highlight-layer" aria-hidden="true">
       {highlightRects.map(rect => <span
         key={rect.id}
@@ -3373,6 +3650,7 @@ function FloatingWindows({
   onMinimize,
   onMaximize,
   onClose,
+  onAcceptModification,
   onRaise,
   onMove,
   onResize,
@@ -3400,6 +3678,7 @@ function FloatingWindows({
   onMinimize: (windowId: string) => void
   onMaximize: (windowId: string) => void
   onClose: (windowId: string) => void
+  onAcceptModification: (windowId: string) => void
   onRaise: (windowId: string) => void
   onMove: (windowId: string, x: number, y: number) => void
   onResize: (windowId: string, width: number, height: number) => void
@@ -3483,6 +3762,12 @@ function FloatingWindows({
           <div className="window-controls">
             <button title="缩小" onClick={() => onMinimize(win.id)}><Minimize2 size={15}/></button>
             <button title="全屏" onClick={() => onMaximize(win.id)}><Maximize2 size={15}/></button>
+            {win.action === 'modify' && <button
+              className="accept-modification"
+              title={session?.selection?.accepted ? '该修改已接受' : '用当前最终候选替换原选区'}
+              disabled={busy || !!session?.selection?.accepted}
+              onClick={() => onAcceptModification(win.id)}
+            ><Check size={14}/>{session?.selection?.accepted ? '已接受' : '接受修改'}</button>}
             <button className="delete-window" title="删除并删除子树" onClick={() => onClose(win.id)}><Trash2 size={14}/>删除</button>
           </div>
         </header>
@@ -3680,15 +3965,19 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
   </div>
 })
 
-const MarkdownText = memo(function MarkdownText({ text, chatId, sourceSessionId, highlights, onOpenHighlight, basePath = '' }: {
+const MarkdownText = memo(function MarkdownText({ text, chatId, sourceSessionId, assetSessionId = '', highlights, onOpenHighlight, basePath = '' }: {
   text: string
   chatId: string
   sourceSessionId?: string
+  assetSessionId?: string
   highlights: Record<string, HighlightRecord>
   onOpenHighlight: (highlightId: string) => void
   basePath?: string
 }) {
-  const html = useMemo(() => renderMarkdownToHtml(text || '', { basePath, chatId, sourceSessionId, highlights }), [text, basePath, chatId, sourceSessionId, highlights])
+  const html = useMemo(
+    () => renderMarkdownToHtml(text || '', { basePath, chatId, sourceSessionId, assetSessionId, highlights }),
+    [text, basePath, chatId, sourceSessionId, assetSessionId, highlights],
+  )
   return <div
     className="markdown-body"
     onMouseDown={event => {
@@ -3722,6 +4011,7 @@ function renderMarkdownToHtml(text: string, options: {
   basePath?: string
   chatId: string
   sourceSessionId?: string
+  assetSessionId?: string
   highlights: Record<string, HighlightRecord>
 }): string {
   const mathItems: MathRenderPlaceholder[] = []
@@ -3734,7 +4024,7 @@ function renderMarkdownToHtml(text: string, options: {
   mathItems.forEach((item, index) => {
     html = html.split(`@@RAGENT_MATH_${index}@@`).join(renderMathPlaceholder(item))
   })
-  html = rewriteMarkdownAssetUrls(html, options.basePath || '')
+  html = rewriteMarkdownAssetUrls(html, options.basePath || '', options.assetSessionId || '')
   html = applyMarkdownHighlights(html, options.chatId, options.sourceSessionId, options.highlights)
   html = wrapMarkdownTextTokens(html)
   return html
@@ -3781,16 +4071,16 @@ function renderMathPlaceholder(item: MathRenderPlaceholder): string {
   return `<${tag} class="${className}" data-md-math="1">${item.html}${source}</${tag}>`
 }
 
-function rewriteMarkdownAssetUrls(html: string, basePath: string): string {
+function rewriteMarkdownAssetUrls(html: string, basePath: string, sessionId = ''): string {
   if (!basePath) return html
   return html.replace(/\s(src|href)="([^"]+)"/g, (match, attr, rawUrl) => {
     const url = String(rawUrl || '')
     if (/^(https?:|data:|blob:|mailto:|#)/i.test(url)) return match
-    return ` ${attr}="${markdownRenderer.utils.escapeHtml(resolveWorkspaceRelativeUrl(basePath, url))}"`
+    return ` ${attr}="${markdownRenderer.utils.escapeHtml(resolveWorkspaceRelativeUrl(basePath, url, sessionId))}"`
   })
 }
 
-function resolveWorkspaceRelativeUrl(basePath: string, url: string): string {
+function resolveWorkspaceRelativeUrl(basePath: string, url: string, sessionId = ''): string {
   const cleanUrl = url.replace(/^\.\//, '')
   const baseParts = String(basePath || '').split('/').filter(Boolean)
   baseParts.pop()
@@ -3802,7 +4092,7 @@ function resolveWorkspaceRelativeUrl(basePath: string, url: string): string {
       baseParts.push(part)
     }
   }
-  return workspaceOpenUrl(baseParts.join('/'))
+  return workspaceOpenUrl(baseParts.join('/'), false, sessionId)
 }
 
 function wrapMarkdownTextTokens(html: string): string {
@@ -4032,6 +4322,56 @@ function normalizeTextWithMap(value: string): { text: string, map: number[] } {
   return { text, map }
 }
 
+function normalizeMarkdownVisibleTextWithMap(value: string): { text: string, map: number[] } {
+  const ignored = new Array(value.length).fill(false)
+  const patterns = [
+    /^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)/gm,
+    /(?<!\\)(?:\*\*|__|`+)/g,
+    /^[ \t]*(?:\$\$|\\\[|\\\]|\\\(|\\\))[ \t]*$/gm,
+  ]
+  for (const pattern of patterns) {
+    for (const match of value.matchAll(pattern)) {
+      const start = match.index || 0
+      for (let index = start; index < start + match[0].length; index += 1) ignored[index] = true
+    }
+  }
+  let text = ''
+  const map: number[] = []
+  let pendingSpace = false
+  let escaped = false
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index]
+    if (ignored[index]) continue
+    if (escaped) {
+      if (pendingSpace && text.length > 0) {
+        text += ' '
+        map.push(index)
+        pendingSpace = false
+      }
+      text += char
+      map.push(index)
+      escaped = false
+      continue
+    }
+    if (char === '\\') {
+      escaped = true
+      continue
+    }
+    if (/\s/.test(char)) {
+      pendingSpace = text.length > 0
+      continue
+    }
+    if (pendingSpace) {
+      text += ' '
+      map.push(index)
+      pendingSpace = false
+    }
+    text += char
+    map.push(index)
+  }
+  return { text, map }
+}
+
 function applyHighlightRangesToTextNodes(doc: Document, textNodes: Text[], ranges: ResolvedHighlightRange[]): void {
   const normalizedRanges = normalizeHighlightRanges(ranges)
   if (!normalizedRanges.length) return
@@ -4175,6 +4515,23 @@ function buildSessionTree(items: LearningSessionState[]) {
     byParent[parent] = [...(byParent[parent] || []), item]
   }
   return byParent
+}
+
+function buildConversationChildren(items: Record<string, LearningSessionState>): Record<string, string[]> {
+  const children: Record<string, string[]> = {}
+  for (const item of Object.values(items)) {
+    if (!item.parent_session_id) continue
+    children[item.parent_session_id] = [...(children[item.parent_session_id] || []), item.session_id]
+  }
+  for (const parentId of Object.keys(children)) {
+    children[parentId].sort((left, right) => {
+      const leftState = items[left]
+      const rightState = items[right]
+      return Number(rightState?.last_activity_at || rightState?.updated_at || 0) -
+        Number(leftState?.last_activity_at || leftState?.updated_at || 0)
+    })
+  }
+  return children
 }
 
 function isBlankRoot(item: LearningSessionState): boolean {

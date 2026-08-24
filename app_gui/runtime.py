@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from app_gui.event_bus import ContextEventBus
 from app_gui.schemas import (
     EVENT_ERROR,
+    EVENT_LLM_REQUEST_SNAPSHOT,
     EVENT_MEMORY_SNAPSHOT_LOADED,
     EVENT_MESSAGE_APPENDED,
     EVENT_SESSION_STARTED,
@@ -30,10 +31,21 @@ from tools.registry import registry
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+
+def _memory_for_system_prompt() -> str:
+    """返回要拼进 system prompt 的 memory 快照。
+
+    默认 'system' 模式：返回冻结快照（行为不变）。'hidden_user' 模式：返回空串，
+    memory 改由 durable context 以隐藏 user 段注入（权限降级，见 03/04 文档）。
+    """
+    if config.get_memory_injection_mode() == "hidden_user":
+        return ""
+    return memory_manager.load_snapshot()
+
 SELF_EVOLUTION_PROMPT = (
     "\n\n【重要提示：自我进化能力】\n"
     "1. 更新技能(Skills)：你可以使用 `skill_manage` 工具维护技能包；默认优先 patch 现有技能。只有当用户明确要求或发现高度可复用且现有技能无法承载的稳定工作流时，才创建新技能，避免每轮任务都新增 skill。\n"
-    "2. 更新工具(Tools)：你可以使用 `write_file` 工具直接在 `tools/` 目录下编写新的 Python 工具模块并调用 `registry.register`。在下一轮对话时，系统会自动热重载并为你注册新工具。\n"
+    "2. 文件工作区：启用 session sandbox 时，`write_file` 的相对路径属于当前 session workspace，不是宿主仓库。只有用户明确要求并授权修改仓库工具代码时，才能写宿主仓库中的 `tools/`。\n"
     "请始终使用中文回复用户。"
 )
 
@@ -90,18 +102,69 @@ def _coerce_gui_session_id(session_id: Optional[str], *, prefix: str) -> str:
     return sid or new_id(prefix)
 
 
+def _apply_gui_iteration_budget(agent: RAgent) -> RAgent:
+    max_iterations = config.get_gui_max_iterations()
+    agent.max_iterations = max_iterations
+    agent._default_max_iterations = max_iterations
+    return agent
+
+
+def _session_time_bounds(store: ContextSnapshotStore) -> tuple[float, float]:
+    """Return (created_at, last_activity_at) for a persisted GUI session.
+
+    Prefer event timestamps because they reflect conversation activity and survive
+    process restarts. Fall back to context.json mtime for old/empty sessions.
+    """
+    event_times = []
+    for event in getattr(store, "events", []) or []:
+        try:
+            event_times.append(float(event.get("created_at") or 0))
+        except (TypeError, ValueError):
+            continue
+    try:
+        mtime = float(store.context_path.stat().st_mtime) if store.context_path.exists() else 0.0
+    except OSError:
+        mtime = 0.0
+    created_at = min(event_times) if event_times else mtime
+    last_activity_at = max(event_times) if event_times else mtime
+    return created_at, last_activity_at
+
+
+def _session_recent_sort_key(item: Dict[str, Any]) -> tuple[float, float, str]:
+    def _num(value: Any) -> float:
+        try:
+            return float(value or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return (
+        _num(item.get("last_activity_at")),
+        _num(item.get("updated_at")),
+        str(item.get("session_id") or item.get("title") or ""),
+    )
+
+
 def _session_todo_board(session_id: str) -> Optional[Dict[str, Any]]:
     """Return a compact, GUI-friendly todo board snapshot for this session.
 
-    The todo_manage tool stores per-session boards in sandbox/todo_lists. Reading
-    it from session.state() lets the Cockpit polling loop refresh progress even
-    when the agent is still inside a long tool/delegate call and no final chat
-    message has been appended yet.
+    Reading the per-session board from session.state() lets the Cockpit polling
+    loop refresh progress even when the agent is still inside a long
+    tool/delegate call and no final chat message has been appended yet.
     """
     sid = _safe_todo_session_id(session_id)
     if not sid:
         return None
-    path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
+    try:
+        from core import config
+        from core.sandbox_workspace import SandboxWorkspace
+
+        if config.get_session_sandbox_enabled():
+            workspace = SandboxWorkspace(sid, root=config.get_session_sandbox_root())
+            path = workspace.todo_lists / "todo_list.json"
+        else:
+            path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
+    except Exception:
+        path = PROJECT_ROOT / "sandbox" / "todo_lists" / f"todo_list_{sid}.json"
     if not path.exists():
         return None
     try:
@@ -185,7 +248,32 @@ SELECTION_ACTIONS = {
     "explain": ("解释", "请解释选中文本本身的含义、背景、关键概念和常见误区。"),
     "summarize": ("总结", "请总结选中文本本身的核心要点。"),
     "note": ("笔记", "请结合选中文本和用户手写笔记回答，优先围绕笔记中的想法、疑问或判断展开。"),
+    "modify": (
+        "修改",
+        "请根据用户的修改要求改写选中的 Markdown 文本。"
+        "当前阶段只讨论和生成候选替换文本，不要调用任何文件写入工具。"
+        "只回复修改好的 Markdown 内容，不要解释，不要添加标签或 Markdown 代码围栏。"
+        "必须保留内容所需的 Markdown 结构，例如标题/列表、链接、图片、行内代码和数学公式分隔符；"
+        "除非用户明确要求改变结构，否则不要把公式改成普通文本。"
+        "用户后续可以继续提出意见。"
+    ),
 }
+
+MODIFICATION_BRANCH_PROMPT = (
+    "\n\n【Markdown 修改分支协议】\n"
+    "本会话只讨论来源 Markdown 中已选中的文本及其对应完整原始行。"
+    "用户可能连续提出修改意见；每次回答都必须基于此前候选和最新意见，"
+    "给出一份用于替换这些完整原始行的最新 Markdown。"
+    "只回复修改好的 Markdown 内容，不要解释、不要添加标签、不要使用 Markdown 代码围栏。"
+    "保留必要的 Markdown 结构和语义标记，尤其是列表、链接、图片、行内代码、"
+    "数学公式内容与 `$$` / `\\[` / `\\]` 分隔符；用户未要求改变结构时不要删除它们。"
+    "不要调用文件写入、删除或命令工具；只有用户在界面点击“接受修改”后，"
+    "宿主程序才会写入文件。"
+)
+
+_PERSISTED_OUTPUT_PATH_RE = re.compile(r"Full output saved to:\s*(.+)")
+_PERSISTED_OUTPUT_SIZE_RE = re.compile(r"too large \(([\d,]+) characters")
+_DURABLE_SUMMARY_RE = re.compile(r"<durable_summary>\s*(.*?)\s*</durable_summary>", re.DOTALL)
 
 
 class GuiSession:
@@ -195,11 +283,12 @@ class GuiSession:
         self.event_bus = ContextEventBus(store=self.store, session_id=session_id)
         if restore:
             self.event_bus.events = list(self.store.events)
-        self.agent = agent or RAgent(session_id=session_id)
+        self.agent = _apply_gui_iteration_budget(agent or RAgent(session_id=session_id, max_iterations=config.get_gui_max_iterations()))
         self.agent.session_id = session_id
         self.cancel_event = threading.Event()
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
+        self._disposed = False
         self._active_run_id = ""
         self._active_run_baseline = []
         self.last_response: Optional[str] = None
@@ -207,9 +296,11 @@ class GuiSession:
         if restore:
             self.system_prompt = self._restore_system_prompt()
             self.agent.messages = self._restore_agent_messages()
+            self._restore_thread_state()
         else:
             self.system_prompt = self._build_and_emit_system_prompt()
             self.event_bus.emit(EVENT_SESSION_STARTED, {"session_id": session_id, "model": self.agent.model})
+            self._persist_thread_state()
 
     def _restore_system_prompt(self) -> str:
         for event in reversed(self.store.events):
@@ -226,7 +317,7 @@ class GuiSession:
         return self._build_system_prompt_text()
 
     def _build_system_prompt_text(self) -> str:
-        return build_system_prompt() + SELF_EVOLUTION_PROMPT + memory_manager.load_snapshot()
+        return build_system_prompt() + SELF_EVOLUTION_PROMPT + _memory_for_system_prompt()
 
     def _restore_agent_messages(self) -> list:
         messages = []
@@ -268,11 +359,89 @@ class GuiSession:
             return [self._expand_payload_refs(item) for item in value]
         return value
 
+    def _thread_state_snapshot(self, agent: Optional[RAgent] = None) -> Dict[str, Any]:
+        active_agent = agent or self.agent
+        state = getattr(active_agent, "state", None)
+        if state is None:
+            return {"version": 1, "summary_text": "", "artifact_index": []}
+        artifacts = []
+        for entry in getattr(state, "artifact_index", None) or []:
+            if isinstance(entry, dict) and entry.get("path"):
+                artifacts.append(dict(entry))
+        return {
+            "version": 1,
+            "summary_text": str(getattr(state, "summary_text", "") or ""),
+            "artifact_index": artifacts,
+        }
+
+    def _persist_thread_state(self, agent: Optional[RAgent] = None, *, save: bool = True) -> None:
+        if self._disposed:
+            return
+        try:
+            self.store.update_thread_state(self._thread_state_snapshot(agent), save=save)
+        except Exception:
+            pass
+
+    def _restore_thread_state(self) -> None:
+        snapshot = dict(getattr(self.store, "thread_state", None) or {})
+        summary_text = str(snapshot.get("summary_text") or "").strip()
+        if not summary_text:
+            summary_text = self._restore_summary_from_request_events()
+        self.agent.state.summary_text = summary_text
+
+        for entry in snapshot.get("artifact_index") or []:
+            self.agent.state.add_artifact(entry)
+        for entry in self._restore_artifacts_from_messages(self.agent.messages):
+            self.agent.state.add_artifact(entry)
+
+        # Migrate old GUI sessions forward once they have been reconstructed.
+        self._persist_thread_state()
+
+    def _restore_summary_from_request_events(self) -> str:
+        for event in reversed(self.store.events):
+            if event.get("event_type") != EVENT_LLM_REQUEST_SNAPSHOT:
+                continue
+            payload = self._expand_payload_refs(event.get("payload") or {})
+            for message in reversed(payload.get("messages") or []):
+                if not isinstance(message, dict):
+                    continue
+                content = self._expand_payload_refs(message.get("content", ""))
+                match = _DURABLE_SUMMARY_RE.search(str(content or ""))
+                if match:
+                    return match.group(1).strip()
+        return ""
+
+    @staticmethod
+    def _restore_artifacts_from_messages(messages) -> list[Dict[str, Any]]:
+        artifacts = []
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+            content = str(message.get("content") or "")
+            if "<persisted-output>" not in content:
+                continue
+            path_match = _PERSISTED_OUTPUT_PATH_RE.search(content)
+            if not path_match:
+                continue
+            entry = {
+                "path": path_match.group(1).strip(),
+                "tool": message.get("name") or "",
+                "call_id": message.get("tool_call_id"),
+            }
+            size_match = _PERSISTED_OUTPUT_SIZE_RE.search(content)
+            if size_match:
+                try:
+                    entry["original_chars"] = int(size_match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+            artifacts.append(entry)
+        return artifacts
+
     def _build_and_emit_system_prompt(self) -> str:
         base_prompt = build_system_prompt() + SELF_EVOLUTION_PROMPT
         memory_snapshot = memory_manager.load_snapshot()
         self.event_bus.emit(EVENT_MEMORY_SNAPSHOT_LOADED, {"payload_ref": self.store.put_payload(memory_snapshot).to_dict()})
-        system_prompt = base_prompt + memory_snapshot
+        system_prompt = base_prompt + (memory_snapshot if config.get_memory_injection_mode() != "hidden_user" else "")
         self.event_bus.emit(EVENT_SYSTEM_PROMPT_BUILT, {"payload_ref": self.store.put_payload(system_prompt).to_dict()})
         return system_prompt
 
@@ -290,20 +459,24 @@ class GuiSession:
             def emit(self, event_type: str, payload=None, **kwargs):
                 if not session._is_current_run(run_id):
                     return {}
-                return session.event_bus.emit(event_type, payload, **kwargs)
+                session._persist_thread_state(save=False)
+                event = session.event_bus.emit(event_type, payload, **kwargs)
+                return event
 
             def __call__(self, event_type: str, payload=None, **kwargs):
                 if not session._is_current_run(run_id):
                     return {}
-                return session.event_bus(event_type, payload, **kwargs)
+                session._persist_thread_state(save=False)
+                event = session.event_bus(event_type, payload, **kwargs)
+                return event
 
         return ScopedEventSink()
 
     def _new_agent_from_baseline(self, baseline_messages) -> RAgent:
-        agent = RAgent(session_id=self.session_id)
+        agent = RAgent(session_id=self.session_id, max_iterations=config.get_gui_max_iterations())
         agent.session_id = self.session_id
         agent.messages = list(baseline_messages or [])
-        return agent
+        return _apply_gui_iteration_budget(agent)
 
     def send_message(self, text: str, *, background: bool = True) -> Dict[str, Any]:
         text = str(text or "")
@@ -362,6 +535,69 @@ class GuiSession:
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
+                self._persist_thread_state(active_agent)
+            if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
+                self._thread = None
+
+    def continue_after_truncation(self, *, extra_iterations: Optional[int] = None, background: bool = True) -> Dict[str, Any]:
+        if extra_iterations is None:
+            extra_iterations = config.get_gui_max_iterations()
+        extra_iterations = int(extra_iterations)
+        with self._lock:
+            if self.running:
+                raise RuntimeError("session is already running")
+            if not self.agent.is_truncated():
+                raise RuntimeError("session is not truncated")
+            run_id = new_id("continue")
+            self._active_run_id = run_id
+            self._active_run_baseline = list(self.agent.messages)
+            self.cancel_event = threading.Event()
+            cancel_event = self.cancel_event
+            self.last_response = None
+            self.last_error = None
+            run_agent = self.agent
+            event_sink = self._scoped_event_sink(run_id)
+            if background:
+                self._thread = threading.Thread(
+                    target=self._run_continue_after_truncation,
+                    args=(extra_iterations, run_id, run_agent, event_sink, cancel_event),
+                    name=f"gui-session-{self.session_id}-continue",
+                    daemon=True,
+                )
+                self._thread.start()
+                return {"session_id": self.session_id, "status": "running", "extra_iterations": extra_iterations}
+        response = self._run_continue_after_truncation(extra_iterations, run_id, run_agent, event_sink, cancel_event)
+        return {"session_id": self.session_id, "status": "completed", "response": response, "extra_iterations": extra_iterations}
+
+    def _run_continue_after_truncation(self, extra_iterations: int, run_id: str = "", agent: Optional[RAgent] = None, event_sink=None, cancel_event=None) -> str:
+        active_agent = agent or self.agent
+        sink = event_sink or self.event_bus
+        try:
+            active_agent.model = config.get_model()
+            active_agent.session_id = self.session_id
+            active_agent.client = config.create_llm_client()
+            response = active_agent.continue_after_truncation(
+                extra_iterations,
+                cancel_event=cancel_event or self.cancel_event,
+                event_sink=sink,
+            )
+            if not run_id or self._is_current_run(run_id):
+                self.last_response = response
+            return response
+        except AgentInterrupted:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = "interrupted"
+                sink.emit(EVENT_ERROR, {"error": "interrupted"})
+            return "interrupted"
+        except Exception as exc:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = str(exc)
+                sink.emit(EVENT_ERROR, {"error": str(exc)})
+            raise
+        finally:
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
+                self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
 
@@ -386,6 +622,11 @@ class GuiSession:
         alive_background = self.agent.shutdown_background_tasks(timeout=join_timeout)
         interrupt_result["alive_background_tasks"] = alive_background
         return interrupt_result
+
+    def dispose(self, *, join_timeout: float = 1.0) -> Dict[str, Any]:
+        """Stop the session and prevent background saves from recreating it."""
+        self._disposed = True
+        return self.shutdown(join_timeout=join_timeout)
 
 
 
@@ -490,11 +731,17 @@ class GuiSession:
         }
 
     def state(self) -> Dict[str, Any]:
+        created_at, last_activity_at = _session_time_bounds(self.store)
         return {
             "session_id": self.session_id,
             "model": self.agent.model,
             "running": self.running,
+            "truncated": self.agent.is_truncated(),
+            "max_iterations": self.agent.max_iterations,
             "event_count": self.store.event_count(),
+            "created_at": created_at,
+            "updated_at": last_activity_at,
+            "last_activity_at": last_activity_at,
             "last_response": self.last_response,
             "last_error": self.last_error,
             # Backward compatible fields: token_usage remains the parent Agent session total.
@@ -541,6 +788,12 @@ class LearningSession(GuiSession):
         super().__init__(session_id, store_root=store_root, agent=agent, restore=restore, base_dir=base_dir)
         if not self.selection and isinstance(self.store.metadata.get("selection"), dict):
             self.selection = dict(self.store.metadata.get("selection") or {})
+        if self.selection.get("action") == "modify" and MODIFICATION_BRANCH_PROMPT not in self.system_prompt:
+            self.system_prompt += MODIFICATION_BRANCH_PROMPT
+            self.event_bus.emit(
+                EVENT_SYSTEM_PROMPT_BUILT,
+                {"payload_ref": self.store.put_payload(self.system_prompt).to_dict()},
+            )
         self.store.update_metadata({
             "title": self.title,
             "root_question": self.root_question,
@@ -557,12 +810,12 @@ class LearningSession(GuiSession):
         base_prompt = build_system_prompt() + LEARNING_AGENT_PROMPT
         memory_snapshot = memory_manager.load_snapshot()
         self.event_bus.emit(EVENT_MEMORY_SNAPSHOT_LOADED, {"payload_ref": self.store.put_payload(memory_snapshot).to_dict()})
-        system_prompt = base_prompt + memory_snapshot
+        system_prompt = base_prompt + (memory_snapshot if config.get_memory_injection_mode() != "hidden_user" else "")
         self.event_bus.emit(EVENT_SYSTEM_PROMPT_BUILT, {"payload_ref": self.store.put_payload(system_prompt).to_dict()})
         return system_prompt
 
     def _build_system_prompt_text(self) -> str:
-        return build_system_prompt() + LEARNING_AGENT_PROMPT + memory_manager.load_snapshot()
+        return build_system_prompt() + LEARNING_AGENT_PROMPT + _memory_for_system_prompt()
 
     def send_message(self, text: str, *, background: bool = True) -> Dict[str, Any]:
         cleaned = str(text or "").strip()
@@ -603,6 +856,40 @@ class LearningSession(GuiSession):
                 sink.emit(EVENT_ERROR, {"error": str(exc)})
             raise
         finally:
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
+                self._persist_thread_state(active_agent)
+            if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
+                self._thread = None
+
+    def _run_continue_after_truncation(self, extra_iterations: int, run_id: str = "", agent: Optional[RAgent] = None, event_sink=None, cancel_event=None) -> str:
+        active_agent = agent or self.agent
+        sink = event_sink or self.event_bus
+        try:
+            active_agent.model = config.get_model()
+            active_agent.session_id = self.session_id
+            active_agent.client = config.create_llm_client()
+            response = active_agent.continue_after_truncation(
+                extra_iterations,
+                cancel_event=cancel_event or self.cancel_event,
+                event_sink=sink,
+                allowed_tools=LEARNING_ALLOWED_TOOLS if self.tools_enabled else set(),
+            )
+            if not run_id or self._is_current_run(run_id):
+                self.last_response = response
+            return response
+        except AgentInterrupted:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = "interrupted"
+                sink.emit(EVENT_ERROR, {"error": "interrupted"})
+            return "interrupted"
+        except Exception as exc:
+            if not run_id or self._is_current_run(run_id):
+                self.last_error = str(exc)
+                sink.emit(EVENT_ERROR, {"error": str(exc)})
+            raise
+        finally:
+            if not self._disposed and (not run_id or self._is_current_run(run_id)):
+                self._persist_thread_state(active_agent)
             if run_id and self._is_current_run(run_id) and threading.current_thread() is self._thread:
                 self._thread = None
 
@@ -710,6 +997,9 @@ class AgentRuntimeService:
 
     def send_message(self, session_id: str, text: str, *, background: bool = True) -> Dict[str, Any]:
         return self.get_session(session_id).send_message(text, background=background)
+
+    def continue_after_truncation(self, session_id: str, *, extra_iterations: Optional[int] = None, background: bool = True) -> Dict[str, Any]:
+        return self.get_session(session_id).continue_after_truncation(extra_iterations=extra_iterations, background=background)
 
     def interrupt(self, session_id: str) -> Dict[str, Any]:
         return self.get_session(session_id).interrupt()
@@ -1002,7 +1292,7 @@ class LearningRuntimeService(AgentRuntimeService):
             for session in self.sessions.values()
             if getattr(session, "account_id", "default") == account and not getattr(session, "parent_session_id", None)
         ]
-        roots.sort(key=lambda item: (item.get("node_kind") != "chat", item.get("title") or item.get("session_id")))
+        roots.sort(key=_session_recent_sort_key, reverse=True)
         return {"account_id": account, "nodes": roots}
 
     def child_nodes(self, session_id: str) -> Dict[str, Any]:
@@ -1012,11 +1302,7 @@ class LearningRuntimeService(AgentRuntimeService):
             for session in self.sessions.values()
             if getattr(session, "parent_session_id", None) == session_id
         ]
-        children.sort(key=lambda item: (
-            item.get("source_message_index") is None,
-            item.get("source_message_index") if item.get("source_message_index") is not None else 10**12,
-            item.get("title") or item.get("session_id"),
-        ))
+        children.sort(key=_session_recent_sort_key, reverse=True)
         return {
             "session_id": session_id,
             "account_id": getattr(parent, "account_id", "default"),
@@ -1024,11 +1310,15 @@ class LearningRuntimeService(AgentRuntimeService):
         }
 
     def _tree_node_state(self, session: LearningSession) -> Dict[str, Any]:
+        created_at, last_activity_at = _session_time_bounds(session.store)
         return {
             "session_id": session.session_id,
             "model": session.agent.model,
             "running": session.running,
             "event_count": session.store.event_count(),
+            "created_at": created_at,
+            "updated_at": last_activity_at,
+            "last_activity_at": last_activity_at,
             "mode": "learning",
             "title": session.title,
             "root_question": session.root_question,
@@ -1191,6 +1481,7 @@ class LearningRuntimeService(AgentRuntimeService):
         custom_question: str = "",
         target_language: str = "",
         note_text: str = "",
+        modification_instruction: str = "",
         title: str = "",
         source_context: Optional[Dict[str, Any]] = None,
         background: bool = True,
@@ -1204,23 +1495,37 @@ class LearningRuntimeService(AgentRuntimeService):
         question = str(custom_question or "").strip()
         target_language = str(target_language or "").strip()
         note_text = str(note_text or "").strip()
+        modification_instruction = str(modification_instruction or "").strip()
         if action_key == "question" and not question:
             raise ValueError("custom_question is required for question action")
         if action_key == "translate" and not target_language:
             raise ValueError("target_language is required for translate action")
         if action_key == "note" and not note_text:
             raise ValueError("note_text is required for note action")
+        if action_key == "modify" and not modification_instruction:
+            raise ValueError("modification_instruction is required for modify action")
         source = self.get_session(source_session_id)
         source_context = source_context or {}
+        if action_key == "modify":
+            if str(source_context.get("kind") or "").strip().lower() != "markdown":
+                raise ValueError("modify action only supports markdown selections")
+            if not str(source_context.get("path") or "").strip():
+                raise ValueError("source markdown path is required for modify action")
         context_lines = []
         if source_context:
             source_kind = str(source_context.get("kind") or "").strip()
             source_path = str(source_context.get("path") or "").strip()
+            workspace_path = str(source_context.get("workspace_path") or "").strip()
+            absolute_path = str(source_context.get("absolute_path") or "").strip()
             source_location = str(source_context.get("location") or "").strip()
             if source_kind:
                 context_lines.append(f"【来源类型】{source_kind}")
+            if workspace_path and workspace_path != source_path:
+                context_lines.append(f"【文档库路径】{workspace_path}")
             if source_path:
                 context_lines.append(f"【来源文件】{source_path}")
+            if absolute_path:
+                context_lines.append(f"【本地绝对路径】{absolute_path}")
             if source_location:
                 context_lines.append(f"【来源位置】{source_location}")
         context_block = ("\n".join(context_lines) + "\n\n") if context_lines else ""
@@ -1245,6 +1550,16 @@ class LearningRuntimeService(AgentRuntimeService):
                 f"【选中文本】\n{selected_text}\n\n"
                 f"【我的手写笔记】\n{note_text}"
             )
+        elif action_key == "modify":
+            source_lines = str(source_context.get("source_line_text") or selected_text)
+            initial_question = (
+                f"{action_instruction}\n\n"
+                f"{context_block}"
+                f"【选中文本】\n{selected_text}\n\n"
+                f"【接受修改时将被整体替换的原始行】\n{source_lines}\n\n"
+                f"【修改要求】\n{modification_instruction}\n\n"
+                "请只输出用于替换上述完整原始行的最终 Markdown 内容。"
+            )
         else:
             initial_question = (
                 f"{action_instruction}\n\n"
@@ -1259,6 +1574,7 @@ class LearningRuntimeService(AgentRuntimeService):
             "custom_question": question,
             "target_language": target_language,
             "note_text": note_text,
+            "modification_instruction": modification_instruction,
             "source_context": source_context,
         }
         display_title = title or f"{action_label}: {_make_learning_title(selected_text, limit=24)}"
@@ -1271,7 +1587,7 @@ class LearningRuntimeService(AgentRuntimeService):
             node_kind="selection",
             file_path=getattr(source, "file_path", ""),
             source_message_index=len(source.agent.messages),
-            tools_enabled=getattr(source, "tools_enabled", True),
+            tools_enabled=False if action_key == "modify" else getattr(source, "tools_enabled", True),
             selection=selection_meta,
         )
         if action_key in {"question", "explain", "summarize", "note"}:
@@ -1281,6 +1597,301 @@ class LearningRuntimeService(AgentRuntimeService):
         state["send"] = send_result
         state["selection"] = selection_meta
         return state
+
+    def accept_selection_modification(
+        self,
+        session_id: str,
+        *,
+        workspace,
+    ) -> Dict[str, Any]:
+        session = self.get_session(session_id)
+        selection = dict(getattr(session, "selection", None) or {})
+        if selection.get("action") != "modify":
+            raise ValueError("session is not a modify selection branch")
+        if selection.get("accepted"):
+            raise ValueError("modification has already been accepted")
+        if session.running:
+            raise ValueError("session is still running")
+
+        source_context = selection.get("source_context")
+        if not isinstance(source_context, dict):
+            raise ValueError("modify selection source context is missing")
+        if str(source_context.get("kind") or "").strip().lower() != "markdown":
+            raise ValueError("modify action only supports markdown selections")
+        path = str(source_context.get("path") or "").strip()
+        if not path:
+            raise ValueError("source markdown path is missing")
+
+        replacement = self._latest_modification_candidate(session)
+        if replacement is None:
+            raise ValueError("no replacement candidate found; wait for the model response first")
+
+        current = workspace.read_text_file(path)
+        content = str(current.get("content") or "")
+        selected_text = str(selection.get("selected_text") or "")
+        line_start = source_context.get("source_line_start_offset")
+        line_end = source_context.get("source_line_end_offset")
+        original_lines = source_context.get("source_line_text")
+        if (
+            isinstance(line_start, int)
+            and isinstance(line_end, int)
+            and 0 <= line_start <= line_end <= len(content)
+            and isinstance(original_lines, str)
+        ):
+            if content[line_start:line_end] == original_lines:
+                start, end = line_start, line_end
+            else:
+                relocated = self._resolve_original_markdown_range(
+                    content,
+                    selected_text=selected_text,
+                    original_lines=original_lines,
+                    text_offset=source_context.get("source_text_offset"),
+                    occurrence=source_context.get("occurrence"),
+                    preferred_offset=line_start,
+                )
+                if relocated is None:
+                    raise ValueError(
+                        "the original markdown lines have changed and could not be located safely; "
+                        "close this modification window and select the current text again"
+                    )
+                start, end = relocated
+        else:
+            relocated = self._resolve_original_markdown_range(
+                content,
+                selected_text=selected_text,
+                original_lines=original_lines if isinstance(original_lines, str) else "",
+                text_offset=source_context.get("source_text_offset"),
+                occurrence=source_context.get("occurrence"),
+                preferred_offset=source_context.get("source_text_offset"),
+            )
+            if relocated is None:
+                raise ValueError(
+                    "the original selected text has changed and could not be located safely; "
+                    "close this modification window and select the current text again"
+                )
+            start, end = relocated
+
+        updated = content[:start] + replacement + content[end:]
+        item = workspace.write_text_file(path, updated)
+        deleted = []
+        try:
+            deleted = self.delete_subtree(session_id).get("deleted", [])
+        except Exception:
+            # 文件修改已经成功；上下文清理失败不应把成功响应伪装成写入失败。
+            deleted = [session_id]
+        return {
+            "success": True,
+            "session_id": session_id,
+            "path": path,
+            "replacement_text": replacement,
+            "line_start": source_context.get("source_line_start"),
+            "line_end": source_context.get("source_line_end"),
+            "content": updated,
+            "item": item,
+            "deleted": deleted,
+        }
+
+    @staticmethod
+    def _latest_modification_candidate(session: LearningSession) -> Optional[str]:
+        legacy_pattern = re.compile(
+            r"<replacement_markdown>(.*?)</replacement_markdown>",
+            re.DOTALL | re.IGNORECASE,
+        )
+        fence_pattern = re.compile(
+            r"^\s*```(?:markdown|md)?\s*\n(.*?)\n```\s*$",
+            re.DOTALL | re.IGNORECASE,
+        )
+        for message in reversed(normalize_messages(session.agent.messages)):
+            if message.get("role") != "assistant":
+                continue
+            content = str(message.get("content") or "")
+            legacy_match = legacy_pattern.search(content)
+            if legacy_match:
+                content = legacy_match.group(1)
+            else:
+                fence_match = fence_pattern.match(content)
+                if fence_match:
+                    content = fence_match.group(1)
+            candidate = content.strip("\r\n")
+            if candidate.strip():
+                return candidate
+        return None
+
+    @staticmethod
+    def _line_span_for_selection(content: str, start: int, end: int) -> tuple[int, int]:
+        safe_start = max(0, min(start, len(content)))
+        safe_end = max(safe_start, min(end, len(content)))
+        line_start = content.rfind("\n", 0, safe_start) + 1
+        probe = max(safe_start, safe_end - 1)
+        newline = content.find("\n", probe)
+        line_end = len(content) if newline < 0 else newline
+        return line_start, line_end
+
+    @staticmethod
+    def _resolve_selection_offset(
+        content: str,
+        selected_text: str,
+        text_offset: Any,
+        occurrence: Any,
+    ) -> int:
+        if not selected_text:
+            return -1
+        if isinstance(text_offset, int) and text_offset >= 0:
+            if content[text_offset:text_offset + len(selected_text)] == selected_text:
+                return text_offset
+        target_occurrence = occurrence if isinstance(occurrence, int) and occurrence >= 0 else 0
+        start = 0
+        for _ in range(target_occurrence + 1):
+            found = content.find(selected_text, start)
+            if found < 0:
+                return -1
+            start = found + len(selected_text)
+        return found
+
+    @classmethod
+    def _resolve_original_markdown_range(
+        cls,
+        content: str,
+        *,
+        selected_text: str,
+        original_lines: str,
+        text_offset: Any,
+        occurrence: Any,
+        preferred_offset: Any,
+    ) -> Optional[tuple[int, int]]:
+        """Relocate a saved Markdown selection after offsets become stale.
+
+        Existing modify windows can outlive a file reopen or an edit elsewhere
+        in the document. Prefer the exact original line block when it still
+        exists, then fall back to the exact selected text, and finally compare
+        Markdown-visible text (for example `` `G` `` in source versus ``G`` in
+        the rendered selection). Ambiguous matches are rejected unless the
+        saved occurrence or old offset identifies one deterministically.
+        """
+        preferred = preferred_offset if isinstance(preferred_offset, int) and preferred_offset >= 0 else None
+        if original_lines:
+            matches = cls._all_text_ranges(content, original_lines)
+            chosen = cls._choose_relocated_range(matches, preferred_offset=preferred, occurrence=occurrence)
+            if chosen is not None:
+                return chosen
+
+        selected_start = cls._resolve_selection_offset(content, selected_text, text_offset, occurrence)
+        if selected_start >= 0:
+            return cls._line_span_for_selection(
+                content,
+                selected_start,
+                selected_start + len(selected_text),
+            )
+
+        matches = cls._markdown_visible_ranges(content, selected_text)
+        chosen = cls._choose_relocated_range(matches, preferred_offset=preferred, occurrence=occurrence)
+        if chosen is None:
+            return None
+        return cls._line_span_for_selection(content, chosen[0], chosen[1])
+
+    @staticmethod
+    def _all_text_ranges(content: str, needle: str) -> list[tuple[int, int]]:
+        if not needle:
+            return []
+        ranges = []
+        start = 0
+        while True:
+            found = content.find(needle, start)
+            if found < 0:
+                break
+            ranges.append((found, found + len(needle)))
+            start = found + max(1, len(needle))
+        return ranges
+
+    @staticmethod
+    def _choose_relocated_range(
+        matches: list[tuple[int, int]],
+        *,
+        preferred_offset: Optional[int],
+        occurrence: Any,
+    ) -> Optional[tuple[int, int]]:
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        if preferred_offset is not None:
+            distances = sorted(
+                (abs(start - preferred_offset), index, (start, end))
+                for index, (start, end) in enumerate(matches)
+            )
+            if len(distances) == 1 or distances[0][0] < distances[1][0]:
+                return distances[0][2]
+        if isinstance(occurrence, int) and 0 <= occurrence < len(matches):
+            return matches[occurrence]
+        return None
+
+    @classmethod
+    def _markdown_visible_ranges(cls, content: str, selected_text: str) -> list[tuple[int, int]]:
+        source_text, source_map = cls._markdown_visible_text_with_map(content)
+        needle_text, _ = cls._markdown_visible_text_with_map(selected_text)
+        if not source_text or not needle_text:
+            return []
+        ranges = []
+        normalized_start = 0
+        while True:
+            found = source_text.find(needle_text, normalized_start)
+            if found < 0:
+                break
+            normalized_end = found + len(needle_text)
+            start = source_map[found]
+            end = source_map[normalized_end - 1] + 1
+            ranges.append((start, end))
+            normalized_start = found + max(1, len(needle_text))
+        return ranges
+
+    @staticmethod
+    def _markdown_visible_text_with_map(value: str) -> tuple[str, list[int]]:
+        """Normalize common Markdown-only syntax while preserving source offsets."""
+        raw = str(value or "")
+        ignored = [False] * len(raw)
+
+        # Renderers hide structural prefixes and emphasis/code delimiters. Mark
+        # them as non-visible so selections copied from the rendered DOM can be
+        # mapped back to the original Markdown source.
+        prefix_pattern = re.compile(
+            r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)"
+        )
+        delimiter_pattern = re.compile(r"(?<!\\)(?:\*\*|__|`+)")
+        math_delimiter_pattern = re.compile(r"(?m)^[ \t]*(?:\$\$|\\\[|\\\]|\\\(|\\\))[ \t]*$")
+        for pattern in (prefix_pattern, delimiter_pattern, math_delimiter_pattern):
+            for match in pattern.finditer(raw):
+                for index in range(match.start(), match.end()):
+                    ignored[index] = True
+
+        text = ""
+        offsets: list[int] = []
+        pending_space = False
+        escaped = False
+        for index, char in enumerate(raw):
+            if ignored[index]:
+                continue
+            if escaped:
+                if pending_space and text:
+                    text += " "
+                    offsets.append(index)
+                    pending_space = False
+                text += char
+                offsets.append(index)
+                escaped = False
+                continue
+            if char == "\\":
+                escaped = True
+                continue
+            if char.isspace():
+                pending_space = bool(text)
+                continue
+            if pending_space:
+                text += " "
+                offsets.append(index)
+                pending_space = False
+            text += char
+            offsets.append(index)
+        return text, offsets
 
     def save_selection_note(
         self,
@@ -1397,7 +2008,13 @@ class LearningRuntimeService(AgentRuntimeService):
             return False
         return candidate == root or root in candidate.parents
 
-    def delete_sessions_for_workspace_path(self, workspace_path: str, *, is_directory: bool = False) -> Dict[str, Any]:
+    def delete_sessions_for_workspace_path(
+        self,
+        workspace_path: str,
+        *,
+        is_directory: bool = False,
+        session_id: str = "",
+    ) -> Dict[str, Any]:
         """Delete learning session subtrees associated with a workspace file/path.
 
         Matching is intentionally metadata-only: a session is associated when its
@@ -1413,8 +2030,13 @@ class LearningRuntimeService(AgentRuntimeService):
             return {"deleted_learning_sessions": []}
 
         with self._lock:
+            allowed_sessions = None
+            if session_id:
+                allowed_sessions = {session_id, *self.descendant_session_ids(session_id)}
             matched = []
             for sid, session in list(self.sessions.items()):
+                if allowed_sessions is not None and sid not in allowed_sessions:
+                    continue
                 paths = [
                     getattr(session, "file_path", ""),
                     self._selection_source_path(session),
@@ -1460,7 +2082,7 @@ class LearningRuntimeService(AgentRuntimeService):
                 if session is None:
                     continue
                 try:
-                    session.shutdown(join_timeout=0.2)
+                    session.dispose(join_timeout=0.2)
                 except Exception:
                     pass
                 deleted.append(sid)

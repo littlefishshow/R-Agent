@@ -388,5 +388,188 @@ class MemoryManager:
             "content": content,
         }
 
+    def review_memory(self, target: str = "all", long_entry_chars: int = 400) -> dict:
+        """只读审计长期记忆，返回容量、重复、过长和疑似易过期条目。
+
+        该方法只生成 dry-run 报告，绝不修改 USER.md / MEMORY.md。所有命中都是
+        “人工复核候选”，不是自动删除结论。
+        """
+        normalized_target = (target or "all").strip().lower()
+        if normalized_target not in {"all", "user", "memory"}:
+            raise MemoryOperationError("target must be 'all', 'user', or 'memory'.")
+        try:
+            long_limit = int(long_entry_chars)
+        except (TypeError, ValueError):
+            raise MemoryOperationError("long_entry_chars must be an integer.")
+        long_limit = max(80, min(long_limit, 4000))
+
+        stale_patterns = [
+            ("dated_snapshot", re.compile(r"\b20\d{2}-\d{2}-\d{2}\b")),
+            ("commit_sha", re.compile(r"\b[0-9a-f]{7,40}\b", re.IGNORECASE)),
+            ("ticket_reference", re.compile(r"\b(?:PR|MR|issue)\s*#?\d+\b", re.IGNORECASE)),
+            (
+                "task_progress",
+                re.compile(
+                    r"(?:已完成|已修复|阶段\s*\d+|任务进度|本轮结果|"
+                    r"\b(?:fixed|completed|submitted|phase\s+\d+|task progress)\b)",
+                    re.IGNORECASE,
+                ),
+            ),
+        ]
+
+        selected = ["user", "memory"] if normalized_target == "all" else [normalized_target]
+        entries = []
+        capacities = {}
+        with self._lock():
+            for current_target in selected:
+                target_file, label, limit = self._target_file(current_target)
+                raw = self._read_file(target_file)
+                capacities[current_target] = {
+                    "chars": len(raw),
+                    "limit": limit,
+                    "usage_ratio": round(len(raw) / limit, 4) if limit else None,
+                    "status": "high" if limit and len(raw) / limit >= 0.85 else "ok",
+                }
+                for line_no, line in enumerate(raw.splitlines(), start=1):
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    entries.append({
+                        "target": label.lower(),
+                        "line": line_no,
+                        "text": stripped,
+                        "normalized": self._normalize_entry(stripped),
+                    })
+
+        duplicate_map = {}
+        for entry in entries:
+            duplicate_map.setdefault(entry["normalized"], []).append(entry)
+        duplicate_groups = []
+        for normalized, group in duplicate_map.items():
+            if normalized and len(group) > 1:
+                duplicate_groups.append({
+                    "normalized": normalized,
+                    "occurrences": [
+                        {"target": item["target"], "line": item["line"], "text": item["text"]}
+                        for item in group
+                    ],
+                })
+
+        long_entries = [
+            {
+                "target": entry["target"],
+                "line": entry["line"],
+                "chars": len(entry["text"]),
+                "text": entry["text"],
+            }
+            for entry in entries
+            if len(entry["text"]) > long_limit
+        ]
+
+        staleness_candidates = []
+        for entry in entries:
+            reasons = [name for name, pattern in stale_patterns if pattern.search(entry["text"])]
+            if reasons:
+                staleness_candidates.append({
+                    "target": entry["target"],
+                    "line": entry["line"],
+                    "reasons": reasons,
+                    "text": entry["text"],
+                })
+
+        recommendations = []
+        if any(item["status"] == "high" for item in capacities.values()):
+            recommendations.append("Memory 容量超过 85%，建议先人工整理再继续写入。")
+        if duplicate_groups:
+            recommendations.append("发现重复条目；请人工确认后用 memory remove/replace 合并。")
+        if long_entries:
+            recommendations.append("发现过长条目；建议拆成更短、单一事实的记忆。")
+        if staleness_candidates:
+            recommendations.append("发现可能易过期的任务/日期/提交引用；请人工确认是否仍应长期保留。")
+        if not recommendations:
+            recommendations.append("未发现明显治理风险；无需修改。")
+
+        return {
+            "dry_run": True,
+            "target": normalized_target,
+            "entry_count": len(entries),
+            "capacities": capacities,
+            "duplicate_groups": duplicate_groups,
+            "long_entries": long_entries,
+            "staleness_candidates": staleness_candidates,
+            "recommendations": recommendations,
+        }
+
+    def consolidate_memory(self, target: str = "all", apply: bool = False) -> dict:
+        """去重合并长期记忆：仅处理**重复条目**（保留每组首次出现，删除后续重复）。
+
+        安全边界（人工批准闸门）：
+        - 默认 ``apply=False`` 只返回计划（dry-run），不改任何文件；
+        - 只做去重这一**无歧义**操作；过长 / 易过期条目仍只在 review 里报告，需人工判断，
+          本方法不动它们；
+        - 每个文件在锁内一次性原子重写，保留首个出现的行顺序。
+        """
+        normalized_target = (target or "all").strip().lower()
+        if normalized_target not in {"all", "user", "memory"}:
+            raise MemoryOperationError("target must be 'all', 'user', or 'memory'.")
+
+        selected = ["user", "memory"] if normalized_target == "all" else [normalized_target]
+        planned = []
+        removed = []
+
+        with self._lock():
+            for current_target in selected:
+                target_file, label, _limit = self._target_file(current_target)
+                raw = self._read_file(target_file)
+                lines = raw.splitlines()
+
+                seen = set()
+                kept_lines = []
+                dropped_here = []
+                for line in lines:
+                    stripped = line.strip()
+                    if not stripped:
+                        kept_lines.append(line)
+                        continue
+                    key = self._normalize_entry(stripped)
+                    if key and key in seen:
+                        dropped_here.append(stripped)
+                        continue
+                    if key:
+                        seen.add(key)
+                    kept_lines.append(line)
+
+                for text in dropped_here:
+                    entry = {"target": label.lower(), "text": text}
+                    planned.append(entry)
+                    if apply:
+                        removed.append(entry)
+
+                if apply and dropped_here:
+                    cleaned = []
+                    for line in kept_lines:
+                        stripped = line.strip()
+                        if stripped in {"", "-", "*"}:
+                            continue
+                        cleaned.append(line.rstrip())
+                    new_text = "\n".join(cleaned)
+                    if new_text:
+                        new_text += "\n"
+                    self._atomic_write(target_file, new_text)
+
+        return {
+            "target": normalized_target,
+            "applied": bool(apply),
+            "dry_run": not apply,
+            "duplicate_removal_count": len(planned),
+            "planned_removals": planned,
+            "removed": removed if apply else [],
+            "note": (
+                "已删除重复条目（保留每组首次出现）。"
+                if apply else
+                "这是计划（dry-run）；传 apply=true 才会真正删除重复条目。过长/易过期条目不在本操作范围内。"
+            ),
+        }
+
 
 memory_manager = MemoryManager()

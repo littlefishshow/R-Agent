@@ -38,7 +38,8 @@ def _prepend_manual_summary(result: dict, summary: str = "", next_steps: str = "
 def archive_subtask(summary: str = "", next_steps: str = "", messages=None, tools=None,
                     model: str = "", max_context_tokens: int = 0,
                     trigger_ratio: float = 0.8, target_ratio: float = 0.55,
-                    preserve_recent_messages: int = 16, force: bool = True) -> str:
+                    preserve_recent_messages: int = 16, force: bool = True,
+                    triggers=None, keep=None, summary_input_tokens: int = 15564) -> str:
     """统一上下文压缩/归档工具。
 
     兼容旧用法：只传 summary/next_steps 时，由 Agent 主循环拦截并压缩当前 self.messages。
@@ -55,6 +56,17 @@ def archive_subtask(summary: str = "", next_steps: str = "", messages=None, tool
                 target_ratio=target_ratio,
                 preserve_recent_messages=preserve_recent_messages,
                 force=force,
+                triggers=[
+                    (str(item.get("type", "")), item.get("value"))
+                    for item in (triggers or [])
+                    if isinstance(item, dict)
+                ] or None,
+                keep=(
+                    (str(keep.get("type", "")), keep.get("value"))
+                    if isinstance(keep, dict)
+                    else None
+                ),
+                summary_input_tokens=summary_input_tokens,
             )
             result = _prepend_manual_summary(result, summary, next_steps)
             result.setdefault("message", "Context archived and compressed from provided messages.")
@@ -96,6 +108,28 @@ registry.register(
             "trigger_ratio": {"type": "number", "description": "触发压缩比例，默认 0.8。"},
             "target_ratio": {"type": "number", "description": "压缩后目标比例，默认 0.55。"},
             "preserve_recent_messages": {"type": "integer", "description": "至少尝试保留的最近完整 message 数，默认 16。"},
+            "triggers": {
+                "type": "array",
+                "description": "可选触发条件列表，支持 tokens/messages/fraction，任一满足即触发。",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "type": {"type": "string", "enum": ["tokens", "messages", "fraction"]},
+                        "value": {"type": "number"}
+                    },
+                    "required": ["type", "value"]
+                }
+            },
+            "keep": {
+                "type": "object",
+                "description": "可选保留策略，支持 tokens/messages/fraction。",
+                "properties": {
+                    "type": {"type": "string", "enum": ["tokens", "messages", "fraction"]},
+                    "value": {"type": "number"}
+                },
+                "required": ["type", "value"]
+            },
+            "summary_input_tokens": {"type": "integer", "description": "摘要模型输入预算，默认 15564 tokens。"},
             "force": {"type": "boolean", "description": "是否强制压缩；false 时低于阈值仅返回原 messages 和统计。"}
         },
         "required": []

@@ -34,6 +34,20 @@ def _todo_file_path(session_id: Optional[str] = None) -> str:
     sid = _current_session_id(session_id)
     if not sid:
         return TODO_FILE
+    try:
+        from core import config
+        from core.sandbox_workspace import SandboxWorkspace
+
+        if config.get_session_sandbox_enabled():
+            workspace = SandboxWorkspace(
+                session_id=sid,
+                root=config.get_session_sandbox_root(),
+            )
+            workspace.ensure()
+            return str(workspace.todo_lists / "todo_list.json")
+    except Exception:
+        # 路由异常时回退既有 per-session todo 路径，不能影响任务看板。
+        pass
     return os.path.join(TODO_LIST_DIR, f"todo_list_{sid}.json")
 
 
@@ -668,7 +682,8 @@ def _session_from_payload(payload: str) -> str:
 def todo_manage(action: str, payload: str = "{}", session_id: str = "") -> str:
     """管理树状、动态、带拓扑依赖的任务看板。
 
-    session_id 会把 todo 文件隔离到 sandbox/todo_lists/todo_list_<session>.json；
+    session_id 会隔离 todo 文件；启用 SESSION_SANDBOX_ENABLED 时写到当前 session
+    沙箱的 todo_lists/todo_list.json，否则沿用 sandbox/todo_lists/todo_list_<session>.json。
     CLI/GUI/父子 Agent 会自动注入同一个 session_id，避免多个终端互相覆盖。
     未提供 session_id 时保留旧 sandbox/todo_list.json 兼容直接工具调用和旧测试。
     """
@@ -712,7 +727,7 @@ registry.register(
             },
             "session_id": {
                 "type": "string",
-                "description": "可选会话编号；通常不要手动传，CLI/GUI/父 Agent 会自动注入。提供后 todo list 隔离到 sandbox/todo_lists/todo_list_<session_id>.json；'default' 是旧版空 session，不代表当前会话。"
+                "description": "可选会话编号；通常不要手动传，CLI/GUI/父 Agent 会自动注入。启用 session sandbox 时看板位于该 session 的 todo_lists/todo_list.json，否则沿用全局 todo_lists 兼容路径；'default' 是旧版空 session，不代表当前会话。"
             }
         },
         "required": ["action"]

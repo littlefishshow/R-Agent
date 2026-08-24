@@ -26,6 +26,50 @@ def memory_tool(action: str, target: str = "memory", content: str = None, old_te
         return _err("Target must be 'memory' or 'user'.")
 
     try:
+        from core import config
+        from core.memory_provider import get_memory_provider
+
+        if config.get_memory_provider_name() == "deermem":
+            provider = get_memory_provider("deermem")
+            if action == "add":
+                if not content:
+                    return _err("Content is required for 'add'.")
+                result = provider.create_fact(
+                    content,
+                    category="preference" if target == "user" else "context",
+                    source="manual-tool",
+                )
+                if result.get("success"):
+                    return _ok(
+                        "Successfully added durable deermem fact; it is immediately "
+                        "searchable and available to future sessions."
+                    )
+                return _ok("Skipped duplicate deermem fact; content already exists.")
+
+            facts = provider.store.load_facts()
+            matches = [
+                fact for fact in facts
+                if isinstance(old_text, str)
+                and old_text
+                and old_text in str(fact.get("content", ""))
+            ]
+            if len(matches) != 1:
+                return _err(
+                    "old_text must match exactly one deermem fact; "
+                    f"matched {len(matches)}."
+                )
+            fact_id = matches[0]["id"]
+            if action == "replace":
+                if not content:
+                    return _err("old_text and content required for 'replace'.")
+                if provider.replace_fact(fact_id, content):
+                    return _ok("Successfully replaced durable deermem fact.")
+                return _err("Failed to replace deermem fact.")
+            if action == "remove":
+                if provider.delete_fact(fact_id):
+                    return _ok("Successfully removed durable deermem fact.")
+                return _err("Failed to remove deermem fact.")
+
         if action == "add":
             if not content:
                 return _err("Content is required for 'add'.")

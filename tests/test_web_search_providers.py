@@ -8,15 +8,17 @@ def test_local_html_provider_returns_unified_shape(monkeypatch):
     monkeypatch.setattr(
         web_tools,
         "_search_with_provider",
-        lambda provider, query, limit: [{"title": "Example", "href": "https://example.com", "body": "Snippet"}],
+        lambda provider, query, limit: [{"title": "Example", "href": "https://example.com", "body": "Snippet"}] if provider == "bing" else [],
     )
 
-    payload = json.loads(web_tools.web_search_tool("example", limit=3))
+    payload = json.loads(
+        web_tools.web_search_tool("example", limit=3, provider="local_html")
+    )
 
     assert payload["success"] is True
     assert payload["status"] == "ok"
     assert payload["provider"] == "local_html"
-    assert payload["source_provider"] == "duckduckgo"
+    assert payload["source_provider"] == "bing"
     assert payload["total_results"] == 1
     assert payload["results"][0]["url"] == "https://example.com"
     assert payload["results"][0]["snippet"] == "Snippet"
@@ -26,19 +28,21 @@ def test_local_html_provider_returns_unified_shape(monkeypatch):
 
 
 def test_auto_provider_falls_back_to_local_html_without_keys(monkeypatch):
+    monkeypatch.delenv("GOOGLE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_SEARCH_ENGINE_ID", raising=False)
     monkeypatch.delenv("SERPER_API_KEY", raising=False)
     monkeypatch.delenv("GROUNDROUTE_API_KEY", raising=False)
     monkeypatch.setattr(
         web_tools,
         "_search_with_provider",
-        lambda provider, query, limit: [{"title": "Fallback", "href": "https://fallback.test", "body": ""}],
+        lambda provider, query, limit: [{"title": "Fallback", "href": "https://fallback.test", "body": ""}] if provider == "bing" else [],
     )
 
     payload = json.loads(web_tools.web_search_tool("fallback", provider="auto"))
 
     assert payload["success"] is True
-    assert payload["provider"] == "local_html"
-    assert payload["results"][0]["source"] == "duckduckgo"
+    assert payload["provider"] == "bing"
+    assert payload["results"][0]["source"] == "bing"
 
 
 def test_serper_provider_reports_missing_key(monkeypatch):
@@ -49,6 +53,55 @@ def test_serper_provider_reports_missing_key(monkeypatch):
     assert payload["success"] is False
     assert payload["status"] == "missing_api_key"
     assert payload["provider"] == "serper"
+
+
+def test_google_cse_provider_reports_missing_credentials(monkeypatch):
+    monkeypatch.delenv("GOOGLE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_SEARCH_ENGINE_ID", raising=False)
+
+    payload = json.loads(web_tools.web_search_tool("query", provider="google_cse"))
+
+    assert payload["success"] is False
+    assert payload["status"] == "missing_api_key"
+    assert payload["provider"] == "google_cse"
+    assert "GOOGLE_SEARCH_API_KEY" in payload["error"]
+    assert "GOOGLE_SEARCH_ENGINE_ID" in payload["error"]
+
+
+def test_google_cse_provider_returns_unified_shape(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SEARCH_API_KEY", "google-key")
+    monkeypatch.setenv("GOOGLE_SEARCH_ENGINE_ID", "engine-id")
+    captured = {}
+
+    def fake_get_json(url, timeout):
+        captured["url"] = url
+        captured["timeout"] = timeout
+        return {
+            "items": [{
+                "title": "Official result",
+                "link": "https://example.com/google",
+                "snippet": "Google snippet",
+            }]
+        }
+
+    monkeypatch.setattr(web_tools, "_get_json", fake_get_json)
+
+    payload = json.loads(
+        web_tools.web_search_tool("agent runtime", limit=20, provider="google_cse")
+    )
+
+    assert payload["success"] is True
+    assert payload["provider"] == "google_cse"
+    assert payload["source_provider"] == "google"
+    assert payload["results"][0]["url"] == "https://example.com/google"
+    assert payload["results"][0]["snippet"] == "Google snippet"
+    parsed = web_tools.urllib.parse.urlparse(captured["url"])
+    params = web_tools.urllib.parse.parse_qs(parsed.query)
+    assert parsed.netloc == "www.googleapis.com"
+    assert params["key"] == ["google-key"]
+    assert params["cx"] == ["engine-id"]
+    assert params["q"] == ["agent runtime"]
+    assert params["num"] == ["10"]
 
 
 def test_groundroute_provider_reports_missing_key(monkeypatch):
@@ -67,4 +120,102 @@ def test_web_search_schema_exposes_provider_parameter():
 
     properties = web_search_schema["function"]["parameters"]["properties"]
     assert "provider" in properties
-    assert properties["provider"]["default"] == "local_html"
+    assert properties["provider"]["default"] == "auto"
+
+
+def test_local_html_order_can_be_configured(monkeypatch):
+    seen = []
+
+    def fake_search(provider, query, limit):
+        seen.append(provider)
+        return [{"title": "Y", "href": "https://y.test", "body": ""}] if provider == "yahoo" else []
+
+    monkeypatch.setenv("WEB_SEARCH_LOCAL_HTML_ORDER", "yahoo,bing,duckduckgo")
+    monkeypatch.setattr(web_tools, "_search_with_provider", fake_search)
+
+    payload = json.loads(web_tools.web_search_tool("custom", provider="local_html"))
+
+    assert payload["source_provider"] == "yahoo"
+    assert seen == ["yahoo"]
+
+
+def test_auto_provider_order_can_be_configured(monkeypatch):
+    monkeypatch.setenv("SERPER_API_KEY", "dummy")
+    monkeypatch.setenv("GROUNDROUTE_API_KEY", "dummy")
+    monkeypatch.setenv("WEB_SEARCH_PROVIDER_ORDER", "serper,groundroute,local_html")
+
+    assert web_tools._provider_order("auto") == ["serper", "groundroute", "local_html"]
+
+
+def test_auto_provider_places_google_cse_after_bing_when_configured(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SEARCH_API_KEY", "google-key")
+    monkeypatch.setenv("GOOGLE_SEARCH_ENGINE_ID", "engine-id")
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("GROUNDROUTE_API_KEY", raising=False)
+    monkeypatch.delenv("WEB_SEARCH_PROVIDER_ORDER", raising=False)
+
+    assert web_tools._provider_order("auto") == [
+        "bing",
+        "google_cse",
+        "yahoo",
+        "duckduckgo",
+    ]
+
+
+def test_auto_uses_google_after_bing_returns_no_results(monkeypatch):
+    monkeypatch.setenv("GOOGLE_SEARCH_API_KEY", "google-key")
+    monkeypatch.setenv("GOOGLE_SEARCH_ENGINE_ID", "engine-id")
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("GROUNDROUTE_API_KEY", raising=False)
+    monkeypatch.delenv("WEB_SEARCH_PROVIDER_ORDER", raising=False)
+    calls = []
+
+    def fake_search_provider(provider, query, limit):
+        calls.append(provider)
+        if provider == "google_cse":
+            return {
+                "success": True,
+                "status": "ok",
+                "provider": "google_cse",
+                "source_provider": "google",
+                "query": query,
+                "total_results": 1,
+                "results": [{
+                    "title": "Google",
+                    "url": "https://google.test/result",
+                    "snippet": "",
+                }],
+                "warnings": [],
+            }
+        return {
+            "success": True,
+            "status": "no_results",
+            "provider": provider,
+            "source_provider": provider,
+            "query": query,
+            "total_results": 0,
+            "results": [],
+            "warnings": [],
+        }
+
+    monkeypatch.setattr(web_tools, "_search_provider", fake_search_provider)
+
+    payload = json.loads(web_tools.web_search_tool("query", provider="auto"))
+
+    assert calls == ["bing", "google_cse"]
+    assert payload["provider"] == "google_cse"
+    assert payload["results"][0]["url"] == "https://google.test/result"
+
+
+def test_auto_provider_without_google_keeps_local_fallback_order(monkeypatch):
+    monkeypatch.delenv("GOOGLE_SEARCH_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_SEARCH_ENGINE_ID", raising=False)
+    monkeypatch.delenv("SERPER_API_KEY", raising=False)
+    monkeypatch.delenv("GROUNDROUTE_API_KEY", raising=False)
+    monkeypatch.delenv("WEB_SEARCH_PROVIDER_ORDER", raising=False)
+
+    assert web_tools._provider_order("auto") == [
+        "bing",
+        "yahoo",
+        "duckduckgo",
+    ]

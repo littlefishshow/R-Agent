@@ -14,8 +14,29 @@ def _json(data) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def memory_search(query: str, target: str = "all", max_results: int = 5) -> str:
-    """在持久化 memory 中搜索关键词，返回匹配行摘要。"""
+def memory_search(
+    query: str,
+    target: str = "all",
+    max_results: int = 5,
+    session_id: str = "",
+) -> str:
+    """在持久化 memory 中搜索关键词，返回匹配行摘要。
+
+    MEMORY_PROVIDER=deermem 时走结构化事实库的 FTS5 检索（返回带 confidence/category
+    的 fact）；默认 file backend 时走原有的关键词计数搜索，行为不变。
+    """
+    try:
+        from core import config
+        from core.memory_provider import get_memory_provider
+
+        provider_name = config.get_memory_provider_name()
+        if provider_name == "deermem":
+            provider = get_memory_provider("deermem")
+            result = provider.search(query, top_k=max_results, thread_id=session_id or None)
+            return _json({"success": True, "provider": "deermem", **result})
+    except Exception:
+        # 解析/检索出错时退回文件型搜索，保证 memory_search 永不因新 backend 崩溃。
+        pass
     try:
         return _json({"success": True, **memory_manager.search_memory(query, target, max_results)})
     except MemoryOperationError as e:
@@ -34,6 +55,34 @@ def memory_get(target: str, from_line: int = 1, lines: int = 50) -> str:
         return _json({"success": False, "error": f"Unexpected memory_get error: {e}"})
 
 
+def memory_review(target: str = "all", long_entry_chars: int = 400) -> str:
+    """只读审计长期 memory；只报告候选问题，不自动修改。"""
+    try:
+        return _json({
+            "success": True,
+            **memory_manager.review_memory(target=target, long_entry_chars=long_entry_chars),
+        })
+    except MemoryOperationError as e:
+        return _json({"success": False, "error": str(e)})
+    except Exception as e:
+        return _json({"success": False, "error": f"Unexpected memory_review error: {e}"})
+
+
+def memory_consolidate(target: str = "all", confirm: bool = False) -> str:
+    """去重合并长期 memory：仅删除重复条目（保留每组首次出现）。
+
+    人工批准闸门：``confirm`` 缺省为 false，只返回计划（dry-run）；必须显式传
+    ``confirm=true`` 才真正删除。过长/易过期条目不在本操作范围内。
+    """
+    try:
+        result = memory_manager.consolidate_memory(target=target, apply=bool(confirm))
+        return _json({"success": True, **result})
+    except MemoryOperationError as e:
+        return _json({"success": False, "error": str(e)})
+    except Exception as e:
+        return _json({"success": False, "error": f"Unexpected memory_consolidate error: {e}"})
+
+
 registry.register(
     name="memory_search",
     description=(
@@ -47,6 +96,10 @@ registry.register(
             "query": {"type": "string", "description": "搜索关键词；可包含多个空格分隔词"},
             "target": {"type": "string", "enum": ["all", "user", "memory"], "description": "搜索范围，默认 all"},
             "max_results": {"type": "integer", "description": "最大返回结果数，范围 1-50，默认 5"},
+            "session_id": {
+                "type": "string",
+                "description": "当前 session ID；Agent 会自动注入，用于检索临时情节记忆",
+            },
         },
         "required": ["query"],
     },
@@ -70,4 +123,55 @@ registry.register(
         "required": ["target"],
     },
     handler=memory_get,
+)
+
+registry.register(
+    name="memory_review",
+    description=(
+        "只读审计长期 memory 的健康状况：容量占用、重复条目、过长条目、"
+        "疑似易过期的日期/任务/提交引用。该工具是 dry-run，只给人工复核建议，"
+        "绝不会自动删除或修改 USER.md / MEMORY.md。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "enum": ["all", "user", "memory"],
+                "description": "审计范围，默认 all",
+            },
+            "long_entry_chars": {
+                "type": "integer",
+                "description": "超过多少字符视为过长候选，默认 400",
+            },
+        },
+    },
+    handler=memory_review,
+    metadata={"summary": "只读审计长期记忆的重复、容量和易过期风险", "category": "memory"},
+)
+
+registry.register(
+    name="memory_consolidate",
+    description=(
+        "去重合并长期 memory：仅删除重复条目（保留每组首次出现），不动过长/易过期条目。"
+        "**人工批准闸门**：默认 confirm=false 只返回删除计划（dry-run，不改文件）；"
+        "必须在向用户说明后显式传 confirm=true 才会真正删除。请先用 memory_review 复核，"
+        "再在得到确认后执行。"
+    ),
+    parameters={
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "enum": ["all", "user", "memory"],
+                "description": "处理范围，默认 all",
+            },
+            "confirm": {
+                "type": "boolean",
+                "description": "false（默认）只返回计划；true 才真正删除重复条目",
+            },
+        },
+    },
+    handler=memory_consolidate,
+    metadata={"summary": "去重合并长期记忆（需 confirm=true 才落盘）", "category": "memory"},
 )

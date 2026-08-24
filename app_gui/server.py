@@ -43,6 +43,36 @@ def get_file_workspace() -> FileWorkspace:
     return _file_workspace
 
 
+def _workspace_for_session(default_workspace: FileWorkspace, session_id: str = "") -> FileWorkspace:
+    """Return the shared GUI library rooted at ``outputs/``.
+
+    The Cockpit file panel is a user-managed document library (papers, notes,
+    generated reading outputs), not a disposable Agent execution workspace.
+    Keep it shared and stable across chat sessions; ``session_id`` is accepted
+    only for API compatibility with clients created during the sandbox rollout.
+    """
+    return default_workspace
+
+
+def _source_context_with_absolute_path(workspace: FileWorkspace, source_context: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(source_context, dict):
+        return None
+    context = dict(source_context)
+    kind = str(context.get("kind") or "").strip().lower()
+    if kind not in {"pdf", "markdown"}:
+        return context
+    workspace_path = str(context.get("workspace_path") or context.get("path") or "").strip()
+    if not workspace_path:
+        return context
+    try:
+        resolved = workspace.get_file(workspace_path)
+    except Exception:
+        return context
+    context.setdefault("workspace_path", workspace._rel(resolved))
+    context["absolute_path"] = str(resolved)
+    return context
+
+
 def create_app(
     runtime_service: Optional[AgentRuntimeService] = None,
     learning_service: Optional[LearningRuntimeService] = None,
@@ -113,6 +143,18 @@ def create_app(
             text = str(request.get("text") or "")
             background = bool(request.get("background", True))
             return service.send_message(session_id, text, background=background)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/sessions/{session_id}/continue")
+    def continue_session(session_id: str, request: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        try:
+            extra = request.get("extra_iterations")
+            extra_iterations = int(extra) if extra not in (None, "") else None
+            background = bool(request.get("background", True))
+            return service.continue_after_truncation(session_id, extra_iterations=extra_iterations, background=background)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except Exception as exc:
@@ -223,6 +265,18 @@ def create_app(
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/learning/sessions/{session_id}/continue")
+    def continue_learning_session(session_id: str, request: Dict[str, Any] = Body(default_factory=dict)) -> Dict[str, Any]:
+        try:
+            extra = request.get("extra_iterations")
+            extra_iterations = int(extra) if extra not in (None, "") else None
+            background = bool(request.get("background", True))
+            return learning.continue_after_truncation(session_id, extra_iterations=extra_iterations, background=background)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/learning/sessions/{session_id}/tools")
     def set_learning_tools_enabled(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
@@ -274,8 +328,12 @@ def create_app(
                 custom_question=str(request.get("custom_question") or ""),
                 target_language=str(request.get("target_language") or ""),
                 note_text=str(request.get("note_text") or ""),
+                modification_instruction=str(request.get("modification_instruction") or ""),
                 title=str(request.get("title") or ""),
-                source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
+                source_context=_source_context_with_absolute_path(
+                    _workspace_for_session(workspace, str(request.get("workspace_session_id") or "")),
+                    request.get("source_context"),
+                ),
                 background=bool(request.get("background", True)),
                 child_session_id=request.get("session_id"),
             )
@@ -292,8 +350,23 @@ def create_app(
                 selected_text=str(request.get("selected_text") or ""),
                 note_text=str(request.get("note_text") or ""),
                 title=str(request.get("title") or ""),
-                source_context=request.get("source_context") if isinstance(request.get("source_context"), dict) else None,
+                source_context=_source_context_with_absolute_path(
+                    _workspace_for_session(workspace, str(request.get("workspace_session_id") or "")),
+                    request.get("source_context"),
+                ),
                 child_session_id=request.get("session_id"),
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/learning/sessions/{session_id}/accept-modification")
+    def accept_learning_selection_modification(session_id: str) -> Dict[str, Any]:
+        try:
+            return learning.accept_selection_modification(
+                session_id,
+                workspace=_workspace_for_session(workspace, session_id),
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -353,9 +426,9 @@ def create_app(
             raise HTTPException(status_code=404, detail=f"payload not found: {payload_id}") from exc
 
     @app.get("/workspace/files")
-    def list_workspace_files(path: str = "") -> Dict[str, Any]:
+    def list_workspace_files(path: str = "", session_id: str = "") -> Dict[str, Any]:
         try:
-            return workspace.list_dir(path)
+            return _workspace_for_session(workspace, session_id).list_dir(path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
         except NotADirectoryError as exc:
@@ -364,17 +437,18 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/workspace/tree")
-    def get_workspace_tree(expanded: str = "") -> Dict[str, Any]:
+    def get_workspace_tree(expanded: str = "", session_id: str = "") -> Dict[str, Any]:
         try:
             expanded_paths = [item for item in str(expanded or "").split(",") if item or item == ""]
-            return workspace.tree(expanded_paths)
+            return _workspace_for_session(workspace, session_id).tree(expanded_paths)
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/workspace/folders")
     def create_workspace_folder(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
-            return workspace.create_folder(str(request.get("path") or ""), str(request.get("name") or ""))
+            scoped_workspace = _workspace_for_session(workspace, str(request.get("session_id") or ""))
+            return scoped_workspace.create_folder(str(request.get("path") or ""), str(request.get("name") or ""))
         except FileExistsError as exc:
             raise HTTPException(status_code=409, detail=f"folder exists: {exc}") from exc
         except FileNotFoundError as exc:
@@ -385,7 +459,8 @@ def create_app(
     @app.post("/workspace/files")
     def upload_workspace_file(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
-            return workspace.write_base64_file(
+            scoped_workspace = _workspace_for_session(workspace, str(request.get("session_id") or ""))
+            return scoped_workspace.write_base64_file(
                 str(request.get("path") or ""),
                 str(request.get("name") or ""),
                 str(request.get("content_base64") or ""),
@@ -398,9 +473,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/workspace/text")
-    def read_workspace_text(path: str) -> Dict[str, Any]:
+    def read_workspace_text(path: str, session_id: str = "") -> Dict[str, Any]:
         try:
-            return workspace.read_text_file(path)
+            return _workspace_for_session(workspace, session_id).read_text_file(path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
         except IsADirectoryError as exc:
@@ -411,7 +486,8 @@ def create_app(
     @app.put("/workspace/text")
     def write_workspace_text(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
-            return workspace.write_text_file(str(request.get("path") or ""), str(request.get("content") or ""))
+            scoped_workspace = _workspace_for_session(workspace, str(request.get("session_id") or ""))
+            return scoped_workspace.write_text_file(str(request.get("path") or ""), str(request.get("content") or ""))
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
         except IsADirectoryError as exc:
@@ -422,7 +498,8 @@ def create_app(
     @app.post("/workspace/copy")
     def copy_workspace_item(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
-            return workspace.copy(
+            scoped_workspace = _workspace_for_session(workspace, str(request.get("session_id") or ""))
+            return scoped_workspace.copy(
                 str(request.get("source") or ""),
                 str(request.get("target_dir") or ""),
                 str(request.get("name") or "") or None,
@@ -435,16 +512,20 @@ def create_app(
     @app.delete("/workspace/files")
     def delete_workspace_item(request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
+            scoped_workspace = _workspace_for_session(workspace, str(request.get("session_id") or ""))
             requested_path = str(request.get("path") or "")
-            resolved_path = workspace._resolve(requested_path)
-            if resolved_path == workspace.root:
+            resolved_path = scoped_workspace._resolve(requested_path)
+            if resolved_path == scoped_workspace.root:
                 raise ValueError("cannot delete workspace root")
             if not resolved_path.exists():
-                raise FileNotFoundError(workspace._rel(resolved_path))
+                raise FileNotFoundError(scoped_workspace._rel(resolved_path))
             is_directory = resolved_path.is_dir()
-            normalized_path = workspace._rel(resolved_path)
-            result = workspace.delete(requested_path)
-            cleanup = learning.delete_sessions_for_workspace_path(normalized_path, is_directory=is_directory)
+            normalized_path = scoped_workspace._rel(resolved_path)
+            result = scoped_workspace.delete(requested_path)
+            cleanup = learning.delete_sessions_for_workspace_path(
+                normalized_path,
+                is_directory=is_directory,
+            )
             result["deleted_learning_sessions"] = cleanup.get("deleted_learning_sessions", [])
             return result
         except FileNotFoundError as exc:
@@ -453,9 +534,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/workspace/open")
-    def open_workspace_file(path: str, download: bool = False):
+    def open_workspace_file(path: str, download: bool = False, session_id: str = ""):
         try:
-            file_path = workspace.get_file(path)
+            file_path = _workspace_for_session(workspace, session_id).get_file(path)
             media_type = "application/pdf" if file_path.suffix.lower() == ".pdf" else None
             return FileResponse(
                 str(file_path),
@@ -471,9 +552,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/workspace/pdf-text")
-    def get_workspace_pdf_text(path: str) -> Dict[str, Any]:
+    def get_workspace_pdf_text(path: str, session_id: str = "") -> Dict[str, Any]:
         try:
-            return workspace.extract_pdf_text(path)
+            return _workspace_for_session(workspace, session_id).extract_pdf_text(path)
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=f"path not found: {exc}") from exc
         except IsADirectoryError as exc:
@@ -482,9 +563,9 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/workspace/pdf-page-image")
-    def get_workspace_pdf_page_image(path: str, page: int, zoom: float = 1.6):
+    def get_workspace_pdf_page_image(path: str, page: int, zoom: float = 1.6, session_id: str = ""):
         try:
-            png = workspace.render_pdf_page_png(path, page, zoom=zoom)
+            png = _workspace_for_session(workspace, session_id).render_pdf_page_png(path, page, zoom=zoom)
             return StreamingResponse(
                 BytesIO(png),
                 media_type="image/png",

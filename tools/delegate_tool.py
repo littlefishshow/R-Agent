@@ -1,4 +1,5 @@
 import json
+import os
 import time
 import threading
 from pathlib import Path
@@ -9,6 +10,22 @@ from app_gui.schemas import EVENT_DELEGATE_SUBAGENT_STARTED, EVENT_DELEGATE_SUBA
 from rich.panel import Panel
 from tools import progress_render
 from tools.todo_tool import _safe_session_id
+
+
+def _build_subagent_middlewares():
+    """为委派子 Agent 组装中间件：默认加 loop detection（deer-flow loop_capped）。
+
+    子任务是自动执行、无人盯着的，最容易陷入"同一工具反复调用"的死循环，因此这里
+    默认启用循环保护（阈值来自 config，可关）。返回空列表则回退到无中间件。
+    """
+    try:
+        from core.middleware.builtins import LoopDetectionMiddleware
+
+        if not config.get_loop_detection_enabled():
+            return []
+        return [LoopDetectionMiddleware(threshold=config.get_loop_detection_threshold())]
+    except Exception:
+        return []
 
 
 def _current_cli_status():
@@ -65,6 +82,18 @@ def _emit_delegate_event(event_sink, event_type, payload):
             event_sink(event_type, payload)
     except Exception:
         pass
+
+
+def _append_step_event(events, event_type, payload=None, *, limit=32):
+    """追加一条有界子 Agent 步骤事件；达到上限后静默丢弃后续细节。"""
+    if limit <= 0 or len(events) >= limit:
+        return
+    events.append({
+        "seq": len(events) + 1,
+        "event_type": event_type,
+        "created_at": time.time(),
+        **dict(payload or {}),
+    })
 
 
 def _agent_token_usage_summary(agent):
@@ -151,6 +180,44 @@ def _compact_token_usage(usage):
     }
 
 
+def _derive_stop_reason(item) -> str:
+    """从既有 status/truncated 字段推导 deer-flow 风格的 stop_reason（附加语义，不改 status）。
+
+    映射规则：
+    - 已显式带 stop_reason（如 loop detection 设置的 loop_capped）-> 保留
+    - status == success            -> completed
+    - status == timeout            -> timeout（墙钟超时）
+    - status == truncated / truncated=True -> turn_capped（达到 max_iterations）
+    - status == error / 其它       -> error
+    """
+    if not isinstance(item, dict):
+        return "error"
+    explicit = item.get("stop_reason")
+    if explicit:
+        return str(explicit)
+    status = item.get("status")
+    if status == "success":
+        return "completed"
+    if status == "timeout":
+        return "timeout"
+    if status == "truncated" or item.get("truncated"):
+        return "turn_capped"
+    return "error"
+
+
+def _normalize_result_contract(item):
+    """为一条子任务结果补齐 deer-flow 风格的附加契约字段（stop_reason）。
+
+    只**新增**字段，不修改 status/truncated 等既有字段，保证向后兼容。
+    started_at/completed_at 若在 _run_subagent 里已填则保留。
+    """
+    if not isinstance(item, dict):
+        return item
+    item.setdefault("stop_reason", _derive_stop_reason(item))
+    return item
+
+
+
 def _compact_delegate_item(item, *, include_context_artifacts=True, include_token_detail=False, include_goal=False):
     compact = {
         "task_index": item.get("task_index"),
@@ -159,6 +226,11 @@ def _compact_delegate_item(item, *, include_context_artifacts=True, include_toke
         "truncated": bool(item.get("truncated")),
         "max_iterations": item.get("max_iterations"),
     }
+    # stop_reason 是对齐 deer-flow 契约的附加字段（见 Improve_progress/05）。
+    if item.get("stop_reason"):
+        compact["stop_reason"] = item.get("stop_reason")
+    if item.get("step_events"):
+        compact["step_events"] = item.get("step_events")
     if include_goal and "goal" in item:
         compact["goal"] = item.get("goal")
     if item.get("status") == "error" and item.get("result"):
@@ -196,9 +268,23 @@ def _shorten(text, limit=90):
     return text[: limit - 1] + "…"
 
 
+DELEGATE_CONTEXTS_DIR_ENV = "R_AGENT_DELEGATE_CONTEXTS_DIR"
+
+
+def _delegate_contexts_base() -> Path:
+    """委派上下文归档的根目录。
+
+    默认 ``sandbox/delegate_contexts``（旧路径）。启用 per-session 沙箱时，Agent 会把
+    env ``R_AGENT_DELEGATE_CONTEXTS_DIR`` 指向 ``<session-root>/delegate_contexts``，实现
+    按会话隔离。用 env 传递便于跨进程一致，也让删除的安全边界能覆盖两处根。
+    """
+    override = os.environ.get(DELEGATE_CONTEXTS_DIR_ENV, "").strip()
+    return Path(override) if override else Path("sandbox") / "delegate_contexts"
+
+
 def _context_dir(session_id=None):
     safe = str(session_id or "default").replace("/", "_").replace("..", "_")[:80] or "default"
-    path = Path("sandbox") / "delegate_contexts" / safe
+    path = _delegate_contexts_base() / safe
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -265,8 +351,12 @@ def _delete_context_artifact(path):
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
         candidate = candidate.resolve()
-        root = (Path.cwd() / "sandbox" / "delegate_contexts").resolve()
-        if root in candidate.parents and candidate.is_file():
+        # 安全边界：只允许删除位于全局或 per-session 委派上下文根下的文件。
+        allowed_roots = {
+            (Path.cwd() / "sandbox" / "delegate_contexts").resolve(),
+            _delegate_contexts_base().resolve(),
+        }
+        if any(root in candidate.parents for root in allowed_roots) and candidate.is_file():
             candidate.unlink()
             return True
     except Exception:
@@ -598,9 +688,11 @@ def delegate_task(
         return goal
 
     subagent_refs = {}
+    subagent_step_events = {}
     subagent_refs_lock = threading.Lock()
 
     def _run_subagent(task_index, task, cancel_event=None):
+        started_at = time.time()
         goal = _format_goal(task)
         max_iters = task.get("max_iterations", default_max_iterations)
         try:
@@ -609,6 +701,8 @@ def delegate_task(
             max_iters = default_max_iterations
         max_iters = max(1, min(max_iters, 200))
         task_id = _task_id_of(task)
+        step_events = []
+        step_events_limit = config.get_delegate_step_events_limit()
 
         if task_id:
             _print_after_status(
@@ -621,17 +715,23 @@ def delegate_task(
                 f"开始执行普通委托任务(max_iterations={max_iters}): {goal[:500]}"
             )
         try:
-            sub_agent = RAgent(max_iterations=max_iters, session_id=session_id)
+            sub_agent = RAgent(max_iterations=max_iters, session_id=session_id,
+                               middlewares=_build_subagent_middlewares())
         except TypeError:
-            sub_agent = RAgent(max_iterations=max_iters)
             try:
-                setattr(sub_agent, "session_id", session_id)
-            except Exception:
-                pass
+                sub_agent = RAgent(max_iterations=max_iters, session_id=session_id)
+            except TypeError:
+                sub_agent = RAgent(max_iterations=max_iters)
+                try:
+                    setattr(sub_agent, "session_id", session_id)
+                except Exception:
+                    pass
         cancel_event = cancel_event or threading.Event()
         run_id = f"delegate-{task_index}-{task_id or 'adhoc'}"
         with subagent_refs_lock:
-            subagent_refs[(task_index, str(task_id or ""))] = sub_agent
+            subagent_key = (task_index, str(task_id or ""))
+            subagent_refs[subagent_key] = sub_agent
+            subagent_step_events[subagent_key] = step_events
 
         system_prompt = (
             "你是一个专注的子智能体，负责完成被委托的具体子任务。\n\n"
@@ -648,13 +748,39 @@ def delegate_task(
         )
 
         def on_think(iteration, **kwargs):
-            pass
+            payload = {"iteration": iteration}
+            for key in ("retry_attempt", "retry_max", "retry_delay", "retry_reason"):
+                if key in kwargs:
+                    payload[key] = kwargs[key]
+            _append_step_event(
+                step_events,
+                "llm.step",
+                payload,
+                limit=step_events_limit,
+            )
 
         def on_tool_start(func_name, func_args):
             _print_after_status(f"[bold cyan]🛠️  [Sub-Agent {task_index}][/bold cyan] 调用工具: {func_name}")
+            _append_step_event(
+                step_events,
+                "tool.start",
+                {
+                    "name": func_name,
+                    "arguments_preview": str(func_args or "")[:300],
+                },
+                limit=step_events_limit,
+            )
 
         def on_tool_end(func_name, result):
-            pass
+            _append_step_event(
+                step_events,
+                "tool.end",
+                {
+                    "name": func_name,
+                    "result_preview": str(result or "")[:500],
+                },
+                limit=step_events_limit,
+            )
 
         _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_STARTED, {
             "run_id": run_id,
@@ -753,7 +879,13 @@ def delegate_task(
                 "blocked_update": blocked_update,
                 "context_artifact_path": context_artifact_path,
                 "token_usage": token_usage_summary,
+                "started_at": started_at,
+                "completed_at": time.time(),
+                "step_events": list(step_events),
             }
+            # 循环保护命中时，显式记 stop_reason=loop_capped（优先于 status 推导）。
+            if getattr(sub_agent, "_loop_capped", False):
+                item["stop_reason"] = "loop_capped"
             _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_FINISHED, item)
             return item
         except Exception as e:
@@ -783,6 +915,9 @@ def delegate_task(
                 "blocked_update": blocked_update,
                 "context_artifact_path": context_artifact_path,
                 "token_usage": token_usage_summary,
+                "started_at": started_at,
+                "completed_at": time.time(),
+                "step_events": list(step_events),
             }
             _emit_delegate_event(event_sink, EVENT_DELEGATE_SUBAGENT_FINISHED, item)
             return item
@@ -846,6 +981,9 @@ def delegate_task(
                         "blocked_update": blocked_update,
                         "context_artifact_path": None,
                         "token_usage": _agent_token_usage_summary(None),
+                        "step_events": list(
+                            subagent_step_events.get((i, str(_task_id_of(task) or "")), [])
+                        ),
                     }
                 results.append(item)
                 task_id = item.get("task_id") or f"index={item.get('task_index')}"
@@ -870,7 +1008,9 @@ def delegate_task(
                     pass
                 future.cancel()
                 with subagent_refs_lock:
-                    timed_sub_agent = subagent_refs.get((i, str(task_id or "")))
+                    subagent_key = (i, str(task_id or ""))
+                    timed_sub_agent = subagent_refs.get(subagent_key)
+                    timed_step_events = list(subagent_step_events.get(subagent_key, []))
                 context_artifact_path = _save_subagent_context(task_id, timed_sub_agent, "timeout", session_id=session_id, run_id=f"delegate-{i}-{task_id or 'adhoc'}")
                 blocked_update = _mark_task_blocked(
                     task_id,
@@ -888,6 +1028,7 @@ def delegate_task(
                     "blocked_update": blocked_update,
                     "context_artifact_path": context_artifact_path,
                     "token_usage": timed_token_usage,
+                    "step_events": timed_step_events,
                 }
                 results.append(item)
                 pending.remove(future)
@@ -898,6 +1039,9 @@ def delegate_task(
         executor.shutdown(wait=False, cancel_futures=True)
 
     results.sort(key=lambda x: x.get("task_index", 0))
+    # 为每条结果补齐 deer-flow 风格的附加契约字段（stop_reason），只新增不改旧字段。
+    for _item in results:
+        _normalize_result_contract(_item)
     delegated_token_usage = _sum_token_usage(results)
     whole_todo_completed = _all_tasks_completed(session_id)
     cleaned_context_artifacts = _cleanup_all_completed_contexts(session_id)

@@ -50,6 +50,8 @@ def test_frozen_snapshot_does_not_change_after_write(tmp_path):
 
 
 def test_tool_reports_frozen_visibility(monkeypatch, tmp_path):
+    # file backend（显式回退）：验证工具提示写入 frozen system prompt 之外。
+    monkeypatch.setenv("MEMORY_PROVIDER", "file")
     store = MemoryManager(memory_dir=str(tmp_path))
     monkeypatch.setattr(memory_tool_module, "memory_manager", store)
 
@@ -58,3 +60,33 @@ def test_tool_reports_frozen_visibility(monkeypatch, tmp_path):
     assert result["success"] is True
     assert "future sessions" in result["message"]
     assert "frozen system prompt" in result["message"]
+
+
+def test_memory_tool_writes_deermem_fact(monkeypatch, tmp_path):
+    import core.memory_provider as provider_module
+    from core.memory_facts import FactStore
+    from core.memory_provider import DeerMemProvider
+
+    store = FactStore(memory_dir=str(tmp_path))
+    provider = DeerMemProvider(
+        store=store,
+        async_extract=False,
+        memory_dir=str(tmp_path),
+    )
+    monkeypatch.setenv("MEMORY_PROVIDER", "deermem")
+    monkeypatch.setattr(
+        provider_module,
+        "get_memory_provider",
+        lambda name=None: provider,
+    )
+
+    result = json.loads(memory_tool_module.memory_tool(
+        action="add",
+        target="user",
+        content="用户偏好中文回复",
+    ))
+    assert result["success"] is True
+    facts = store.load_facts()
+    assert len(facts) == 1
+    assert facts[0]["content"] == "用户偏好中文回复"
+    assert provider.search("中文回复")["count"] == 1

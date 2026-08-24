@@ -7,11 +7,26 @@ export type ContextEvent = {
   payload: Record<string, any>
 }
 
+export class ApiRequestError extends Error {
+  status: number
+
+  constructor(status: number, message: string) {
+    super(message)
+    this.name = 'ApiRequestError'
+    this.status = status
+  }
+}
+
 export type SessionState = {
   session_id: string
   model: string
   running: boolean
+  truncated?: boolean
+  max_iterations?: number
   event_count: number
+  created_at?: number
+  updated_at?: number
+  last_activity_at?: number
   last_response?: string | null
   last_error?: string | null
   token_usage?: string | number
@@ -47,11 +62,14 @@ export type TodoBoardState = {
 export type LearningSelectionState = {
   source_session_id?: string
   selected_text?: string
-  action?: 'question' | 'translate' | 'explain' | 'summarize' | 'note'
+  action?: 'question' | 'translate' | 'explain' | 'summarize' | 'note' | 'modify'
   action_label?: string
   custom_question?: string
   target_language?: string
   note_text?: string
+  modification_instruction?: string
+  accepted?: boolean
+  replacement_text?: string
   source_context?: Record<string, any>
 }
 
@@ -141,6 +159,16 @@ export async function sendMessage(sessionId: string, text: string): Promise<any>
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, background: true }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function continueSession(sessionId: string, extraIterations?: number): Promise<any> {
+  const res = await fetch(`${API_BASE}/sessions/${sessionId}/continue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ background: true, extra_iterations: extraIterations }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
@@ -242,7 +270,7 @@ export async function fetchLearningChildren(sessionId: string): Promise<{ sessio
 
 export async function fetchLearningSession(sessionId: string): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}`)
-  if (!res.ok) throw new Error(await res.text())
+  if (!res.ok) throw new ApiRequestError(res.status, await res.text())
   return res.json()
 }
 
@@ -251,6 +279,16 @@ export async function sendLearningMessage(sessionId: string, text: string): Prom
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ text, background: true }),
+  })
+  if (!res.ok) throw new Error(await res.text())
+  return res.json()
+}
+
+export async function continueLearningSession(sessionId: string, extraIterations?: number): Promise<any> {
+  const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/continue`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ background: true, extra_iterations: extraIterations }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
@@ -298,12 +336,14 @@ export async function forkLearningSessionFromMessage(sessionId: string, messageI
 
 export async function selectionBranchLearningSession(sessionId: string, payload: {
   selected_text: string
-  action: 'question' | 'translate' | 'explain' | 'summarize' | 'note'
+  action: 'question' | 'translate' | 'explain' | 'summarize' | 'note' | 'modify'
   custom_question?: string
   target_language?: string
   note_text?: string
+  modification_instruction?: string
   title?: string
   source_context?: Record<string, any>
+  workspace_session_id?: string
   background?: boolean
   session_id?: string
 }): Promise<LearningSessionState> {
@@ -316,11 +356,27 @@ export async function selectionBranchLearningSession(sessionId: string, payload:
   return res.json()
 }
 
+export async function acceptSelectionModification(sessionId: string): Promise<{
+  success: boolean
+  session_id: string
+  path: string
+  replacement_text: string
+  content: string
+  deleted: string[]
+}> {
+  const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/accept-modification`, {
+    method: 'POST',
+  })
+  if (!res.ok) throw new ApiRequestError(res.status, await res.text())
+  return res.json()
+}
+
 export async function saveSelectionNoteLearningSession(sessionId: string, payload: {
   selected_text: string
   note_text: string
   title?: string
   source_context?: Record<string, any>
+  workspace_session_id?: string
   session_id?: string
 }): Promise<LearningSessionState> {
   const res = await fetch(`${API_BASE}/learning/sessions/${sessionId}/selection-note`, {
@@ -377,90 +433,99 @@ export async function fetchLearningResources(sessionId: string): Promise<Record<
   return res.json()
 }
 
-export async function listWorkspaceFiles(path = ''): Promise<WorkspaceListing> {
-  const res = await fetch(`${API_BASE}/workspace/files?path=${encodeURIComponent(path)}`)
+export async function listWorkspaceFiles(path = '', sessionId = ''): Promise<WorkspaceListing> {
+  const query = new URLSearchParams({ path })
+  if (sessionId) query.set('session_id', sessionId)
+  const res = await fetch(`${API_BASE}/workspace/files?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function fetchWorkspaceTree(expanded: string[] = ['']): Promise<{ root: WorkspaceTreeNode }> {
+export async function fetchWorkspaceTree(expanded: string[] = [''], sessionId = ''): Promise<{ root: WorkspaceTreeNode }> {
   const query = new URLSearchParams({ expanded: expanded.join(',') })
+  if (sessionId) query.set('session_id', sessionId)
   const res = await fetch(`${API_BASE}/workspace/tree?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function createWorkspaceFolder(path: string, name: string): Promise<WorkspaceItem> {
+export async function createWorkspaceFolder(path: string, name: string, sessionId = ''): Promise<WorkspaceItem> {
   const res = await fetch(`${API_BASE}/workspace/folders`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, name }),
+    body: JSON.stringify({ path, name, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function uploadWorkspaceFile(path: string, file: File): Promise<WorkspaceItem> {
+export async function uploadWorkspaceFile(path: string, file: File, sessionId = ''): Promise<WorkspaceItem> {
   const content_base64 = await fileToBase64(file)
   const res = await fetch(`${API_BASE}/workspace/files`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, name: file.name, content_base64 }),
+    body: JSON.stringify({ path, name: file.name, content_base64, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function copyWorkspaceItem(source: string, targetDir: string, name?: string): Promise<WorkspaceItem> {
+export async function copyWorkspaceItem(source: string, targetDir: string, name?: string, sessionId = ''): Promise<WorkspaceItem> {
   const res = await fetch(`${API_BASE}/workspace/copy`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ source, target_dir: targetDir, name: name || undefined }),
+    body: JSON.stringify({ source, target_dir: targetDir, name: name || undefined, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function deleteWorkspaceItem(path: string): Promise<{ deleted: string }> {
+export async function deleteWorkspaceItem(path: string, sessionId = ''): Promise<{ deleted: string }> {
   const res = await fetch(`${API_BASE}/workspace/files`, {
     method: 'DELETE',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path }),
+    body: JSON.stringify({ path, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export function workspaceOpenUrl(path: string, download = false): string {
+export function workspaceOpenUrl(path: string, download = false, sessionId = ''): string {
   const query = new URLSearchParams({ path })
   if (download) query.set('download', 'true')
+  if (sessionId) query.set('session_id', sessionId)
   return `${API_BASE}/workspace/open?${query.toString()}`
 }
 
-export async function fetchWorkspaceText(path: string): Promise<{ path: string, name: string, content: string, item: WorkspaceItem }> {
-  const res = await fetch(`${API_BASE}/workspace/text?path=${encodeURIComponent(path)}`)
+export async function fetchWorkspaceText(path: string, sessionId = ''): Promise<{ path: string, name: string, content: string, item: WorkspaceItem }> {
+  const query = new URLSearchParams({ path })
+  if (sessionId) query.set('session_id', sessionId)
+  const res = await fetch(`${API_BASE}/workspace/text?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function saveWorkspaceText(path: string, content: string): Promise<WorkspaceItem> {
+export async function saveWorkspaceText(path: string, content: string, sessionId = ''): Promise<WorkspaceItem> {
   const res = await fetch(`${API_BASE}/workspace/text`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ path, content }),
+    body: JSON.stringify({ path, content, session_id: sessionId }),
   })
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export async function fetchWorkspacePdfText(path: string): Promise<PdfTextDocument> {
-  const res = await fetch(`${API_BASE}/workspace/pdf-text?path=${encodeURIComponent(path)}`)
+export async function fetchWorkspacePdfText(path: string, sessionId = ''): Promise<PdfTextDocument> {
+  const query = new URLSearchParams({ path })
+  if (sessionId) query.set('session_id', sessionId)
+  const res = await fetch(`${API_BASE}/workspace/pdf-text?${query.toString()}`)
   if (!res.ok) throw new Error(await res.text())
   return res.json()
 }
 
-export function workspacePdfPageImageUrl(path: string, page: number, zoom = 1.6): string {
+export function workspacePdfPageImageUrl(path: string, page: number, zoom = 1.6, sessionId = ''): string {
   const query = new URLSearchParams({ path, page: String(page), zoom: String(zoom) })
+  if (sessionId) query.set('session_id', sessionId)
   return `${API_BASE}/workspace/pdf-page-image?${query.toString()}`
 }
 

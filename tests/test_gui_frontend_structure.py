@@ -182,6 +182,8 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "selected markdown text" in app
     assert "kind: 'markdown'" in app
     assert "kind: 'pdf'" in app
+    assert "workspace_session_id" in app
+    assert "workspace_session_id" in api
     assert "read_paper" in app
     assert "column-resizer" in app
     assert "PdfTextReader" in app
@@ -298,6 +300,14 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "window-dock" in styles
     assert "dock-item" in styles
     assert "pdf-page-image" in styles
+    assert "restoreRunningSessionWindows" in app
+    assert "preserveRunningSessionAsWindow" not in app
+    assert "item.node_kind === 'selection' || item.node_kind === 'note'" in app
+    assert "buildConversationChildren" in app
+    assert "listLearningSessions(accountId)" in app
+    assert "err instanceof ApiRequestError && err.status === 404" in app
+    assert "error instanceof ApiRequestError && error.status === 404" in app
+    assert "export class ApiRequestError" in api
     assert "pdf-text-status" in styles
     assert "pdf-frame" in styles
     assert "left: var(--sidebar-width, 296px)" in styles

@@ -1,5 +1,6 @@
 import os
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -95,7 +96,8 @@ MEMORY_GUIDANCE = (
     "that prevents the user from having to correct or remind you again. "
     "User preferences and recurring corrections matter more than procedural task details.\n"
     "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
+    "state to memory; use memory_search to recall prior durable memory or current-session "
+    "episodic details when the answer depends on history not visible in the current context. "
     "Specifically: do not record PR numbers, issue numbers, commit SHAs, 'fixed bug X', "
     "'submitted PR Y', 'Phase N done', file counts, or any artifact that will be stale "
     "in 7 days. If a fact will be stale in a week, it does not belong in memory. "
@@ -156,6 +158,37 @@ _SUSPICIOUS_SOUL_PATTERNS = [
 def get_project_root() -> Path:
     """Return the R-Agent repository root."""
     return Path(__file__).resolve().parent.parent
+
+
+def build_runtime_context_block() -> str:
+    """构建动态运行时上下文块（当前只含日期）。
+
+    对齐 deer-flow 的 DynamicContextMiddleware（见学习文档第 6.1 节）：当前日期
+    属于**框架权限**信息，放在 system 层。它每次构建 system prompt 时刷新，弥补
+    R-Agent 此前"模型不知道今天几号"的缺口。
+
+    时区默认 Asia/Shanghai，可用环境变量 R_AGENT_TIMEZONE 覆盖；zoneinfo 不可用
+    时退回本地时间，绝不因此报错。
+    """
+    tz_name = os.environ.get("R_AGENT_TIMEZONE", "Asia/Shanghai")
+    now = None
+    try:
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo(tz_name))
+    except Exception:
+        try:
+            now = datetime.now()
+            tz_name = "local"
+        except Exception:
+            return ""
+    weekday_cn = "一二三四五六日"[now.weekday()]
+    return (
+        "# Runtime context\n"
+        f"Current date: {now.strftime('%Y-%m-%d')} (星期{weekday_cn}), timezone {tz_name}.\n"
+        "This is framework-provided ground truth. Use it for any relative-date reasoning "
+        "(\"today\", \"this week\", \"latest\"). For exact current time, still run a tool."
+    )
 
 
 def get_soul_path() -> Path:
@@ -243,6 +276,11 @@ def build_system_prompt(agent_tools=None) -> str:
         parts.append(soul_content)
     else:
         parts.append(DEFAULT_AGENT_IDENTITY)
+
+    # 1.5 Runtime context: 当前日期（框架权限，每次构建刷新）。
+    runtime_block = build_runtime_context_block()
+    if runtime_block:
+        parts.append(runtime_block)
 
     # 2. General Tool Use Enforcement
     parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)

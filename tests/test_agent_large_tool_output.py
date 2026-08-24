@@ -111,3 +111,43 @@ def test_agent_enforces_aggregate_tool_turn_budget(monkeypatch, tmp_path):
     artifacts = list((Path("sandbox") / "tool_outputs").glob("*.txt"))
     assert len(artifacts) == 1
     assert '"result": "' + ("A" * 100) in artifacts[0].read_text(encoding="utf-8")
+
+
+def test_large_tool_result_migrates_to_per_session_sandbox(monkeypatch, tmp_path):
+    """启用 per-session 沙箱后，大工具结果落盘到 <session-root>/tool_outputs。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SESSION_SANDBOX_ENABLED", "1")
+    monkeypatch.setenv("SESSION_SANDBOX_ROOT", "sandbox/sessions")
+
+    def huge_tool():
+        return "Z" * 90_000
+
+    registry.register("huge_tool_for_migration_test", "huge", {"type": "object", "properties": {}}, huge_tool)
+    monkeypatch.setattr(registry, "get_all_schemas", lambda: [registry._tools["huge_tool_for_migration_test"]["schema"]])
+    monkeypatch.setattr(registry, "execute_tool_isolated", lambda name, args, **kwargs: registry.execute_tool(name, args))
+
+    agent = RAgent(model="test-model", max_iterations=3, enable_self_review=False, session_id="gui/a")
+    agent.client = _FakeClient([
+        _response(_message(tool_calls=[_tool_call("huge_tool_for_migration_test", {})])),
+        _response(_message(content="done", tool_calls=None)),
+    ])
+
+    assert agent.run_conversation("use huge") == "done"
+    # 落盘到该 session 沙箱下，而非全局 sandbox/tool_outputs
+    scoped = list((Path("sandbox") / "sessions" / "gui_a" / "tool_outputs").glob("*.txt"))
+    assert len(scoped) == 1
+    assert "Z" * 100 in scoped[0].read_text(encoding="utf-8")
+    assert not (Path("sandbox") / "tool_outputs").exists()
+
+    # artifact 工具仍能按 <persisted-output> 里的路径读取该文件
+    tool_messages = [m for m in agent.messages if isinstance(m, dict) and m.get("role") == "tool"]
+    persisted = tool_messages[0]["content"]
+    assert PERSISTED_OUTPUT_TAG in persisted
+    saved_line = next(line for line in persisted.splitlines() if "Full output saved to:" in line)
+    saved_path = saved_line.split("Full output saved to:", 1)[1].strip()
+    assert Path(saved_path).is_absolute()
+    assert "/sandbox/sessions/gui_a/tool_outputs/" in saved_path
+    from tools.artifact_tools import artifact_slice_tool
+
+    sliced = json.loads(artifact_slice_tool(saved_path, offset=1, limit=1))
+    assert "Z" in sliced.get("content", "")

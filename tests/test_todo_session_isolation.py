@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import core.agent
@@ -118,6 +119,35 @@ def test_delegate_saves_failed_context_by_artifact_only(monkeypatch, tmp_path):
     digest_task = payload["todo_digest"]["tasks"][0]
     assert digest_task["status"] == "blocked"
     assert digest_task["context_artifact_path"] == item["context_artifact_path"]
+
+
+def test_delegate_context_migrates_to_per_session_sandbox(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    monkeypatch.setattr(todo_tool, "TODO_LIST_DIR", str(tmp_path / "todo_lists"))
+    monkeypatch.setattr(core.agent, "RAgent", _FailingAgent)
+    # Agent 未介入路径解析时，直接用 env 模拟已启用的 per-session 沙箱委派上下文目录。
+    scoped_root = tmp_path / "sandbox" / "sessions" / "ctx-s" / "delegate_contexts"
+    monkeypatch.setenv("R_AGENT_DELEGATE_CONTEXTS_DIR", str(scoped_root))
+    todo_tool.todo_manage("init", json.dumps({"tasks": [{"id": "bad", "description": "bad"}]}), session_id="ctx-s")
+
+    payload = json.loads(delegate_tool.delegate_task(
+        tasks=json.dumps([{"task_id": "bad", "goal": "fail"}]),
+        max_workers=1,
+        session_id="ctx-s",
+        default_wall_timeout_seconds=5,
+    ))
+
+    item = payload["tasks"][0]
+    assert item["status"] == "error"
+    saved = item["context_artifact_path"]
+    assert saved
+    # 落在 per-session 沙箱委派上下文根下，而非全局 sandbox/delegate_contexts
+    assert Path(saved).resolve().is_relative_to(scoped_root.resolve())
+    assert not (tmp_path / "sandbox" / "delegate_contexts").exists()
+    # 安全边界已放宽：迁移后的文件仍可被安全删除
+    assert delegate_tool._delete_context_artifact(saved) is True
+    assert not Path(saved).exists()
 
 
 def test_todo_ready_defaults_to_ids_and_digest_params(monkeypatch, tmp_path):

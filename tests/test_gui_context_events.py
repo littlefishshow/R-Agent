@@ -62,6 +62,11 @@ def test_normalize_message_supports_dict_and_sdk_like_tool_calls():
 def test_snapshot_store_payload_ref_and_single_context_file(tmp_path):
     store = ContextSnapshotStore(tmp_path, preview_chars=5)
     ref = store.put_payload("abcdefghijklmnopqrstuvwxyz")
+    store.update_thread_state({
+        "version": 1,
+        "summary_text": "saved summary",
+        "artifact_index": [{"path": "sandbox/tool_outputs/a.txt", "tool": "demo"}],
+    })
 
     assert ref.truncated is True
     assert ref.preview == "abcde"
@@ -73,6 +78,8 @@ def test_snapshot_store_payload_ref_and_single_context_file(tmp_path):
     bundle = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
     assert bundle["payloads"][ref.id]["content"] == "abcdefghijklmnopqrstuvwxyz"
     assert bundle["events"][0]["event_type"] == "demo"
+    assert bundle["thread_state"]["summary_text"] == "saved summary"
+    assert bundle["thread_state"]["artifact_index"][0]["path"] == "sandbox/tool_outputs/a.txt"
 
 
 def test_build_llm_request_snapshot_contains_messages_and_tool_schemas():

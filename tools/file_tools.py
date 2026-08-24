@@ -3,6 +3,7 @@ import json
 import glob
 import difflib
 import threading
+from typing import Optional
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -33,11 +34,121 @@ def is_in_sandbox(path: str) -> bool:
     except ValueError:
         return False
 
-def is_in_workspace(path: str) -> bool:
-    abs_path = os.path.abspath(path)
-    abs_workspace = os.path.abspath(WORKSPACE_DIR)
+
+def _is_repo_workspace_path(abs_path: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.abspath(abs_path), os.path.abspath(WORKSPACE_DIR)]) == os.path.abspath(WORKSPACE_DIR)
+    except ValueError:
+        return False
+
+
+def _is_relative_host_path(path: str) -> bool:
+    raw = str(path or "").strip().replace("\\", "/")
+    expanded = os.path.expanduser(raw)
+    return bool(raw) and not raw.startswith("/mnt/") and not os.path.isabs(expanded)
+
+
+def _resolve_repo_relative_path(path: str) -> str:
+    candidate = os.path.abspath(os.path.join(WORKSPACE_DIR, os.path.expanduser(str(path or "").strip())))
+    if not _is_repo_workspace_path(candidate):
+        raise ValueError("path escapes R-Agent workspace")
+    return candidate
+
+
+def _session_workspace(session_id: str = ""):
+    """Return the active per-session workspace when the opt-in sandbox is enabled."""
+    try:
+        from core import config
+        from core.sandbox_workspace import SandboxWorkspace
+
+        if not config.get_session_sandbox_enabled():
+            return None
+        sid = str(session_id or os.environ.get("R_AGENT_SESSION_ID", "")).strip()
+        if not sid or sid == "default":
+            return None
+        workspace = SandboxWorkspace(sid, root=config.get_session_sandbox_root())
+        workspace.ensure()
+        return workspace
+    except Exception:
+        return None
+
+
+def _resolve_tool_path(path: str, session_id: str = "") -> tuple[str, object]:
+    """Resolve a tool path against the session workspace when enabled.
+
+    Relative paths become session-workspace-relative. Supported /mnt virtual
+    paths use SandboxWorkspace's mapper. Absolute host paths remain absolute and
+    are handled by the existing outside-workspace approval policy.
+    """
+    raw = str(path or "").strip()
+    workspace = _session_workspace(session_id)
+    if workspace is None:
+        return os.path.abspath(os.path.expanduser(raw)), None
+
+    normalized = raw.replace("\\", "/")
+    if normalized.startswith("/mnt/"):
+        return str(workspace.resolve_virtual(normalized)), workspace
+    expanded = os.path.expanduser(raw)
+    if os.path.isabs(expanded):
+        return os.path.abspath(expanded), workspace
+    candidate = (workspace.workspace / expanded).resolve()
+    root = workspace.workspace.resolve()
+    if candidate != root and root not in candidate.parents:
+        raise ValueError("path escapes session workspace")
+    return str(candidate), workspace
+
+
+def _resolve_read_path(path: str, session_id: str = "") -> tuple[str, object, str]:
+    """Resolve read/search paths with two relative roots.
+
+    With session sandbox enabled, relative read paths first target the session
+    workspace. If absent, the same relative path is tried under the R-Agent repo
+    root so learning-mode questions can inspect shared project/output files.
+    """
+    resolved_path, workspace = _resolve_tool_path(path, session_id)
+    if (
+        workspace is not None
+        and _is_relative_host_path(path)
+        and not os.path.exists(resolved_path)
+    ):
+        repo_path = _resolve_repo_relative_path(path)
+        if os.path.exists(repo_path):
+            return repo_path, workspace, "r_agent_workspace"
+    return resolved_path, workspace, "session_workspace" if workspace is not None else "r_agent_workspace"
+
+
+def _resolve_search_roots(path: str, session_id: str = "") -> tuple[list[tuple[str, str]], object]:
+    resolved_path, workspace, resolved_root = _resolve_read_path(path, session_id)
+    roots = [(resolved_path, resolved_root)]
+    if workspace is not None and _is_relative_host_path(path):
+        repo_path = _resolve_repo_relative_path(path)
+        if os.path.exists(repo_path) and repo_path != resolved_path:
+            roots.append((repo_path, "r_agent_workspace"))
+    return roots, workspace
+
+
+def is_in_workspace(path: str, session_id: str = "") -> bool:
+    try:
+        abs_path, workspace = _resolve_tool_path(path, session_id)
+    except ValueError:
+        return False
+    abs_workspace = str(workspace.workspace.resolve()) if workspace is not None else os.path.abspath(WORKSPACE_DIR)
     try:
         return os.path.commonpath([abs_path, abs_workspace]) == abs_workspace
+    except ValueError:
+        return False
+
+
+def _is_in_active_sandbox(path: str, session_id: str = "") -> bool:
+    try:
+        abs_path, workspace = _resolve_tool_path(path, session_id)
+    except ValueError:
+        return False
+    if workspace is None:
+        return is_in_sandbox(abs_path)
+    root = str(workspace.root.resolve())
+    try:
+        return os.path.commonpath([abs_path, root]) == root
     except ValueError:
         return False
 
@@ -46,6 +157,7 @@ def _outside_workspace_permission_required(
     action: str,
     tool_name: str,
     allow_param: str = "allow_outside_workspace",
+    session_id: str = "",
 ) -> str:
     """Return a non-blocking approval response for outside-workspace file operations.
 
@@ -55,8 +167,8 @@ def _outside_workspace_permission_required(
     assistant must explain the risk to the user; only after explicit chat
     approval may it retry with ``allow_outside_workspace=true``.
     """
-    abs_path = os.path.abspath(os.path.expanduser(path))
-    abs_workspace = os.path.abspath(WORKSPACE_DIR)
+    abs_path, workspace = _resolve_tool_path(path, session_id)
+    abs_workspace = str(workspace.workspace.resolve()) if workspace is not None else os.path.abspath(WORKSPACE_DIR)
     risk_level = "high" if action in {"写入/修改", "删除"} else "medium"
 
     return json.dumps({
@@ -85,26 +197,34 @@ def check_outside_workspace_auth(
     action: str,
     allow_outside_workspace: bool = False,
     tool_name: str = "file_operation",
+    session_id: str = "",
+    resolved_path: Optional[str] = None,
 ) -> object:
     """Check outside-workspace access without blocking for terminal input.
 
     Returns None when the operation may continue; otherwise returns a JSON
     string containing ``permission_required=true``.
     """
-    if not is_in_workspace(path) and not allow_outside_workspace:
-        return _outside_workspace_permission_required(path, action, tool_name)
+    if resolved_path is not None and _is_repo_workspace_path(resolved_path):
+        return None
+    if (
+        not is_in_workspace(path, session_id)
+        and not _is_in_active_sandbox(path, session_id)
+        and not allow_outside_workspace
+    ):
+        return _outside_workspace_permission_required(path, action, tool_name, session_id=session_id)
     return None
 
-def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_workspace: bool = False) -> str:
+def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_workspace: bool = False, session_id: str = "") -> str:
     """Read a file with pagination and line numbers."""
-    permission_response = check_outside_workspace_auth(path, "读取", allow_outside_workspace, "read_file")
-    if permission_response:
-        return permission_response
-        
-    if not os.path.exists(path):
-        return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
     try:
-        abs_path = os.path.abspath(path)
+        resolved_path, _workspace, resolved_root = _resolve_read_path(path, session_id)
+        permission_response = check_outside_workspace_auth(path, "读取", allow_outside_workspace, "read_file", session_id, resolved_path=resolved_path)
+        if permission_response:
+            return permission_response
+        if not os.path.exists(resolved_path):
+            return json.dumps({"error": f"File not found: {path}", "resolved_path": resolved_path}, ensure_ascii=False)
+        abs_path = os.path.abspath(resolved_path)
         read_key = (abs_path, offset, limit)
         
         # 1. 去重检查 (Deduplication Check)
@@ -126,7 +246,7 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_w
                         "dedup": True
                     }, ensure_ascii=False)
                     
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(resolved_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
         start = max(0, offset - 1)
@@ -150,6 +270,8 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_w
 
         result_dict = {
             "path": path,
+            "resolved_path": resolved_path,
+            "resolved_root": resolved_root,
             "content": content,
             "total_lines": len(lines),
             "offset": offset,
@@ -167,16 +289,16 @@ def read_file_tool(path: str, offset: int = 1, limit: int = 500, allow_outside_w
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-def write_file_tool(path: str, content: str, allow_outside_workspace: bool = False) -> str:
+def write_file_tool(path: str, content: str, allow_outside_workspace: bool = False, session_id: str = "") -> str:
     """Write content to a file, completely replacing existing content."""
-    permission_response = check_outside_workspace_auth(path, "写入/修改", allow_outside_workspace, "write_file")
-    if permission_response:
-        return permission_response
-        
     try:
+        resolved_path, _workspace = _resolve_tool_path(path, session_id)
+        permission_response = check_outside_workspace_auth(path, "写入/修改", allow_outside_workspace, "write_file", session_id)
+        if permission_response:
+            return permission_response
         old_content = ""
-        if os.path.exists(path):
-            with open(path, 'r', encoding='utf-8') as f:
+        if os.path.exists(resolved_path):
+            with open(resolved_path, 'r', encoding='utf-8') as f:
                 old_content = f.read()
                 
         # 比较并输出 diff
@@ -194,52 +316,67 @@ def write_file_tool(path: str, content: str, allow_outside_workspace: bool = Fal
         else:
             console.print(f"[dim]ℹ️ 文件 {path} 内容未改变[/dim]")
 
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, 'w', encoding='utf-8') as f:
+        os.makedirs(os.path.dirname(os.path.abspath(resolved_path)), exist_ok=True)
+        with open(resolved_path, 'w', encoding='utf-8') as f:
             f.write(content)
             
         # 使写操作路径对应的去重缓存失效
-        abs_path = os.path.abspath(path)
+        abs_path = os.path.abspath(resolved_path)
         with _read_tracker_lock:
             keys_to_remove = [k for k in _read_tracker["dedup"] if k[0] == abs_path]
             for k in keys_to_remove:
                 _read_tracker["dedup"].pop(k, None)
                 _read_tracker["dedup_hits"].pop(k, None)
                 
-        return json.dumps({"success": True, "path": path}, ensure_ascii=False)
+        return json.dumps({"success": True, "path": path, "resolved_path": resolved_path}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-def search_files_tool(pattern: str, target: str = "content", path: str = ".", allow_outside_workspace: bool = False) -> str:
+def search_files_tool(pattern: str, target: str = "content", path: str = ".", allow_outside_workspace: bool = False, session_id: str = "") -> str:
     """Search for content or files."""
-    permission_response = check_outside_workspace_auth(path, "搜索", allow_outside_workspace, "search_files")
-    if permission_response:
-        return permission_response
-        
     try:
+        search_roots, _workspace = _resolve_search_roots(path, session_id)
+        for resolved_path, _resolved_root in search_roots:
+            permission_response = check_outside_workspace_auth(path, "搜索", allow_outside_workspace, "search_files", session_id, resolved_path=resolved_path)
+            if permission_response:
+                return permission_response
         import re
         results = []
-        if target == "files":
-            for root, _, files in os.walk(path):
-                for file in files:
-                    if re.search(pattern, file):
-                        results.append(os.path.join(root, file))
-        else:
-            for root, _, files in os.walk(path):
-                for file in files:
-                    filepath = os.path.join(root, file)
-                    try:
-                        with open(filepath, 'r', encoding='utf-8') as f:
-                            for i, line in enumerate(f):
-                                if re.search(pattern, line):
-                                    results.append(f"{filepath}:{i+1}:{line.strip()}")
-                    except Exception:
-                        pass
-        return json.dumps({"results": results[:100], "truncated": len(results) > 100}, ensure_ascii=False)
+        seen = set()
+        for resolved_path, _resolved_root in search_roots:
+            if target == "files":
+                for root, _, files in os.walk(resolved_path):
+                    for file in files:
+                        if re.search(pattern, file):
+                            item = os.path.join(root, file)
+                            if item not in seen:
+                                seen.add(item)
+                                results.append(item)
+            else:
+                for root, _, files in os.walk(resolved_path):
+                    for file in files:
+                        filepath = os.path.join(root, file)
+                        try:
+                            with open(filepath, 'r', encoding='utf-8') as f:
+                                for i, line in enumerate(f):
+                                    if re.search(pattern, line):
+                                        item = f"{filepath}:{i+1}:{line.strip()}"
+                                        if item not in seen:
+                                            seen.add(item)
+                                            results.append(item)
+                        except Exception:
+                            pass
+        return json.dumps({
+            "results": results[:100],
+            "truncated": len(results) > 100,
+            "resolved_path": search_roots[0][0] if search_roots else "",
+            "resolved_root": search_roots[0][1] if search_roots else "",
+            "searched_roots": [{"path": root, "root": name} for root, name in search_roots],
+        }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
-def delete_file_tool(path: str, confirm: bool = False) -> str:
+def delete_file_tool(path: str, confirm: bool = False, session_id: str = "") -> str:
     """Delete a file or directory with sandbox protection.
 
     A 方案：删除沙盒外文件/目录时，第一次调用只返回
@@ -247,18 +384,19 @@ def delete_file_tool(path: str, confirm: bool = False) -> str:
     只有用户明确同意后，Agent 才应再次调用并传入 confirm=true。
     """
     try:
-        if not os.path.exists(path):
-            return json.dumps({"error": f"File not found: {path}"}, ensure_ascii=False)
+        resolved_path, workspace = _resolve_tool_path(path, session_id)
+        if not os.path.exists(resolved_path):
+            return json.dumps({"error": f"File not found: {path}", "resolved_path": resolved_path}, ensure_ascii=False)
 
-        abs_path = os.path.abspath(path)
-        abs_sandbox = os.path.abspath(SANDBOX_DIR)
-        abs_workspace = os.path.abspath(WORKSPACE_DIR)
-        target_type = "directory" if os.path.isdir(path) else "file"
+        abs_path = os.path.abspath(resolved_path)
+        abs_sandbox = str(workspace.root.resolve()) if workspace is not None else os.path.abspath(SANDBOX_DIR)
+        abs_workspace = str(workspace.workspace.resolve()) if workspace is not None else os.path.abspath(WORKSPACE_DIR)
+        target_type = "directory" if os.path.isdir(resolved_path) else "file"
 
-        in_workspace = is_in_workspace(path)
+        in_workspace = is_in_workspace(path, session_id)
 
         # 如果不在沙盒内，必须由上层对话确认；不阻塞等待 input。
-        if not is_in_sandbox(path) and not confirm:
+        if not _is_in_active_sandbox(path, session_id) and not confirm:
             return json.dumps({
                 "permission_required": True,
                 "risk_level": "high",
@@ -281,11 +419,11 @@ def delete_file_tool(path: str, confirm: bool = False) -> str:
                 },
             }, ensure_ascii=False)
 
-        if os.path.isdir(path):
+        if os.path.isdir(resolved_path):
             module = __import__("shutil")
-            getattr(module, "rmtree")(path)
+            getattr(module, "rmtree")(resolved_path)
         else:
-            getattr(os, "remove")(path)
+            getattr(os, "remove")(resolved_path)
 
         # 使删除操作路径对应的去重缓存失效
         with _read_tracker_lock:
@@ -295,7 +433,7 @@ def delete_file_tool(path: str, confirm: bool = False) -> str:
                 _read_tracker["dedup_hits"].pop(k, None)
 
         console.print(f"[bold green]✅ 已删除: {path}[/bold green]")
-        return json.dumps({"success": True, "message": f"Deleted {path}"}, ensure_ascii=False)
+        return json.dumps({"success": True, "message": f"Deleted {path}", "resolved_path": resolved_path}, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
@@ -312,6 +450,10 @@ registry.register(
                 "type": "boolean",
                 "description": "用户已明确同意读取工作区外路径时设为 true；默认 false",
                 "default": False
+            },
+            "session_id": {
+                "type": "string",
+                "description": "当前 session ID；Agent 会自动注入。启用 session sandbox 时，相对路径从该 session 的 workspace 解析。"
             }
         },
         "required": ["path"]
@@ -331,6 +473,10 @@ registry.register(
                 "type": "boolean",
                 "description": "用户已明确同意写入工作区外路径时设为 true；默认 false",
                 "default": False
+            },
+            "session_id": {
+                "type": "string",
+                "description": "当前 session ID；Agent 会自动注入。启用 session sandbox 时，相对路径写入该 session 的 workspace。"
             }
         },
         "required": ["path", "content"]
@@ -351,6 +497,10 @@ registry.register(
                 "type": "boolean",
                 "description": "用户已明确同意搜索工作区外路径时设为 true；默认 false",
                 "default": False
+            },
+            "session_id": {
+                "type": "string",
+                "description": "当前 session ID；Agent 会自动注入。启用 session sandbox 时，相对搜索根位于该 session 的 workspace。"
             }
         },
         "required": ["pattern"]
@@ -373,6 +523,10 @@ registry.register(
                 "type": "boolean",
                 "description": "用户已明确同意执行沙盒外删除时设为 true；默认 false",
                 "default": False
+            },
+            "session_id": {
+                "type": "string",
+                "description": "当前 session ID；Agent 会自动注入。启用 session sandbox 时，相对路径从该 session 的 workspace 解析。"
             }
         },
         "required": ["path"]

@@ -8,6 +8,8 @@ import multiprocessing
 import threading
 from typing import Callable, Dict, Any, List, Optional, Type
 
+import cloudpickle
+
 
 def _json_error(message: str) -> str:
     return json.dumps({"error": message}, ensure_ascii=False)
@@ -27,6 +29,11 @@ def _terminate_process(process: multiprocessing.Process, join_timeout: float = 1
         if callable(kill):
             kill()
             process.join(timeout=join_timeout)
+
+
+def _tool_process_start_method(platform: Optional[str] = None) -> str:
+    """Choose a safe multiprocessing start method for isolated tools."""
+    return "spawn" if (platform or sys.platform) in ("darwin", "win32") else "fork"
 
 
 def _execute_tool_from_mapping(tools: Dict[str, Dict[str, Any]], name: str, args_json: str) -> str:
@@ -50,7 +57,7 @@ def _execute_tool_from_mapping(tools: Dict[str, Dict[str, Any]], name: str, args
         return json.dumps({"error": str(e)}, ensure_ascii=False)
 
 
-def _tool_process_entry(conn, tools_snapshot, name: str, args_json: str):
+def _tool_process_entry(conn, tools_payload, name: str, args_json: str):
     """Child-process entry point for isolated tool execution.
 
     The child always attempts to send a JSON string back to the parent.  When a
@@ -59,6 +66,7 @@ def _tool_process_entry(conn, tools_snapshot, name: str, args_json: str):
     tools in the child as a compatibility fallback for spawn-based platforms.
     """
     try:
+        tools_snapshot = cloudpickle.loads(tools_payload) if tools_payload is not None else None
         if tools_snapshot is not None:
             result = _execute_tool_from_mapping(tools_snapshot, name, args_json)
         else:
@@ -98,8 +106,14 @@ class ToolRegistry:
         self._lock = threading.RLock()
         self._tools_signature = None
 
-    def register(self, name: str, description: str, parameters: Dict[str, Any], handler: Callable):
-        """注册一个工具"""
+    def register(self, name: str, description: str, parameters: Dict[str, Any], handler: Callable,
+                 metadata: Optional[Dict[str, Any]] = None):
+        """注册一个工具。
+
+        ``metadata`` 是可选的轻量元信息（如 ``{"summary": "...", "category": "..."}``），
+        供工具目录（deferred exposure）使用。不传时向后兼容，目录会用 description 的
+        首行兜底。
+        """
         with self._lock:
             self._tools[name] = {
                 "schema": {
@@ -110,7 +124,8 @@ class ToolRegistry:
                         "parameters": parameters,
                     }
                 },
-                "handler": handler
+                "handler": handler,
+                "metadata": dict(metadata or {}),
             }
 
     def _iter_tool_files(self):
@@ -150,10 +165,67 @@ class ToolRegistry:
                     print(f"⚠️ Warning: Failed to load tool module {module_name}: {e}")
 
     def get_all_schemas(self) -> List[Dict[str, Any]]:
-        """获取所有已注册工具的 schema 列表，并在工具文件变化时热更新。"""
+        """获取所有已注册工具的 schema 列表，并在工具文件变化时热更新。
+
+        按工具名固定排序返回：注册顺序或 dev 期热重载都可能打乱 dict 插入序，
+        而工具 schema 位于模型请求前缀（通过 tools= 字段传递），顺序抖动会击穿
+        KV cache。固定排序让稳态前缀逐字节稳定。
+        """
         self.reload_all(force=False)
         with self._lock:
-            return [tool["schema"] for tool in self._tools.values()]
+            schemas = [tool["schema"] for tool in self._tools.values()]
+        schemas.sort(key=lambda s: s.get("function", {}).get("name", ""))
+        return schemas
+
+    @staticmethod
+    def _summary_of(tool: Dict[str, Any]) -> str:
+        """取工具的一句话摘要：优先 metadata.summary，否则用 description 首行。"""
+        meta = tool.get("metadata") or {}
+        summary = meta.get("summary")
+        if summary:
+            return str(summary)
+        desc = tool.get("schema", {}).get("function", {}).get("description", "") or ""
+        return desc.strip().splitlines()[0] if desc.strip() else ""
+
+    def get_tool_catalog(self) -> List[Dict[str, Any]]:
+        """返回精简工具目录（name + summary + category），供延迟暴露时给模型看。
+
+        只含"是什么"，不含完整参数 schema，避免工具很多时把上下文撑爆。
+        """
+        self.reload_all(force=False)
+        with self._lock:
+            catalog = []
+            for name, tool in self._tools.items():
+                meta = tool.get("metadata") or {}
+                catalog.append({
+                    "name": name,
+                    "summary": self._summary_of(tool),
+                    "category": meta.get("category", ""),
+                })
+            return catalog
+
+    def get_schemas_for(self, names) -> List[Dict[str, Any]]:
+        """返回指定名字集合的完整 schema（供延迟暴露时提升已选工具）。"""
+        self.reload_all(force=False)
+        wanted = set(names or [])
+        with self._lock:
+            return [t["schema"] for n, t in self._tools.items() if n in wanted]
+
+    def search_catalog(self, query: str, limit: int = 8) -> List[Dict[str, Any]]:
+        """在工具目录里做轻量关键词匹配，返回 name+summary+category 列表。"""
+        q = str(query or "").strip().lower()
+        catalog = self.get_tool_catalog()
+        if not q:
+            return catalog[:limit]
+        terms = [t for t in q.replace(",", " ").split() if t]
+        scored = []
+        for entry in catalog:
+            hay = f"{entry['name']} {entry['summary']} {entry['category']}".lower()
+            score = sum(hay.count(t) for t in terms)
+            if score > 0:
+                scored.append((score, entry))
+        scored.sort(key=lambda x: -x[0])
+        return [e for _s, e in scored[:limit]]
 
     def execute_tool(self, name: str, args_json: str) -> str:
         """执行工具，返回结果的 JSON 字符串"""
@@ -184,28 +256,31 @@ class ToolRegistry:
                 return json.dumps({"error": f"Tool '{name}' not found."})
             tools_snapshot = dict(self._tools)
 
-        # Prefer fork where available: it preserves dynamically registered or
-        # otherwise unpickleable handlers while still isolating execution in a
-        # child process.  Fall back to the platform default (usually spawn on
-        # Windows), where module-defined tools are reloaded if the snapshot cannot
-        # be serialized.
+        # macOS warns (and may deadlock) when a multi-threaded process forks.
+        # cloudpickle preserves dynamically registered lambdas/closures across
+        # spawn, so macOS and Windows can use the safe start method without
+        # losing the registry snapshot. Linux keeps fork for lower overhead.
+        start_method = _tool_process_start_method()
         try:
-            ctx = multiprocessing.get_context("fork")
+            ctx = multiprocessing.get_context(start_method)
         except ValueError:
-            ctx = multiprocessing.get_context()
+            ctx = multiprocessing.get_context("spawn")
+        try:
+            tools_payload = cloudpickle.dumps(tools_snapshot)
+        except Exception:
+            tools_payload = None
 
         parent_conn, child_conn = ctx.Pipe(duplex=False)
         process = ctx.Process(
             target=_tool_process_entry,
-            args=(child_conn, tools_snapshot, name, args_json),
+            args=(child_conn, tools_payload, name, args_json),
             daemon=True,
         )
 
         try:
             process.start()
         except Exception as exc:
-            # Spawn may fail when a dynamically registered handler is not
-            # pickleable.  Retry without the snapshot; child reloads module tools.
+            # Retry without the snapshot; child reloads module-defined tools.
             start_error = exc
             try:
                 parent_conn.close()

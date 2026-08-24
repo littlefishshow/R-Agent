@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import html
 import json
 import re
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 
 # OpenAI/Azure-compatible chat APIs generally do not expose the model context
@@ -26,6 +27,7 @@ DEFAULT_CONTEXT_WINDOW_TOKENS = 128_000
 DEFAULT_TRIGGER_RATIO = 0.8
 DEFAULT_TARGET_RATIO = 0.55
 DEFAULT_PRESERVE_RECENT_MESSAGES = 16
+DEFAULT_SUMMARY_INPUT_TOKENS = 15_564
 
 
 def _as_plain(value: Any) -> Any:
@@ -113,16 +115,47 @@ def should_compress_context(
     *,
     max_context_tokens: int,
     trigger_ratio: float = DEFAULT_TRIGGER_RATIO,
+    triggers: Optional[Sequence[Tuple[str, int | float]]] = None,
+    summary_text: str = "",
 ) -> Dict[str, Any]:
-    estimated = estimate_request_tokens(messages, tools)
-    threshold = int(max_context_tokens * trigger_ratio)
+    normalized = normalize_messages_for_context(messages)
+    estimated = estimate_request_tokens(normalized, tools)
+    summary = str(summary_text or "").strip()
+    summary_already_present = bool(
+        summary
+        and any(summary in _message_content(message) for message in normalized)
+    )
+    summary_tokens = 0 if not summary or summary_already_present else estimate_tokens(summary)
+    summary_messages = 0 if not summary or summary_already_present else 1
+    estimated += summary_tokens
+    configured_triggers = list(triggers or [("fraction", trigger_ratio)])
+    trigger_results = []
+    for kind, value in configured_triggers:
+        kind = str(kind).strip().lower()
+        threshold = int(max_context_tokens * float(value)) if kind == "fraction" else int(value)
+        observed = len(normalized) + summary_messages if kind == "messages" else estimated
+        trigger_results.append({
+            "type": kind,
+            "value": value,
+            "threshold": max(1, threshold),
+            "observed": observed,
+            "met": observed >= max(1, threshold),
+        })
+    token_thresholds = [
+        item["threshold"] for item in trigger_results
+        if item["type"] in ("tokens", "fraction")
+    ]
     return {
-        "should_compress": estimated >= threshold,
+        "should_compress": any(item["met"] for item in trigger_results),
         "estimated_tokens": estimated,
         "max_context_tokens": max_context_tokens,
         "trigger_ratio": trigger_ratio,
-        "threshold_tokens": threshold,
+        "threshold_tokens": token_thresholds[0] if token_thresholds else None,
         "usage_ratio": estimated / max_context_tokens if max_context_tokens else None,
+        "summary_tokens": summary_tokens,
+        "summary_messages": summary_messages,
+        "trigger_results": trigger_results,
+        "triggered_by": [item["type"] for item in trigger_results if item["met"]],
     }
 
 
@@ -192,6 +225,180 @@ def _count_messages(units: Iterable[Iterable[Dict[str, Any]]]) -> int:
     return sum(len(list(unit)) for unit in units)
 
 
+def _normalize_keep(
+    keep: Optional[Tuple[str, int | float]],
+    preserve_recent_messages: int,
+) -> Tuple[str, int | float]:
+    if keep is None:
+        return ("messages", max(1, preserve_recent_messages))
+    kind, value = keep
+    kind = str(kind).strip().lower()
+    if kind not in ("messages", "tokens", "fraction"):
+        return ("messages", max(1, preserve_recent_messages))
+    if kind == "fraction":
+        number = float(value)
+        if not 0 < number <= 1:
+            return ("messages", max(1, preserve_recent_messages))
+        return (kind, number)
+    return (kind, max(1, int(value)))
+
+
+def _split_units_by_keep(
+    units: Sequence[List[Dict[str, Any]]],
+    keep: Tuple[str, int | float],
+    max_context_tokens: int,
+) -> Tuple[List[List[Dict[str, Any]]], List[List[Dict[str, Any]]], Dict[str, Any]]:
+    kind, value = keep
+    if kind == "messages":
+        keep_units: List[List[Dict[str, Any]]] = []
+        kept_messages = 0
+        for unit in reversed(units):
+            if keep_units and kept_messages >= int(value):
+                break
+            keep_units.append(unit)
+            kept_messages += len(unit)
+        keep_units.reverse()
+        cutoff = len(units) - len(keep_units)
+        return list(units[:cutoff]), keep_units, {
+            "keep_type": kind,
+            "keep_value": value,
+            "keep_binary_search": False,
+        }
+
+    target_tokens = (
+        int(max_context_tokens * float(value))
+        if kind == "fraction"
+        else int(value)
+    )
+    target_tokens = max(1, target_tokens)
+    left, right = 0, len(units)
+    cutoff = len(units)
+    while left < right:
+        middle = (left + right) // 2
+        suffix_tokens = estimate_request_tokens(_flatten(units[middle:]))
+        if suffix_tokens <= target_tokens:
+            cutoff = middle
+            right = middle
+        else:
+            left = middle + 1
+    if cutoff >= len(units):
+        cutoff = max(0, len(units) - 1)
+    return list(units[:cutoff]), list(units[cutoff:]), {
+        "keep_type": kind,
+        "keep_value": value,
+        "keep_target_tokens": target_tokens,
+        "keep_binary_search": True,
+    }
+
+
+def _trim_text_to_token_budget(text: str, max_tokens: int, *, strategy: str) -> str:
+    text = str(text or "")
+    if not text or estimate_tokens(text) <= max_tokens:
+        return text
+    left, right = 0, len(text)
+    best = ""
+    while left <= right:
+        length = (left + right) // 2
+        candidate = text[-length:] if strategy == "last" and length else text[:length]
+        if estimate_tokens(candidate) <= max_tokens:
+            best = candidate
+            left = length + 1
+        else:
+            right = length - 1
+    return best
+
+
+def _escape_text_to_token_budget(text: str, max_tokens: int, *, strategy: str) -> str:
+    text = str(text or "")
+    escaped = html.escape(text, quote=False)
+    if not escaped or estimate_tokens(escaped) <= max_tokens:
+        return escaped
+    left, right = 0, len(text)
+    best = ""
+    while left <= right:
+        length = (left + right) // 2
+        candidate = text[-length:] if strategy == "last" and length else text[:length]
+        escaped_candidate = html.escape(candidate, quote=False)
+        if estimate_tokens(escaped_candidate) <= max_tokens:
+            best = escaped_candidate
+            left = length + 1
+        else:
+            right = length - 1
+    return best
+
+
+def build_summary_input(
+    messages_to_summarize: Sequence[Dict[str, Any]],
+    *,
+    previous_summary: str = "",
+    max_tokens: int = DEFAULT_SUMMARY_INPUT_TOKENS,
+) -> Tuple[str, Dict[str, int]]:
+    formatted_messages = json.dumps(
+        normalize_messages_for_context(messages_to_summarize),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    previous = str(previous_summary or "").strip()
+    max_tokens = max(2, int(max_tokens))
+    if previous:
+        wrapper = (
+            "<existing_summary>\n\n</existing_summary>\n\n"
+            "<new_messages>\n\n</new_messages>"
+        )
+        content_budget = max(2, max_tokens - estimate_tokens(wrapper))
+        new_budget = max(1, content_budget // 2)
+        previous_budget = max(1, content_budget - new_budget)
+        trimmed_previous = _trim_text_to_token_budget(
+            previous,
+            previous_budget,
+            strategy="last",
+        )
+        trimmed_messages = _trim_text_to_token_budget(
+            formatted_messages,
+            new_budget,
+            strategy="first",
+        )
+    else:
+        previous_budget = 0
+        wrapper = "<new_messages>\n\n</new_messages>"
+        new_budget = max(1, max_tokens - estimate_tokens(wrapper))
+        trimmed_previous = ""
+        trimmed_messages = _trim_text_to_token_budget(
+            formatted_messages,
+            new_budget,
+            strategy="first",
+        )
+    escaped_previous = _escape_text_to_token_budget(
+        trimmed_previous,
+        previous_budget,
+        strategy="last",
+    ) if trimmed_previous else ""
+    escaped_messages = _escape_text_to_token_budget(
+        trimmed_messages,
+        new_budget,
+        strategy="first",
+    ) if trimmed_messages else ""
+    parts = []
+    if escaped_previous:
+        parts.append(
+            "<existing_summary>\n"
+            + escaped_previous
+            + "\n</existing_summary>"
+        )
+    if escaped_messages:
+        parts.append(
+            "<new_messages>\n"
+            + escaped_messages
+            + "\n</new_messages>"
+        )
+    return "\n\n".join(parts), {
+        "summary_input_budget_tokens": max_tokens,
+        "previous_summary_budget_tokens": previous_budget,
+        "new_messages_budget_tokens": new_budget,
+        "summary_input_estimated_tokens": estimate_tokens("\n\n".join(parts)),
+    }
+
+
 def _build_summary_message(old_messages: Sequence[Dict[str, Any]]) -> Dict[str, str]:
     user_points: List[str] = []
     assistant_points: List[str] = []
@@ -245,6 +452,12 @@ def compress_messages(
     target_ratio: float = DEFAULT_TARGET_RATIO,
     preserve_recent_messages: int = DEFAULT_PRESERVE_RECENT_MESSAGES,
     force: bool = False,
+    summarizer: Optional[Callable[[str], str]] = None,
+    include_summary_message: bool = True,
+    previous_summary: str = "",
+    triggers: Optional[Sequence[Tuple[str, int | float]]] = None,
+    keep: Optional[Tuple[str, int | float]] = None,
+    summary_input_tokens: int = DEFAULT_SUMMARY_INPUT_TOKENS,
 ) -> Dict[str, Any]:
     normalized = normalize_messages_for_context(messages)
     if not normalized:
@@ -257,8 +470,15 @@ def compress_messages(
         }
 
     max_tokens = resolve_context_window(model, max_context_tokens)
-    original_estimated = estimate_request_tokens(normalized, tools)
-    trigger = should_compress_context(normalized, tools, max_context_tokens=max_tokens, trigger_ratio=trigger_ratio)
+    trigger = should_compress_context(
+        normalized,
+        tools,
+        max_context_tokens=max_tokens,
+        trigger_ratio=trigger_ratio,
+        triggers=triggers,
+        summary_text=previous_summary,
+    )
+    original_estimated = trigger["estimated_tokens"]
     if not force and not trigger["should_compress"]:
         return {
             "success": True,
@@ -286,16 +506,13 @@ def compress_messages(
             "stats": {"original_messages": len(normalized), "compressed_messages": len(normalized), **trigger},
         }
 
-    keep_units: List[List[Dict[str, Any]]] = []
-    kept_message_count = 0
-    for unit in reversed(units):
-        if keep_units and kept_message_count >= max(1, preserve_recent_messages):
-            break
-        keep_units.append(unit)
-        kept_message_count += len(unit)
-    keep_units.reverse()
-
-    old_units = units[: len(units) - len(keep_units)]
+    explicit_keep = keep is not None
+    resolved_keep = _normalize_keep(keep, preserve_recent_messages)
+    old_units, keep_units, keep_stats = _split_units_by_keep(
+        units,
+        resolved_keep,
+        max_tokens,
+    )
     old_messages = _flatten(old_units)
     if not old_messages:
         # Not enough history to summarize safely; keep all complete messages.
@@ -308,18 +525,90 @@ def compress_messages(
             "stats": {"original_messages": len(normalized), "compressed_messages": len(normalized), **trigger},
         }
 
-    summary_msg = _build_summary_message(old_messages)
-    compressed = list(leading_system[:1]) + [summary_msg] + _flatten(keep_units)
+    heuristic_source = list(old_messages)
+    if previous_summary.strip():
+        heuristic_source.insert(
+            0,
+            {
+                "role": "system",
+                "content": "【上一版上下文摘要】\n" + previous_summary.strip(),
+            },
+        )
+    summary_msg = _build_summary_message(heuristic_source)
+
+    def build_compressed_messages() -> List[Dict[str, Any]]:
+        summary_part = [summary_msg] if include_summary_message else []
+        return list(leading_system[:1]) + summary_part + _flatten(keep_units)
+
+    def build_budget_messages() -> List[Dict[str, Any]]:
+        return list(leading_system[:1]) + [summary_msg] + _flatten(keep_units)
+
+    compressed = build_compressed_messages()
 
     target_tokens = int(max_tokens * target_ratio)
-    while len(keep_units) > 1 and estimate_request_tokens(compressed, tools) > target_tokens:
+    while (
+        not explicit_keep
+        and len(keep_units) > 1
+        and estimate_request_tokens(build_budget_messages(), tools) > target_tokens
+    ):
         if len(_flatten(keep_units)) <= max(1, preserve_recent_messages):
             break
         old_messages = old_messages + keep_units.pop(0)
-        summary_msg = _build_summary_message(old_messages)
-        compressed = list(leading_system[:1]) + [summary_msg] + _flatten(keep_units)
+        heuristic_source = list(old_messages)
+        if previous_summary.strip():
+            heuristic_source.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": "【上一版上下文摘要】\n" + previous_summary.strip(),
+                },
+            )
+        summary_msg = _build_summary_message(heuristic_source)
+        compressed = build_compressed_messages()
 
-    compressed_estimated = estimate_request_tokens(compressed, tools)
+    summary_strategy = "heuristic"
+    summary_error = None
+    summary_input_stats: Dict[str, int] = {}
+    if summarizer is not None:
+        summary_input, summary_input_stats = build_summary_input(
+            old_messages,
+            previous_summary=previous_summary,
+            max_tokens=summary_input_tokens,
+        )
+        try:
+            generated = str(summarizer(summary_input) or "").strip()
+            if generated:
+                summary_msg = {"role": "system", "content": generated}
+                compressed = build_compressed_messages()
+                summary_strategy = "llm"
+            else:
+                summary_strategy = "llm_failed"
+                summary_error = "summarizer returned empty content"
+        except Exception as exc:
+            summary_strategy = "llm_failed"
+            summary_error = str(exc)
+        if summary_strategy == "llm_failed":
+            return {
+                "success": True,
+                "compressed": False,
+                "reason": "summary_failed",
+                "compressed_messages": normalized,
+                "summary": previous_summary,
+                "stats": {
+                    "original_messages": len(normalized),
+                    "compressed_messages": len(normalized),
+                    "original_estimated_tokens": original_estimated,
+                    "compressed_estimated_tokens": original_estimated,
+                    "max_context_tokens": max_tokens,
+                    "summary_strategy": summary_strategy,
+                    "summary_error": summary_error,
+                    **trigger,
+                    **keep_stats,
+                    **summary_input_stats,
+                },
+            }
+
+    compressed_estimated = estimate_request_tokens(build_budget_messages(), tools)
     return {
         "success": True,
         "compressed": True,
@@ -335,9 +624,15 @@ def compress_messages(
             "max_context_tokens": max_tokens,
             "trigger_ratio": trigger_ratio,
             "target_ratio": target_ratio,
-            "threshold_tokens": int(max_tokens * trigger_ratio),
+            "threshold_tokens": trigger.get("threshold_tokens"),
+            "trigger_results": trigger.get("trigger_results", []),
+            "triggered_by": trigger.get("triggered_by", []),
             "target_tokens": target_tokens,
             "usage_ratio_before": original_estimated / max_tokens if max_tokens else None,
             "usage_ratio_after": compressed_estimated / max_tokens if max_tokens else None,
+            "summary_strategy": summary_strategy,
+            **keep_stats,
+            **summary_input_stats,
+            **({"summary_error": summary_error} if summary_error else {}),
         },
     }
