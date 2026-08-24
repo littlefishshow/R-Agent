@@ -4327,6 +4327,7 @@ function normalizeMarkdownVisibleTextWithMap(value: string): { text: string, map
   const patterns = [
     /^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)/gm,
     /(?<!\\)(?:\*\*|__|`+)/g,
+    /^[ \t]*(?:\$\$|\\\[|\\\]|\\\(|\\\))[ \t]*$/gm,
   ]
   for (const pattern of patterns) {
     for (const match of value.matchAll(pattern)) {

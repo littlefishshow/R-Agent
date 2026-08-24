@@ -218,7 +218,10 @@ def test_skill_policy_only_applies_after_explicit_activation(monkeypatch, tmp_pa
 
     assert agent.run_conversation("activate files") == "done"
     assert "run_command" in seen_tools[0]  # 激活前不收窄
-    assert set(seen_tools[1]) == {
+    # 收缩延迟（KV 稳定）：技能激活是「收窄」而非「增长」，schema 前缀仍保留激活前
+    # 的工具超集，run_command 依旧出现在 schema 里，等下次压缩才随 KV 重建收窄。
+    assert "run_command" in seen_tools[1]
+    assert set(seen_tools[1]) >= {
         "skill_activate",
         "skill_view",
         "skill_search",
@@ -227,6 +230,9 @@ def test_skill_policy_only_applies_after_explicit_activation(monkeypatch, tmp_pa
         "write_file",
     }
     assert agent.state.active_skill_policy["skill"] == "files"
+    # 但执行层保底闸门已生效：白名单不含 run_command，真正调用会被拒。
+    allowed = agent._effective_skill_allowed_tools()
+    assert allowed is not None and "run_command" not in allowed
 
 
 def test_skill_policy_deactivate_restores_unrestricted_state():

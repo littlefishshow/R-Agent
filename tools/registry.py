@@ -165,10 +165,17 @@ class ToolRegistry:
                     print(f"⚠️ Warning: Failed to load tool module {module_name}: {e}")
 
     def get_all_schemas(self) -> List[Dict[str, Any]]:
-        """获取所有已注册工具的 schema 列表，并在工具文件变化时热更新。"""
+        """获取所有已注册工具的 schema 列表，并在工具文件变化时热更新。
+
+        按工具名固定排序返回：注册顺序或 dev 期热重载都可能打乱 dict 插入序，
+        而工具 schema 位于模型请求前缀（通过 tools= 字段传递），顺序抖动会击穿
+        KV cache。固定排序让稳态前缀逐字节稳定。
+        """
         self.reload_all(force=False)
         with self._lock:
-            return [tool["schema"] for tool in self._tools.values()]
+            schemas = [tool["schema"] for tool in self._tools.values()]
+        schemas.sort(key=lambda s: s.get("function", {}).get("name", ""))
+        return schemas
 
     @staticmethod
     def _summary_of(tool: Dict[str, Any]) -> str:

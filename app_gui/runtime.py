@@ -253,6 +253,8 @@ SELECTION_ACTIONS = {
         "请根据用户的修改要求改写选中的 Markdown 文本。"
         "当前阶段只讨论和生成候选替换文本，不要调用任何文件写入工具。"
         "只回复修改好的 Markdown 内容，不要解释，不要添加标签或 Markdown 代码围栏。"
+        "必须保留内容所需的 Markdown 结构，例如标题/列表、链接、图片、行内代码和数学公式分隔符；"
+        "除非用户明确要求改变结构，否则不要把公式改成普通文本。"
         "用户后续可以继续提出意见。"
     ),
 }
@@ -263,6 +265,8 @@ MODIFICATION_BRANCH_PROMPT = (
     "用户可能连续提出修改意见；每次回答都必须基于此前候选和最新意见，"
     "给出一份用于替换这些完整原始行的最新 Markdown。"
     "只回复修改好的 Markdown 内容，不要解释、不要添加标签、不要使用 Markdown 代码围栏。"
+    "保留必要的 Markdown 结构和语义标记，尤其是列表、链接、图片、行内代码、"
+    "数学公式内容与 `$$` / `\\[` / `\\]` 分隔符；用户未要求改变结构时不要删除它们。"
     "不要调用文件写入、删除或命令工具；只有用户在界面点击“接受修改”后，"
     "宿主程序才会写入文件。"
 )
@@ -1853,7 +1857,8 @@ class LearningRuntimeService(AgentRuntimeService):
             r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)"
         )
         delimiter_pattern = re.compile(r"(?<!\\)(?:\*\*|__|`+)")
-        for pattern in (prefix_pattern, delimiter_pattern):
+        math_delimiter_pattern = re.compile(r"(?m)^[ \t]*(?:\$\$|\\\[|\\\]|\\\(|\\\))[ \t]*$")
+        for pattern in (prefix_pattern, delimiter_pattern, math_delimiter_pattern):
             for match in pattern.finditer(raw):
                 for index in range(match.start(), match.end()):
                     ignored[index] = True

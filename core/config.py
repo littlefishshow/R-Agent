@@ -259,31 +259,36 @@ def get_run_events_dir():
 
 
 def get_memory_provider_name():
-    """长期记忆 backend 名称；默认 file（零配置文件型）。"""
-    return os.environ.get("MEMORY_PROVIDER", "").strip().lower() or "file"
+    """长期记忆 backend 名称；默认 deermem（结构化 JSONL 事实库）。
+
+    历史默认为 file（零配置文件型）；deermem + 持久上下文现已作为开箱默认。
+    仍可用 MEMORY_PROVIDER=file/noop 覆盖回退。
+    """
+    return os.environ.get("MEMORY_PROVIDER", "").strip().lower() or "deermem"
 
 
 def get_memory_injection_mode():
-    """记忆注入方式：'system'（现状，拼进 system prompt）或 'hidden_user'（降权为隐藏 user 段）。
+    """记忆注入方式：'hidden_user'（默认，降权为隐藏 user 段）或 'system'（拼进 system prompt）。
 
-    默认保持 'system' 以确保零行为变化；设为 'hidden_user' 可启用 deer-flow 风格的
-    权限隔离（memory 作为数据而非最高指令）。
+    默认 'hidden_user'：记忆作为【数据/参考资料】随 durable context 注入，权限低于
+    system，符合 deer-flow 风格的权限隔离。设为 'system' 可回退旧行为（拼进 system
+    prompt，需重启才刷新）。
     """
-    raw = str(os.environ.get("MEMORY_INJECTION_MODE", "system")).strip().lower()
-    return raw if raw in ("system", "hidden_user") else "system"
+    raw = str(os.environ.get("MEMORY_INJECTION_MODE", "hidden_user")).strip().lower()
+    return raw if raw in ("system", "hidden_user") else "hidden_user"
 
 
 def get_durable_context_enabled():
     """是否每轮注入 durable context（summary_text + delegation_ledger + skill_context + memory）。
 
-    默认关闭，保持现状；开启后按 deer-flow 风格以隐藏低权限 user 段回注结构化上下文。
-    当 MEMORY_INJECTION_MODE=hidden_user 时强制开启，避免 memory 已退出 system prompt，
-    却因为 durable 通道关闭而在本轮完全不可见。
+    默认开启：durable context 是压缩后续接工作的稳定前缀（KV 友好，压缩时才刷新）。
+    hidden_user 记忆模式下强制开启，避免记忆退出 system prompt 后却因 durable 通道关闭
+    而完全不可见。可用 DURABLE_CONTEXT_ENABLED=0 显式关闭（仅在 system 记忆模式下生效）。
     """
     if get_memory_injection_mode() == "hidden_user":
         return True
-    raw = str(os.environ.get("DURABLE_CONTEXT_ENABLED", "0")).strip().lower()
-    return raw not in ("0", "false", "no", "off", "")
+    raw = str(os.environ.get("DURABLE_CONTEXT_ENABLED", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
 
 
 def get_tool_sanitization_enabled():

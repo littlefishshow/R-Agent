@@ -50,6 +50,8 @@ def test_frozen_snapshot_does_not_change_after_write(tmp_path):
 
 
 def test_tool_reports_frozen_visibility(monkeypatch, tmp_path):
+    # file backend（显式回退）：验证工具提示写入 frozen system prompt 之外。
+    monkeypatch.setenv("MEMORY_PROVIDER", "file")
     store = MemoryManager(memory_dir=str(tmp_path))
     monkeypatch.setattr(memory_tool_module, "memory_manager", store)
 

@@ -184,11 +184,11 @@ def test_memory_search_tool_dispatches_to_deermem(tmp_path, monkeypatch):
 
 
 def test_memory_search_tool_default_file_backend_unchanged(monkeypatch, tmp_path):
-    """默认 file backend 时 memory_search 走原有 search_memory，不含 provider=deermem 字段。"""
+    """file backend（显式回退）时 memory_search 走原有 search_memory，不含 provider=deermem 字段。"""
     from core.memory import MemoryManager
     from tools import memory_read_tool
 
-    monkeypatch.delenv("MEMORY_PROVIDER", raising=False)
+    monkeypatch.setenv("MEMORY_PROVIDER", "file")
     store = MemoryManager(memory_dir=str(tmp_path))
     store.append_memory("user", "用户喜欢简洁回答")
     monkeypatch.setattr(memory_read_tool, "memory_manager", store)

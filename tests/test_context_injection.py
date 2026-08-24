@@ -106,3 +106,83 @@ def test_no_summary_when_not_compressed(monkeypatch):
     agent.messages = [{"role": "user", "content": "short"}]
     agent._maybe_compress_context([])
     assert agent.state.summary_text == ""
+
+
+# --------------------------------------------------------------------------- #
+# 3. KV-cache 前缀稳定化：durable 快照冻结 + 压缩时刷新
+# --------------------------------------------------------------------------- #
+def test_durable_snapshot_is_frozen_until_compaction(monkeypatch):
+    """durable 备份在压缩之间冻结：ledger 变化不改快照，压缩后才并入新摘要。"""
+    monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_INJECTION_MODE", "system")  # 排除记忆读盘的环境干扰
+
+    agent = RAgent(model="test-model", max_iterations=2, enable_self_review=False)
+    agent.state.summary_text = "摘要 A"
+
+    first = agent._get_durable_snapshot()
+    assert first is not None and "摘要 A" in first["content"]
+
+    # 压缩之间即使派生通道变化，快照仍逐字节冻结（KV 友好）。
+    agent.state.delegation_ledger = [{"task_id": "td9", "status": "done"}]
+    second = agent._get_durable_snapshot()
+    assert second is first
+    assert "td9" not in second["content"]
+
+    # 模拟一次压缩完成：摘要更新 + 统一刷新钩子重建快照。
+    agent.state.summary_text = "摘要 B"
+    agent._on_context_compacted()
+    third = agent._get_durable_snapshot()
+    assert third is not second
+    assert "摘要 B" in third["content"]
+    assert "td9" in third["content"]  # 压缩时才把最新 ledger 并入前缀
+
+
+def test_tool_snapshot_grows_but_does_not_shrink_between_compactions(monkeypatch):
+    """工具快照只增不减：提升后立即可见；收窄不动快照，压缩时才复位。"""
+    monkeypatch.setenv("DEFERRED_TOOLS_ENABLED", "1")
+    monkeypatch.setenv("DEFERRED_TOOLS_ALWAYS_ON", "tool_search")
+
+    def _schema(name):
+        return {"type": "function", "function": {"name": name, "description": name, "parameters": {"type": "object", "properties": {}}}}
+
+    agent = RAgent(model="test-model", max_iterations=2, enable_self_review=False)
+
+    live = [_schema("tool_search")]
+    snap1 = agent._stabilize_request_tools(live)
+    assert {s["function"]["name"] for s in snap1} == {"tool_search"}
+
+    # 提升 web_fetch（增长）：并入快照，且保持按 name 排序稳定。
+    agent._promoted_tools.add("web_fetch")
+    live2 = [_schema("tool_search"), _schema("web_fetch")]
+    snap2 = agent._stabilize_request_tools(live2)
+    names2 = [s["function"]["name"] for s in snap2]
+    assert names2 == ["tool_search", "web_fetch"]
+
+    # 收窄回只有 tool_search（收缩）：快照不缩小，web_fetch 仍在前缀（KV 稳定）。
+    live3 = [_schema("tool_search")]
+    snap3 = agent._stabilize_request_tools(live3)
+    assert {s["function"]["name"] for s in snap3} == {"tool_search", "web_fetch"}
+
+    # 压缩后复位：下一轮从当前作用域现算，收窄由此生效。
+    agent._on_context_compacted()
+    snap4 = agent._stabilize_request_tools(live3)
+    assert {s["function"]["name"] for s in snap4} == {"tool_search"}
+
+
+def test_deferred_tool_denied_backstops_unpromoted_calls(monkeypatch):
+    """执行层保底闸门：延迟暴露开启时，未提升且非 always-on 的工具被拒。"""
+    monkeypatch.setenv("DEFERRED_TOOLS_ENABLED", "1")
+    monkeypatch.setenv("DEFERRED_TOOLS_ALWAYS_ON", "tool_search,read_file")
+
+    agent = RAgent(model="test-model", max_iterations=2, enable_self_review=False)
+    assert agent._deferred_tool_denied("web_fetch") is True   # 未提升 -> 拒
+    assert agent._deferred_tool_denied("read_file") is False   # always-on -> 放行
+    agent._promoted_tools.add("web_fetch")
+    assert agent._deferred_tool_denied("web_fetch") is False   # 提升后 -> 放行
+
+
+def test_deferred_tool_denied_off_allows_everything(monkeypatch):
+    """延迟暴露关闭时保底闸门不生效，全量放行（零行为变化）。"""
+    monkeypatch.delenv("DEFERRED_TOOLS_ENABLED", raising=False)
+    agent = RAgent(model="test-model", max_iterations=2, enable_self_review=False)
+    assert agent._deferred_tool_denied("anything") is False

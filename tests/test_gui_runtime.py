@@ -909,6 +909,60 @@ def test_learning_markdown_modification_matches_numbered_bold_list(monkeypatch, 
     assert accepted["deleted"] == [branch["session_id"]]
 
 
+def test_learning_markdown_modification_matches_display_math_blocks(monkeypatch, tmp_path):
+    selected = (
+        "Stage 3：Executable Validation。先构造候选：\n"
+        "S' = Revise(S_t, \\ell_c, EM)\n"
+        "然后比较局部效果：\n"
+        "\\hat{\\tau}_{attr}(S')=\\frac{1}{|A_c|}\\sum_{x_i\\in A_c}V(x_i)\n"
+        "A_c 检查修复案例，直到 LocalPasses。"
+    )
+
+    def fake_run(self, user_message, **kwargs):
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "通俗但完整的新说明"})
+        return "通俗但完整的新说明"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    workspace = FileWorkspace(tmp_path / "files")
+    path = workspace.root / "papers" / "note.md"
+    path.write_text(
+        "# 前文\n\n"
+        "**Stage 3：Executable Validation。**先构造候选：\n\n"
+        "$$\n"
+        "S' = Revise(S_t, \\ell_c, EM)\n"
+        "$$\n\n"
+        "然后比较局部效果：\n\n"
+        "$$\n"
+        "\\hat{\\tau}_{attr}(S')=\\frac{1}{|A_c|}\\sum_{x_i\\in A_c}V(x_i)\n"
+        "$$\n\n"
+        "`A_c` 检查修复案例，直到 `LocalPasses`。\n\n"
+        "## 后文\n",
+        encoding="utf-8",
+    )
+    parent = service.create_session(session_id="modify-display-math")
+    branch = service.branch_from_selection(
+        parent.session_id,
+        selected_text=selected,
+        action="modify",
+        modification_instruction="写得更通俗但不丢细节",
+        source_context={
+            "kind": "markdown",
+            "path": "papers/note.md",
+            "text_offset": 0,
+            "occurrence": 0,
+        },
+        background=False,
+    )
+
+    accepted = service.accept_selection_modification(branch["session_id"], workspace=workspace)
+
+    assert accepted["content"] == "# 前文\n\n通俗但完整的新说明\n\n## 后文\n"
+    assert accepted["deleted"] == [branch["session_id"]]
+
+
 def test_learning_markdown_modification_replaces_full_selected_line(monkeypatch, tmp_path):
     def fake_run(self, user_message, **kwargs):
         self.messages.append({"role": "user", "content": user_message})

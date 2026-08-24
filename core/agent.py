@@ -40,6 +40,9 @@ LARGE_MESSAGE_COMPLETION_TOKEN_THRESHOLD = 50_000
 LONG_CONTEXT_OUTPUT_DIR = Path("outputs") / "long_context"
 SUMMARY_NOSTREAM_TAG = "TAG_NOSTREAM"
 
+# 哨兵：区分「工具目录快照尚未计算」与「已计算且结果为空（无需注入）」。
+_CATALOG_NOTE_UNSET = object()
+
 
 class AgentInterrupted(Exception):
     """用户主动中断当前 Agent 运行。"""
@@ -389,6 +392,12 @@ class RAgent:
         # 延迟工具暴露：本次 run 内已被 tool_search 提升的工具名集合（见 06 章）。
         self._promoted_tools = set()
         self._sandbox_workspace = None
+        # KV-cache 前缀稳定化：durable/记忆快照与工具可见集快照都做备份，稳态下逐轮
+        # 复用同一份，只有在上下文压缩或工具可见范围「增长」时才重建，避免每轮重建
+        # 击穿模型端 KV cache 前缀。None 表示尚未构建，首次使用时惰性生成。
+        self._durable_snapshot = None
+        self._visible_tools_snapshot = None
+        self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
 
     # ------------------------------------------------------------------
     # ThreadState 兼容属性
@@ -509,6 +518,70 @@ class RAgent:
             # 出错时退回全量暴露，绝不因此让 Agent 无工具可用。
             return tools
 
+    def _deferred_tool_denied(self, func_name) -> bool:
+        """执行层保底闸门：延迟暴露开启时，未提升且非 always-on 的工具不允许执行。
+
+        工具 schema 前缀现在走「只增不减」快照，可能滞后于收窄；且模型可能凭历史里
+        的旧 schema 发起调用。此处始终按「当前」提升状态判定，保证前缀无论朝哪个方向
+        stale，执行都合规。出错时放行，绝不因判定异常阻断正常工具。
+        """
+        try:
+            if not config.get_deferred_tools_enabled():
+                return False
+            always_on = set(config.get_deferred_tools_always_on())
+            visible = always_on | set(self._promoted_tools or set())
+            return func_name not in visible
+        except Exception:
+            return False
+
+    def _stabilize_request_tools(self, live_tools):
+        """把每轮现算的可见工具并入稳定快照，只增不减（增长即刻，收缩延迟）。
+
+        - 首次或压缩后快照为空：直接采用当前 live 集，并让目录一起重建。
+        - 后续轮次：只把「新出现」的工具（tool_search 提升、skill 激活新增）并入快照；
+          收窄（skill 停用/白名单缩小）不改快照，靠执行层保底闸门拦截——这样工具 schema
+          前缀在两次压缩之间逐字节稳定，不击穿 KV cache。
+        - 压缩发生时 `_on_context_compacted` 会清空快照，narrowing 随 KV 重建一并生效。
+
+        注意：live_tools 可能是中间件原地改写过的 ctx.tools，本方法只读不改它，
+        另建列表返回，避免破坏调用方状态。
+        """
+        if self._visible_tools_snapshot is None:
+            self._visible_tools_snapshot = list(live_tools)
+            self._catalog_note_snapshot = _CATALOG_NOTE_UNSET  # 目录随工具快照一起重建
+            return self._visible_tools_snapshot
+        snap_names = {
+            s.get("function", {}).get("name") for s in self._visible_tools_snapshot
+        }
+        additions = [
+            s for s in live_tools
+            if s.get("function", {}).get("name") not in snap_names
+        ]
+        if additions:
+            merged = list(self._visible_tools_snapshot) + additions
+            merged.sort(key=lambda s: s.get("function", {}).get("name", ""))
+            self._visible_tools_snapshot = merged
+            self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
+        return self._visible_tools_snapshot
+
+    def _on_context_compacted(self):
+        """压缩/归档完成后统一刷新派生上下文备份，让它们在 KV 重建时一起更新。
+
+        - durable 备份：用最新 summary_text + ledger/artifacts/skills/memory 重建。
+        - 工具 / 目录快照：清空，下一轮从当前作用域现算，收窄由此生效。
+        """
+        self._refresh_durable_snapshot()
+        self._visible_tools_snapshot = None
+        self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
+
+    def _invalidate_tool_snapshots(self):
+        """工具可见范围「增长」后强制下一轮重算工具/目录快照（增长即刻生效）。
+
+        只清目录快照并标记工具快照需要并入新增项；实际的「只增不减」合并仍由
+        ``_stabilize_request_tools`` 完成，收窄不受影响。
+        """
+        self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
+
     def _maybe_promote_from_tool_search(self, func_name, result) -> None:
         """若刚执行的是 tool_search，则把它返回的匹配工具名提升为本次 run 可见。"""
         if func_name != "tool_search":
@@ -519,10 +592,14 @@ class RAgent:
             if isinstance(inner, str):
                 inner = json.loads(inner)
             matches = (inner or {}).get("matches") if isinstance(inner, dict) else None
+            promoted_any = False
             for m in matches or []:
                 name = m.get("name") if isinstance(m, dict) else None
                 if name:
                     self._promoted_tools.add(name)
+                    promoted_any = True
+            if promoted_any:
+                self._invalidate_tool_snapshots()
         except Exception:
             pass
 
@@ -587,7 +664,12 @@ class RAgent:
                 "allowed_tools": sorted(allowed_tools),
                 "description": inner.get("description") or "",
             }
+            before = len(self._promoted_tools)
             self._promoted_tools.update(allowed_tools)
+            if len(self._promoted_tools) > before:
+                # 激活带来新的可见工具（增长），下一轮立即并入快照；白名单收窄
+                # 不改快照，由执行层保底闸门拦截，前缀保持稳定。
+                self._invalidate_tool_snapshots()
         except Exception:
             pass
 
@@ -601,11 +683,23 @@ class RAgent:
         allowed.update({"skill_activate", "skill_view", "skill_search", "tool_search"})
         return allowed
 
+    def _get_tool_catalog_note(self):
+        """返回本次请求使用的工具目录文本，命中缓存则复用备份。
+
+        目录内容只随「已提升工具集」变化，而提升会触发 ``_stabilize_request_tools``
+        把 catalog 快照置为未计算态，因此这里惰性重算一次即可稳定复用，避免每轮
+        重算导致的前缀抖动。
+        """
+        if self._catalog_note_snapshot is _CATALOG_NOTE_UNSET:
+            self._catalog_note_snapshot = self._build_tool_catalog_note()
+        return self._catalog_note_snapshot
+
     def _build_tool_catalog_note(self):
         """构建"被延迟工具"的精简目录文本（name + summary）。返回 None 表示无需注入。
 
         目录是**派生上下文**（和工具 schema 同类），不写进 self.messages，而是每次
         请求时临时拼进 messages 头部——避免多轮累积、被压缩或被回滚污染。
+        列表按 name 排序，保证同一提升状态下逐字节稳定。
         """
         try:
             if not config.get_deferred_tools_enabled():
@@ -619,6 +713,7 @@ class RAgent:
             ]
             if not hidden:
                 return None
+            hidden.sort(key=lambda c: c.get("name", ""))
             lines = [f"- {c['name']}: {c.get('summary','')}" for c in hidden]
             return (
                 "# 可用工具目录（延迟暴露）\n"
@@ -629,7 +724,7 @@ class RAgent:
             return None
 
     def _build_durable_context_message(self):
-        """构建本次模型请求使用的临时 durable context 消息。"""
+        """从当前 ThreadState 现算一条 durable context 消息（不读/不写快照）。"""
         try:
             if not config.get_durable_context_enabled():
                 return None
@@ -646,6 +741,23 @@ class RAgent:
             return {"role": "user", "content": durable}
         except Exception:
             return None
+
+    def _get_durable_snapshot(self):
+        """返回本次请求使用的 durable context 消息，稳态复用缓存的备份。
+
+        备份只在两种时机刷新：① 首次构建（惰性）；② 上下文压缩/归档完成后由
+        ``_refresh_durable_snapshot`` 显式重建。压缩之间即使 ledger/artifacts/记忆
+        发生变化也不刷新——这些变化的原始信号仍在 messages 里，等下次压缩才把
+        精炼版并入前缀，从而保证 KV cache 前缀在压缩之间逐字节稳定。
+        """
+        if self._durable_snapshot is None:
+            self._durable_snapshot = self._build_durable_context_message()
+        return self._durable_snapshot
+
+    def _refresh_durable_snapshot(self):
+        """在上下文压缩/归档写入新 summary_text 后重建 durable 备份。"""
+        self._durable_snapshot = self._build_durable_context_message()
+
 
     def _messages_without_derived_context(self, *, remove_summary=False):
         """移除旧版本写入历史的 durable 消息与重复摘要。"""
@@ -668,7 +780,11 @@ class RAgent:
         return cleaned
 
     def _build_request_messages(self, catalog_note=None):
-        """把派生上下文临时插到 system prompt 后，不写回会话历史。"""
+        """把派生上下文临时插到 system prompt 后，不写回会话历史。
+
+        catalog_note 与 durable context 都取自稳定备份（分别由工具可见集快照与
+        durable 快照维护），压缩之间逐轮复用同一份，保证 KV cache 前缀稳定。
+        """
         request_messages = self._messages_without_derived_context()
         insert_at = 0
         while (
@@ -680,7 +796,7 @@ class RAgent:
         if catalog_note:
             request_messages.insert(insert_at, {"role": "system", "content": catalog_note})
             insert_at += 1
-        durable_message = self._build_durable_context_message()
+        durable_message = self._get_durable_snapshot()
         if durable_message:
             request_messages.insert(insert_at, durable_message)
         return request_messages
@@ -736,6 +852,8 @@ class RAgent:
                 archive_summary = result.get("summary")
                 if archive_summary:
                     self.state.summary_text = (manual_text + "\n\n" + archive_summary) if manual_text else archive_summary
+                # 摘要已变，重建 durable 备份并复位工具/目录快照，让它们随 KV 重建一起更新。
+                self._on_context_compacted()
                 return
         except Exception:
             pass
@@ -748,6 +866,7 @@ class RAgent:
                 existing = self.state.summary_text.strip()
                 self.state.summary_text = manual_text + (("\n\n" + existing) if existing else "")
             self.messages = system_msgs + recent_user
+            self._on_context_compacted()
             return
         archive_msg = {
             "role": "system",
@@ -853,6 +972,8 @@ class RAgent:
             summary = result.get("summary")
             if summary:
                 self.state.summary_text = summary
+            # 摘要已变，重建 durable 备份并复位工具/目录快照，让它们随 KV 重建一起更新。
+            self._on_context_compacted()
             self.context_usage.update({
                 "estimated_tokens": stats.get("compressed_estimated_tokens", check.get("estimated_tokens", 0)),
                 "max_context_tokens": max_context,
@@ -1254,6 +1375,10 @@ class RAgent:
         self._soft_warned = False
         self._active_exclude_tools = set(exclude_tools or [])
         self._promoted_tools = set()
+        # 新 run 提升集已复位，工具/目录快照随之复位，保证 schema 可见范围与执行层
+        # 保底闸门一致；durable 快照跨轮持久，只在压缩时刷新，故此处不动。
+        self._visible_tools_snapshot = None
+        self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
 
         try:
             result = self._loop(start_iteration=0, on_think=on_think,
@@ -1373,15 +1498,19 @@ class RAgent:
                 ]
 
             # 中间件：调用模型前。内核运行时链先完成上下文压缩，
-            # 随后调用方中间件看到压缩后的状态。
+            # 随后调用方中间件看到压缩后的状态。DeferredToolFilterMiddleware 会在此
+            # 原地收窄 mw_ctx.tools（延迟暴露），ContextCompressionMiddleware 用它估算窗口。
             mw_ctx.tools = tools
             self.middleware.run_before_model(mw_ctx)
 
-            catalog_note = self._build_tool_catalog_note()
+            # 把本轮现算的可见工具并入稳定快照（只增不减），发给模型的始终是快照，
+            # 保证工具 schema 前缀在两次压缩之间逐字节稳定，不频繁击穿 KV cache。
+            request_tools = self._stabilize_request_tools(mw_ctx.tools)
+            catalog_note = self._get_tool_catalog_note()
             request_messages = self._build_request_messages(catalog_note=catalog_note)
             kwargs = {"model": self.model, "messages": request_messages}
-            if tools:
-                kwargs["tools"] = tools
+            if request_tools:
+                kwargs["tools"] = request_tools
 
             durable_message = next(
                 (
@@ -1405,12 +1534,12 @@ class RAgent:
             _emit_event(event_sink, EVENT_LLM_REQUEST_SNAPSHOT, build_llm_request_snapshot(
                 model=self.model,
                 messages=request_messages,
-                tools=tools,
+                tools=request_tools,
                 iteration=iteration,
             ))
             self._emit_run_event(
                 run_events.EV_LLM_REQUEST,
-                {"iteration": iteration, "message_count": len(request_messages), "tool_count": len(tools)},
+                {"iteration": iteration, "message_count": len(request_messages), "tool_count": len(request_tools)},
             )
 
             if on_think:
@@ -1523,6 +1652,14 @@ class RAgent:
                         result = f'工具 {func_name} 未在当前上下文中启用，未执行。'
                     elif func_name in excluded:
                         result = f'工具 {func_name} 已在当前上下文中被禁用，未执行。'
+                    elif self._deferred_tool_denied(func_name):
+                        # 保底闸门：工具快照可能滞后于收窄，或前缀里根本没有该工具的
+                        # schema。无论如何，执行层用「当前」提升状态判定合规，未挂载则
+                        # 引导模型先检索提升，绝不误跑未暴露工具。
+                        result = (
+                            f'工具 {func_name} 尚未在当前上下文挂载（延迟暴露）。'
+                            f'请先用 tool_search 检索并提升该工具，再调用。'
+                        )
                     elif func_name == "delegate_task":
                         # delegate_task 是父进程调度器：内部会启动线程/子 Agent，并需要
                         # 直接向当前终端打印 Rich 看板。若再放进隔离工具进程，容易形成

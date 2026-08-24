@@ -149,6 +149,10 @@ def test_context_length_failure_saves_top_three_long_messages(tmp_path, monkeypa
 def test_loop_context_length_failure_returns_saved_path(tmp_path, monkeypatch):
     import core.agent as agent_mod
 
+    # 关闭 durable 注入，保证请求 messages 只含 [system, user]，与本用例关注的
+    # 「诊断落盘」解耦，避免默认 deermem 注入的记忆使计数随环境漂移。
+    monkeypatch.setenv("MEMORY_INJECTION_MODE", "system")
+    monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "0")
     monkeypatch.setattr(agent_mod, "LONG_CONTEXT_OUTPUT_DIR", tmp_path)
     agent = RAgent(model="test", max_iterations=1)
     agent.client = _FailingClient()

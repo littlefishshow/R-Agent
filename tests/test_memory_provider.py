@@ -118,13 +118,20 @@ def _agent_with_channels():
     return agent
 
 
-def test_durable_context_not_injected_by_default(monkeypatch):
+def test_durable_context_not_injected_when_opted_out(monkeypatch):
+    """显式回退 system 记忆模式 + 关闭 durable 通道后，不再注入参考上下文。"""
     monkeypatch.setattr(registry, "get_all_schemas", lambda: [])
-    monkeypatch.delenv("DURABLE_CONTEXT_ENABLED", raising=False)
+    monkeypatch.setenv("MEMORY_INJECTION_MODE", "system")
+    monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "0")
     agent = _agent_with_channels()
     assert agent.run_conversation("hi") == "ok"
     injected = [m for m in agent.messages if isinstance(m, dict) and "参考上下文" in str(m.get("content", ""))]
     assert injected == []
+    request_messages = agent.client.requests[-1]["messages"]
+    assert not any(
+        isinstance(m, dict) and "参考上下文" in str(m.get("content", ""))
+        for m in request_messages
+    )
 
 
 def test_durable_context_injected_when_enabled(monkeypatch):
@@ -201,12 +208,20 @@ def test_config_defaults(monkeypatch):
     monkeypatch.delenv("MEMORY_PROVIDER", raising=False)
     monkeypatch.delenv("MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD", raising=False)
     monkeypatch.delenv("MEMORY_SESSION_MAX_FACTS", raising=False)
-    assert cfg.get_memory_injection_mode() == "system"       # 默认不降权
-    assert cfg.get_durable_context_enabled() is False         # 默认不注入
-    assert cfg.get_memory_provider_name() == "file"           # 默认文件型
+    # deermem + 持久上下文现为开箱默认（KV 友好：durable 压缩时才刷新）。
+    assert cfg.get_memory_injection_mode() == "hidden_user"    # 默认降权注入
+    assert cfg.get_durable_context_enabled() is True           # 默认注入 durable
+    assert cfg.get_memory_provider_name() == "deermem"         # 默认结构化事实库
     assert cfg.get_context_summarization_mode() == "llm"      # 默认复用当前模型摘要
     assert cfg.get_memory_session_fact_confidence_threshold() == 0.3
     assert cfg.get_memory_session_max_facts() == 100
+
+
+def test_system_mode_can_disable_durable_context(monkeypatch):
+    """显式回退 system 记忆模式后，durable 通道可用 DURABLE_CONTEXT_ENABLED=0 关闭。"""
+    monkeypatch.setenv("MEMORY_INJECTION_MODE", "system")
+    monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "0")
+    assert cfg.get_durable_context_enabled() is False
 
 
 def test_hidden_user_forces_durable_context(monkeypatch):

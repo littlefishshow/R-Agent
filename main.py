@@ -1421,9 +1421,9 @@ def main():
     console.print(f"[dim]Session: {cli_session_id}[/dim]")
     if workspace is not None:
         console.print(f"[dim]Workspace: {workspace.workspace}[/dim]")
-    # memory 注入权限：默认 'system'（拼进 system prompt，行为不变）；设为
-    # 'hidden_user' 时 memory 改由 durable context 以隐藏 user 段注入（权限降级），
-    # 此处就不再把 memory 快照拼进 system prompt，避免重复注入。
+    # memory 注入权限：默认 'hidden_user'，memory 由 durable context 以隐藏 user 段注入
+    # （权限降级 + 压缩时才刷新，KV 友好），此处不再把 memory 快照拼进 system prompt，
+    # 避免重复注入。仅当显式回退 MEMORY_INJECTION_MODE=system 时才拼进 system prompt。
     _memory_in_system = config.get_memory_injection_mode() != "hidden_user"
     system_prompt = (
         build_system_prompt()

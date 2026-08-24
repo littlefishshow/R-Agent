@@ -324,6 +324,10 @@ def test_agent_auto_compresses_before_llm_request(monkeypatch):
 
 
 def test_agent_llm_summarization_calls_summary_then_main_model(monkeypatch):
+    # durable-off 变体：显式回退 system 记忆模式并关闭 durable 通道，验证摘要以
+    # system 消息回注 messages（durable-on 变体见 test_agent_durable_compression_*）。
+    monkeypatch.setenv("MEMORY_INJECTION_MODE", "system")
+    monkeypatch.setenv("DURABLE_CONTEXT_ENABLED", "0")
     monkeypatch.setattr(config, "get_llm_context_window", lambda: 180)
     monkeypatch.setattr(config, "get_context_compression_trigger_ratio", lambda: 0.2)
     monkeypatch.setattr(config, "get_context_compression_target_ratio", lambda: 0.5)
