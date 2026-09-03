@@ -219,3 +219,52 @@ def test_auto_provider_without_google_keeps_local_fallback_order(monkeypatch):
         "yahoo",
         "duckduckgo",
     ]
+
+
+# --- web_extract PDF support ---------------------------------------------
+# The real NeurIPS 2023 "AUF" paper. It previously came back as raw "%PDF"
+# garbage; these tests pin that it now returns parsed text.
+AUF_PDF_URL = "https://proceedings.neurips.cc/paper_files/paper/2023/file/fed1ea8dcc2a13f3835cc854e8c8294c-Paper-Conference.pdf"
+
+
+def test_web_extract_reads_pdf_as_text_not_garbage():
+    result = json.loads(web_tools.web_extract_tool(urls=[AUF_PDF_URL]))["results"][0]
+
+    assert result["content_type"] == "pdf"
+    assert result["page_count"] > 0
+    assert not result["content"].startswith("%PDF")
+    assert "Rehearsal Learning for Avoiding Undesired Future" in result["content"]
+
+
+def test_web_extract_pdf_preview_is_bounded_and_flags_truncation():
+    result = json.loads(web_tools.web_extract_tool(urls=[AUF_PDF_URL], max_chars=2000))["results"][0]
+
+    assert len(result["content"]) <= 2000
+    assert result["char_count"] > 2000  # full paper is longer than the preview
+    assert result["truncated"] is True
+
+
+def test_pdf_detected_by_content_not_by_url_suffix():
+    # Recognised by magic bytes or content-type, regardless of the URL.
+    assert web_tools._looks_like_pdf(b"%PDF-1.5 ...", "", "https://x/no-extension")
+    assert web_tools._looks_like_pdf(b"anything", "application/pdf", "https://x")
+    # A ".pdf" suffix alone is not enough; real HTML stays HTML.
+    assert not web_tools._looks_like_pdf(b"<html>", "text/html", "https://x/page.pdf")
+
+
+def test_arxiv_abstract_url_rewritten_to_pdf():
+    assert web_tools._normalize_pdf_url("https://arxiv.org/abs/2402.03300") == "https://arxiv.org/pdf/2402.03300"
+    assert web_tools._normalize_pdf_url("https://example.com/foo") == "https://example.com/foo"
+
+
+def test_web_extract_html_still_returns_text(monkeypatch):
+    monkeypatch.setattr(
+        web_tools,
+        "_fetch_bytes",
+        lambda url, timeout=10: (b"<html><body>Hello <b>world</b></body></html>", "text/html"),
+    )
+
+    result = json.loads(web_tools.web_extract_tool(urls=["https://example.com"]))["results"][0]
+
+    assert result["content_type"] == "html"
+    assert "Hello world" in result["content"]

@@ -530,7 +530,7 @@ def get_deferred_tools_always_on():
         # 核心文件 / 命令 / 代码执行
         "read_file", "write_file", "search_files", "run_command", "run_python",
         # 核心网页
-        "web_search", "web_extract",
+        "web_search", "web_extract", "pdf_read",
         # 核心记忆
         "memory", "memory_search", "memory_review",
     ]
