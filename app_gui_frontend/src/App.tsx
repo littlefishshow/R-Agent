@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import MarkdownIt from 'markdown-it'
 import { renderToString } from 'katex'
-import { BookOpen, Check, Copy, Edit3, Ellipsis, Eye, File, FileText, Folder, Languages, Lightbulb, ListTree, Maximize2, MessageCircle, Minimize2, Plus, Search, Save, Send, Square, Trash2, Workflow, X, ZoomIn, ZoomOut } from 'lucide-react'
+import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardPaste, Clock, Copy, Download, Edit3, Eye, File, FileCode, FileText, Folder, FolderMinus, FolderOpen, FolderPlus, Languages, Lightbulb, ListTree, Maximize2, MessageCircle, MessageSquare, Minimize2, Moon, MoreHorizontal, Plus, RefreshCw, Search, Save, Send, Square, Sun, Trash2, Upload, Workflow, Wrench, X, ZoomIn, ZoomOut } from 'lucide-react'
 import 'katex/dist/katex.min.css'
 import {
   acceptSelectionModification,
@@ -168,6 +168,7 @@ type FileContextMenuState = {
   x: number
   y: number
   item: WorkspaceTreeNode | null
+  isWorkspaceRoot?: boolean
 }
 
 type TextSelectionResult = {
@@ -238,7 +239,7 @@ export function App() {
   const [collapsedMessages, setCollapsedMessages] = useState<Record<string, boolean>>({})
   const [workspace, setWorkspace] = useState<WorkspaceListing | null>(null)
   const [workspaceTree, setWorkspaceTree] = useState<WorkspaceTreeNode | null>(null)
-  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({ '': true, papers: true })
+  const [expandedFolders, setExpandedFolders] = useState<Record<string, boolean>>({ '': true })
   const [clipboardPath, setClipboardPath] = useState<string | null>(null)
   const [fileContextMenu, setFileContextMenu] = useState<FileContextMenuState | null>(null)
   const [uploadTargetPath, setUploadTargetPath] = useState('')
@@ -249,6 +250,40 @@ export function App() {
   const [sidebarWidth, setSidebarWidth] = useState(296)
   const [detailWidth, setDetailWidth] = useState(340)
   const [topZ, setTopZ] = useState(30)
+  // Visual theme only — flips a data attribute the token sheet keys off; no
+  // interaction logic depends on it. Seeds from localStorage, else OS setting.
+  const [darkMode, setDarkMode] = useState(() => {
+    try {
+      const stored = localStorage.getItem('ragent-theme')
+      if (stored) return stored === 'dark'
+      return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false
+    } catch {
+      return false
+    }
+  })
+  // Which panel the left sidebar shows: the conversation list or the workspace
+  // file tree. Independent of `activeMode` (which decides whether the center
+  // area shows chat vs a file). Persisted so a refresh keeps the chosen panel.
+  const [sidebarMode, setSidebarMode] = useState<'chat' | 'workspace'>(() => {
+    try {
+      return localStorage.getItem('ragent-sidebar-mode') === 'workspace' ? 'workspace' : 'chat'
+    } catch {
+      return 'chat'
+    }
+  })
+  // Virtual workspaces: a UI-only selection of top-level folders shown as
+  // workspace roots. Backed by the existing single workspace dir — "new
+  // workspace" creates a folder and adds its path here; "remove workspace"
+  // only drops the path from this list (the folder is left on disk). null =
+  // not yet seeded from the tree's top-level directories.
+  const [workspaceRoots, setWorkspaceRoots] = useState<string[] | null>(() => {
+    try {
+      const stored = localStorage.getItem('ragent-workspace-roots')
+      return stored ? JSON.parse(stored) : null
+    } catch {
+      return null
+    }
+  })
   const activeTextSelectionRangeRef = useRef<Range | null>(null)
   // Sessions with a just-sent message whose background run may not yet report
   // running=true. The poller keeps reconciling these so a reply can't get stuck.
@@ -323,6 +358,32 @@ export function App() {
   }
 
   useEffect(() => { boot() }, [])
+
+  useEffect(() => {
+    const root = document.documentElement
+    if (darkMode) root.setAttribute('data-ds-dark-theme', '')
+    else root.removeAttribute('data-ds-dark-theme')
+    try { localStorage.setItem('ragent-theme', darkMode ? 'dark' : 'light') } catch { /* ignore */ }
+  }, [darkMode])
+
+  useEffect(() => {
+    try { localStorage.setItem('ragent-sidebar-mode', sidebarMode) } catch { /* ignore */ }
+  }, [sidebarMode])
+
+  useEffect(() => {
+    if (workspaceRoots === null) return
+    try { localStorage.setItem('ragent-workspace-roots', JSON.stringify(workspaceRoots)) } catch { /* ignore */ }
+  }, [workspaceRoots])
+
+  // Seed the workspace-root selection from the tree's top-level directories the
+  // first time the tree loads (and there is no persisted selection yet).
+  useEffect(() => {
+    if (workspaceRoots !== null || !workspaceTree) return
+    const topDirs = (workspaceTree.children || [])
+      .filter(child => child.type === 'directory')
+      .map(child => child.path || child.name)
+    setWorkspaceRoots(topDirs)
+  }, [workspaceTree, workspaceRoots])
 
   useEffect(() => {
     eventsRef.current = events
@@ -1859,6 +1920,31 @@ export function App() {
     }
   }
 
+  // New workspace = create a top-level folder and promote it into the virtual
+  // workspace list. The folder path equals its name (relative to the root).
+  async function createWorkspaceFromPrompt() {
+    const name = window.prompt('新建工作区名称')
+    if (!name) return
+    const trimmed = name.trim()
+    if (!trimmed) return
+    try {
+      const created = await createWorkspaceFolder('', trimmed, session?.session_id || '')
+      const path = created.path || trimmed
+      await refreshWorkspace()
+      setWorkspaceRoots(prev => {
+        const list = prev || []
+        return list.includes(path) ? list : [...list, path]
+      })
+    } catch (err: any) {
+      setError(err.message || String(err))
+    }
+  }
+
+  // Remove a workspace from the sidebar without touching the folder on disk.
+  function removeWorkspaceRoot(path: string) {
+    setWorkspaceRoots(prev => (prev || []).filter(item => item !== path))
+  }
+
   async function pasteClipboard() {
     if (!workspace || !clipboardPath) return
     try {
@@ -1896,12 +1982,32 @@ export function App() {
     return item.type === 'directory' ? item.path : parentPath(item.path)
   }
 
+  // Open the file context menu clamped to the viewport so it never spills past
+  // the bottom/right edge (rows near the screen bottom flip the menu upward).
+  function openFileContextMenu(event: { clientX: number, clientY: number }, item: WorkspaceTreeNode | null, isWorkspaceRoot?: boolean) {
+    const MENU_WIDTH = 200
+    // Estimate row count from which conditional items will render (34px each +
+    // 10px padding), so the flip decision matches the real menu height.
+    let rows = 3 // upload + new-folder + paste always present
+    if (item) rows += 2 // open + copy
+    if (item?.type === 'file') rows += 1 // download
+    if (isWorkspaceRoot) rows += 1 // remove-workspace
+    if (item) rows += 1 // delete
+    const menuHeight = rows * 34 + 10
+    const margin = 8
+    let x = event.clientX
+    let y = event.clientY
+    if (x + MENU_WIDTH + margin > window.innerWidth) x = Math.max(margin, window.innerWidth - MENU_WIDTH - margin)
+    if (y + menuHeight + margin > window.innerHeight) y = Math.max(margin, event.clientY - menuHeight)
+    setFileContextMenu({ x, y, item, isWorkspaceRoot })
+  }
+
   function openUploadDialog(targetPath: string) {
     setUploadTargetPath(targetPath)
     uploadInputRef.current?.click()
   }
 
-  function handleFileContextAction(action: 'upload' | 'new-folder' | 'copy' | 'paste' | 'delete' | 'download' | 'open') {
+  function handleFileContextAction(action: 'upload' | 'new-folder' | 'copy' | 'paste' | 'delete' | 'download' | 'open' | 'remove-workspace') {
     const item = fileContextMenu?.item || null
     setFileContextMenu(null)
     if (action === 'upload') {
@@ -1910,6 +2016,10 @@ export function App() {
     }
     if (action === 'new-folder') {
       createFolderFromPrompt(contextTargetDir(item))
+      return
+    }
+    if (action === 'remove-workspace' && item) {
+      removeWorkspaceRoot(item.path)
       return
     }
     if (action === 'copy' && item) {
@@ -1945,28 +2055,57 @@ export function App() {
     '--detail-width': `${detailWidth}px`,
   } as any}>
     {error && <div className="error-banner">{error}<button className="error-close" onClick={() => setError(null)}>x</button></div>}
-    <aside className="learning-sidebar">
-      <div className="search-row">
-        <div className="search-box"><Search size={16}/><input value={filter} onChange={e => setFilter(e.target.value)} placeholder="搜索问题链"/></div>
-        <button className="icon-button" onClick={newQuestionChain} title="新建问题链"><Plus size={18}/></button>
-      </div>
-      <div className="chain-list">
-        <div className="account-tree-root">
-          {visibleSessions.map(item => <ConversationTreeNode
-            key={item.session_id}
-            item={item}
-            depth={0}
-            activeSessionId={session?.session_id || ''}
-            childrenById={conversationChildren}
-            sessions={sessions}
-            expanded={expandedConversationNodes}
-            colors={branchColors}
-            onToggle={stableToggleNode}
-            onActivate={stableActivateSession}
-            onDelete={stableDeleteRoot}
-          />)}
+    <aside className={`learning-sidebar mode-${sidebarMode}`}>
+      <div className="sidebar-brand">
+        <div className="brand-identity">
+          <span className="brand-mark"><Workflow size={18}/></span>
+          <span className="brand-name">R-Agent</span>
         </div>
+        <button className="icon-button ghost" onClick={() => setDarkMode(prev => !prev)} title={darkMode ? '切换到亮色模式' : '切换到暗色模式'}>{darkMode ? <Sun size={18}/> : <Moon size={18}/>}</button>
       </div>
+      <div className="sidebar-mode-switch">
+        <button className={sidebarMode === 'chat' ? 'selected' : ''} onClick={() => setSidebarMode('chat')}><MessageSquare size={15}/>对话</button>
+        <button className={sidebarMode === 'workspace' ? 'selected' : ''} onClick={() => setSidebarMode('workspace')}><Folder size={15}/>工作区</button>
+      </div>
+      {sidebarMode === 'chat' ? <>
+        <div className="search-row">
+          <div className="search-box"><Search size={16}/><input value={filter} onChange={e => setFilter(e.target.value)} placeholder="搜索问题链"/></div>
+          <button className="icon-button" onClick={newQuestionChain} title="新建对话"><Plus size={18}/></button>
+        </div>
+        <div className="chain-list">
+          <div className="account-tree-root">
+            {visibleSessions.map(item => <ConversationTreeNode
+              key={item.session_id}
+              item={item}
+              depth={0}
+              activeSessionId={session?.session_id || ''}
+              childrenById={conversationChildren}
+              sessions={sessions}
+              expanded={expandedConversationNodes}
+              colors={branchColors}
+              onToggle={stableToggleNode}
+              onActivate={stableActivateSession}
+              onDelete={stableDeleteRoot}
+            />)}
+          </div>
+        </div>
+      </> : <FileBrowser
+        listing={workspace}
+        tree={workspaceTree}
+        workspaceRoots={workspaceRoots || []}
+        activeFilePath={activeFilePath}
+        expanded={expandedFolders}
+        clipboardPath={clipboardPath}
+        onRefresh={() => refreshWorkspace()}
+        onNewWorkspace={createWorkspaceFromPrompt}
+        onToggleFolder={toggleWorkspaceFolder}
+        onOpen={openWorkspaceItem}
+        onContextMenu={(event, item, isWorkspaceRoot) => {
+          event.preventDefault()
+          event.stopPropagation()
+          openFileContextMenu(event, item, isWorkspaceRoot)
+        }}
+      />}
     </aside>
     <button className="column-resizer left-resizer" title="调整左侧栏宽度" onMouseDown={event => beginColumnResize('left', event)}/>
 
@@ -2138,54 +2277,39 @@ export function App() {
           <span>本次回答已达到思考轮数上限（{session.max_iterations || '当前预算'}）。</span>
           <button className="secondary" onClick={continueActiveAfterTruncation}>继续思考</button>
         </div>}
-        <div className="composer-row">
+        <div className="composer-card">
           <ComposerInput
+            className="composer-input"
             value={input}
             onChange={setInput}
             onDraftChange={value => { inputDraftRef.current = value }}
             resetSignal={inputResetToken}
             onSubmit={submit}
           />
-          <button className="primary" onClick={() => submit()}><Send size={18}/>发送</button>
-          <div className="composer-side-actions">
-            <button className="secondary icon-only" onClick={stop} title="停止当前回答"><Square size={16}/></button>
+          <div className="composer-toolbar">
             <ToolsToggleButton
               enabled={session?.tools_enabled !== false}
               disabled={!session || !!session.running}
               onToggle={toggleActiveSessionTools}
             />
+            <div className="composer-actions">
+              <button className="composer-stop" onClick={stop} title="停止当前回答"><Square size={16}/></button>
+              <button className="composer-send" onClick={() => submit()} title="发送 (Enter)"><Send size={18}/></button>
+            </div>
           </div>
         </div>
       </section>}
     </main>
-    <button className="column-resizer right-resizer" title="调整右侧栏宽度" onMouseDown={event => beginColumnResize('right', event)}/>
-
-    <aside className="learning-detail">
-      <input
-        ref={uploadInputRef}
-        className="hidden-file-input"
-        type="file"
-        multiple
-        onChange={event => {
-          uploadFiles(event.target.files, uploadTargetPath)
-          event.currentTarget.value = ''
-        }}
-      />
-      <FileBrowser
-        listing={workspace}
-        tree={workspaceTree}
-        expanded={expandedFolders}
-        clipboardPath={clipboardPath}
-        onRefresh={() => refreshWorkspace()}
-        onToggleFolder={toggleWorkspaceFolder}
-        onOpen={openWorkspaceItem}
-        onContextMenu={(event, item) => {
-          event.preventDefault()
-          event.stopPropagation()
-          setFileContextMenu({ x: event.clientX, y: event.clientY, item })
-        }}
-      />
-    </aside>
+    <input
+      ref={uploadInputRef}
+      className="hidden-file-input"
+      type="file"
+      multiple
+      onChange={event => {
+        uploadFiles(event.target.files, uploadTargetPath)
+        event.currentTarget.value = ''
+      }}
+    />
     {fileContextMenu && <FileContextMenu
       menu={fileContextMenu}
       clipboardPath={clipboardPath}
@@ -2511,6 +2635,25 @@ function formatFileSize(size: number): string {
   return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`
 }
 
+// Friendly creation-time label for the conversation list: relative for recent
+// items ("刚刚 / N 分钟前 / N 小时前"), calendar date otherwise. Accepts an
+// epoch in seconds or milliseconds; returns '' when the timestamp is missing.
+function formatSessionTime(ts?: number): string {
+  if (!ts || !Number.isFinite(ts)) return ''
+  const ms = ts < 1e12 ? ts * 1000 : ts
+  const date = new Date(ms)
+  if (Number.isNaN(date.getTime())) return ''
+  const diffMin = (Date.now() - ms) / 60000
+  if (diffMin < 1) return '刚刚'
+  if (diffMin < 60) return `${Math.floor(diffMin)} 分钟前`
+  if (diffMin < 24 * 60) return `${Math.floor(diffMin / 60)} 小时前`
+  const now = new Date()
+  const sameYear = date.getFullYear() === now.getFullYear()
+  const mm = String(date.getMonth() + 1).padStart(2, '0')
+  const dd = String(date.getDate()).padStart(2, '0')
+  return sameYear ? `${mm}-${dd}` : `${date.getFullYear()}-${mm}-${dd}`
+}
+
 function describeMarkdownSelectionLocation(content: string, selectedText: string): string {
   const source = String(content || '')
   const selected = String(selectedText || '').trim()
@@ -2597,11 +2740,12 @@ function ToolsToggleButton({ enabled, disabled, onToggle }: {
     type="button"
     className={enabled ? 'tools-toggle active' : 'tools-toggle'}
     disabled={disabled}
-    title="控制下一次请求是否携带 tools schema"
+    title={enabled ? '工具已启用：下一次请求会携带 tools schema（点击关闭）' : '工具已关闭：下一次请求不携带 tools schema（点击开启）'}
     onClick={() => onToggle(!enabled)}
   >
-    <span>Tools</span>
-    <strong>{enabled ? 'On' : 'Off'}</strong>
+    <Wrench size={14}/>
+    <span>工具</span>
+    <span className="tools-toggle-dot" aria-hidden="true"/>
   </button>
 }
 
@@ -2781,10 +2925,18 @@ const ConversationTreeNode = memo(function ConversationTreeNode({ item, depth, a
       className={item.session_id === activeSessionId ? 'conversation-row active' : 'conversation-row'}
       style={{ ...colorVars(colors[item.session_id] || ROOT_BRANCH_COLOR), '--tree-depth': depth } as any}
     >
-      <button className="tree-toggle" onClick={() => hasChildren && onToggle(item.session_id)}>{hasChildren ? (isOpen ? 'v' : '>') : ''}</button>
+      <button className="tree-toggle" onClick={() => hasChildren && onToggle(item.session_id)} title={hasChildren ? (isOpen ? '收起分支' : '展开分支') : undefined}>
+        {hasChildren ? (isOpen ? <ChevronDown size={14}/> : <ChevronRight size={14}/>) : ''}
+      </button>
       <button className="conversation-open" onClick={() => onActivate(item.session_id)}>
         <span className="chain-title">{item.title || item.root_question || item.file_path || '新的学习问题'}</span>
-        <span className="chain-meta">{item.node_kind === 'file_root' ? 'file root' : item.running ? '运行中' : `${item.event_count || 0} events`}</span>
+        <span className="chain-meta">
+          {item.node_kind === 'file_root'
+            ? <><FileText size={11}/>文件根节点</>
+            : item.running
+              ? <><span className="running-dot"/>运行中</>
+              : <><Clock size={11}/>{formatSessionTime(item.created_at) || '新建对话'}</>}
+        </span>
       </button>
       <button className="chain-delete" title="删除节点及其子树" onClick={() => onDelete(item.session_id)}><Trash2 size={13}/></button>
     </div>
@@ -2807,75 +2959,118 @@ const ConversationTreeNode = memo(function ConversationTreeNode({ item, depth, a
 function FileBrowser({
   listing,
   tree,
+  workspaceRoots,
+  activeFilePath,
   expanded,
   clipboardPath,
   onRefresh,
+  onNewWorkspace,
   onToggleFolder,
   onOpen,
   onContextMenu,
 }: {
   listing: WorkspaceListing | null
   tree: WorkspaceTreeNode | null
+  workspaceRoots: string[]
+  activeFilePath: string | null
   expanded: Record<string, boolean>
   clipboardPath: string | null
   onRefresh: () => void
+  onNewWorkspace: () => void
   onToggleFolder: (path: string) => void
   onOpen: (item: WorkspaceItem) => void
-  onContextMenu: (event: any, item: WorkspaceTreeNode | null) => void
+  onContextMenu: (event: any, item: WorkspaceTreeNode | null, isWorkspaceRoot?: boolean) => void
 }) {
-  const currentPath = listing?.cwd || ''
-  const crumbs = currentPath ? currentPath.split('/') : []
+  const topLevel = tree?.children || []
+  const rootSet = new Set(workspaceRoots)
+  // Directories the user has promoted to workspaces render as workspace roots;
+  // everything else at the top level (loose files, un-promoted folders) falls
+  // into a plain "其他文件" section so nothing silently disappears.
+  const workspaceNodes = topLevel.filter(node => node.type === 'directory' && rootSet.has(node.path || node.name))
+  const looseNodes = topLevel.filter(node => !(node.type === 'directory' && rootSet.has(node.path || node.name)))
   return <section className="file-browser" onContextMenu={event => onContextMenu(event, null)}>
-    <header className="file-head">
-      <div>
-        <div className="detail-title"><Folder size={14}/>EXPLORER</div>
-        <div className="file-path">{crumbs.length ? crumbs.join(' / ') : 'outputs'}</div>
+    <div className="workspace-toolbar">
+      <span className="workspace-toolbar-title">工作区</span>
+      <div className="workspace-toolbar-actions">
+        <button className="icon-button ghost" title="新建工作区" onClick={onNewWorkspace}><FolderPlus size={16}/></button>
+        <button className="icon-button ghost" title="刷新文件列表" onClick={onRefresh}><RefreshCw size={15}/></button>
       </div>
-      <button className="icon-button" title="刷新文件列表" onClick={onRefresh}><Workflow size={14}/></button>
-    </header>
+    </div>
     {clipboardPath && <div className="clipboard-note"><Copy size={13}/>待粘贴：{clipboardPath}</div>}
     <div className="file-list">
       {!tree && <div className="muted">正在读取文件系统...</div>}
-      {tree?.children?.map(item => <FileTreeNode
-        key={item.path || item.name}
-        node={item}
+      {tree && !workspaceNodes.length && !looseNodes.length && <div className="workspace-empty">
+        <FolderPlus size={26}/>
+        <div>还没有工作区</div>
+        <div>点击右上角「新建工作区」创建一个文件夹，或让智能体在 outputs 下生成文件后刷新。</div>
+      </div>}
+      {workspaceNodes.map(node => <FileTreeNode
+        key={node.path || node.name}
+        node={node}
         depth={0}
+        isWorkspaceRoot
+        activeFilePath={activeFilePath}
         expanded={expanded}
         onToggleFolder={onToggleFolder}
         onOpen={onOpen}
         onContextMenu={onContextMenu}
       />)}
-      {tree && !tree.children?.length && <div className="muted">暂无文件。outputs/papers 会在初始化时自动创建；read_paper 会在阅读笔记产生或手动新建后显示。</div>}
+      {!!looseNodes.length && <div className="file-section-label">其他文件</div>}
+      {looseNodes.map(node => <FileTreeNode
+        key={node.path || node.name}
+        node={node}
+        depth={0}
+        activeFilePath={activeFilePath}
+        expanded={expanded}
+        onToggleFolder={onToggleFolder}
+        onOpen={onOpen}
+        onContextMenu={onContextMenu}
+      />)}
     </div>
   </section>
 }
 
-function FileTreeNode({ node, depth, expanded, onToggleFolder, onOpen, onContextMenu }: {
+function FileTreeNode({ node, depth, expanded, activeFilePath, isWorkspaceRoot = false, onToggleFolder, onOpen, onContextMenu }: {
   node: WorkspaceTreeNode
   depth: number
   expanded: Record<string, boolean>
+  activeFilePath?: string | null
+  isWorkspaceRoot?: boolean
   onToggleFolder: (path: string) => void
   onOpen: (item: WorkspaceItem) => void
-  onContextMenu: (event: any, item: WorkspaceTreeNode) => void
+  onContextMenu: (event: any, item: WorkspaceTreeNode, isWorkspaceRoot?: boolean) => void
 }) {
+  const isDir = node.type === 'directory'
   const isOpen = expanded[node.path || '']
-  const Icon = node.type === 'directory' ? Folder : node.is_pdf ? FileText : File
+  const Icon = isWorkspaceRoot ? (isOpen ? FolderOpen : Folder) : isDir ? (isOpen ? FolderOpen : Folder) : node.is_pdf ? FileText : node.is_markdown ? FileCode : File
+  const isActive = !isDir && !!activeFilePath && node.path === activeFilePath
+  const rowClass = ['file-row', isDir ? 'dir' : '', node.is_pdf ? 'pdf' : '', isWorkspaceRoot ? 'workspace' : '', isActive ? 'active' : ''].filter(Boolean).join(' ')
+  // Folder rows toggle expansion in place (VS Code / DeepSeek tree behavior);
+  // file rows open the file. The chevron and the label share one target so the
+  // whole row is one click affordance.
+  const activate = () => { if (isDir) onToggleFolder(node.path || ''); else onOpen(node) }
   return <div className="file-tree-node">
-    <div className={node.is_pdf ? 'file-row pdf' : 'file-row'} style={{ '--tree-depth': depth } as any} onContextMenu={event => onContextMenu(event, node)}>
-      <button className="tree-toggle" onClick={() => node.type === 'directory' && onToggleFolder(node.path || '')}>
-        {node.type === 'directory' ? (isOpen ? 'v' : '>') : <span/>}
+    <div className={rowClass} style={{ '--tree-depth': depth } as any} onContextMenu={event => onContextMenu(event, node, isWorkspaceRoot)}>
+      <button className="tree-toggle" onClick={activate} tabIndex={-1}>
+        {isDir ? (isOpen ? <ChevronDown size={14}/> : <ChevronRight size={14}/>) : <span/>}
       </button>
-      <button className="file-open" onClick={() => onOpen(node)} title={node.path || 'workspace root'}>
-        <Icon size={14}/>
+      <button className="file-open" onClick={activate} title={node.path || 'workspace root'}>
+        <Icon size={15} className="file-icon"/>
         <span className="file-name">{node.name}</span>
         {node.type === 'file' && <span className="file-size">{formatFileSize(node.size)}</span>}
       </button>
+      <button
+        className="file-more"
+        title="更多操作"
+        onClick={event => { event.stopPropagation(); onContextMenu(event, node, isWorkspaceRoot) }}
+      ><MoreHorizontal size={15}/></button>
     </div>
-    {node.type === 'directory' && isOpen && node.children?.map(child => <FileTreeNode
+    {isDir && isOpen && node.children?.map(child => <FileTreeNode
       key={child.path || child.name}
       node={child}
       depth={depth + 1}
       expanded={expanded}
+      activeFilePath={activeFilePath}
       onToggleFolder={onToggleFolder}
       onOpen={onOpen}
       onContextMenu={onContextMenu}
@@ -2886,17 +3081,18 @@ function FileTreeNode({ node, depth, expanded, onToggleFolder, onOpen, onContext
 function FileContextMenu({ menu, clipboardPath, onAction }: {
   menu: FileContextMenuState
   clipboardPath: string | null
-  onAction: (action: 'upload' | 'new-folder' | 'copy' | 'paste' | 'delete' | 'download' | 'open') => void
+  onAction: (action: 'upload' | 'new-folder' | 'copy' | 'paste' | 'delete' | 'download' | 'open' | 'remove-workspace') => void
 }) {
   const item = menu.item
   return <div className="file-context-menu" style={{ left: menu.x, top: menu.y }} onMouseDown={event => event.stopPropagation()}>
-    {item && <button onClick={() => onAction('open')}>Open</button>}
-    <button onClick={() => onAction('upload')}>Upload...</button>
-    <button onClick={() => onAction('new-folder')}>New Folder</button>
-    {item && <button onClick={() => onAction('copy')}>Copy</button>}
-    <button disabled={!clipboardPath} onClick={() => onAction('paste')}>Paste</button>
-    {item?.type === 'file' && <button onClick={() => onAction('download')}>Download</button>}
-    {item && <button className="danger" onClick={() => onAction('delete')}>Delete</button>}
+    {item && <button onClick={() => onAction('open')}><Eye size={14}/>打开</button>}
+    <button onClick={() => onAction('upload')}><Upload size={14}/>上传文件…</button>
+    <button onClick={() => onAction('new-folder')}><FolderPlus size={14}/>新建文件夹</button>
+    {item && <button onClick={() => onAction('copy')}><Copy size={14}/>复制</button>}
+    <button disabled={!clipboardPath} onClick={() => onAction('paste')}><ClipboardPaste size={14}/>粘贴</button>
+    {item?.type === 'file' && <button onClick={() => onAction('download')}><Download size={14}/>下载</button>}
+    {menu.isWorkspaceRoot && <button onClick={() => onAction('remove-workspace')}><FolderMinus size={14}/>从侧栏移除工作区</button>}
+    {item && <button className="danger" onClick={() => onAction('delete')}><Trash2 size={14}/>删除</button>}
   </div>
 }
 
