@@ -103,6 +103,129 @@ def _fetch_text(url: str, timeout: int = 10) -> str:
         raise RuntimeError(f"curl failed: {curl_error}; urllib failed: {exc}") from exc
 
 
+def _fetch_bytes(url: str, timeout: int = 10) -> tuple[bytes, str]:
+    """Fetch raw bytes and content-type without decoding.
+
+    Needed for binary payloads such as PDFs, where ``_fetch_text``'s
+    ``decode(errors="replace")`` would corrupt the content. Keeps the same
+    curl-first / urllib-fallback strategy as ``_fetch_text`` to stay fork-safe
+    on macOS.
+    """
+    curl = shutil.which("curl")
+    if curl:
+        completed = subprocess.run(
+            [
+                curl,
+                "-L",
+                "--silent",
+                "--show-error",
+                "--max-time",
+                str(timeout),
+                "-A",
+                _USER_AGENT,
+                "-w",
+                "\n%{content_type}",
+                url,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        if completed.returncode == 0:
+            out = completed.stdout
+            # The -w content_type is appended after a trailing newline.
+            newline = out.rfind(b"\n")
+            if newline >= 0:
+                content_type = out[newline + 1:].decode("utf-8", errors="replace").strip()
+                body = out[:newline]
+            else:
+                content_type = ""
+                body = out
+            return body, content_type
+        curl_error = completed.stderr.decode("utf-8", errors="replace").strip()
+    else:
+        curl_error = "curl not found"
+
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+        with _OPENER.open(req, timeout=timeout) as response:
+            raw = response.read()
+            content_type = ""
+            headers = getattr(response, "headers", None)
+            if headers is not None:
+                get_content_type = getattr(headers, "get_content_type", None)
+                if callable(get_content_type):
+                    content_type = get_content_type() or ""
+            return raw, content_type
+    except Exception as exc:
+        raise RuntimeError(f"curl failed: {curl_error}; urllib failed: {exc}") from exc
+
+
+def _looks_like_pdf(data: bytes, content_type: str, url: str) -> bool:
+    if data[:5] == b"%PDF-":
+        return True
+    if "application/pdf" in (content_type or "").lower():
+        return True
+    return False
+
+
+def _normalize_pdf_url(url: str) -> str:
+    """Rewrite arxiv abstract links to their PDF endpoint.
+
+    ``arxiv.org/abs/<id>`` serves HTML; ``arxiv.org/pdf/<id>`` serves the PDF.
+    Other URLs are returned unchanged.
+    """
+    match = re.match(r"(?i)^(https?://(?:www\.)?arxiv\.org)/abs/(.+?)/?$", url.strip())
+    if match:
+        return f"{match.group(1)}/pdf/{match.group(2)}"
+    return url
+
+
+def _extract_pdf(data: bytes, max_chars: int) -> Dict[str, Any]:
+    """Extract text + light metadata from PDF bytes using pymupdf.
+
+    Returns a dict with content_type=pdf, a bounded ``content`` preview, and
+    ``char_count`` / ``page_count`` / ``truncated`` so the model can decide
+    whether the preview is enough or a deeper read is needed.
+    """
+    try:
+        import pymupdf  # fitz; provided by pymupdf>=1.26 in requirements
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        return {"content_type": "pdf", "error": f"pymupdf unavailable: {exc}"}
+
+    try:
+        doc = pymupdf.open(stream=data, filetype="pdf")
+    except Exception as exc:
+        return {"content_type": "pdf", "error": f"failed to open PDF: {exc}"}
+
+    try:
+        pages = []
+        for page in doc:
+            pages.append(page.get_text())
+        full = "\n".join(pages)
+        page_count = doc.page_count
+        meta = doc.metadata or {}
+    finally:
+        doc.close()
+
+    char_count = len(full)
+    content = full[:max_chars]
+    result = {
+        "content_type": "pdf",
+        "page_count": page_count,
+        "char_count": char_count,
+        "content": content,
+        "truncated": char_count > max_chars,
+    }
+    title = (meta.get("title") or "").strip()
+    author = (meta.get("author") or "").strip()
+    if title:
+        result["title"] = title
+    if author:
+        result["authors"] = author
+    return result
+
+
 def _post_json(url: str, payload: Dict[str, Any], headers: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
     body = json.dumps(payload).encode("utf-8")
     request = urllib.request.Request(
@@ -647,20 +770,39 @@ def web_search_tool(query: str, limit: int = 5, provider: str = "auto") -> str:
     })
 
 
-def web_extract_tool(urls: list) -> str:
-    """Extract readable text from up to five web page URLs."""
+_DEFAULT_PDF_PREVIEW_CHARS = 12000
+
+
+def web_extract_tool(urls: list, max_chars: int = _DEFAULT_PDF_PREVIEW_CHARS) -> str:
+    """Extract readable text from up to five web page URLs.
+
+    HTML pages return a text preview. PDFs (detected by magic bytes or
+    content-type, regardless of site) are parsed with pymupdf and return
+    structured metadata plus a bounded ``content`` preview so the model can
+    tell an abstract-level preview from the full paper.
+    """
     if not isinstance(urls, list):
         return _json_failure("urls must be a list of URL strings")
+
+    try:
+        max_chars = max(1000, min(int(max_chars), 200000))
+    except Exception:
+        max_chars = _DEFAULT_PDF_PREVIEW_CHARS
 
     results = []
     for url in urls[:5]:
         if not isinstance(url, str) or not url.strip():
             results.append({"url": url, "error": "invalid URL"})
             continue
+        target = _normalize_pdf_url(url.strip())
         try:
-            page_html = _fetch_text(url.strip(), timeout=10)
-            text = _strip_html(page_html)
-            results.append({"url": url, "content": text[:5000]})
+            data, content_type = _fetch_bytes(target, timeout=30)
+            if _looks_like_pdf(data, content_type, target):
+                pdf_result = _extract_pdf(data, max_chars)
+                results.append({"url": url, **pdf_result})
+            else:
+                text = _strip_html(data.decode("utf-8", errors="replace"))
+                results.append({"url": url, "content_type": "html", "content": text[:5000]})
         except Exception as e:
             results.append({"url": url, "error": str(e)})
 
@@ -688,7 +830,12 @@ registry.register(
 
 registry.register(
     name="web_extract",
-    description="从指定的 URL 提取网页文本内容。",
+    description=(
+        "从指定的 URL 提取内容。HTML 返回正文文本预览；PDF（按 magic bytes/content-type "
+        "自动识别，含 arxiv.org/abs 链接）用 pymupdf 解析，返回 title/authors/page_count/"
+        "char_count 元数据 + 前 max_chars 字符的正文预览。若 truncated=true 表示只是预览、"
+        "全文更长，可调大 max_chars 深读。"
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -696,7 +843,12 @@ registry.register(
                 "type": "array",
                 "items": {"type": "string"},
                 "description": "要提取内容的 URL 列表 (最多 5 个)",
-            }
+            },
+            "max_chars": {
+                "type": "integer",
+                "description": "PDF 正文预览的最大字符数 (默认 12000，足够覆盖标题/作者/摘要/引言)",
+                "default": _DEFAULT_PDF_PREVIEW_CHARS,
+            },
         },
         "required": ["urls"],
     },
