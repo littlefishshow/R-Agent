@@ -313,6 +313,22 @@ def get_llm_streaming_enabled():
     return raw in ("1", "true", "yes", "on")
 
 
+def get_context_log_enabled():
+    """是否维护会话级无损时间流（虚拟上下文，见 core/context_log.py）。
+
+    默认开启：虚拟上下文与物理 ``messages`` 隔离，压缩只往日志追加 fold 标记而不删
+    原始消息，供排查 bug 与 Agent 溯源过去任务。设 ``CONTEXT_LOG_ENABLED=0`` 关闭，
+    关闭后行为完全回退到仅维护物理上下文。
+    """
+    raw = str(os.environ.get("CONTEXT_LOG_ENABLED", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def get_context_log_dir():
+    """虚拟上下文时间流落盘目录；默认 sandbox/context_log（启用 session 沙箱时迁入会话目录）。"""
+    return os.environ.get("CONTEXT_LOG_DIR", "").strip() or os.path.join("sandbox", "context_log")
+
+
 def get_tool_sanitization_enabled():
     """兼容旧布尔开关：audit/enforce 都视为“已启用中间件”."""
     return get_tool_sanitization_mode() != "off"

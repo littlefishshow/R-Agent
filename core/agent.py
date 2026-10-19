@@ -10,6 +10,7 @@ from core.context_control import compress_messages, resolve_context_window, shou
 from tools.registry import registry
 from core.sandbox_cleanup import maybe_cleanup_sandbox
 from core import events as run_events
+from core.context_log import ContextLog
 from core.state import ThreadState, build_durable_context
 from core.memory_provider import get_memory_provider
 from core.sandbox_workspace import SandboxWorkspace
@@ -118,6 +119,20 @@ def _assistant_message_for_history(message):
     if isinstance(message, ProviderMessage):
         return message.to_dict()
     return message
+
+
+def _thinking_of(message) -> str:
+    """Best-effort extract reasoning/thinking text from an assistant message.
+
+    Physical ``messages`` drop thinking, but the virtual context log keeps it for
+    traceability. Covers both the L0 ``ProviderMessage`` wrapper and raw SDK
+    objects that expose ``reasoning_content`` / ``reasoning``.
+    """
+    for attr in ("reasoning_content", "reasoning"):
+        value = _msg_get(message, attr, None)
+        if value:
+            return str(value)
+    return ""
 
 
 def _tool_call_ids(message) -> list:
@@ -397,6 +412,15 @@ class RAgent:
         # 惰性创建：每次 run_conversation 开启一个新 run_id 的 store。
         self.event_store = None
         self._run_counter = 0
+        # 虚拟上下文（无损时间流）：与物理 messages 隔离的会话级真相源。压缩/归档只往
+        # 日志追加 fold 标记而不删原始消息，供排查 bug 与 Agent 溯源。惰性创建、会话级
+        # （不按 run 切分），运行期间 seq 跨 run 连续。
+        self.context_log = None
+        self._current_run_id = ""
+        # 已记入虚拟上下文的消息 entry（按记录顺序的 {seq, role, folded}）。用于把一次
+        # 压缩精确映射成 fold 标记的 [start_seq, end_seq] 区间。压缩会保留开头的 system
+        # 消息，因此折叠索引需跳过它。
+        self._ctx_message_log = []
         # 内核运行时中间件始终安装；调用方传入的中间件替换“可选默认链”，
         # 但不会移除输出预算、状态追踪等运行时不变量。
         optional_middlewares = (
@@ -569,6 +593,97 @@ class RAgent:
         os.environ.pop("R_AGENT_TOOL_OUTPUTS_DIR", None)
         os.environ.pop("R_AGENT_DELEGATE_CONTEXTS_DIR", None)
         return config.get_run_events_dir()
+
+    def _resolve_context_log_dir(self):
+        """决定虚拟上下文时间流落盘目录。
+
+        与 run_events 一致：启用 per-session 沙箱时迁入 ``<session-root>/context_log``，
+        否则回退全局 ``sandbox/context_log``。异常时回退全局，绝不打断对话。
+        """
+        try:
+            workspace = self.get_sandbox_workspace()
+            if workspace is not None:
+                target = workspace.root / "context_log"
+                target.mkdir(parents=True, exist_ok=True)
+                return str(target)
+        except Exception:
+            pass
+        return config.get_context_log_dir()
+
+    def _ensure_context_log(self):
+        """惰性创建会话级虚拟上下文时间流；禁用或异常时返回 None。"""
+        if not config.get_context_log_enabled():
+            return None
+        if self.context_log is None:
+            try:
+                self.context_log = ContextLog(
+                    session_id=_safe_tool_session_id(self.session_id) or (self.session_id or "default"),
+                    base_dir=self._resolve_context_log_dir(),
+                    enabled=True,
+                )
+            except Exception:
+                self.context_log = None
+        return self.context_log
+
+    def _log_context_message(self, message, *, thinking: str = "", msg_id: str = "") -> None:
+        """把一条进入物理历史的消息无损镜像进虚拟上下文。绝不打断主循环。"""
+        log = self._ensure_context_log()
+        if log is None:
+            return
+        try:
+            entry = log.record_message(message, run_id=self._current_run_id, thinking=thinking, msg_id=msg_id)
+            if entry is not None:
+                self._ctx_message_log.append({"seq": entry.seq, "role": entry.role, "folded": False})
+        except Exception:
+            pass
+
+    def _log_context_fold(self, *, summarized_count, summary, reason, stats=None) -> None:
+        """把一次压缩映射成 fold 标记。
+
+        压缩保留开头第一条 system 消息并把最早的若干**对话**消息折叠成摘要。这里在已
+        镜像的消息里，跳过那条常驻 leading system，取最早、尚未折叠的 ``summarized_count``
+        条，记录它们的 ``[start_seq, end_seq]`` 区间并追加 fold 标记。原始消息仍留在时间
+        流里，``slice`` 可无损取回；该映射仅用于回放便利，即便计数略有出入日志仍无损。
+        """
+        log = self._ensure_context_log()
+        if log is None:
+            return
+        try:
+            count = int(summarized_count or 0)
+            if count <= 0:
+                return
+            # 候选 = 尚未折叠的消息，跳过第一条 system（压缩始终保留它）。
+            candidates = [e for e in self._ctx_message_log if not e["folded"]]
+            if candidates and candidates[0]["role"] == "system":
+                candidates = candidates[1:]
+            target = candidates[:count]
+            if not target:
+                return
+            start_seq = target[0]["seq"]
+            end_seq = target[-1]["seq"]
+            log.record_fold(
+                start_seq=start_seq,
+                end_seq=end_seq,
+                summary=summary or "",
+                run_id=self._current_run_id,
+                reason=reason,
+                stats=stats or {},
+            )
+            folded_seqs = {e["seq"] for e in target}
+            for e in self._ctx_message_log:
+                if e["seq"] in folded_seqs:
+                    e["folded"] = True
+        except Exception:
+            pass
+
+    def _log_context_event(self, entry_type, content="", **meta) -> None:
+        log = self._ensure_context_log()
+        if log is None:
+            return
+        try:
+            log.append(entry_type, content, run_id=self._current_run_id, meta=meta or {})
+        except Exception:
+            pass
 
     def _apply_deferred_tool_filter(self, tools):
         """延迟工具暴露：默认关；开启时只保留固定 always-on/control schemas。
@@ -1053,6 +1168,14 @@ class RAgent:
         self._durable_snapshot = {"role": "user", "content": durable} if durable else None
         if epoch > 1:
             self._mark_cache_change("durable_promoted")
+        # 在虚拟上下文记录一次 durable 晋升（元事件，不属于消息镜像）。
+        self._log_context_event(
+            "durable_promote",
+            durable or "",
+            epoch=epoch,
+            reason=str(reason or "context_boundary"),
+            component_hash=promoted.get("component_hash"),
+        )
 
     def _build_durable_context_message(self):
         """Return the already-promoted current message; never render live state."""
@@ -1178,6 +1301,13 @@ class RAgent:
                 archive_summary = result.get("summary")
                 if archive_summary:
                     self.state.summary_text = (manual_text + "\n\n" + archive_summary) if manual_text else archive_summary
+                # 虚拟上下文无损：记录一次归档折叠，原始消息仍留在时间流里。
+                self._log_context_fold(
+                    summarized_count=(result.get("stats") or {}).get("summarized_messages"),
+                    summary=archive_summary or summary or "",
+                    reason="archive_subtask",
+                    stats=result.get("stats") or {},
+                )
                 # 摘要已变，重建 durable 备份并复位工具/目录快照，让它们随 KV 重建一起更新。
                 self._on_context_compacted()
                 return
@@ -1298,6 +1428,14 @@ class RAgent:
             summary = result.get("summary")
             if summary:
                 self.state.summary_text = summary
+            # 虚拟上下文无损：物理层折叠了最早 summarized_messages 条消息，这里只在
+            # 时间流上追加一个 fold 标记，原始消息仍留在日志里可无损取回。
+            self._log_context_fold(
+                summarized_count=stats.get("summarized_messages"),
+                summary=summary or "",
+                reason="auto_compaction",
+                stats=stats,
+            )
             # 摘要已变，重建 durable 备份并复位工具/目录快照，让它们随 KV 重建一起更新。
             self._on_context_compacted()
             self.context_usage.update({
@@ -1875,6 +2013,7 @@ class RAgent:
             raise AgentInterrupted()
         message = response.choices[0].message
         self.messages.append(_assistant_message_for_history(message))
+        self._log_context_message(message, thinking=_thinking_of(message))
         return message.content or "(模型未返回文本)"
 
     # ------------------------------------------------------------------
@@ -1890,14 +2029,17 @@ class RAgent:
         用户输入后的快照（保留用户输入，丢弃 assistant/tool 中间消息）并
         抛出 AgentInterrupted。
         """
+        system_msg_to_log = None
         if system_message and not any(m.get("role") == "system" for m in self.messages):
             system_msg = {"role": "system", "content": system_message}
             self.messages.append(system_msg)
+            system_msg_to_log = system_msg
             _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(system_msg), "message_index": len(self.messages) - 1})
 
         # 为本次 run 开启一个 append-only 事件流（每轮用户对话一个 run_id）。
         self._run_counter += 1
         run_id = f"{_safe_tool_session_id(self.session_id) or 'run'}-{int(time.time())}-{self._run_counter}"
+        self._current_run_id = run_id
         try:
             self.event_store = run_events.RunEventStore(
                 run_id=run_id,
@@ -1912,9 +2054,14 @@ class RAgent:
             {"model": self.model, "max_iterations": self.max_iterations},
             user_message_preview=str(user_message)[:200],
         )
+        # 虚拟上下文：标记一次 run 边界，并无损镜像本轮新进入历史的消息。
+        self._log_context_event("run_start", str(user_message)[:200], run_id=run_id, model=self.model)
+        if system_msg_to_log is not None:
+            self._log_context_message(system_msg_to_log)
 
         user_msg = {"role": "user", "content": user_message}
         self.messages.append(user_msg)
+        self._log_context_message(user_msg)
         _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(user_msg), "message_index": len(self.messages) - 1})
         # Repair any dangling tool-call state left by a previous run that died
         # mid tool-call (interrupt/crash/restart). Otherwise the chat API rejects
@@ -1948,6 +2095,12 @@ class RAgent:
                 run_events.EV_RUN_END,
                 {"truncated": bool(getattr(self, _TRUNCATED_FLAG, False))},
                 total_tokens=self.token_usage.get("total_tokens"),
+            )
+            self._log_context_event(
+                "run_end",
+                "",
+                run_id=run_id,
+                truncated=bool(getattr(self, _TRUNCATED_FLAG, False)),
             )
             self._turns_since_self_review += 1
             review_interval = config.get_self_evolution_review_interval()
@@ -1990,6 +2143,7 @@ class RAgent:
             ),
         }
         self.messages.append(resume_msg)
+        self._log_context_message(resume_msg)
         _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(resume_msg), "message_index": len(self.messages) - 1})
         self.max_iterations += extra_iterations
         setattr(self, _TRUNCATED_FLAG, False)
@@ -2152,6 +2306,7 @@ class RAgent:
                 cache_usage=self.get_cache_usage(),
             )
             self.messages.append(_assistant_message_for_history(message))
+            self._log_context_message(message, thinking=_thinking_of(message))
             _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(message), "message_index": len(self.messages) - 1})
 
             # 中间件：拿到模型回复后
@@ -2343,6 +2498,7 @@ class RAgent:
                         tool_msg["content"] = replaced
 
                     self.messages.append(tool_msg)
+                    self._log_context_message(tool_msg)
                     normalized_tool_msg = normalize_message(tool_msg)
                     _emit_event(event_sink, EVENT_TOOL_RESULT_APPENDED, {"message": normalized_tool_msg})
                     _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalized_tool_msg, "message_index": len(self.messages) - 1})
