@@ -21,6 +21,8 @@ from core.middleware import (
     build_runtime_middlewares,
 )
 from core.cache_observability import build_request_fingerprint, provider_cache_tokens, stable_hash
+from core.llm import ModelRequest, StreamOptions, build_provider
+from core.llm.compat import ProviderMessage, ProviderResponse
 from app_gui.normalizer import build_llm_request_snapshot, normalize_message
 from app_gui.schemas import (
     EVENT_LLM_REQUEST_SNAPSHOT,
@@ -104,6 +106,18 @@ def _msg_get(message, key, default=None):
     if isinstance(message, dict):
         return message.get(key, default)
     return getattr(message, key, default)
+
+
+def _assistant_message_for_history(message):
+    """Return a history-safe assistant message.
+
+    When the L0 provider layer is active, ``message`` is a ``ProviderMessage``
+    wrapper. Store its plain OpenAI dict form so subsequent requests serialize
+    cleanly through the SDK; SDK-native objects (direct path) are kept as-is.
+    """
+    if isinstance(message, ProviderMessage):
+        return message.to_dict()
+    return message
 
 
 def _tool_call_ids(message) -> list:
@@ -361,6 +375,9 @@ class RAgent:
         self._active_exclude_tools = set()
         # 统一使用 config 模块创建配置好的客户端 (支持 Azure 等)
         self.client = config.create_llm_client()
+        # L0 Provider 层（core/llm）惰性构造；None 表示尚未创建。主模型请求默认经由
+        # ModelProvider 契约发出，可用 LLM_PROVIDER_LAYER_ENABLED=0 回退直连 SDK。
+        self._model_provider = None
         # 结构化运行状态（见 core/state.py / Improve_progress/02）。
         # messages / token_usage / delegated_token_usage / context_usage 现在都
         # 收编到 ThreadState，并通过下面的 property 代理回来，保证外部代码
@@ -1189,7 +1206,7 @@ class RAgent:
             return None
 
         def _summarize(summary_input):
-            response = self._chat_completion_with_retry(
+            response = self._complete(
                 model=config.get_context_summarization_model() or self.model,
                 stream=False,
                 _internal_tags=(SUMMARY_NOSTREAM_TAG,),
@@ -1642,6 +1659,110 @@ class RAgent:
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
+    def _get_model_provider(self, cancel_event=None):
+        """惰性构造 L0 ``ModelProvider``，复用本 Agent 已配置的 SDK 客户端。
+
+        重试在 adapter 内按 config 执行；取消检查桥接到传入的 ``cancel_event``，
+        以便 Esc 中断能让流产出 ``aborted`` 终止事件。
+        """
+        provider = getattr(self, "_model_provider", None)
+        if provider is None:
+            provider = build_provider(
+                self.client,
+                cancel_check=(lambda: _is_cancelled(cancel_event)) if cancel_event is not None else None,
+            )
+            self._model_provider = provider
+        else:
+            # 刷新取消检查，绑定到当前这轮的 cancel_event。
+            provider.cancel_check = (
+                (lambda: _is_cancelled(cancel_event)) if cancel_event is not None else None
+            )
+        return provider
+
+    def _chat_completion_via_provider(
+        self,
+        *,
+        on_think=None,
+        iteration=None,
+        cancel_event=None,
+        event_sink=None,
+        stream=None,
+        **kwargs,
+    ):
+        """通过 L0 ``ModelProvider`` 发起一次主模型请求，返回兼容的响应对象。
+
+        - 消费统一 ``AssistantMessageEvent`` 流；``stream=True`` 时把 text/thinking
+          增量转发给 ``on_think``（供 CLI/GUI 实时渲染）；
+        - 终止事件给出最终 ``AssistantMessage``，再适配回 ``.choices[0].message`` +
+          ``.usage`` 的响应对象，让既有 token/cache 记账与主循环零改动复用；
+        - ``error`` 终止转成异常抛给调用方，复用既有错误处理分支；取消转成
+          ``AgentInterrupted``。
+        """
+        internal_tags = tuple(kwargs.pop("_internal_tags", ()) or ())
+        cache_observation = kwargs.pop("_cache_observation", None)
+        kwargs.pop("stream", None)  # 流开关由 StreamOptions 统一控制
+        want_stream = bool(config.get_llm_streaming_enabled() if stream is None else stream)
+        if SUMMARY_NOSTREAM_TAG in internal_tags:
+            want_stream = False
+
+        request = ModelRequest(
+            model=kwargs.pop("model", self.model),
+            messages=kwargs.pop("messages", []),
+            tools=kwargs.pop("tools", None),
+            temperature=kwargs.pop("temperature", None),
+            max_tokens=kwargs.pop("max_tokens", None),
+            extra={k: v for k, v in kwargs.items() if v is not None},
+        )
+        provider = self._get_model_provider(cancel_event=cancel_event)
+        request_started = time.monotonic()
+        event_stream = provider.stream_simple(request, StreamOptions(stream=want_stream))
+
+        # 过程视图：转发增量。result 视图在循环后读取。
+        for event in event_stream:
+            if _is_cancelled(cancel_event):
+                raise AgentInterrupted()
+            if not want_stream:
+                continue
+            if event.type in ("text_delta", "thinking_delta") and event.delta and on_think and iteration is not None:
+                try:
+                    on_think(iteration, stream_delta=event.delta, stream_kind=event.type)
+                except TypeError:
+                    # 旧版 on_think 不支持增量 kwargs：忽略增量，最终消息仍会呈现。
+                    pass
+
+        final = event_stream.result()
+        if final.stop_reason == "aborted":
+            raise AgentInterrupted()
+        if final.is_error:
+            raise RuntimeError(final.error_message or "model request failed")
+
+        response = ProviderResponse(final)
+        self._record_token_usage(response)
+        if cache_observation is not None:
+            self._record_cache_usage(
+                response,
+                observation=cache_observation,
+                latency_seconds=time.monotonic() - request_started,
+            )
+        return response
+
+    def _complete(self, *, on_think=None, iteration=None, cancel_event=None, event_sink=None, **kwargs):
+        """统一的主模型请求入口：按配置选择 L0 Provider 层或直连 SDK 路径。"""
+        if config.get_llm_provider_layer_enabled():
+            return self._chat_completion_via_provider(
+                on_think=on_think,
+                iteration=iteration,
+                cancel_event=cancel_event,
+                event_sink=event_sink,
+                **kwargs,
+            )
+        return self._chat_completion_with_retry(
+            on_think=on_think,
+            iteration=iteration,
+            cancel_event=cancel_event,
+            **kwargs,
+        )
+
     def _chat_completion_with_retry(self, on_think=None, iteration=None, cancel_event=None, **kwargs):
         """
         包装 client.chat.completions.create，对瞬时错误自动指数退避重试。
@@ -1737,7 +1858,7 @@ class RAgent:
                 request_tools=[],
                 request_kind="force_finalize",
             )
-            response = self._chat_completion_with_retry(
+            response = self._complete(
                 on_think=on_think,
                 iteration=used,
                 cancel_event=cancel_event,
@@ -1753,7 +1874,7 @@ class RAgent:
         if _is_cancelled(cancel_event):
             raise AgentInterrupted()
         message = response.choices[0].message
-        self.messages.append(message)
+        self.messages.append(_assistant_message_for_history(message))
         return message.content or "(模型未返回文本)"
 
     # ------------------------------------------------------------------
@@ -1994,10 +2115,11 @@ class RAgent:
                 on_think(iteration)
 
             try:
-                response = self._chat_completion_with_retry(
+                response = self._complete(
                     on_think=on_think,
                     iteration=iteration,
                     cancel_event=cancel_event,
+                    event_sink=event_sink,
                     _cache_observation=cache_observation,
                     **kwargs,
                 )
@@ -2029,7 +2151,7 @@ class RAgent:
                 last_total_tokens=self.token_usage.get("last_total_tokens"),
                 cache_usage=self.get_cache_usage(),
             )
-            self.messages.append(message)
+            self.messages.append(_assistant_message_for_history(message))
             _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(message), "message_index": len(self.messages) - 1})
 
             # 中间件：拿到模型回复后

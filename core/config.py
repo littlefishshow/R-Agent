@@ -291,6 +291,28 @@ def get_durable_context_enabled():
     return raw not in ("0", "false", "no", "off")
 
 
+def get_llm_provider_layer_enabled():
+    """是否通过 L0 统一 Provider 层（core/llm）发起主模型请求。
+
+    默认开启：Agent Loop 依赖 ``ModelProvider`` 契约，不再直接调用厂商 SDK。
+    设 ``LLM_PROVIDER_LAYER_ENABLED=0`` 可回退到旧的直连 ``chat.completions`` 路径，
+    便于隔离排查 L0 层相关问题。
+    """
+    raw = str(os.environ.get("LLM_PROVIDER_LAYER_ENABLED", "1")).strip().lower()
+    return raw not in ("0", "false", "no", "off")
+
+
+def get_llm_streaming_enabled():
+    """主模型请求是否使用流式响应（经 L0 Provider 层）。
+
+    默认关闭：R-Agent 当前主循环按整条消息推进，非流式更稳定且与既有事件语义一致；
+    开启后 L0 adapter 会边到边产出 text/thinking/tool 增量事件，供 CLI/GUI 实时渲染。
+    设 ``LLM_STREAMING_ENABLED=1`` 开启。仅在 Provider 层开启时生效。
+    """
+    raw = str(os.environ.get("LLM_STREAMING_ENABLED", "0")).strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def get_tool_sanitization_enabled():
     """兼容旧布尔开关：audit/enforce 都视为“已启用中间件”."""
     return get_tool_sanitization_mode() != "off"

@@ -385,12 +385,12 @@ def test_agent_durable_compression_injects_single_summary_copy(monkeypatch):
     assert len(durable_messages) == 1
     assert main_messages[0]["content"] == "base"
     assert main_messages[1] is durable_messages[0]
+    # durable 摘要只投影进请求视图，绝不写回会话历史。
+    # 注：经 L0 Provider 层后，助手回复以可序列化 dict 形式入历史（旧路径为 SDK 对象），
+    # 因此这里只校验 durable 摘要未泄漏，不再隐式依赖"最终回复不是 dict"。
     assert not any(
         isinstance(message, dict)
-        and (
-            "<durable_summary>" in str(message.get("content", ""))
-            or message.get("content") == "ok"
-        )
+        and "<durable_summary>" in str(message.get("content", ""))
         for message in agent.messages
     )
 
