@@ -1082,6 +1082,25 @@ pre {
   white-space: pre-wrap;
 }
 
+.markdown-body ::selection {
+  color: inherit;
+  background: color-mix(in srgb, var(--dsw-alias-accent) 30%, transparent);
+}
+
+.md-token.active-text-selection {
+  color: inherit;
+  background: color-mix(in srgb, var(--dsw-alias-accent) 28%, transparent);
+  border-radius: 3px;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.md-math-token.active-text-selection {
+  background: color-mix(in srgb, var(--dsw-alias-accent) 22%, transparent);
+  outline: 1px solid color-mix(in srgb, var(--dsw-alias-accent) 62%, transparent);
+  outline-offset: 2px;
+}
+
 
 .md-math-source {
   position: absolute;
@@ -1268,6 +1287,39 @@ pre {
   background: var(--dsw-alias-accent-bg);
   color: var(--dsw-alias-label-secondary);
   font-size: 12px;
+}
+
+.cache-observability {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 800px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 12px;
+  margin-bottom: 7px;
+  padding: 7px 12px;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: var(--dsw-radius-card);
+  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 84%, transparent);
+  color: var(--dsw-alias-label-tertiary);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.cache-observability-primary {
+  color: var(--dsw-alias-label-secondary);
+  font-weight: 760;
+}
+
+.cache-observability-primary.available,
+.cache-observability .prefix-good {
+  color: var(--dsw-alias-accent-strong);
+}
+
+.cache-observability-primary.unavailable,
+.cache-observability .prefix-changed {
+  color: var(--dsw-alias-label-tertiary);
 }
 
 .composer-card {
@@ -1896,6 +1948,10 @@ textarea:focus {
   position: fixed;
   z-index: 1000;
   display: flex;
+  flex-wrap: nowrap;
+  width: max-content;
+  max-width: calc(100vw - 16px);
+  overflow-x: auto;
   gap: 4px;
   padding: 5px;
   border: 1px solid var(--dsw-alias-border-l2-strong);
@@ -1905,12 +1961,14 @@ textarea:focus {
 }
 
 .selection-menu button {
+  flex: 0 0 auto;
   height: 30px;
   padding: 0 9px;
   color: var(--dsw-alias-label-secondary);
   background: var(--dsw-alias-bg-layer-2);
   border: 1px solid var(--dsw-alias-border-l2);
   font-size: 12px;
+  white-space: nowrap;
 }
 
 .selection-menu button:hover {

@@ -53,9 +53,16 @@ class ToolRuntimeStateMiddleware(Middleware):
         agent = ctx.agent
         if call.name == "delegate_task":
             agent._merge_delegated_token_usage_from_tool_result(result)
+            merge_cache = getattr(agent, "_merge_delegated_cache_usage_from_tool_result", None)
+            if callable(merge_cache):
+                merge_cache(result)
         agent._maybe_promote_from_tool_search(call.name, result)
         agent._maybe_record_skill_context(call.name, call.arguments, result)
         agent._maybe_apply_skill_policy(call.name, result)
+        if call.name in {"tool_search", "skill_view", "skill_activate", "todo_manage", "memory"}:
+            stage = getattr(agent, "_stage_durable_next", None)
+            if callable(stage):
+                stage()
         return None
 
 
@@ -200,6 +207,9 @@ class ToolResultTrackingMiddleware(Middleware):
                 "call_id": call.call_id,
                 "chars": len(result_text),
             })
+            stage = getattr(agent, "_stage_durable_next", None)
+            if callable(stage):
+                stage()
 
         if call.name == "delegate_task":
             agent._emit_run_event(
@@ -209,6 +219,9 @@ class ToolResultTrackingMiddleware(Middleware):
             )
             for entry in _delegation_entries(result_text):
                 agent.state.add_delegation(entry)
+            stage = getattr(agent, "_stage_durable_next", None)
+            if callable(stage):
+                stage()
 
 
 # 明显的注入式指令特征。命中后不删除内容（可能是正常引用），而是**中和**：

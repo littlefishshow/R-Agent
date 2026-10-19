@@ -107,11 +107,22 @@ RAgent(
 )
 ```
 
-它获得：
+同一次 `delegate_task` 会先冻结一个批次级公共前缀：
+
+```text
+SUBAGENT_SYSTEM_PROMPT（所有兄弟完全相同）
+Tool Catalog / 固定 Tool Schema
+delegation_prefix_snapshot
+  ├─ 本批次启动时的未完成 Todo
+  └─ 本批次启动时的 Memory
+```
+
+每个子 Agent 获得：
 
 - 新的 `ThreadState` 和 `messages`；
-- 专用 system prompt；
-- 任务 id、worker id、补充目标；
+- 同批次完全相同的静态 system prompt；
+- 同批次完全相同的冻结 durable current；
+- 只放在尾部 user message 的任务 id、worker id、goal、依赖、context summary、验收标准和交付物；
 - 与父 Agent 相同的 session id；
 - 父层允许工具的进一步收窄；
 - 独立的取消事件和迭代预算。
@@ -133,6 +144,10 @@ self_evolution_review
 ```
 
 这既防递归委派爆炸，也防子 Agent 擅自修改跨会话状态。
+
+这样兄弟子 Agent 的请求只在最后一条任务消息处分叉。Todo claim/update 作为尾部 tool result
+立即可见，并写入各自 durable next，但不会修改同批共享的 durable current。每条委派结果都带
+`delegation_prefix_hash`，同批任务应完全一致。
 
 ## 5. 子 Agent 必须遵守的 Todo 协议
 
@@ -183,6 +198,14 @@ self_evolution_review
     "total_tokens": 1500,
     "available": true
   },
+  "cache_usage": {
+    "request_count": 4,
+    "local_prompt_tokens": 12000,
+    "local_reusable_tokens": 9000,
+    "local_new_tokens": 3000,
+    "kv_reuse_ratio": 0.75
+  },
+  "delegation_prefix_hash": "...",
   "step_events": [
     {"seq": 1, "event_type": "llm.step"},
     {"seq": 2, "event_type": "tool.start", "name": "read_file"},
@@ -190,6 +213,16 @@ self_evolution_review
   ]
 }
 ```
+
+顶层结果还返回 `delegated_cache_usage`，父 Agent 合并后展示：
+
+```text
+tok L/T <last>/<total> · KV L/O <last>/<overall> · <prefix-state>
+```
+
+children/overall 按 tokens 加权，不对各子 Agent 百分比做简单平均。当前 child 指标按每个
+RAgent 实例独立计算，因此每个子 Agent 第一轮仍按冷启动 0% 计入；这是对跨兄弟复用能力的
+保守估计，`delegation_prefix_hash` 用于单独验证公共前缀是否一致。
 
 ### `status` 与 `stop_reason`
 

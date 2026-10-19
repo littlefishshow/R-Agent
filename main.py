@@ -97,16 +97,60 @@ def _with_interrupt_status_hint(message: str) -> str:
     return f"{message} {INTERRUPT_STATUS_HINT}"
 
 
+def _compact_usage_value(value) -> str:
+    """Format status-bar counters without losing their order of magnitude."""
+    if value in (None, "unavailable"):
+        return "—"
+    if isinstance(value, str):
+        if value.endswith("+unavailable"):
+            return value.split("+", 1)[0] + "+"
+        try:
+            value = float(value)
+        except ValueError:
+            return value
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}k"
+    return str(int(number)) if number.is_integer() else f"{number:.1f}"
+
+
 def _format_token_usage_label(agent: RAgent) -> str:
-    """生成 token 使用量文案，区分父会话、子 Agent 与总量。"""
+    """Compact CLI badge: last/total tokens, last/overall reuse, prefix state."""
     get_last = getattr(agent, "get_last_token_usage_total", None)
-    get_children = getattr(agent, "get_delegated_token_usage_total", None)
     get_total = getattr(agent, "get_total_token_usage_including_children", None)
     last = get_last() if callable(get_last) else "unavailable"
     parent = agent.get_token_usage_total()
-    children = get_children() if callable(get_children) else "unavailable"
     total = get_total() if callable(get_total) else parent
-    return f"last/parent/children/total tokens: {last}/{parent}/{children}/{total}"
+    cache_getter = getattr(agent, "get_cache_usage", None)
+    cache = cache_getter() if callable(cache_getter) else {}
+    last_ratio = cache.get("last_kv_reuse_ratio", cache.get("last_cache_hit_ratio"))
+    parent_ratio = cache.get("kv_reuse_ratio", cache.get("cache_hit_ratio"))
+    overall_ratio = cache.get("overall_kv_reuse_ratio", parent_ratio)
+    if last_ratio is not None:
+        overall_text = f"{overall_ratio:.1%}" if overall_ratio is not None else "n/a"
+        cache_text = f"KV L/O {last_ratio:.1%}/{overall_text}"
+    else:
+        cache_text = "KV L/O —/—"
+    reasons = cache.get("last_prefix_change_reasons") or []
+    reason_labels = (
+        ("context_compacted", "compact"),
+        ("system_changed", "sysΔ"),
+        ("tool_schema_changed", "toolsΔ"),
+        ("durable_changed", "durableΔ"),
+        ("history_rewritten", "rewrite"),
+        ("tail_append_only", "tail"),
+        ("first_request", "cold"),
+    )
+    prefix_text = next((label for reason, label in reason_labels if reason in reasons), "—")
+    return (
+        f"tok L/T {_compact_usage_value(last)}/{_compact_usage_value(total)}"
+        f" · {cache_text} · {prefix_text}"
+    )
 
 
 def _format_token_usage_rprompt(agent: RAgent) -> HTML:

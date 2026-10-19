@@ -1,15 +1,19 @@
 ---
 name: "read_paper"
-description: "以研究者视角定位、精读、批判论文并沉淀中文研究笔记"
+description: "以研究者视角定位、精读、批判论文并沉淀中文研究笔记；用于用户提供论文路径、标题、作者、日期、arXiv ID/URL 或要求读论文、总结论文、分析方法/实验/图表/局限/复现性时。对 arXiv 论文优先下载并解析 LaTeX source，保留公式、表格和原始图片，PDF 用于页码、最终排版核对与 source 不可用时的兜底。"
 ---
 
 # Read Paper
 
-## When to Use
-- 用户想阅读 `outputs/papers/` 文件夹下的一篇论文，并要求快速抓住论文主线、方法、实验、图表、局限和可落地性。
-- 用户指定论文 PDF/文本路径、日期、标题关键词、arXiv ID、作者、类别目录，或要求“帮我读这篇论文/总结这篇论文/精读论文”。
-- 用户希望把论文阅读转化为后续研究判断：选题价值、核心假设、可复现性、baseline 公平性、可能的后续实验、可借鉴的工具/数据/写作方式。
-- 用户需要将阅读结果沉淀到 `outputs/papers_output/` 文件夹，便于复查、对比、写综述或形成自己的研究记录。
+## Source-first Evidence Policy
+
+对 arXiv 论文强制采用 **LaTeX source 优先、PDF 核对/兜底**：
+
+1. 章节、正文、公式、表格数值、caption 和 label 优先读取 `expanded.tex` 与原始 source 文件。
+2. 图片优先复用 source 包中的 PNG/JPEG/SVG/PDF/EPS；多子图、TikZ/PGF、宏生成图和最终组合版必须回查 PDF。
+3. PDF 始终用于页码、双栏顺序、脚注、浮动体位置和最终排版核对；source 不可用、损坏或 PDF-only 时切换到 PDF 抽取/OCR。
+4. source line 只能标为 source 行号，不得伪装成 PDF 页码。关键 claim 最终尽量同时给出 `Sec./Eq./Fig./Table/label + source file/line + PDF page`。
+5. 不执行或编译不可信 TeX，不运行 shell-escape。
 
 ## Researcher Mindset
 读论文不是把论文压缩成摘要，而是训练研究品味与形成自己的问题判断。执行本技能时遵守以下原则：
@@ -35,23 +39,29 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 - 每个分类目录的图片资产放在该分类输出目录下：
   - `outputs/papers_output/agent_RL/assets/foo/<figure>.png`
   - Markdown 中引用为 `assets/foo/<figure>.png`。
-- 中间/暂存文件（全文抽取、分块、OCR 临时文本、索引 JSON、调试日志等）不要放在 `outputs/papers_output/`；统一放在 `sandbox/read_paper/<paper_stem>/`，最终完成后可删除。`outputs/papers_output/` 只保留阅读笔记、用户明确需要的导出版和图片资产。
+- source 包、`expanded.tex`、章节文件、表格源码、全文抽取、OCR、索引 JSON 与调试日志等中间产物统一放在 `sandbox/read_paper/<arxiv-id-or-paper-stem>/`。`outputs/papers_output/` 只保留最终阅读笔记、用户明确需要的导出版和最终图片资产。
 
 ## Required Tool / Skill-local Scripts
 - read_paper 专用能力默认采用 **skill-local scripts + `run_command`** 调用方式，避免把论文专用入口注册成全局 LLM tools，从而减少每轮 tool schema 干扰。
+- 对 arXiv ID/URL，或能够识别 arXiv ID 的本地 PDF，先调用 source 准备器：
+  ```bash
+  python3 skills/productivity/read_paper/scripts/arxiv_source.py "<arxiv-id-url-or-local-pdf>"
+  ```
+  只有明确需要重新下载/重建时才加 `--force`。成功后先读 `source_manifest.json`，再读 `section_index.md/json`、`sections/*.tex|md`、`figure_table_index.md/json`、`tables/*.tex` 与 `assets/`。`paper.md` 只是保守阅读视图，`expanded.tex` 与原始 source 才是权威文本。
 - 定位论文时通过 `run_command` 调用：
   ```bash
   python3 skills/productivity/read_paper/scripts/paper_locator.py "<query>" --category "<category>"
   ```
   该脚本默认递归搜索 `outputs/papers/`，默认输出到 `outputs/papers_output/`，并自动计算 Markdown 输出路径。匹配策略保持简单：明确路径/日期/文件名关键词/类别目录。
-- 论文含关键 Figure/Table/Algorithm/案例图表时通过 `run_command` 调用：
+- source 原图缺失、不可渲染、需要最终组合图或需要核对 PDF 版面时，通过 `run_command` 调用：
   ```bash
   python3 skills/productivity/read_paper/scripts/pdf_snapshot.py <pdf_path> --mode smart
   ```
-  默认根据 PDF 在 `outputs/papers/` 下的相对目录镜像输出到 `outputs/papers_output/<category>/assets/<pdf_stem>/`；**默认只截 Figure/Table/Algorithm/案例图表主体区域（含必要标题/图注），不得用整页截图冒充图表截图**。自动裁剪不理想或返回 suspicious/full-page 警告时，必须用 `--mode crops --crops-json '<json>'` 精裁；若暂时无法精裁，只能作为明确标注的降级资产使用，并在笔记中写明“降级整页/大区域截图，非最终图表主体裁剪”。
+  默认根据 PDF 在 `outputs/papers/` 下的相对目录镜像输出到 `outputs/papers_output/<category>/assets/<paper_stem>/`；只截 Figure/Table/Algorithm/案例图表主体区域（含必要标题/图注），不得用整页截图冒充图表截图。自动裁剪不理想或返回 suspicious/full-page 警告时，必须用 `--mode crops --crops-json '<json>'` 精裁；若暂时无法精裁，只能作为明确标注的降级资产使用。
 - `skills/productivity/read_paper/scripts/` 中的核心脚本：
+  - `arxiv_source.py`：下载 arXiv source、安全解压、选择主 TeX、展开 include、生成章节/图表/表格索引与原始图片资产。
   - `paper_locator.py`：论文定位与输出路径计算。
-  - `pdf_snapshot.py`：PDF Figure/Table/Algorithm caption 定位、智能裁剪和渲染。
+  - `pdf_snapshot.py`：PDF 最终版 Figure/Table/Algorithm caption 定位、智能裁剪和渲染。
 - 不再保留 `tools/paper_locator_tool.py` 与 `tools/pdf_snapshot_tool.py` 全局 wrapper；维护算法逻辑时只改 skill-local scripts。
 - 每次确认要阅读某篇论文后，同时调用 `paper_research_scout` 的 skill-local read history 脚本登记该论文，避免后续论文调研重复推荐已经读过的文章：
   ```bash
@@ -60,26 +70,32 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
   该脚本写入 `skills/productivity/paper_research_scout/references/read_papers.json`，是 skill-local reference，不注册为全局工具。
 
 ## Inputs
-- `query`：日期、标题关键词、文件名片段、arXiv ID 等，例如 `2025-02-20`、`STeCa`。
+- `query`：日期、标题关键词、文件名片段、arXiv ID/URL 等，例如 `2025-02-20`、`STeCa`、`1706.03762`。
 - `category`：可选类别目录，例如 `agent_RL`、`OPD`。
 - 用户关注点：方法细节、公式、实验公平性、落地成本、某个图表、与某类 baseline 的差异、可复现性、后续研究方向等。
 - 输出语言：默认中文。
 
 ## Paper Discovery Procedure
-1. 若用户给出明确文件路径：直接使用该路径；输出路径仍尽量按 `outputs/papers` 到 `outputs/papers_output` 的相对路径镜像生成。
-2. 否则通过 `run_command` 调用 `paper_locator.py`：
+1. 若用户给出 arXiv ID/URL：直接调用 `arxiv_source.py`，并把输出目录设为或接受默认的 `sandbox/read_paper/<arxiv-id>/`。
+2. 若用户给出明确本地文件路径：直接使用该路径；本地 PDF 先让 `arxiv_source.py` 尝试从文件名或前两页识别 arXiv ID。识别不到则走 PDF fallback。输出路径仍尽量按 `outputs/papers` 到 `outputs/papers_output` 的相对路径镜像生成。
+3. 否则通过 `run_command` 调用 `paper_locator.py`：
    - `query` 填用户给出的日期、标题关键词、arXiv ID 或文件名片段。
    - `category` 填用户给出的类别目录；没有则留空。
    - 默认 `papers_dir="outputs/papers"`，`output_dir="outputs/papers_output"`。
-3. 处理 `paper_locator.py` 返回 JSON：
+4. 处理 `paper_locator.py` 返回 JSON：
    - `status="unique"`：直接阅读 `selected.paper_path`，输出到 `selected.output_path`。
    - `status="ambiguous"`：如果上下文不能明显决定，列出候选路径让用户选择。
    - `status="no_match"` 或 `no_files`：告知没有找到，并列出使用的查询条件和默认目录。
-4. 在 Markdown 基本信息中记录：论文路径、类别目录、输出路径、搜索线索。
-5. 确认选定论文后，调用 `paper_research_scout/scripts/paper_read_history.py add` 登记已读历史；若只知道本地 PDF 路径，也必须至少记录 `--path`、推断标题和 `--category`。若知道 arXiv ID/DOI/URL，应一并记录，便于后续调研精确过滤。
+5. 处理 `arxiv_source.py` 的 `source_manifest.json`：
+   - `status="source_ready"`：以 source 建索引，并保留 PDF 做最终核对。
+   - `status="pdf_fallback_required"`：记录原因并切换到 PDF 抽取/截图；不要反复重试确定为 PDF-only 的论文。
+   - `status="source_error"`：网络临时错误可有限重试；安全限制、损坏归档、主 TeX 无法判定时保留 manifest/warnings，不得静默把不完整 source 当作全文。
+6. 在 Markdown 基本信息中记录：arXiv ID/版本、source 状态、main TeX、PDF/论文路径、类别目录、输出路径、搜索线索和重要 warnings。
+7. 确认选定论文后，调用 `paper_research_scout/scripts/paper_read_history.py add` 登记已读历史；若只知道本地 PDF 路径，也必须至少记录 `--path`、推断标题和 `--category`。若知道 arXiv ID/DOI/URL，应一并记录，便于后续调研精确过滤。
 
 ## Output Requirements
 - 每篇论文生成一份 Markdown 总结，保存到 `paper_locator.py` 返回 JSON 中的 `output_path`。
+- arXiv 论文必须在基本信息和重检查记录中写明 source 状态、版本和 PDF 核对范围；source 不可用时写明 fallback 原因。
 - 总结必须优先回答用户明确要求的信息；若用户没有额外指定，则按本技能模板完整输出。模板章节职责必须保持一致：`## 1` 是“小白友好版论文解释”（合并旧“一句话结论”和旧“全局扫描”职责），`## 3` 是“论文主线串读”（原第 4 章职责前移），不得再单独设置独立的扫描式概览章节。
 - `## 1 小白友好版论文解释` 必须包含 `### 1.1` 到 `### 1.6` 六个小节：研究问题、核心方法直观理解与关键公式/代码解释、方法细节、实验结果、相比已有方法的优势与原因、代价或局限；如果涉及关键图片、表格、公式或代码片段，必须在第一章对应解释处就地插入/列出，不能只放到后文索引。
 - 不确定的信息必须标注“论文未明确说明”或“未在当前可读内容中找到”，不得猜测。
@@ -97,7 +113,7 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 当论文很长、结构复杂或用户要求精读时，必须先拆解任务和上下文，再进入逐段阅读；不要把整篇长论文一次性塞进主上下文后直接生成笔记。长论文流程采用三层结构：**章节任务 + 证据/图表任务 + 机制复原/审稿任务**，防止退化为章节摘要拼接，并显式解决长文精读中的六类失败模式：信息瓶颈、拆分粒度过粗、缺少证据矩阵、图表没有硬门槛、最终内容级二次对照不足、跨章节一致性缺失。落地时采用 A-D 策略：A 章节任务（Section Tasks）负责局部深读和证据矩阵，B 图表任务（Evidence & Figure/Table Tasks）负责关键图表硬门槛与 ledger，C 机制复原任务（Mechanism Reconstruction Tasks）负责跨章节复原机制链，D 最终审稿任务（Final Review Tasks）负责最终内容级二次对照与跨章节一致性验收。
 
 触发条件包括但不限于：
-- **PDF 页数大于 20 页（>20）即视为长论文**，必须进入本节的长论文拆解流程。
+- **PDF 页数大于 20 页（>20）或 source 章节/附录规模明显超出单轮上下文**即视为长论文，必须进入本节的长论文拆解流程。
 - 主文虽短，但 Appendix / Supplementary Material / supplementary PDF 很长，或正文外材料包含关键方法、实验、prompt、超参、证明、失败案例。
 - 图表、公式、算法框、prompt、实验设置、附录细节很多，导致单次阅读难以完整覆盖。
 - 用户明确要求精读、复现、公式推导、实验公平性、代码对应关系或长文细读。
@@ -109,28 +125,28 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 - 若当前执行者就是父进程，也应先重规划 todo_list，再按下述索引→章节/机制文件→证据账本→机制复原→最终汇总→内容审稿流程执行。
 
 执行策略：
-1. **先用 PDF 阅读/抽取工具建索引**：先定位 PDF，使用 PyMuPDF、pdftotext、OCR 或可用 PDF 阅读/抽取工具抽取目录、页码、章节标题、图表/公式/算法/附录位置，建立 `section_index.md/json`、图表/公式/算法候选索引，并写入 `sandbox/read_paper/<paper_stem>/`；主上下文只保留索引摘要、当前阶段目标、关键证据锚点和待解决问题。注意：`figure_table_index.md/json` 只能作为候选索引和截图任务输入，不能替代后续经过截图、质量检查、解释和去向确认的 `figure_table_ledger.md/json`。
-2. **按章节保存独立阅读文件**：根据章节索引把每个章节或页码范围保存为独立文件到 `sandbox/read_paper/<paper_stem>/sections/`，文件名建议包含顺序号、章节名和页码范围。每个章节文件开头必须记录来源 PDF、页码范围、章节标题、抽取方式和已知图表/公式锚点。
-3. **拆分粒度必须足够细**：章节任务必须细到“少数机制问题/少数实验问题/少数附录问题”，不能让一个任务吞掉多个信息密集模块（如完整 Method+Theory+Training 或完整 Experiments+Ablation+Cost）。若单章内部包含多个密集机制、训练目标、实验族或附录细节，必须从“章节拆分”升级为“机制专题任务/实验专题任务”。拆分任务的输入应指向 `sections/` 下的局部文件和必要图表材料，而不是整篇 PDF 全文。
+1. **source-first 建索引**：对 arXiv 论文先运行 `arxiv_source.py`，读取 `source_manifest.json`，以 `expanded.tex`、`section_index.md/json`、`sections/*.tex|md`、`figure_table_index.md/json` 和 `tables/*.tex` 建立章节、公式、算法、图表与附录索引。source 不可用时才用 PyMuPDF、pdftotext、OCR 等从 PDF 建等价索引。所有中间产物写入 `sandbox/read_paper/<paper_stem>/`；主上下文只保留索引摘要、当前目标、关键证据锚点和待解决问题。`figure_table_index` 只是候选索引，不能替代最终 ledger。
+2. **按章节保存独立阅读文件**：source-ready 时直接使用 `sections/*.tex|md`，并记录 source 文件/行号、章节/label 和后续补充的 PDF 页码；PDF fallback 时按页码范围生成章节文件。每个章节文件必须记录来源、抽取方式和图表/公式锚点。
+3. **拆分粒度必须足够细**：章节任务必须细到“少数机制问题/少数实验问题/少数附录问题”，不能让一个任务吞掉多个信息密集模块（如完整 Method+Theory+Training 或完整 Experiments+Ablation+Cost）。若单章内部包含多个密集机制、训练目标、实验族或附录细节，必须升级为机制/实验专题任务。输入应指向 `sections/` 下的局部文件和必要图表材料，而不是整篇 `expanded.tex` 或 PDF 全文。
 4. **第一层：章节任务（Section Tasks）**：父进程批准后，子进程并行或分批阅读不同章节/专题文件。每个章节任务除 `*_summary.md` 与 `*_details.md` 外，**强制**在 `sandbox/read_paper/<paper_stem>/notes/` 或等价位置输出：
    - `*_claims.md`：本章节主张与 Claim-Evidence Matrix。
    - `*_figures_tables.md`：涉及的 Figure/Table/Algorithm/案例图、截图状态、解释和去向。
    - `*_formulas_algorithms.md`：公式、算法、伪代码、变量、输入输出和机制角色。
    - `*_missing_details.md`：未说明、未读到、冲突点、跨章节依赖、需要附录/原文回查的问题。
    - Claim-Evidence Matrix 必须含字段：`Claim` / `原文位置` / `图表公式` / `机制步骤` / `证据强度` / `未说明` / `汇总去向` / `跨章节依赖`。证据强度可用 强/中/弱/仅作者声称/未验证，但必须说明原因。
-5. **第二层：证据/图表任务（Evidence & Figure/Table Tasks）**：图表任务独立设置且是硬门槛。必须提取关键 Figure/Table/Algorithm/案例图，调用 `pdf_snapshot.py` 或手工 crops 完成截图，检查裁剪质量（主体完整、非整页冒充、caption/必要标题清楚、路径可访问），逐项解释，并维护 `figure_table_ledger.md/json`。评测子任务必须截图主结果表、消融表、成本/效率表或等价证据；关键图表缺失时最终验收不得通过，除非在 ledger 和重检查记录中明确写明无法截取原因与替代证据（如原文表格转写、页码、数值回查）。`figure_table_index.md/json` 只是候选清单；只有 `figure_table_ledger.md/json` 才是最终合成和验收的图表账本。ledger 每项至少记录：图/表/算法编号、原文页码/章节、截图相对路径、裁剪质量状态、是否关键图表、解释摘要、最终 Markdown 插入章节/行文位置、缺失原因或替代证据。
+5. **第二层：证据/图表任务（Evidence & Figure/Table Tasks）**：图表任务独立设置且是硬门槛。source-ready 时先读取 raw `table`/`tabular`、caption、label 与 `includegraphics` 原图；表格数值以 raw `.tex` 为准，不默认对表格做 OCR。source 原图不能表达最终组合、不可渲染或缺失时，调用 `pdf_snapshot.py` 或手工 crops 从 PDF 精裁。逐项检查资产完整性、caption、最终排版和路径，并维护 `figure_table_ledger.md/json`。主结果表、消融表、成本/效率表等关键证据必须进入正文；缺失时记录原因与替代证据。`figure_table_index` 只是候选清单，只有 ledger 才是最终账本。
 6. **第三层：机制复原/审稿任务（Mechanism Reconstruction & Review Tasks）**：机制复原任务按问题横跨章节读取，而不是按章节摘要拼接。每个关键机制/实验结论必须复原：输入、输出、步骤、训练/推理差异、监督信号或 evaluator 来源、成本、失败模式、适用边界、依赖的图表/公式/附录证据；必要时生成 `mechanism_<topic>.md`。
 7. **阶段性交接要可合并**：每个阶段应生成 `stage_summary.md`、`section_index.md/json`、`notes/*_summary.md`、`notes/*_details.md`、`notes/*_claims.md`、`figure_table_ledger.md/json`、`mechanism_*.md` 或等价摘要，记录已读范围、关键结论、证据锚点、未解决问题、章节间冲突、需要父任务统一口径的地方。长论文/多子任务交接必须额外生成固定机器可读的 `handoff_manifest.json`，放在 `sandbox/read_paper/<paper_stem>/` 或阶段输出根目录；它是汇总/机制/验收任务寻找材料的第一入口，不替代原始文件。manifest 至少包含：`final_note_path`、`asset_dir`、`figure_table_ledger_md`、`figure_table_ledger_json`、`section_index`、`claims_files`、`details_files`、`mechanism_files`、`ledger_item_count`、`image_count`、`missing_required_figures`、`validation_status`；进入最终写作前还必须扩展包含：`ordered_section_queue`（按最终 Markdown 章节顺序排列的写作队列）、`final_markdown_write_plan`（每章写入范围、输入材料、预计插图/公式/claim 去向）、`write_lock`（当前被授权写同一 final Markdown 的章节/worker/开始时间/释放状态）、`section_status`（queued/in_progress/done/blocked/reviewed）、`previous_section_summaries` 或等价前序章节摘要、`final_markdown_write_log`（每章写后记录）。`validation_status` 建议取 `draft` / `ready_for_synthesis` / `writing_in_progress` / `blocked` / `validated`，并在 `missing_required_figures` 非空、关键文件缺失、写作队列未完成或锁状态异常时不得标为 `validated`。
-8. **顺序章节写作合成阶段（扩展“汇总子进程统一合成最终 Markdown”）**：汇总阶段**不得只读 `summary` 拼接**；必须先读取 `handoff_manifest.json`（若存在）定位 Claim-Evidence Matrix、figure/table ledger、关键 `details`、公式/算法记录和机制复原文件，并按 `claim → evidence → mechanism` 写最终笔记。父进程必须先生成 `ordered_section_queue` 和 `final_markdown_write_plan`，把最终 Markdown 拆成有序章节/节点写作任务；同一 `final_note_path` 一次只能授权一个章节写作子 agent 持有 `write_lock` 并写入，其他子 agent 可以读取前序产物但**不得并行写同一个 final Markdown 文件**。每个章节写作子 agent 在动笔前必须读取当前 final Markdown、`handoff_manifest.json`、前序章节摘要/写作记录和本章所需 evidence/details/ledger；写作时只修改被授权章节或计划范围，保持章节顺序、术语和过渡；写完后必须更新 `section_status`、`final_markdown_write_log`、本章摘要、插图/claim 去向和锁释放状态，后续子 agent 以此为输入继续写。若图表任务已完成，但汇总/机制阶段找不到 `figure_table_ledger.md/json`，必须依次回查 `handoff_manifest.json`、阶段 outputs、todo 摘要/result 中记录的路径；仍找不到则把任务标为 blocked/请求补交，不得静默跳过或用 `figure_table_index` 冒充 ledger。最终合成必须按 ledger 在正文对应论证位置就地插入关键图片（Markdown `![...](assets/<pdf_stem>/...)`），不能只写“见 Figure/Table x”或只保留文字引用；对于 ledger 中标为关键但未插图的项目，必须写明无法插入原因和替代证据。必须满足 `## 1 小白友好版论文解释` 的 1.1-1.6 要求，以及 `## 3 论文主线串读` 按行文顺序串联主文与附录的要求；同时统一术语、消除重复、检查章节结论冲突、补齐遗漏。
+8. **顺序章节写作合成阶段（扩展“汇总子进程统一合成最终 Markdown”）**：汇总阶段**不得只读 `summary` 拼接**；必须先读取 `handoff_manifest.json`（若存在）定位 Claim-Evidence Matrix、figure/table ledger、关键 `details`、公式/算法记录和机制复原文件，并按 `claim → evidence → mechanism` 写最终笔记。父进程必须先生成 `ordered_section_queue` 和 `final_markdown_write_plan`，把最终 Markdown 拆成有序章节/节点写作任务；同一 `final_note_path` 一次只能授权一个章节写作子 agent 持有 `write_lock` 并写入，其他子 agent 可以读取前序产物但**不得并行写同一个 final Markdown 文件**。每个章节写作子 agent 在动笔前必须读取当前 final Markdown、`handoff_manifest.json`、前序章节摘要/写作记录和本章所需 evidence/details/ledger；写作时只修改被授权章节或计划范围，保持章节顺序、术语和过渡；写完后必须更新 `section_status`、`final_markdown_write_log`、本章摘要、插图/claim 去向和锁释放状态，后续子 agent 以此为输入继续写。若图表任务已完成，但汇总/机制阶段找不到 `figure_table_ledger.md/json`，必须依次回查 `handoff_manifest.json`、阶段 outputs、todo 摘要/result 中记录的路径；仍找不到则把任务标为 blocked/请求补交，不得静默跳过或用 `figure_table_index` 冒充 ledger。最终合成必须按 ledger 在正文对应论证位置就地插入关键图片（Markdown `![...](assets/<paper_stem>/...)`），不能只写“见 Figure/Table x”或只保留文字引用；对于 ledger 中标为关键但未插图的项目，必须写明无法插入原因和替代证据。必须满足 `## 1 小白友好版论文解释` 的 1.1-1.6 要求，以及 `## 3 论文主线串读` 按行文顺序串联主文与附录的要求；同时统一术语、消除重复、检查章节结论冲突、补齐遗漏。
 9. **最终审稿与内容级二次对照**：最终审稿任务必须逐条关键 claim 回查原文 section/页码/图表/公式/数值，检查作者声称 vs 事实证据、负结果、附录细节、空泛概括、数值/设置混淆和未说明处。长论文还必须检查 `ordered_section_queue` 是否覆盖最终模板与论文关键材料，是否存在章节乱序、重复、遗漏、越权改写同一范围、写作锁未释放或并行写同一文件痕迹；检查跨章节术语是否统一、前后过渡是否自然、图表/公式是否重复插入或遗漏插入。父进程应抽查关键章节原文；若抽查发现关键证据缺失、claim 与原文不符、队列覆盖不完整或写作记录异常，必须退回补读/修正，不能最终验收。
 10. **上下文预算优先**：当抽取文本或中间材料过长时，先写入 sandbox/artifact 并建立索引；当前对话只保留摘要、证据定位和下一步任务。禁止把整篇长论文全文、大段附录、整批 OCR 文本或所有子任务完整上下文复制到主对话。
 11. **拆解不能降低质量门槛**：即使采用多阶段或多子任务阅读，也必须满足第 1 章小白解释、第 3 章主线串读、Appendix/Limitations 覆盖、图表/公式就地解释、强制重检查和最终验收要求。最终 Markdown 应保留“重检查记录/内容审稿记录”，必要时说明分块阅读范围、章节笔记来源与补漏情况。
 
 ### 1. 定位与抽取论文内容
-1. 使用 `run_command` 调用 `paper_locator.py`，或根据明确路径选定论文文件，并确定输出 Markdown 路径。
+1. 根据 `Paper Discovery Procedure` 选定论文和输出 Markdown；arXiv 论文先调用 `arxiv_source.py` 并检查 `source_manifest.json`，本地查询继续使用 `paper_locator.py`。
 2. 调用 `paper_research_scout/scripts/paper_read_history.py add` 登记该论文为已读/正在读，防止后续 `paper_research_scout` 重复推荐。登记失败不应阻塞阅读，但必须在最终说明中标注。
-3. 抽取文本：PDF 优先使用 PyMuPDF、pdftotext 或 OCR/文档工具；若 PDF 是扫描件或图表文字缺失，使用 OCR/截图辅助理解。抽取全文、分块文本、索引 JSON 等中间文件必须写入 `sandbox/read_paper/<paper_stem>/`，不要写入 `outputs/papers_output/`。
-4. 建立章节索引：记录 Abstract、Introduction、Related Work、Method、Experiments、Ablation、Analysis、Conclusion、Limitations、Appendix 等位置。
+3. 抽取文本：source-ready 时以 `expanded.tex` 和 `sections/*.tex` 为权威文本，`paper.md` 只作快速阅读；source 不可用时使用 PyMuPDF、pdftotext，扫描 PDF 再使用 OCR。中间文件只能写入 `sandbox/read_paper/<paper_stem>/`。
+4. 建立章节索引：记录 Abstract、Introduction、Related Work、Method、Experiments、Ablation、Analysis、Conclusion、Limitations、Appendix 的 source file/line、label 与 PDF 页码；source 和 PDF 不一致时明确记录版本差异。
 5. 建立术语/简称表：从标题、摘要、引言、方法和实验设置中抽取所有高频简称、方法名、数据集名、指标名、算法名和任务名；尽量回查原文首次定义，记录完整英文名、中文解释、所在章节/页码。若原文未展开，标注“原文未展开”。
 6. 如果论文方法依赖任何中间监督或评测信号（如 step label、critique、proxy、reward、preference、verifier、judge、oracle、ground truth、confidence/belief readout、tool/evaluator signal），在章节索引阶段必须建立“监督信号来源表”：逐项记录信号名称、取值空间、由谁/什么产生、是否使用 ground truth 或 benchmark evaluator、训练时是否可见、公式/规则、所在主文与附录位置。不得只写“easy-to-obtain / rule-based / automatic”而不展开具体构造。
 7. 如果全文过长，分阶段阅读：先做初步概览并草拟第 1 章，再按 Method/Experiments/Appendix/Limitations 深读。
@@ -203,12 +219,14 @@ description: "以研究者视角定位、精读、批判论文并沉淀中文研
 
 ### 4.1 图表与截图的就地插入规则（服务输出第 1 章和第 3 章）
 对论文中的图、表、算法框、流程图、案例和错误样本进行系统梳理，但输出时要嵌入第 1 章或第 3 章对应论证位置：
-- 先用 `run_command` 调用 `pdf_snapshot.py` 为关键 Figure/Table/Algorithm/案例图表生成 PNG 截图；优先使用 `--mode smart`，结合 caption、相邻文本和像素内容自动精裁。
+- source-ready 时先从 `figure_table_index` 定位 Figure/Table：图片优先复用 `assets/` 中的原始 source 资产；表格读取 `tables/*.tex`，预览 Markdown 只帮助定位，关键数值必须回查 raw TeX。
+- source 图片必须检查是否为完整 Figure：一个 Figure 可能由多个 `includegraphics` 子图组成；TikZ/PGF、宏生成图、同名资产歧义和最终组合排版必须回查 PDF。
+- source 原图缺失、不可渲染，或需要最终组合图时，再调用 `pdf_snapshot.py --mode smart` 结合 caption、相邻文本和像素内容自动精裁。
 - **默认截图粒度是图表主体区域**：只截对应 Figure/Table/Algorithm/案例图表本身及必要标题/图注，不得把整页截图当作图表截图交付，也不要把大片正文/其他图表混入截图。
 - 自动裁剪不理想、明显过大、包含整页或脚本返回 `full_page_snapshot` / `is_suspicious_large_crop` 时，必须用 `--mode crops --crops-json ...` 指定 bbox 精裁；若一时无法精裁，必须在 Markdown 图片说明和重检查记录中显式标注“降级整页/大区域截图，非最终图表主体裁剪”，并说明待精裁原因。
-- 将截图保存到阅读笔记所在输出目录的 `assets/<pdf_stem>/` 下，例如 `outputs/papers_output/agent_RL/assets/foo/foo_p001_figure_1.png`；图片链接必须写成相对当前 Markdown 文件的 `assets/<pdf_stem>/xxx.png`，不要写成 `outputs/papers_output/...` 绝对式路径，否则移动分类目录后 Markdown 预览可能找不到图片。
+- 将最终采用的 source 原图或 PDF 截图复制到阅读笔记所在输出目录的 `assets/<paper_stem>/` 下；最终 Markdown 不得引用 `sandbox/`。图片链接必须相对当前 Markdown，例如 `assets/<paper_stem>/xxx.png`。
 - 图：在讲到相关方法/实验节点时插入截图，说明图号、标题、作者想表达的信息、与当前论证的关系。
-- 表：在讲到对应结果或消融时插入截图，说明比较对象、指标、最佳结果、相对提升，以及作者分析是否充分。
+- 表：优先把 source 表格转写为可读 Markdown 并核对 raw TeX；若复杂排版不适合转写，再插入最终 PDF 表格截图。说明比较对象、指标、最佳结果、相对提升，以及作者分析是否充分。
 - 对关键架构图/流程图：截图之外，必要时用 Mermaid 或 ASCII 重画一个更易懂的抽象流程，但重画图要跟原图截图放在同一叙事节点。
 - 对重要曲线图：说明横轴、纵轴、趋势、拐点、作者用它证明什么，以及它和前后实验的关系。
 - 对案例图/错误分析图：说明成功案例、失败案例、错误类型和边界条件。
@@ -349,7 +367,7 @@ PY
 - 每条关键 claim 是否能在 Claim-Evidence Matrix 中找到原文位置、图表/公式、机制步骤、证据强度、未说明项、汇总去向和跨章节依赖。
 - 图表是否覆盖主文所有关键 Figure/Table/Algorithm/案例；表格数值是否抄错；提升幅度是否算错。长论文必须核对 `handoff_manifest.json` 中的 `ledger_item_count`、`image_count`、`missing_required_figures`、`ordered_section_queue`、`final_markdown_write_plan`、`write_lock`、`section_status`、`validation_status` 与实际 ledger/final Markdown 是否一致。
 - 顺序章节写作记录是否证明队列覆盖完整、每章按顺序完成、没有章节乱序/重复/遗漏、没有多个子 agent 并行写同一 final Markdown、后续章节已读取当前 final Markdown 和前序章节摘要。
-- 关键 Figure/Table/Algorithm 是否已通过 `pdf_snapshot.py` 截图并就地插入到对应解释附近；截图路径是否存在，Markdown 链接是否相对当前笔记可访问（通常应为 `assets/<pdf_stem>/xxx.png`）；自动裁剪是否截到主体，必要时是否用 crops 精裁。评测类论文的主结果表、消融表、成本/效率表缺失时不得通过，除非 ledger 记录无法截取原因与替代证据。
+- 关键 Figure/Table/Algorithm 是否已从 source 原始资产/raw TeX 或 PDF 精裁中取得，并就地插入对应解释；最终图片路径是否存在且相对当前笔记可访问；source 多子图是否核对最终组合，表格数值是否回查 raw TeX。评测类论文的主结果表、消融表、成本/效率表缺失时不得通过，除非 ledger 记录原因与替代证据。
 - 关键公式是否就地出现在相关方法/实验/理论段落，而不是集中堆在公式表里；公式是否解释了它如何服务当前论证。
 - Appendix 中是否有重要细节未纳入：数据统计、prompt 模板、训练超参、额外实验、更多消融、案例、限制；尤其是主文只抽象描述的标签/critique/proxy/reward 构造细节。
 - Baseline 公平性判断是否有证据；是否遗漏计算预算、数据预算、模型规模、训练轮数。
@@ -373,7 +391,7 @@ PY
 ### 9.4 最终验收与父进程二次对照
 当阅读任务由多步/子任务完成，或已经生成初版/重检查版 Markdown 后，必须把最终验收并入 `read_paper` 流程，而不是另建独立论文检查技能：
 
-1. 定位最终 Markdown、sandbox 中的抽取文本/索引和原 PDF。
+1. 定位最终 Markdown、`source_manifest.json`、sandbox 中的 source/抽取文本/索引和原 PDF；非 arXiv/PDF-only 论文记录 source fallback 状态。
 2. 读取最终 Markdown 全文或关键章节，确认包含 `## 重检查记录`，并检查是否存在空章节、重复章节、章节乱序/遗漏、未闭合代码块、表格错位、图片链接缺失、数学公式渲染风险。
 3. 针对论文类型抽查关键证据，并做内容级二次对照：
    - 逐条关键 claim 回查原文 section/页码/图表/公式/数值，确认 Claim-Evidence Matrix 中证据强度与最终表述一致。
@@ -488,7 +506,7 @@ PY
 ### 1.2 核心方法及思想的直观理解和关键公式/代码解释
 先用白话和例子解释核心 idea；再就地插入关键方法图、公式或伪代码/代码片段，并解释变量、输入输出和通俗含义。
 
-![方法/直觉相关图表](assets/<pdf_stem>/xxx.png)
+![方法/直觉相关图表](assets/<paper_stem>/xxx.png)
 
 $$
 关键公式写在这里；没有公式则删除本公式块
@@ -525,7 +543,7 @@ $$
 
 然后在需要处就地插入图表或公式，而不是先列图表再解释：
 
-![相关图表](assets/<pdf_stem>/xxx.png)
+![相关图表](assets/<paper_stem>/xxx.png)
 
 $$
 相关公式写在这里；没有公式则删除本公式块
@@ -602,16 +620,16 @@ $$
 ````
 
 ## Quality Checklist
-- 是否通过 `run_command` 调用 `paper_locator.py` 定位论文并确定输出路径？
+- arXiv 论文是否先调用 `arxiv_source.py`，读取 `source_manifest.json` 并记录 source 版本、main TeX、warnings 与 fallback 状态？本地查询是否通过 `paper_locator.py` 或明确路径确定输出？
 - 输出是否镜像 `outputs/papers/` 下的相对目录到 `outputs/papers_output/`？
-- 若 PDF 页数大于 20 页（>20），或主文短但 Appendix / Supplementary Material 很长，是否已按长论文流程处理，而不是沿用旧的“约 30 页”阈值？
+- 若 PDF 页数大于 20 页（>20）、source 章节/附录材料很长，或主文短但 Supplementary Material 很长，是否已按长论文流程处理？
 - 发现长论文且原任务只是简单 `read_paper` 时，是否由父进程重新规划 `todo_list`；子进程是否只提出 `propose_split`，没有自行批准/调度拆分？
-- 长论文是否先用 PDF 阅读/抽取工具建立章节/页码/图表/公式/算法索引，并把每个章节或页码范围保存为 `sandbox/read_paper/<paper_stem>/sections/` 下的独立文件？
+- 长论文是否优先使用 source 建立章节、公式、表格和图片索引，并把章节保存为 `sandbox/read_paper/<paper_stem>/sections/` 下的独立文件；source 不可用时是否明确切换 PDF 抽取？
 - 拆分粒度是否细到少数机制/实验问题；是否避免一个任务吞掉多个密集 Method/Experiment/Appendix 模块，必要时是否升级为机制专题任务？
 - 章节阅读子任务是否只读取负责的章节/专题文件，并为每个章节强制产出 `summary`、`details`、`claims.md`、`figures_tables.md`、`formulas_algorithms.md`、`missing_details.md`？
 - `claims.md` 是否包含 Claim-Evidence Matrix 字段：Claim / 原文位置 / 图表公式 / 机制步骤 / 证据强度 / 未说明 / 汇总去向 / 跨章节依赖？
-- 是否设置独立证据/图表任务，并维护 `figure_table_ledger.md/json`，逐项记录截图、裁剪质量检查、解释和汇总去向？
-- 评测子任务是否截图主结果表、消融表、成本/效率表；关键图表缺失时是否已明确记录无法截取原因与替代证据？
+- 是否设置独立证据/图表任务，并维护 `figure_table_ledger.md/json`，逐项记录 source/PDF 来源、raw TeX/图片路径、最终排版核对、解释和汇总去向？
+- 评测子任务是否纳入主结果表、消融表、成本/效率表；source 表格数值是否回查 raw TeX，复杂表格是否用 PDF 核对；关键图表缺失时是否记录原因与替代证据？
 - 是否设置跨章节机制复原任务，复原输入、输出、步骤、训练/推理差异、监督信号、成本、失败模式和依赖证据？
 - 最终汇总是否先读取 `handoff_manifest.json` 定位 evidence matrix、figure/table ledger、关键 details 和机制复原文件，并按 `claim → evidence → mechanism` 写作，而不是只拼接 summary？
 - 父进程是否生成 `ordered_section_queue` 与 `final_markdown_write_plan`；同一 final Markdown 是否一次只授权一个章节写作子 agent 持有 `write_lock` 写入，且未并行写同一文件？
@@ -621,8 +639,9 @@ $$
 - 第 1 章是否完整包含 `### 1.1`-`### 1.6`，并明确问题、现有不足、作者方案、实验结果、相比已有方法的提升幅度/原因和代价局限？
 - 是否给出重要简称/术语的完整名称和中文解释，避免只堆缩写让用户困惑？
 - 是否在第 1 章和第 3 章就地覆盖关键图表、公式、代码/算法框、案例、原始输出，并解释作者分析？
-- 是否已对关键 Figure/Table/Algorithm/案例图表生成并按 ledger 在正文就地插入截图，且 Markdown 图片路径可用？若图表任务已完成但找不到 ledger，是否已回查 manifest/outputs/todo 摘要，仍找不到则 blocked？
+- 是否已对关键 Figure/Table/Algorithm/案例图表取得 source 原图/raw table 或 PDF 精裁，并按 ledger 在正文就地插入或转写，且 Markdown 资产路径可用？若找不到 ledger，是否已回查 manifest/outputs/todo 摘要，仍找不到则 blocked？
 - 截图是否默认只覆盖图表主体区域（含必要标题/图注），没有用整页截图冒充；若自动裁剪失败，是否已用 crops 精裁，或在 Markdown 与重检查记录中明确标注降级整页/大区域截图？
+- source-ready 时是否逐项处理 unresolved include/figure、include cycle、同名资产歧义、EPS/PS/PDF 转换警告；source line 与 PDF page 是否明确区分？
 - 是否讲清任务输入、输出、成功标准和难点？
 - 是否找到了核心假设，而不是只复述方法？
 - 第 3 章是否按论文行文顺序完成完整主线串读/近似翻译式串读，把问题、方法、图表、公式、实验、局限和附录连接成一个统一叙事？

@@ -29,9 +29,9 @@ Memory 不是“把全部聊天永久保存”。它只应该保存将来仍有�
 
 ## 2. 双后端：兼容旧系统，也提供结构化系统
 
-### 2.1 `file`：默认、零配置、显式写入
+### 2.1 `file`：兼容后端、显式写入
 
-代码默认 `MEMORY_PROVIDER=file`。它继续使用：
+设置 `MEMORY_PROVIDER=file` 时继续使用：
 
 - `memories/USER.md`：用户身份和偏好；
 - `memories/MEMORY.md`：项目、环境和稳定约定；
@@ -63,7 +63,7 @@ Memory 不是“把全部聊天永久保存”。它只应该保存将来仍有�
 长期事实存于 `memories/facts.jsonl`。每行一条 JSON，坏行会被跳过；写入采用进程锁、
 线程锁、临时文件、`fsync` 和 `os.replace`，避免并发写坏整个库。
 
-当前本机 `.env` 已启用 `deermem`，但这是部署选择，不是代码默认。
+当前代码默认和本机 `.env` 都使用 `deermem`；仍可显式切回 `file` 或 `noop`。
 
 ## 3. 一条记忆怎样产生
 
@@ -247,14 +247,14 @@ D7:19：Melanie 说，这双鞋是用来跑步的。
 
 ### 6.1 `system` 模式
 
-代码默认 `MEMORY_INJECTION_MODE=system`。CLI/GUI 启动时调用
+显式设置 `MEMORY_INJECTION_MODE=system` 时，CLI/GUI 启动调用
 `memory_manager.load_snapshot()`，把 file memory 快照拼入 system prompt。
 
 它是 frozen snapshot：会话中途写入文件不会自动改变已经构建的 system prompt。
 
 ### 6.2 `hidden_user` 模式
 
-设置 `MEMORY_INJECTION_MODE=hidden_user` 后：
+代码默认 `MEMORY_INJECTION_MODE=hidden_user`。在该模式下：
 
 1. CLI/GUI 不再把 memory 拼进 system prompt；
 2. `get_durable_context_enabled()` 强制返回 true；
@@ -467,8 +467,8 @@ MEMORY_MULTI_QUERY_ENABLED=0
 
 | 配置 | 代码默认 | 含义 |
 | --- | --- | --- |
-| `MEMORY_PROVIDER` | `file` | `file` / `deermem` / `noop` |
-| `MEMORY_INJECTION_MODE` | `system` | `system` / `hidden_user` |
+| `MEMORY_PROVIDER` | `deermem` | `file` / `deermem` / `noop` |
+| `MEMORY_INJECTION_MODE` | `hidden_user` | `system` / `hidden_user` |
 | `MEMORY_WRITE_MIDDLEWARE_ENABLED` | `0` | 压缩成功后是否自动抽取 |
 | `MEMORY_SESSION_FACTS_ENABLED` | `1` | 是否保存 session 工作事实 |
 | `MEMORY_SESSION_FACT_CONFIDENCE_THRESHOLD` | `0.3` | session fact 最低置信度 |

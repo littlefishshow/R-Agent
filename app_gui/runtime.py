@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -171,6 +172,11 @@ def _session_todo_board(session_id: str) -> Optional[Dict[str, Any]]:
         data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"exists": True, "path": str(path), "error": "todo board is not readable"}
+    try:
+        stat = path.stat()
+        revision = f"{stat.st_mtime_ns}:{stat.st_size}"
+    except OSError:
+        revision = ""
     tasks = data.get("tasks", []) if isinstance(data, dict) else []
     if not isinstance(tasks, list):
         tasks = []
@@ -232,7 +238,34 @@ def _session_todo_board(session_id: str) -> Optional[Dict[str, Any]]:
         "tasks": compact_tasks[:40],
         "truncated": len(compact_tasks) > 40,
         "updated_at": max_updated_at,
+        # The task timestamps have one-second precision, which is not enough to
+        # distinguish a freshly rewritten board from the previous turn.  The
+        # file revision lets a running GUI session suppress only the unchanged,
+        # already-finished board while still showing a board rewritten this turn.
+        "revision": revision,
     }
+
+
+def _todo_board_is_finished(board: Optional[Dict[str, Any]]) -> bool:
+    """Whether a board is safely archival rather than active work.
+
+    Failed/blocked work remains visible on the next turn so the user does not
+    lose an actionable error.  A mixture of completed and cancelled tasks is a
+    finished board and may be hidden until the current turn rewrites it.
+    """
+    if not isinstance(board, dict):
+        return False
+    counts = board.get("status_counts")
+    total = board.get("total")
+    if isinstance(counts, dict) and isinstance(total, int) and total > 0:
+        return int(counts.get("completed") or 0) + int(counts.get("cancelled") or 0) == total
+    tasks = board.get("tasks")
+    if not isinstance(tasks, list) or not tasks:
+        return False
+    return all(
+        isinstance(task, dict) and str(task.get("status") or "pending") in {"completed", "cancelled"}
+        for task in tasks
+    )
 
 
 def _make_learning_title(text: str, *, limit: int = 34) -> str:
@@ -291,6 +324,7 @@ class GuiSession:
         self._disposed = False
         self._active_run_id = ""
         self._active_run_baseline = []
+        self._suppressed_todo_revision = ""
         self.last_response: Optional[str] = None
         self.last_error: Optional[str] = None
         if restore:
@@ -369,9 +403,16 @@ class GuiSession:
             if isinstance(entry, dict) and entry.get("path"):
                 artifacts.append(dict(entry))
         return {
-            "version": 1,
+            "version": 2,
             "summary_text": str(getattr(state, "summary_text", "") or ""),
             "artifact_index": artifacts,
+            "delegation_ledger": list(getattr(state, "delegation_ledger", None) or []),
+            "skill_context": list(getattr(state, "skill_context", None) or []),
+            "active_skill_policy": dict(getattr(state, "active_skill_policy", None) or {}),
+            "todos": list(getattr(state, "todos", None) or []),
+            "durable_current": dict(getattr(state, "durable_current", None) or {}),
+            "durable_next": dict(getattr(state, "durable_next", None) or {}),
+            "cache_usage": dict(getattr(state, "cache_usage", None) or {}),
         }
 
     def _persist_thread_state(self, agent: Optional[RAgent] = None, *, save: bool = True) -> None:
@@ -393,6 +434,39 @@ class GuiSession:
             self.agent.state.add_artifact(entry)
         for entry in self._restore_artifacts_from_messages(self.agent.messages):
             self.agent.state.add_artifact(entry)
+
+        for entry in snapshot.get("delegation_ledger") or []:
+            self.agent.state.add_delegation(entry)
+        for entry in snapshot.get("skill_context") or []:
+            self.agent.state.add_skill_context(entry)
+        self.agent.state.active_skill_policy = dict(snapshot.get("active_skill_policy") or {})
+        self.agent.state.todos = list(snapshot.get("todos") or [])
+        if isinstance(snapshot.get("durable_current"), dict):
+            self.agent.state.durable_current = dict(snapshot["durable_current"])
+        if isinstance(snapshot.get("durable_next"), dict):
+            self.agent.state.durable_next = dict(snapshot["durable_next"])
+        if isinstance(snapshot.get("cache_usage"), dict) and snapshot.get("cache_usage"):
+            saved_cache = dict(snapshot["cache_usage"])
+            if "local_prompt_tokens" in saved_cache:
+                self.agent.state.cache_usage.update(saved_cache)
+            else:
+                # v1 used provider cached_tokens as the primary percentage. Keep
+                # those values only as secondary diagnostics; never relabel them
+                # as local harness reuse after restore.
+                self.agent.state.cache_usage.update({
+                    "provider_cache_supported": saved_cache.get("provider_cache_supported"),
+                    "provider_prompt_tokens": saved_cache.get("observed_prompt_tokens", 0),
+                    "provider_cached_prompt_tokens": saved_cache.get("cached_prompt_tokens", 0),
+                    "provider_uncached_prompt_tokens": saved_cache.get("uncached_prompt_tokens", 0),
+                    "provider_cache_hit_ratio": saved_cache.get("cache_hit_ratio"),
+                    "last_provider_prompt_tokens": saved_cache.get("last_prompt_tokens", 0),
+                    "last_provider_cached_prompt_tokens": saved_cache.get("last_cached_prompt_tokens"),
+                    "last_provider_uncached_prompt_tokens": saved_cache.get("last_uncached_prompt_tokens"),
+                    "last_provider_cache_hit_ratio": saved_cache.get("last_cache_hit_ratio"),
+                })
+        # Reuse the exact promoted bytes after restore.  The first request lazily
+        # rebuilds the message wrapper from durable_current without re-rendering.
+        self.agent._durable_snapshot = None
 
         # Migrate old GUI sessions forward once they have been reconstructed.
         self._persist_thread_state()
@@ -488,6 +562,12 @@ class GuiSession:
             run_id = new_id("run")
             self._active_run_id = run_id
             self._active_run_baseline = list(self.agent.messages)
+            previous_todo_board = _session_todo_board(self.session_id)
+            self._suppressed_todo_revision = (
+                str(previous_todo_board.get("revision") or "")
+                if _todo_board_is_finished(previous_todo_board)
+                else ""
+            )
             self.cancel_event = threading.Event()
             cancel_event = self.cancel_event
             self.last_response = None
@@ -732,6 +812,14 @@ class GuiSession:
 
     def state(self) -> Dict[str, Any]:
         created_at, last_activity_at = _session_time_bounds(self.store)
+        todo_board = _session_todo_board(self.session_id)
+        if (
+            self.running
+            and self._suppressed_todo_revision
+            and isinstance(todo_board, dict)
+            and str(todo_board.get("revision") or "") == self._suppressed_todo_revision
+        ):
+            todo_board = None
         return {
             "session_id": self.session_id,
             "model": self.agent.model,
@@ -752,7 +840,8 @@ class GuiSession:
             "total_token_usage_including_children": self.agent.get_total_token_usage_including_children(),
             "token_usage_breakdown": self.agent.get_token_usage_summary(include_children=True),
             "context_usage": self.agent.get_context_usage(),
-            "todo_board": _session_todo_board(self.session_id),
+            "cache_usage": self.agent.get_cache_usage(),
+            "todo_board": todo_board,
         }
 
 
@@ -1639,7 +1728,7 @@ class LearningRuntimeService(AgentRuntimeService):
             and isinstance(original_lines, str)
         ):
             if content[line_start:line_end] == original_lines:
-                start, end = line_start, line_end
+                start, end = self._line_span_for_selection(content, line_start, line_end)
             else:
                 relocated = self._resolve_original_markdown_range(
                     content,
@@ -1725,7 +1814,31 @@ class LearningRuntimeService(AgentRuntimeService):
         probe = max(safe_start, safe_end - 1)
         newline = content.find("\n", probe)
         line_end = len(content) if newline < 0 else newline
+        for block_start, block_end in LearningRuntimeService._display_math_block_ranges(content):
+            if safe_start < block_end and safe_end > block_start:
+                line_start = min(line_start, block_start)
+                line_end = max(line_end, block_end)
         return line_start, line_end
+
+    @staticmethod
+    def _display_math_block_ranges(content: str) -> list[tuple[int, int]]:
+        """Return complete source spans for fenced display-math blocks."""
+        ranges: list[tuple[int, int]] = []
+        dollar_delimiters = list(re.finditer(r"(?m)^[ \t]*\$\$[ \t]*$", content))
+        for index in range(0, len(dollar_delimiters) - 1, 2):
+            ranges.append((dollar_delimiters[index].start(), dollar_delimiters[index + 1].end()))
+
+        bracket_open = list(re.finditer(r"(?m)^[ \t]*\\\[[ \t]*$", content))
+        bracket_close = list(re.finditer(r"(?m)^[ \t]*\\\][ \t]*$", content))
+        close_index = 0
+        for opening in bracket_open:
+            while close_index < len(bracket_close) and bracket_close[close_index].start() <= opening.end():
+                close_index += 1
+            if close_index >= len(bracket_close):
+                break
+            ranges.append((opening.start(), bracket_close[close_index].end()))
+            close_index += 1
+        return ranges
 
     @staticmethod
     def _resolve_selection_offset(
@@ -1785,9 +1898,24 @@ class LearningRuntimeService(AgentRuntimeService):
 
         matches = cls._markdown_visible_ranges(content, selected_text)
         chosen = cls._choose_relocated_range(matches, preferred_offset=preferred, occurrence=occurrence)
-        if chosen is None:
+        if chosen is not None:
+            return cls._line_span_for_selection(content, chosen[0], chosen[1])
+
+        # Rendered Markdown can concatenate adjacent block/cell text even
+        # though the source contains newlines, spaces, or table separators.
+        # Use a whitespace-free visible-text fallback only when it identifies
+        # one range unambiguously (or a saved source offset does so).  This is
+        # deliberately last: exact source and normal visible-text matches keep
+        # priority, and ambiguous compact matches remain rejected.
+        compact_matches = cls._markdown_visible_ranges(content, selected_text, compact=True)
+        compact_chosen = cls._choose_relocated_range(
+            compact_matches,
+            preferred_offset=preferred,
+            occurrence=None,
+        )
+        if compact_chosen is None:
             return None
-        return cls._line_span_for_selection(content, chosen[0], chosen[1])
+        return cls._line_span_for_selection(content, compact_chosen[0], compact_chosen[1])
 
     @staticmethod
     def _all_text_ranges(content: str, needle: str) -> list[tuple[int, int]]:
@@ -1826,9 +1954,18 @@ class LearningRuntimeService(AgentRuntimeService):
         return None
 
     @classmethod
-    def _markdown_visible_ranges(cls, content: str, selected_text: str) -> list[tuple[int, int]]:
+    def _markdown_visible_ranges(
+        cls,
+        content: str,
+        selected_text: str,
+        *,
+        compact: bool = False,
+    ) -> list[tuple[int, int]]:
         source_text, source_map = cls._markdown_visible_text_with_map(content)
         needle_text, _ = cls._markdown_visible_text_with_map(selected_text)
+        if compact:
+            source_text, source_map = cls._compact_text_with_map(source_text, source_map)
+            needle_text = "".join(char for char in needle_text if not char.isspace())
         if not source_text or not needle_text:
             return []
         ranges = []
@@ -1846,9 +1983,20 @@ class LearningRuntimeService(AgentRuntimeService):
 
     @staticmethod
     def _markdown_visible_text_with_map(value: str) -> tuple[str, list[int]]:
-        """Normalize common Markdown-only syntax while preserving source offsets."""
+        """Approximate Markdown-rendered text while preserving source offsets.
+
+        The GUI selects rendered DOM text, not literal Markdown.  Account for
+        syntax hidden by markdown-it and its typographer substitutions so a
+        safe source line can be captured before the modification branch opens.
+        This is a locator, not a Markdown parser; ambiguous results are still
+        rejected by ``_choose_relocated_range``.
+        """
         raw = str(value or "")
         ignored = [False] * len(raw)
+
+        def ignore(start: int, end: int) -> None:
+            for position in range(max(0, start), min(len(raw), end)):
+                ignored[position] = True
 
         # Renderers hide structural prefixes and emphasis/code delimiters. Mark
         # them as non-visible so selections copied from the rendered DOM can be
@@ -1856,19 +2004,54 @@ class LearningRuntimeService(AgentRuntimeService):
         prefix_pattern = re.compile(
             r"(?m)^[ \t]*(?:#{1,6}[ \t]+|>[ \t]*|[-+*][ \t]+|\d+[.)][ \t]+)"
         )
-        delimiter_pattern = re.compile(r"(?<!\\)(?:\*\*|__|`+)")
+        delimiter_pattern = re.compile(r"(?<!\\)(?:[*_]+|~~|`+)")
         math_delimiter_pattern = re.compile(r"(?m)^[ \t]*(?:\$\$|\\\[|\\\]|\\\(|\\\))[ \t]*$")
-        for pattern in (prefix_pattern, delimiter_pattern, math_delimiter_pattern):
+        hidden_line_pattern = re.compile(
+            r"(?m)^[ \t]*(?:\[[^\]\n]+\]:[ \t]*\S.*|\|?[ \t]*:?-{3,}:?[ \t]*(?:\|[ \t]*:?-{3,}:?[ \t]*)+\|?)[ \t]*$"
+        )
+        for pattern in (prefix_pattern, delimiter_pattern, math_delimiter_pattern, hidden_line_pattern):
             for match in pattern.finditer(raw):
-                for index in range(match.start(), match.end()):
-                    ignored[index] = True
+                ignore(match.start(), match.end())
+
+        # The GUI renders ``$...$`` as math but exposes only the TeX source in
+        # its selectable hidden span.  Keep the formula body and hide the two
+        # dollar delimiters so a rendered cross-block selection can be mapped
+        # back to its Markdown source safely.
+        inline_math_pattern = re.compile(r"(?<!\\)\$([^$\n]+?)(?<!\\)\$")
+        for match in inline_math_pattern.finditer(raw):
+            ignore(match.start(), match.start() + 1)
+            ignore(match.end() - 1, match.end())
+
+        # Images have no selectable text in the preview.  Links keep only the
+        # label; their brackets and destination/reference are hidden.
+        image_pattern = re.compile(r"!\[[^\]\n]*\](?:\([^\n)]*\)|\[[^\]\n]*\])")
+        for match in image_pattern.finditer(raw):
+            ignore(match.start(), match.end())
+        link_pattern = re.compile(r"(?<!!)\[([^\]\n]+)\](\([^\n)]*\)|\[[^\]\n]*\])")
+        for match in link_pattern.finditer(raw):
+            ignore(match.start(), match.start(1))
+            ignore(match.end(1), match.end())
+        autolink_pattern = re.compile(r"<((?:https?://|mailto:)[^>\n]+)>", re.IGNORECASE)
+        for match in autolink_pattern.finditer(raw):
+            ignore(match.start(), match.start(1))
+            ignore(match.end(1), match.end())
+
+        # Pipes and alignment colons are structural in rendered tables.  A
+        # literal pipe is rare; ignoring it on both source and selection keeps
+        # matching symmetric while the final replacement still expands to full
+        # original lines.
+        for match in re.finditer(r"(?<!\\)\|", raw):
+            ignore(match.start(), match.end())
 
         text = ""
         offsets: list[int] = []
         pending_space = False
         escaped = False
-        for index, char in enumerate(raw):
+        index = 0
+        while index < len(raw):
+            char = raw[index]
             if ignored[index]:
+                index += 1
                 continue
             if escaped:
                 if pending_space and text:
@@ -1878,20 +2061,78 @@ class LearningRuntimeService(AgentRuntimeService):
                 text += char
                 offsets.append(index)
                 escaped = False
+                index += 1
                 continue
             if char == "\\":
                 escaped = True
+                index += 1
                 continue
             if char.isspace():
                 pending_space = bool(text)
+                index += 1
                 continue
             if pending_space:
                 text += " "
                 offsets.append(index)
                 pending_space = False
+
+            if char == "&":
+                entity_match = re.match(r"&(?:#[0-9]+|#x[0-9a-f]+|[a-z][a-z0-9]+);", raw[index:], re.IGNORECASE)
+                if entity_match:
+                    entity = entity_match.group(0)
+                    decoded = html.unescape(entity)
+                    if decoded != entity:
+                        for visible_char in decoded:
+                            text += visible_char
+                            offsets.append(index)
+                        index += len(entity)
+                        continue
+
+            # markdown-it's typographer changes these source spellings in the
+            # preview. Canonicalize both source and selected DOM text.
+            lower_tail = raw[index:index + 4].lower()
+            substitutions = (
+                ("(tm)", "™"),
+                ("(c)", "©"),
+                ("(r)", "®"),
+                ("(p)", "§"),
+                ("...", "…"),
+                ("+-", "±"),
+                ("---", "-"),
+                ("--", "-"),
+            )
+            substituted = False
+            for source_token, visible_token in substitutions:
+                probe = lower_tail[:len(source_token)] if source_token.startswith("(") else raw[index:index + len(source_token)]
+                if probe == source_token:
+                    text += visible_token
+                    offsets.append(index)
+                    index += len(source_token)
+                    substituted = True
+                    break
+            if substituted:
+                continue
+            if char in "“”„‟«»":
+                char = '"'
+            elif char in "‘’‚‛":
+                char = "'"
+            elif char in "–—−":
+                char = "-"
             text += char
             offsets.append(index)
+            index += 1
         return text, offsets
+
+    @staticmethod
+    def _compact_text_with_map(text: str, offsets: list[int]) -> tuple[str, list[int]]:
+        compact_text = ""
+        compact_offsets: list[int] = []
+        for char, offset in zip(text, offsets):
+            if char.isspace():
+                continue
+            compact_text += char
+            compact_offsets.append(offset)
+        return compact_text, compact_offsets
 
     def save_selection_note(
         self,

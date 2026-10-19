@@ -96,12 +96,14 @@ def normalize_tool_schemas(tools: Iterable[Any]) -> List[Dict[str, Any]]:
     return normalized
 
 
-def build_llm_request_snapshot(*, model: str, messages: Iterable[Any], tools: Iterable[Any], iteration: int) -> Dict[str, Any]:
+def build_llm_request_snapshot(*, model: str, messages: Iterable[Any], tools: Iterable[Any], iteration: int,
+                               cache_observation: Dict[str, Any] | None = None) -> Dict[str, Any]:
     return LLMRequestSnapshot(
         model=model,
         messages=normalize_messages(messages),
         tools=normalize_tool_schemas(tools),
         iteration=iteration,
+        cache_observation=dict(cache_observation or {}),
     ).to_dict()
 
 

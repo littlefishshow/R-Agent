@@ -10,6 +10,7 @@
 import json
 
 import core.agent
+from core.state import ThreadState
 from core.middleware import AgentContext, ToolCallView
 from core.middleware.builtins import LoopDetectionMiddleware
 from tools import delegate_tool
@@ -195,3 +196,85 @@ def test_timestamps_present_full_mode(monkeypatch, tmp_path):
     assert "started_at" in task0 and "completed_at" in task0
     assert task0["completed_at"] >= task0["started_at"]
     assert task0["stop_reason"] == "turn_capped"
+
+
+class _PrefixCaptureAgent:
+    instances = []
+
+    def __init__(self, max_iterations=None, session_id="", **kwargs):
+        self.max_iterations = max_iterations
+        self.session_id = session_id
+        self.state = ThreadState()
+        self.messages = []
+        self._durable_snapshot = None
+        self.system_message = ""
+        self.user_message = ""
+        self.current_content = ""
+        self.__class__.instances.append(self)
+
+    def run_conversation(self, **kwargs):
+        self.system_message = kwargs["system_message"]
+        self.user_message = kwargs["user_message"]
+        self.current_content = self.state.durable_current.get("content", "")
+        task_id = self.user_message.split("task_id: ", 1)[1].split("\n", 1)[0]
+        worker_id = self.user_message.split("worker_id: ", 1)[1].split("\n", 1)[0]
+        todo_tool.todo_manage(
+            "claim",
+            json.dumps({"id": task_id, "worker_id": worker_id}, ensure_ascii=False),
+        )
+        todo_tool.todo_manage(
+            "update",
+            json.dumps({"id": task_id, "status": "completed", "result": "done"}, ensure_ascii=False),
+        )
+        return "done"
+
+    def get_token_usage_summary(self, include_children=False):
+        return {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "available": True}
+
+    def get_cache_usage(self):
+        return {
+            "request_count": 2,
+            "local_prompt_tokens": 100,
+            "local_reusable_tokens": 70,
+            "local_new_tokens": 30,
+            "kv_reuse_ratio": 0.7,
+        }
+
+    def is_truncated(self):
+        return False
+
+
+def test_sibling_agents_share_static_system_and_frozen_durable_prefix(monkeypatch, tmp_path):
+    monkeypatch.setattr(todo_tool, "TODO_FILE", str(tmp_path / "todo_list.json"))
+    monkeypatch.setattr(core.agent, "RAgent", _PrefixCaptureAgent)
+    _PrefixCaptureAgent.instances = []
+    todo_tool.todo_manage(
+        "init",
+        json.dumps({
+            "tasks": [
+                {"id": "a", "description": "task A"},
+                {"id": "b", "description": "task B"},
+            ]
+        }, ensure_ascii=False),
+    )
+
+    payload = json.loads(delegate_tool.delegate_task(
+        tasks=json.dumps([
+            {"task_id": "a", "goal": "goal-A", "context_summary": "ctx-A"},
+            {"task_id": "b", "goal": "goal-B", "context_summary": "ctx-B"},
+        ], ensure_ascii=False),
+        max_workers=2,
+    ))
+
+    agents = _PrefixCaptureAgent.instances
+    assert len(agents) == 2
+    assert {agent.system_message for agent in agents} == {delegate_tool.SUBAGENT_SYSTEM_PROMPT}
+    assert all("goal-A" not in agent.system_message and "goal-B" not in agent.system_message for agent in agents)
+    assert len({agent.current_content for agent in agents}) == 1
+    assert all("<durable_unfinished_todos>" in agent.current_content for agent in agents)
+    assert any("goal: goal-A" in agent.user_message for agent in agents)
+    assert any("goal: goal-B" in agent.user_message for agent in agents)
+    prefix_hashes = {task["delegation_prefix_hash"] for task in payload["tasks"]}
+    assert len(prefix_hashes) == 1
+    assert payload["delegated_cache_usage"]["observed_agents"] == 2
+    assert payload["delegated_cache_usage"]["kv_reuse_ratio"] == 0.7

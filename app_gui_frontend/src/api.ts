@@ -30,6 +30,45 @@ export type SessionState = {
   last_response?: string | null
   last_error?: string | null
   token_usage?: string | number
+  cache_usage?: CacheUsageState
+}
+
+export type CacheUsageState = {
+  primary_metric?: 'local_prefix_reuse' | string
+  request_count?: number
+  local_prompt_tokens?: number
+  local_reusable_tokens?: number
+  local_new_tokens?: number
+  kv_reuse_ratio?: number | null
+  cache_hit_ratio?: number | null
+  last_local_prompt_tokens?: number
+  last_local_reusable_tokens?: number
+  last_local_new_tokens?: number
+  last_kv_reuse_ratio?: number | null
+  last_cache_hit_ratio?: number | null
+  provider_cache_supported?: boolean | null
+  provider_prompt_tokens?: number
+  provider_cached_prompt_tokens?: number
+  provider_uncached_prompt_tokens?: number
+  provider_cache_hit_ratio?: number | null
+  last_provider_prompt_tokens?: number
+  last_provider_cached_prompt_tokens?: number | null
+  last_provider_uncached_prompt_tokens?: number | null
+  last_provider_cache_hit_ratio?: number | null
+  last_request_latency_ms?: number | null
+  last_prefix_reuse_expected?: boolean | null
+  last_prefix_change_reasons?: string[]
+  last_component_hashes?: Record<string, string>
+  last_prefix_hash?: string
+  delegated_request_count?: number
+  delegated_observed_agents?: number
+  delegated_local_prompt_tokens?: number
+  delegated_local_reusable_tokens?: number
+  delegated_local_new_tokens?: number
+  delegated_kv_reuse_ratio?: number | null
+  overall_local_prompt_tokens?: number
+  overall_local_reusable_tokens?: number
+  overall_kv_reuse_ratio?: number | null
 }
 
 
@@ -56,6 +95,7 @@ export type TodoBoardState = {
   tasks?: TodoBoardTask[]
   truncated?: boolean
   updated_at?: number
+  revision?: string
   error?: string
 }
 

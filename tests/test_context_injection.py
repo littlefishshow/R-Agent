@@ -138,7 +138,7 @@ def test_durable_snapshot_is_frozen_until_compaction(monkeypatch):
 
 
 def test_tool_snapshot_grows_but_does_not_shrink_between_compactions(monkeypatch):
-    """工具快照只增不减：提升后立即可见；收窄不动快照，压缩时才复位。"""
+    """固定工具热更新时快照只增不减；动态发现不走这条路径。"""
     monkeypatch.setenv("DEFERRED_TOOLS_ENABLED", "1")
     monkeypatch.setenv("DEFERRED_TOOLS_ALWAYS_ON", "tool_search")
 
@@ -151,8 +151,7 @@ def test_tool_snapshot_grows_but_does_not_shrink_between_compactions(monkeypatch
     snap1 = agent._stabilize_request_tools(live)
     assert {s["function"]["name"] for s in snap1} == {"tool_search"}
 
-    # 提升 web_fetch（增长）：并入快照，且保持按 name 排序稳定。
-    agent._promoted_tools.add("web_fetch")
+    # 模拟 always-on registry 热更新新增 web_fetch：并入快照并稳定排序。
     live2 = [_schema("tool_search"), _schema("web_fetch")]
     snap2 = agent._stabilize_request_tools(live2)
     names2 = [s["function"]["name"] for s in snap2]
@@ -170,15 +169,20 @@ def test_tool_snapshot_grows_but_does_not_shrink_between_compactions(monkeypatch
 
 
 def test_deferred_tool_denied_backstops_unpromoted_calls(monkeypatch):
-    """执行层保底闸门：延迟暴露开启时，未提升且非 always-on 的工具被拒。"""
+    """隐藏工具即使已发现也不能绕过 invoke_dynamic_tool 直接调用。"""
     monkeypatch.setenv("DEFERRED_TOOLS_ENABLED", "1")
     monkeypatch.setenv("DEFERRED_TOOLS_ALWAYS_ON", "tool_search,read_file")
 
     agent = RAgent(model="test-model", max_iterations=2, enable_self_review=False)
-    assert agent._deferred_tool_denied("web_fetch") is True   # 未提升 -> 拒
+    assert agent._deferred_tool_denied("web_fetch") is True   # 隐藏工具 -> 拒
     assert agent._deferred_tool_denied("read_file") is False   # always-on -> 放行
-    agent._promoted_tools.add("web_fetch")
-    assert agent._deferred_tool_denied("web_fetch") is False   # 提升后 -> 放行
+    agent._register_dynamic_tool_contracts([{
+        "name": "web_fetch",
+        "description": "fetch",
+        "parameters": {"type": "object"},
+    }])
+    assert agent._deferred_tool_denied("web_fetch") is True    # 仍禁止直接调用
+    assert agent._deferred_tool_denied("invoke_dynamic_tool") is False
 
 
 def test_deferred_tool_denied_off_allows_everything(monkeypatch):

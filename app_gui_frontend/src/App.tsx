@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import MarkdownIt from 'markdown-it'
 import { renderToString } from 'katex'
 import { BookOpen, Check, ChevronDown, ChevronRight, ClipboardPaste, Clock, Copy, Download, Edit3, Eye, File, FileCode, FileText, Folder, FolderMinus, FolderOpen, FolderPlus, Languages, Lightbulb, ListTree, Maximize2, MessageCircle, MessageSquare, Minimize2, Moon, MoreHorizontal, Plus, RefreshCw, Search, Save, Send, Square, Sun, Trash2, Upload, Workflow, Wrench, X, ZoomIn, ZoomOut } from 'lucide-react'
@@ -177,6 +177,8 @@ type TextSelectionResult = {
   occurrence?: number
   rect: DOMRect
   range: Range
+  menuX?: number
+  menuY?: number
 }
 
 type TextSelectionAnchor = {
@@ -285,6 +287,11 @@ export function App() {
     }
   })
   const activeTextSelectionRangeRef = useRef<Range | null>(null)
+  const activeTextSelectionElementsRef = useRef<HTMLElement[]>([])
+  const openHighlightRef = useRef<(highlightId: string) => void>(() => {})
+  const stableOpenHighlight = useCallback((highlightId: string) => openHighlightRef.current(highlightId), [])
+  const lastChatSessionIdRef = useRef<string>('')
+  const lastActiveFilePathRef = useRef<string>('')
   // Sessions with a just-sent message whose background run may not yet report
   // running=true. The poller keeps reconciling these so a reply can't get stuck.
   const pendingRunsRef = useRef<Record<string, number>>({})
@@ -320,11 +327,14 @@ export function App() {
   const activeFile = activeFilePath ? openFiles[activeFilePath] || null : null
   const conversationPanelRef = useRef<HTMLElement | null>(null)
   const chatScrollPositionsRef = useRef<Record<string, number>>({})
+  const chatPinnedToBottomRef = useRef<Record<string, boolean>>({})
+  const chatScrollRestoreSessionRef = useRef<string | null>(null)
   const fileScrollPositionsRef = useRef<Record<string, number>>({})
   const openFilesRef = useRef<Record<string, OpenFileTab>>({})
   activateSessionRef.current = activateSession
   toggleConversationNodeRef.current = toggleConversationNode
   deleteRootSessionRef.current = deleteRootSession
+  openHighlightRef.current = openHighlight
   const uploadInputRef = useRef<HTMLInputElement | null>(null)
   const openWindowPollKey = useMemo(() => Object.values(windows)
     .map(win => `${win.id}:${win.sessionId}:${win.minimized ? 'min' : 'open'}`)
@@ -398,17 +408,47 @@ export function App() {
   }, [openFiles])
 
   useEffect(() => {
+    if (session?.session_id && session.node_kind !== 'file_root') {
+      lastChatSessionIdRef.current = session.session_id
+    }
+  }, [session?.session_id, session?.node_kind])
+
+  useEffect(() => {
+    if (activeMode === 'files' && activeFilePath && openFiles[activeFilePath]) {
+      lastActiveFilePathRef.current = activeFilePath
+    }
+  }, [activeMode, activeFilePath, openFiles])
+
+  useLayoutEffect(() => {
     if (activeMode !== 'chat' || !session?.session_id) return
     const panel = conversationPanelRef.current
     if (!panel) return
     const sessionId = session.session_id
+    const hasSavedPosition = Object.prototype.hasOwnProperty.call(chatScrollPositionsRef.current, sessionId)
     const scrollTop = chatScrollPositionsRef.current[sessionId] || 0
-    window.requestAnimationFrame(() => {
+    const pinnedToBottom = chatPinnedToBottomRef.current[sessionId] ?? !hasSavedPosition
+    chatScrollRestoreSessionRef.current = sessionId
+    const restorePosition = () => {
       if (conversationPanelRef.current === panel && session?.session_id === sessionId) {
-        panel.scrollTop = scrollTop
+        panel.scrollTop = pinnedToBottom
+          ? panel.scrollHeight
+          : Math.min(scrollTop, Math.max(0, panel.scrollHeight - panel.clientHeight))
       }
+    }
+    restorePosition()
+    let clearFrame = 0
+    const frame = window.requestAnimationFrame(() => {
+      restorePosition()
+      clearFrame = window.requestAnimationFrame(() => {
+        if (chatScrollRestoreSessionRef.current === sessionId) chatScrollRestoreSessionRef.current = null
+      })
     })
-  }, [activeMode, session?.session_id, chatItems.length])
+    return () => {
+      window.cancelAnimationFrame(frame)
+      if (clearFrame) window.cancelAnimationFrame(clearFrame)
+      if (chatScrollRestoreSessionRef.current === sessionId) chatScrollRestoreSessionRef.current = null
+    }
+  }, [activeMode, session?.session_id, session?.running, session?.todo_board?.revision, events.length, chatItems.length])
 
   useEffect(() => {
     if (!session) return
@@ -430,6 +470,7 @@ export function App() {
       if (target.closest('.selection-menu, .file-context-menu, .message-actions, .message-branch-menu')) return
       if (selectionMenu) {
         activeTextSelectionRangeRef.current = null
+        clearActiveTextSelection()
         window.getSelection()?.removeAllRanges()
         setSelectionMenu(null)
       }
@@ -441,8 +482,10 @@ export function App() {
   }, [selectionMenu, fileContextMenu, messageBranchMenus])
 
   function showSelectionMenu(menu: SelectionMenuState, range?: Range | null) {
+    clearActiveTextSelection()
     if (range) {
       activeTextSelectionRangeRef.current = range.cloneRange()
+      activeTextSelectionElementsRef.current = markActiveTextSelection(range)
       const selection = window.getSelection()
       selection?.removeAllRanges()
       selection?.addRange(range)
@@ -450,6 +493,28 @@ export function App() {
       activeTextSelectionRangeRef.current = null
     }
     setSelectionMenu(menu)
+  }
+
+  function clearActiveTextSelection() {
+    for (const element of activeTextSelectionElementsRef.current) {
+      element.classList.remove('active-text-selection')
+    }
+    activeTextSelectionElementsRef.current = []
+  }
+
+  function clearActiveTextSelectionSoon() {
+    window.requestAnimationFrame(() => {
+      clearActiveTextSelection()
+      activeTextSelectionRangeRef.current = null
+      window.getSelection()?.removeAllRanges()
+    })
+  }
+
+  function cancelPendingSelectionAction() {
+    setPendingAction(null)
+    clearActiveTextSelection()
+    activeTextSelectionRangeRef.current = null
+    window.getSelection()?.removeAllRanges()
   }
 
   function markPendingRun(sessionId: string) {
@@ -825,6 +890,26 @@ export function App() {
     }
   }
 
+  async function handleSidebarModeChange(mode: 'chat' | 'workspace') {
+    setSidebarMode(mode)
+    if (mode === 'workspace') {
+      const recentPath = lastActiveFilePathRef.current || activeFilePath || ''
+      if (recentPath && openFilesRef.current[recentPath]) setActiveFilePath(recentPath)
+      setActiveMode('files')
+      return
+    }
+
+    const recentSessionId = lastChatSessionIdRef.current
+      || (session?.node_kind !== 'file_root' ? session?.session_id || '' : '')
+      || visibleSessions[0]?.session_id
+      || ''
+    if (recentSessionId && recentSessionId !== session?.session_id) {
+      await activateSession(recentSessionId)
+    } else {
+      setActiveMode('chat')
+    }
+  }
+
   async function newQuestionChain() {
     setError(null)
     setInput('')
@@ -852,11 +937,16 @@ export function App() {
     setInput('')
     setInputResetToken(prev => prev + 1)
     setError(null)
+    chatPinnedToBottomRef.current[sessionId] = true
     // Keep the poller reconciling immediately; send can return before the
     // backend run flips running=true, and failures clear the optimistic state.
     markPendingRun(sessionId)
-    setSession(prev => prev && prev.session_id === sessionId ? { ...prev, running: true } : prev)
-    setSessions(prev => prev[sessionId] ? { ...prev, [sessionId]: { ...prev[sessionId], running: true } } : prev)
+    setSession(prev => prev && prev.session_id === sessionId
+      ? hideFinishedTodoBoardForNewTurn({ ...prev, running: true })
+      : prev)
+    setSessions(prev => prev[sessionId]
+      ? { ...prev, [sessionId]: hideFinishedTodoBoardForNewTurn({ ...prev[sessionId], running: true }) }
+      : prev)
     try {
       await sendLearningMessage(sessionId, text)
       await refreshActive(sessionId)
@@ -973,14 +1063,16 @@ export function App() {
         selection?.addRange(result.range)
       }
       if (!result) return
+      const pointerX = Number(event?.clientX)
+      const pointerY = Number(event?.clientY)
       showSelectionMenu({
         sourceSessionId,
         chatId,
         text: result.text,
         textOffset: result.textOffset,
         occurrence: result.occurrence,
-        x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
-        y: Math.max(12, result.rect.top - 46),
+        x: Number.isFinite(pointerX) ? pointerX : result.rect.left + result.rect.width / 2,
+        y: Math.max(12, Number.isFinite(pointerY) ? pointerY - 46 : result.rect.top - 46),
         // Unify with file/PDF selections: always describe where the text came
         // from so the backend prompt gets kind/location/selected text.
         sourceContext: {
@@ -1006,6 +1098,8 @@ export function App() {
     const menu = selectionMenu
     setSelectionMenu(null)
     window.getSelection()?.removeAllRanges()
+    clearActiveTextSelection()
+    activeTextSelectionRangeRef.current = null
     if (action === 'question') {
       setQuestionDraft('')
       setPendingAction({ ...menu, action })
@@ -1024,10 +1118,12 @@ export function App() {
     }
     if (action === 'modify') {
       if (menu.sourceContext?.kind !== 'markdown' || !menu.sourceContext?.path) {
+        clearActiveTextSelection()
         setError('修改功能目前只支持 Markdown 文件中的选中文本。')
         return
       }
       if (menu.sourceContext?.unsaved_changes) {
+        clearActiveTextSelection()
         setError('当前 Markdown 有未保存修改，请先保存文件，再选中文本让 AI 修改。')
         return
       }
@@ -1166,6 +1262,7 @@ export function App() {
       }))
     }
     setHighlights(prev => ({ ...prev, [highlightId]: highlight }))
+    clearActiveTextSelectionSoon()
     markPendingRun(provisionalSessionId)
     const optimisticBranch = makeOptimisticBranch(provisionalSessionId, requestedSourceSessionId, {
       title: options.customQuestion || options.noteText || actionMeta?.label || '新分支',
@@ -1341,6 +1438,7 @@ export function App() {
         color: provisionalColor,
       },
     }))
+    clearActiveTextSelectionSoon()
     const optimisticBranch = makeOptimisticBranch(provisionalSessionId, action.sourceSessionId, {
       title: '笔记',
       action: 'note',
@@ -1449,7 +1547,9 @@ export function App() {
     setWindowInputResetTokens(prev => ({ ...prev, [windowId]: (prev[windowId] || 0) + 1 }))
     setWindowSendingFlag(windowId, true)
     markPendingRun(win.sessionId)
-    setSessions(prev => prev[win.sessionId] ? { ...prev, [win.sessionId]: { ...prev[win.sessionId], running: true } } : prev)
+    setSessions(prev => prev[win.sessionId]
+      ? { ...prev, [win.sessionId]: hideFinishedTodoBoardForNewTurn({ ...prev[win.sessionId], running: true }) }
+      : prev)
     try {
       await sendLearningMessage(win.sessionId, text)
       const [state, ev] = await Promise.all([
@@ -1827,6 +1927,7 @@ export function App() {
       await refreshWorkspace(item.path)
       return
     }
+    lastActiveFilePathRef.current = item.path
     if (openFilesRef.current[item.path]) {
       setActiveFilePath(item.path)
       setActiveMode('files')
@@ -2064,8 +2165,8 @@ export function App() {
         <button className="icon-button ghost" onClick={() => setDarkMode(prev => !prev)} title={darkMode ? '切换到亮色模式' : '切换到暗色模式'}>{darkMode ? <Sun size={18}/> : <Moon size={18}/>}</button>
       </div>
       <div className="sidebar-mode-switch">
-        <button className={sidebarMode === 'chat' ? 'selected' : ''} onClick={() => setSidebarMode('chat')}><MessageSquare size={15}/>对话</button>
-        <button className={sidebarMode === 'workspace' ? 'selected' : ''} onClick={() => setSidebarMode('workspace')}><Folder size={15}/>工作区</button>
+        <button className={sidebarMode === 'chat' ? 'selected' : ''} onClick={() => { void handleSidebarModeChange('chat') }}><MessageSquare size={15}/>对话</button>
+        <button className={sidebarMode === 'workspace' ? 'selected' : ''} onClick={() => { void handleSidebarModeChange('workspace') }}><Folder size={15}/>工作区</button>
       </div>
       {sidebarMode === 'chat' ? <>
         <div className="search-row">
@@ -2123,6 +2224,7 @@ export function App() {
         onZoomOut={() => setPdfZoom(prev => Math.max(1.15, Math.round((prev - 0.15) * 100) / 100))}
         onZoomIn={() => setPdfZoom(prev => Math.min(2.6, Math.round((prev + 0.15) * 100) / 100))}
         onActivate={(path) => {
+          lastActiveFilePathRef.current = path
           setActiveFilePath(path)
           setActiveMode('files')
         }}
@@ -2134,7 +2236,9 @@ export function App() {
           })
           if (activeFilePath === path) {
             const remaining = Object.keys(openFiles).filter(item => item !== path)
-            setActiveFilePath(remaining[0] || null)
+            const nextPath = remaining[0] || null
+            lastActiveFilePathRef.current = nextPath || ''
+            setActiveFilePath(nextPath)
             if (!remaining.length) setActiveMode('chat')
           }
         }}
@@ -2187,8 +2291,8 @@ export function App() {
             text: result.text,
             textOffset: result.textOffset,
             occurrence: result.occurrence,
-            x: Math.min(result.rect.left + result.rect.width / 2, window.innerWidth - 220),
-            y: Math.max(12, result.rect.top - 46),
+            x: result.menuX ?? result.rect.left + result.rect.width / 2,
+            y: Math.max(12, (result.menuY ?? result.rect.top) - 46),
             sourceContext: {
               kind: 'markdown',
               path,
@@ -2211,18 +2315,21 @@ export function App() {
             sourceSessionId: session?.session_id || '',
             chatId: `pdf:${filePath}:p${page}`,
             text,
-            x: Math.min(rect.left + rect.width / 2, window.innerWidth - 220),
+            x: rect.left + rect.width / 2,
             y: Math.max(12, rect.top - 46),
             pdfContext: filePath ? { path: filePath, page, rects } : undefined,
             sourceContext: filePath ? { kind: 'pdf', path: filePath, location: `page ${page}`, page, rects } : undefined,
           })
         }}
-        onOpenHighlight={openHighlight}
+        onOpenHighlight={stableOpenHighlight}
       /> : <section
         ref={conversationPanelRef}
         className="conversation-panel"
         onScroll={event => {
-          if (session?.session_id) chatScrollPositionsRef.current[session.session_id] = event.currentTarget.scrollTop
+          if (!session?.session_id) return
+          if (chatScrollRestoreSessionRef.current === session.session_id) return
+          chatScrollPositionsRef.current[session.session_id] = event.currentTarget.scrollTop
+          chatPinnedToBottomRef.current[session.session_id] = isNearScrollBottom(event.currentTarget)
         }}
       >
           {!chatItems.length && eventsLoading && <div className="learning-empty">
@@ -2266,7 +2373,7 @@ export function App() {
                 setCollapsedMessages(prev => ({ ...prev, [key]: !prev[key] }))
               }}
               onTextSelection={(container, anchor, event) => handleTextSelection(session?.session_id || '', item.id, container, anchor, event)}
-              onOpenHighlight={openHighlight}
+              onOpenHighlight={stableOpenHighlight}
             />
           </article>)}
           {session?.running && <ThinkingState events={events} running={session.running} todoBoard={session.todo_board}/>}
@@ -2277,6 +2384,7 @@ export function App() {
           <span>本次回答已达到思考轮数上限（{session.max_iterations || '当前预算'}）。</span>
           <button className="secondary" onClick={continueActiveAfterTruncation}>继续思考</button>
         </div>}
+        <CacheObservability cache={session?.cache_usage}/>
         <div className="composer-card">
           <ComposerInput
             className="composer-input"
@@ -2320,7 +2428,7 @@ export function App() {
       selectedText={pendingAction.text}
       value={questionDraft}
       onChange={setQuestionDraft}
-      onCancel={() => setPendingAction(null)}
+      onCancel={cancelPendingSelectionAction}
       onSubmit={submitQuestionDialog}
     />}
     {pendingAction?.action === 'translate' && <TranslateDialog
@@ -2329,14 +2437,14 @@ export function App() {
       customLanguage={customLanguage}
       onChoice={setTranslationChoice}
       onCustomLanguage={setCustomLanguage}
-      onCancel={() => setPendingAction(null)}
+      onCancel={cancelPendingSelectionAction}
       onSubmit={submitTranslationDialog}
     />}
     {pendingAction?.action === 'note' && <NoteDialog
       selectedText={pendingAction.text}
       value={noteDraft}
       onChange={setNoteDraft}
-      onCancel={() => setPendingAction(null)}
+      onCancel={cancelPendingSelectionAction}
       onSave={() => saveNoteDialog(false)}
       onSend={() => saveNoteDialog(true)}
     />}
@@ -2344,7 +2452,7 @@ export function App() {
       selectedText={pendingAction.text}
       value={modificationDraft}
       onChange={setModificationDraft}
-      onCancel={() => setPendingAction(null)}
+      onCancel={cancelPendingSelectionAction}
       onSubmit={submitModificationDialog}
     />}
     <FloatingWindows
@@ -2382,7 +2490,7 @@ export function App() {
         }
       }}
       onTextSelection={handleTextSelection}
-      onOpenHighlight={openHighlight}
+      onOpenHighlight={stableOpenHighlight}
       messageBranchMenus={messageBranchMenus}
       onToggleMessageBranchMenu={(key) => setMessageBranchMenus(prev => ({ ...prev, [key]: !prev[key] }))}
       onForkMessage={forkFromUserMessage}
@@ -2426,7 +2534,62 @@ function sameLearningSession(a?: LearningSessionState, b?: LearningSessionState)
     sameStringList(a.allowed_tools, b.allowed_tools) &&
     sameJsonValue(a.selection, b.selection) &&
     sameJsonValue((a as any).token_usage_breakdown, (b as any).token_usage_breakdown) &&
+    sameJsonValue(a.cache_usage, b.cache_usage) &&
     sameJsonValue(a.todo_board, b.todo_board)
+}
+
+function hideFinishedTodoBoardForNewTurn(state: LearningSessionState): LearningSessionState {
+  const counts = state.todo_board?.status_counts
+  const total = state.todo_board?.total
+  const tasks = state.todo_board?.tasks
+  const finished = typeof total === 'number' && total > 0 && counts
+    ? (counts.completed || 0) + (counts.cancelled || 0) === total
+    : Array.isArray(tasks) && tasks.length > 0 && tasks.every(task =>
+      task.status === 'completed' || task.status === 'cancelled'
+    )
+  return finished ? { ...state, todo_board: null } : state
+}
+
+function isNearScrollBottom(element: HTMLElement, threshold = 48): boolean {
+  return element.scrollHeight - element.clientHeight - element.scrollTop <= threshold
+}
+
+function CacheObservability({ cache }: { cache?: LearningSessionState['cache_usage'] }) {
+  if (!cache || !cache.request_count) return null
+  const lastRatio = typeof cache.last_kv_reuse_ratio === 'number'
+    ? cache.last_kv_reuse_ratio
+    : typeof cache.last_cache_hit_ratio === 'number' ? cache.last_cache_hit_ratio : null
+  const parentRatio = typeof cache.kv_reuse_ratio === 'number'
+    ? cache.kv_reuse_ratio
+    : typeof cache.cache_hit_ratio === 'number' ? cache.cache_hit_ratio : null
+  const childRatio = typeof cache.delegated_kv_reuse_ratio === 'number' ? cache.delegated_kv_reuse_ratio : null
+  const overallRatio = typeof cache.overall_kv_reuse_ratio === 'number' ? cache.overall_kv_reuse_ratio : parentRatio
+  const reasons = cache.last_prefix_change_reasons || []
+  const reasonLabels: Record<string, string> = {
+    first_request: '首次请求',
+    tail_append_only: '仅尾部追加',
+    system_changed: 'System 变化',
+    catalog_changed: '工具目录变化',
+    durable_changed: 'Durable 晋升',
+    tool_schema_changed: 'Tool Schema 变化',
+    history_rewritten: '历史被重写',
+    context_compacted: '上下文压缩',
+    durable_promoted: 'Durable 版本切换',
+  }
+  const prefixText = reasons.map(reason => reasonLabels[reason] || reason).join(' · ') || '等待第二次请求'
+  const reuseText = lastRatio !== null
+    ? `本地 KV 复用：本轮 ${(lastRatio * 100).toFixed(1)}% · 父 ${((parentRatio || 0) * 100).toFixed(1)}% · 子 ${childRatio === null ? 'n/a' : `${(childRatio * 100).toFixed(1)}%`} · 总体 ${((overallRatio || 0) * 100).toFixed(1)}%`
+    : '本地 KV 复用：等待第二次请求'
+  const tokenText = lastRatio !== null
+    ? `父本轮可复用 ${cache.last_local_reusable_tokens || 0} / ${cache.last_local_prompt_tokens || 0}；总体 ${cache.overall_local_reusable_tokens || 0} / ${cache.overall_local_prompt_tokens || 0} 估算 tokens`
+    : '按最长公共请求前缀估算，不依赖 provider cached_tokens'
+  const prefixGood = cache.last_prefix_reuse_expected === true
+  return <div className="cache-observability" title={`prefix ${cache.last_prefix_hash || 'n/a'}`}>
+    <span className={`cache-observability-primary ${lastRatio !== null ? 'available' : 'unavailable'}`}>{reuseText}</span>
+    <span>{tokenText}</span>
+    <span className={prefixGood ? 'prefix-good' : 'prefix-changed'}>前缀：{prefixText}</span>
+    {typeof cache.last_request_latency_ms === 'number' && <span>耗时 {Math.round(cache.last_request_latency_ms)} ms</span>}
+  </div>
 }
 
 function sameEventList(a: ContextEvent[] = [], b: ContextEvent[] = []): boolean {
@@ -2700,8 +2863,14 @@ function markdownLineRange(content: string, selectionStart: number, selectionEnd
   text: string
 } {
   const source = String(content || '')
-  const safeStart = Math.max(0, Math.min(selectionStart, source.length))
-  const safeEnd = Math.max(safeStart, Math.min(selectionEnd, source.length))
+  let safeStart = Math.max(0, Math.min(selectionStart, source.length))
+  let safeEnd = Math.max(safeStart, Math.min(selectionEnd, source.length))
+  for (const [blockStart, blockEnd] of markdownDisplayMathBlockRanges(source)) {
+    if (safeStart < blockEnd && safeEnd > blockStart) {
+      safeStart = Math.min(safeStart, blockStart)
+      safeEnd = Math.max(safeEnd, blockEnd)
+    }
+  }
   const start = source.lastIndexOf('\n', Math.max(0, safeStart - 1)) + 1
   const probe = Math.max(safeStart, safeEnd - 1)
   const nextNewline = source.indexOf('\n', probe)
@@ -2709,6 +2878,26 @@ function markdownLineRange(content: string, selectionStart: number, selectionEnd
   const startLine = source.slice(0, start).split('\n').length
   const endLine = startLine + source.slice(start, end).split('\n').length - 1
   return { start, end, startLine, endLine, text: source.slice(start, end) }
+}
+
+function markdownDisplayMathBlockRanges(source: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = []
+  const dollars = Array.from(source.matchAll(/^[ \t]*\$\$[ \t]*$/gm))
+  for (let index = 0; index + 1 < dollars.length; index += 2) {
+    ranges.push([dollars[index].index || 0, (dollars[index + 1].index || 0) + dollars[index + 1][0].length])
+  }
+  const openings = Array.from(source.matchAll(/^[ \t]*\\\[[ \t]*$/gm))
+  const closings = Array.from(source.matchAll(/^[ \t]*\\\][ \t]*$/gm))
+  let closeIndex = 0
+  for (const opening of openings) {
+    const openEnd = (opening.index || 0) + opening[0].length
+    while (closeIndex < closings.length && (closings[closeIndex].index || 0) <= openEnd) closeIndex += 1
+    if (closeIndex >= closings.length) break
+    const closing = closings[closeIndex]
+    ranges.push([opening.index || 0, (closing.index || 0) + closing[0].length])
+    closeIndex += 1
+  }
+  return ranges
 }
 
 function parentPath(path: string): string {
@@ -2723,7 +2912,24 @@ function shouldSubmitFromKey(event: any): boolean {
 }
 
 function SelectionMenu({ menu, onAction }: { menu: SelectionMenuState, onAction: (action: SelectionAction) => void }) {
-  return <div className="selection-menu" style={{ left: menu.x, top: menu.y }} onPointerDown={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()}>
+  const menuRef = useRef<HTMLDivElement | null>(null)
+  const [position, setPosition] = useState({ left: menu.x, top: menu.y })
+  useLayoutEffect(() => {
+    const placeMenu = () => {
+      const element = menuRef.current
+      if (!element) return
+      const margin = 8
+      const width = element.offsetWidth
+      const height = element.offsetHeight
+      const left = Math.max(margin, Math.min(menu.x - width / 2, window.innerWidth - width - margin))
+      const top = Math.max(margin, Math.min(menu.y, window.innerHeight - height - margin))
+      setPosition({ left, top })
+    }
+    placeMenu()
+    window.addEventListener('resize', placeMenu)
+    return () => window.removeEventListener('resize', placeMenu)
+  }, [menu.x, menu.y, menu.sourceContext?.kind])
+  return <div ref={menuRef} className="selection-menu" style={position} onPointerDown={e => e.stopPropagation()} onMouseDown={e => e.stopPropagation()}>
     {SELECTION_ACTIONS.filter(item => item.action !== 'modify' || menu.sourceContext?.kind === 'markdown').map(item => {
       const Icon = item.icon
       return <button key={item.action} onClick={() => onAction(item.action)}><Icon size={14}/>{item.label}</button>
@@ -3109,9 +3315,11 @@ function MarkdownFileEditor({ tab, sessionId, highlights, scrollTop, onScroll, o
   onOpenHighlight: (highlightId: string) => void
 }) {
   const mode = tab.viewMode || 'preview'
-  const selectionAnchorRef = useRef<TextSelectionAnchor | null>(null)
+  const managedSelectionActiveRef = useRef(false)
+  const stopManagedSelectionRef = useRef<(() => void) | null>(null)
   const editorScrollRef = useRef<HTMLTextAreaElement | null>(null)
   const previewScrollRef = useRef<HTMLDivElement | null>(null)
+  useEffect(() => () => stopManagedSelectionRef.current?.(), [])
   useEffect(() => {
     const target = mode === 'edit' ? editorScrollRef.current : previewScrollRef.current
     if (!target) return
@@ -3138,19 +3346,26 @@ function MarkdownFileEditor({ tab, sessionId, highlights, scrollTop, onScroll, o
         />
       : <div ref={previewScrollRef} className="markdown-preview" onScroll={event => onScroll(event.currentTarget.scrollTop)} onMouseDown={event => {
           if (!shouldManageMarkdownSelection(event)) {
-            selectionAnchorRef.current = null
+            managedSelectionActiveRef.current = false
             return
           }
-          event.preventDefault()
-          window.getSelection()?.removeAllRanges()
-          selectionAnchorRef.current = makeTextSelectionAnchor(event.currentTarget, event)
-        }} onMouseMove={event => {
-          updateManagedTextSelection(event.currentTarget, selectionAnchorRef.current, event)
-        }} onMouseLeave={() => {
-          selectionAnchorRef.current = null
-        }} onMouseUp={event => {
+          stopManagedSelectionRef.current?.()
+          managedSelectionActiveRef.current = true
           const container = event.currentTarget
-          const anchor = selectionAnchorRef.current
+          stopManagedSelectionRef.current = beginManagedTextSelection(container, event, (_anchor, finalEvent) => {
+            managedSelectionActiveRef.current = false
+            stopManagedSelectionRef.current = null
+            const result = readTextSelectionWithin(container)
+            if (!result) return
+            const selection = window.getSelection()
+            selection?.removeAllRanges()
+            selection?.addRange(result.range)
+            onSelection({ ...result, menuX: finalEvent.clientX, menuY: finalEvent.clientY })
+          })
+          if (!stopManagedSelectionRef.current) managedSelectionActiveRef.current = false
+        }} onMouseUp={event => {
+          if (managedSelectionActiveRef.current) return
+          const container = event.currentTarget
           const handleResult = (result: TextSelectionResult | null) => {
             if (!result) return
             const selection = window.getSelection()
@@ -3158,9 +3373,8 @@ function MarkdownFileEditor({ tab, sessionId, highlights, scrollTop, onScroll, o
             selection?.addRange(result.range)
             onSelection(result)
           }
-          const result = readTextSelectionWithin(container, anchor, anchor ? event : undefined)
-          selectionAnchorRef.current = null
-          if (result || anchor) {
+          const result = readTextSelectionWithin(container, null, event)
+          if (result) {
             handleResult(result)
             return
           }
@@ -3629,9 +3843,49 @@ function textSelectionResultFromRange(container: HTMLElement, range: Range): Tex
   const leadingTrim = extracted?.leadingTrim ?? (rawText.length - rawText.trimStart().length)
   const text = rawText.trim()
   if (text.length < 2) return null
-  const rect = range.getBoundingClientRect()
+  const rect = selectionVisualRect(container, range)
   if (!rect || (rect.width === 0 && rect.height === 0)) return null
   return { text, rect, range, ...locateSelectionInContainer(container, range, text, leadingTrim) }
+}
+
+function selectionVisualRect(container: HTMLElement, range: Range): DOMRect | null {
+  const nativeRect = range.getBoundingClientRect()
+  if (nativeRect && (nativeRect.width || nativeRect.height)) return nativeRect
+  const rects: DOMRect[] = []
+  for (const token of markdownTokens(container)) {
+    try {
+      if (!range.intersectsNode(token)) continue
+    } catch {
+      continue
+    }
+    const rect = firstUsableRect(token)
+    if (rect) rects.push(rect)
+  }
+  if (!rects.length) return null
+  const left = Math.min(...rects.map(rect => rect.left))
+  const top = Math.min(...rects.map(rect => rect.top))
+  const right = Math.max(...rects.map(rect => rect.right))
+  const bottom = Math.max(...rects.map(rect => rect.bottom))
+  return new DOMRect(left, top, Math.max(1, right - left), Math.max(1, bottom - top))
+}
+
+function markActiveTextSelection(range: Range): HTMLElement[] {
+  const startElement = range.startContainer.nodeType === Node.ELEMENT_NODE
+    ? range.startContainer as HTMLElement
+    : range.startContainer.parentElement
+  const root = startElement?.closest<HTMLElement>('.markdown-body')
+  if (!root) return []
+  const marked: HTMLElement[] = []
+  for (const token of Array.from(root.querySelectorAll<HTMLElement>('[data-md-token]'))) {
+    try {
+      if (!range.intersectsNode(token)) continue
+    } catch {
+      continue
+    }
+    token.classList.add('active-text-selection')
+    marked.push(token)
+  }
+  return marked
 }
 
 function makeTextSelectionAnchor(container: HTMLElement, event: any): TextSelectionAnchor | null {
@@ -3655,6 +3909,122 @@ function updateManagedTextSelection(container: HTMLElement, anchor: TextSelectio
   const selection = window.getSelection()
   selection?.removeAllRanges()
   selection?.addRange(range)
+}
+
+function beginManagedTextSelection(
+  container: HTMLElement,
+  event: any,
+  onFinish: (anchor: TextSelectionAnchor, finalEvent: any) => void,
+): (() => void) | null {
+  const anchor = makeTextSelectionAnchor(container, event)
+  if (!anchor) return null
+
+  event.preventDefault()
+  window.getSelection()?.removeAllRanges()
+  const scrollContainer = findSelectionScrollContainer(container)
+  let pointerX = Number(event.clientX || 0)
+  let pointerY = Number(event.clientY || 0)
+  let active = true
+  let frame = 0
+
+  const pointerEvent = () => selectionPointerEvent(container, scrollContainer, pointerX, pointerY)
+  const updateSelection = () => updateManagedTextSelection(container, anchor, pointerEvent())
+
+  const scrollFrame = () => {
+    if (!active) return
+    if (scrollContainer) {
+      const velocity = selectionAutoScrollVelocity(scrollContainer, pointerX, pointerY)
+      if (velocity) {
+        const before = scrollContainer.scrollTop
+        scrollContainer.scrollTop += velocity
+        if (scrollContainer.scrollTop !== before) updateSelection()
+      }
+    }
+    frame = window.requestAnimationFrame(scrollFrame)
+  }
+
+  const cleanup = () => {
+    if (!active) return
+    active = false
+    if (frame) window.cancelAnimationFrame(frame)
+    window.removeEventListener('mousemove', handleMove, true)
+    window.removeEventListener('mouseup', handleUp)
+    window.removeEventListener('blur', handleBlur)
+  }
+
+  const finish = (finalEvent: MouseEvent) => {
+    if (!active) return
+    pointerX = Number(finalEvent.clientX || pointerX)
+    pointerY = Number(finalEvent.clientY || pointerY)
+    const normalizedEvent = pointerEvent()
+    updateManagedTextSelection(container, anchor, normalizedEvent)
+    cleanup()
+    onFinish(anchor, normalizedEvent)
+  }
+
+  function handleMove(moveEvent: MouseEvent) {
+    if (!active) return
+    if ((moveEvent.buttons & 1) === 0) return
+    moveEvent.preventDefault()
+    pointerX = moveEvent.clientX
+    pointerY = moveEvent.clientY
+    updateSelection()
+  }
+
+  function handleUp(upEvent: MouseEvent) {
+    finish(upEvent)
+  }
+
+  function handleBlur() {
+    cleanup()
+  }
+
+  updateSelection()
+  window.addEventListener('mousemove', handleMove, true)
+  window.addEventListener('mouseup', handleUp)
+  window.addEventListener('blur', handleBlur)
+  frame = window.requestAnimationFrame(scrollFrame)
+  return cleanup
+}
+
+function findSelectionScrollContainer(container: HTMLElement): HTMLElement | null {
+  let current: HTMLElement | null = container
+  while (current) {
+    const overflowY = window.getComputedStyle(current).overflowY
+    if (/(auto|scroll)/.test(overflowY) && current.scrollHeight > current.clientHeight) return current
+    current = current.parentElement
+  }
+  return null
+}
+
+function selectionPointerEvent(container: HTMLElement, scrollContainer: HTMLElement | null, x: number, y: number): any {
+  const bounds = (scrollContainer || container).getBoundingClientRect()
+  const clientX = Math.max(bounds.left + 2, Math.min(x, bounds.right - 2))
+  const clientY = Math.max(bounds.top + 2, Math.min(y, bounds.bottom - 2))
+  const viewportX = Math.max(0, Math.min(clientX, window.innerWidth - 1))
+  const viewportY = Math.max(0, Math.min(clientY, window.innerHeight - 1))
+  const hit = document.elementFromPoint(viewportX, viewportY)
+  return {
+    clientX: viewportX,
+    clientY: viewportY,
+    target: hit instanceof HTMLElement && container.contains(hit) ? hit : container,
+  }
+}
+
+function selectionAutoScrollVelocity(container: HTMLElement, x: number, y: number): number {
+  const rect = container.getBoundingClientRect()
+  if (x < rect.left - 80 || x > rect.right + 80) return 0
+  const edge = Math.min(64, Math.max(28, rect.height / 5))
+  const maxSpeed = 22
+  if (y < rect.top + edge) {
+    const strength = Math.min(1, Math.max(0, (rect.top + edge - y) / edge))
+    return -Math.max(2, Math.round(maxSpeed * strength))
+  }
+  if (y > rect.bottom - edge) {
+    const strength = Math.min(1, Math.max(0, (y - (rect.bottom - edge)) / edge))
+    return Math.max(2, Math.round(maxSpeed * strength))
+  }
+  return 0
 }
 
 function rangeFromAnchorToEvent(container: HTMLElement, anchor: TextSelectionAnchor | null, event: any): Range | null {
@@ -3887,6 +4257,58 @@ function FloatingWindows({
   onSetbackMessage: (sessionId: string, messageIndex?: number, windowId?: string) => void
   onToggleTools: (sessionId: string, enabled: boolean) => void
 }) {
+  const bodyRefs = useRef<Record<string, HTMLDivElement | null>>({})
+  const scrollPositionsRef = useRef<Record<string, number>>({})
+  const pinnedToBottomRef = useRef<Record<string, boolean>>({})
+  const resetTokensSeenRef = useRef<Record<string, number>>({})
+  const restoringScrollRef = useRef<Set<string>>(new Set())
+
+  useLayoutEffect(() => {
+    const liveWindowIds = new Set(Object.keys(windows))
+    for (const key of Object.keys(bodyRefs.current)) {
+      if (!liveWindowIds.has(key)) {
+        delete bodyRefs.current[key]
+        delete scrollPositionsRef.current[key]
+        delete pinnedToBottomRef.current[key]
+        delete resetTokensSeenRef.current[key]
+        restoringScrollRef.current.delete(key)
+      }
+    }
+
+    const restorePositions = () => {
+      for (const win of Object.values(windows)) {
+        if (win.minimized) continue
+        const panel = bodyRefs.current[win.id]
+        if (!panel) continue
+        restoringScrollRef.current.add(win.id)
+
+        const resetToken = inputResetTokens[win.id] || 0
+        const previousResetToken = resetTokensSeenRef.current[win.id]
+        if (previousResetToken !== undefined && previousResetToken !== resetToken) {
+          pinnedToBottomRef.current[win.id] = true
+        }
+        resetTokensSeenRef.current[win.id] = resetToken
+
+        const hasSavedPosition = Object.prototype.hasOwnProperty.call(scrollPositionsRef.current, win.id)
+        const pinnedToBottom = pinnedToBottomRef.current[win.id] ?? !hasSavedPosition
+        panel.scrollTop = pinnedToBottom
+          ? panel.scrollHeight
+          : Math.min(scrollPositionsRef.current[win.id] || 0, Math.max(0, panel.scrollHeight - panel.clientHeight))
+      }
+    }
+    restorePositions()
+    let clearFrame = 0
+    const frame = window.requestAnimationFrame(() => {
+      restorePositions()
+      clearFrame = window.requestAnimationFrame(() => restoringScrollRef.current.clear())
+    })
+    return () => {
+      window.cancelAnimationFrame(frame)
+      if (clearFrame) window.cancelAnimationFrame(clearFrame)
+      restoringScrollRef.current.clear()
+    }
+  }, [windows, sessions, eventsByWindow, inputResetTokens, sendingByWindow])
+
   return <>
     <div className="window-dock">
       {Object.values(windows).filter(win => win.minimized).map(win => {
@@ -3967,7 +4389,15 @@ function FloatingWindows({
             <button className="delete-window" title="删除并删除子树" onClick={() => onClose(win.id)}><Trash2 size={14}/>删除</button>
           </div>
         </header>
-        <div className="window-body">
+        <div
+          ref={node => { bodyRefs.current[win.id] = node }}
+          className="window-body"
+          onScroll={event => {
+            if (restoringScrollRef.current.has(win.id)) return
+            scrollPositionsRef.current[win.id] = event.currentTarget.scrollTop
+            pinnedToBottomRef.current[win.id] = isNearScrollBottom(event.currentTarget)
+          }}
+        >
           {!session?.running && !visibleWindowItems(chatItems, win).length && <div className="window-empty">子窗口上下文已独立创建。</div>}
           {visibleWindowItems(chatItems, win).map(item => <article key={item.id} className={`window-bubble ${item.role}`}>
             <div className="bubble-head">
@@ -4102,7 +4532,8 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
   onOpenHighlight: (highlightId: string) => void
 }) {
   const [fullText, setFullText] = useState<string | null>(null)
-  const selectionAnchorRef = useRef<TextSelectionAnchor | null>(null)
+  const managedSelectionActiveRef = useRef(false)
+  const stopManagedSelectionRef = useRef<(() => void) | null>(null)
   const ref = item.content?.payload_ref
 
   useEffect(() => {
@@ -4120,6 +4551,8 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
     return () => { cancelled = true }
   }, [sessionId, ref?.id])
 
+  useEffect(() => () => stopManagedSelectionRef.current?.(), [])
+
   const text = fullText ?? renderContent(item.content)
   const lines = text.split('\n')
   const canCollapse = lines.length > 10
@@ -4129,23 +4562,22 @@ const MessageContent = memo(function MessageContent({ sessionId, item, collapsed
     data-chat-id={item.id}
     onMouseDown={event => {
       if (!shouldManageMarkdownSelection(event)) {
-        selectionAnchorRef.current = null
+        managedSelectionActiveRef.current = false
         return
       }
-      event.preventDefault()
-      window.getSelection()?.removeAllRanges()
-      selectionAnchorRef.current = makeTextSelectionAnchor(event.currentTarget, event)
-    }}
-    onMouseMove={event => {
-      updateManagedTextSelection(event.currentTarget, selectionAnchorRef.current, event)
-    }}
-    onMouseLeave={() => {
-      selectionAnchorRef.current = null
+      stopManagedSelectionRef.current?.()
+      managedSelectionActiveRef.current = true
+      const container = event.currentTarget
+      stopManagedSelectionRef.current = beginManagedTextSelection(container, event, (anchor, finalEvent) => {
+        managedSelectionActiveRef.current = false
+        stopManagedSelectionRef.current = null
+        onTextSelection(container, anchor, finalEvent)
+      })
+      if (!stopManagedSelectionRef.current) managedSelectionActiveRef.current = false
     }}
     onMouseUp={event => {
-      const anchor = selectionAnchorRef.current
-      onTextSelection(event.currentTarget, anchor, anchor ? event : undefined)
-      selectionAnchorRef.current = null
+      if (managedSelectionActiveRef.current) return
+      onTextSelection(event.currentTarget, null, event)
     }}
   >
     {(item.role === 'user' || item.role === 'assistant') && <button
@@ -4530,6 +4962,13 @@ function normalizeMarkdownVisibleTextWithMap(value: string): { text: string, map
       const start = match.index || 0
       for (let index = start; index < start + match[0].length; index += 1) ignored[index] = true
     }
+  }
+  // Markdown preview math renders the body of `$...$`, not the dollar
+  // delimiters. Preserve the TeX body while excluding only those delimiters.
+  for (const match of value.matchAll(/(?<!\\)\$([^$\n]+?)(?<!\\)\$/g)) {
+    const start = match.index || 0
+    ignored[start] = true
+    ignored[start + match[0].length - 1] = true
   }
   let text = ''
   const map: number[] = []

@@ -20,6 +20,7 @@ from core.middleware import (
     build_default_middlewares,
     build_runtime_middlewares,
 )
+from core.cache_observability import build_request_fingerprint, provider_cache_tokens, stable_hash
 from app_gui.normalizer import build_llm_request_snapshot, normalize_message
 from app_gui.schemas import (
     EVENT_LLM_REQUEST_SNAPSHOT,
@@ -389,8 +390,10 @@ class RAgent:
         self.middleware = MiddlewareChain(
             build_runtime_middlewares(optional_middlewares)
         )
-        # 延迟工具暴露：本次 run 内已被 tool_search 提升的工具名集合（见 06 章）。
+        # _promoted_tools 仅保留为旧插件兼容字段；新路径把契约放进消息尾部，并通过固定的
+        # invoke_dynamic_tool 调用，不再把动态 schema 并入顶层 tools=。
         self._promoted_tools = set()
+        self._dynamic_tool_contracts = {}
         self._sandbox_workspace = None
         # KV-cache 前缀稳定化：durable/记忆快照与工具可见集快照都做备份，稳态下逐轮
         # 复用同一份，只有在上下文压缩或工具可见范围「增长」时才重建，避免每轮重建
@@ -398,6 +401,8 @@ class RAgent:
         self._durable_snapshot = None
         self._visible_tools_snapshot = None
         self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
+        self._last_request_fingerprint = None
+        self._cache_change_hints = set()
 
     # ------------------------------------------------------------------
     # ThreadState 兼容属性
@@ -435,6 +440,55 @@ class RAgent:
     @context_usage.setter
     def context_usage(self, value):
         self.state.context_usage = value
+
+    @property
+    def cache_usage(self):
+        return self.state.cache_usage
+
+    @cache_usage.setter
+    def cache_usage(self, value):
+        self.state.cache_usage = value
+
+    def _mark_cache_change(self, reason: str) -> None:
+        reason = str(reason or "").strip()
+        if reason:
+            self._cache_change_hints.add(reason)
+
+    def _observe_request_prefix(self, *, catalog_note, request_tools, request_kind="main") -> dict:
+        durable_message = self._get_durable_snapshot()
+        observation, private = build_request_fingerprint(
+            base_messages=self._messages_without_derived_context(),
+            catalog_note=catalog_note,
+            durable_message=durable_message,
+            tools=request_tools,
+            previous=self._last_request_fingerprint,
+            change_hints=sorted(self._cache_change_hints),
+            request_kind=request_kind,
+        )
+        self._last_request_fingerprint = private
+        self._cache_change_hints.clear()
+        self.cache_usage["request_count"] = int(self.cache_usage.get("request_count") or 0) + 1
+        local_prompt = int(observation.get("local_prompt_tokens") or 0)
+        local_reusable = int(observation.get("local_reusable_tokens") or 0)
+        local_new = int(observation.get("local_new_tokens") or 0)
+        self.cache_usage["local_prompt_tokens"] = int(self.cache_usage.get("local_prompt_tokens") or 0) + local_prompt
+        self.cache_usage["local_reusable_tokens"] = int(self.cache_usage.get("local_reusable_tokens") or 0) + local_reusable
+        self.cache_usage["local_new_tokens"] = int(self.cache_usage.get("local_new_tokens") or 0) + local_new
+        total_local = int(self.cache_usage.get("local_prompt_tokens") or 0)
+        total_reusable = int(self.cache_usage.get("local_reusable_tokens") or 0)
+        local_session_ratio = total_reusable / total_local if total_local else None
+        self.cache_usage["kv_reuse_ratio"] = local_session_ratio
+        self.cache_usage["cache_hit_ratio"] = local_session_ratio  # compatibility alias
+        self.cache_usage["last_local_prompt_tokens"] = local_prompt
+        self.cache_usage["last_local_reusable_tokens"] = local_reusable
+        self.cache_usage["last_local_new_tokens"] = local_new
+        self.cache_usage["last_kv_reuse_ratio"] = observation.get("local_reuse_ratio")
+        self.cache_usage["last_cache_hit_ratio"] = observation.get("local_reuse_ratio")  # compatibility alias
+        self.cache_usage["last_prefix_reuse_expected"] = observation.get("prefix_reuse_expected")
+        self.cache_usage["last_prefix_change_reasons"] = list(observation.get("change_reasons") or [])
+        self.cache_usage["last_component_hashes"] = dict(observation.get("component_hashes") or {})
+        self.cache_usage["last_prefix_hash"] = observation.get("prefix_hash") or ""
+        return observation
 
     def _emit_run_event(self, event_type: str, content=None, **metadata) -> None:
         """把一条运行事件写入 append-only 事件流；无 store 时静默跳过。"""
@@ -500,16 +554,16 @@ class RAgent:
         return config.get_run_events_dir()
 
     def _apply_deferred_tool_filter(self, tools):
-        """延迟工具暴露：默认关（返回原样）。开启时只保留 always-on + 已提升工具。
+        """延迟工具暴露：默认关；开启时只保留固定 always-on/control schemas。
 
-        catalog 通过系统上下文/`tool_search` 让模型知道有哪些工具；未提升的工具当前不
-        暴露完整 schema，避免上下文膨胀。见 Improve_progress/06。
+        catalog 让模型知道有哪些动态能力；完整契约经 tool_search 写入尾部消息，
+        不再加入顶层 tools=。见 docs/06 与 docs/11。
         """
         try:
             if not config.get_deferred_tools_enabled():
                 return tools
             always_on = set(config.get_deferred_tools_always_on())
-            visible = always_on | set(self._promoted_tools or set())
+            visible = always_on
             return [
                 s for s in tools
                 if s.get("function", {}).get("name") in visible
@@ -519,28 +573,27 @@ class RAgent:
             return tools
 
     def _deferred_tool_denied(self, func_name) -> bool:
-        """执行层保底闸门：延迟暴露开启时，未提升且非 always-on 的工具不允许执行。
+        """执行层保底闸门：隐藏工具不能绕过固定 dispatcher 被直接调用。
 
-        工具 schema 前缀现在走「只增不减」快照，可能滞后于收窄；且模型可能凭历史里
-        的旧 schema 发起调用。此处始终按「当前」提升状态判定，保证前缀无论朝哪个方向
-        stale，执行都合规。出错时放行，绝不因判定异常阻断正常工具。
+        模型可能凭历史猜出隐藏工具名；只有 always-on/control schemas 能直接执行，
+        动态工具必须经 invoke_dynamic_tool 的发现契约与权限校验。异常时沿用旧的
+        fail-open 行为，避免配置解析错误让 Agent 完全失去工具。
         """
         try:
             if not config.get_deferred_tools_enabled():
                 return False
             always_on = set(config.get_deferred_tools_always_on())
-            visible = always_on | set(self._promoted_tools or set())
+            visible = always_on
             return func_name not in visible
         except Exception:
             return False
 
     def _stabilize_request_tools(self, live_tools):
-        """把每轮现算的可见工具并入稳定快照，只增不减（增长即刻，收缩延迟）。
+        """把固定工具面保存为稳定快照，兼容 registry 热更新时的单调增长。
 
         - 首次或压缩后快照为空：直接采用当前 live 集，并让目录一起重建。
-        - 后续轮次：只把「新出现」的工具（tool_search 提升、skill 激活新增）并入快照；
-          收窄（skill 停用/白名单缩小）不改快照，靠执行层保底闸门拦截——这样工具 schema
-          前缀在两次压缩之间逐字节稳定，不击穿 KV cache。
+        - 后续轮次：只有 always-on registry 热更新等真正的新固定工具才可能并入；
+        - tool_search / skill 激活只更新尾部消息和 durable next，不触碰本快照；
         - 压缩发生时 `_on_context_compacted` 会清空快照，narrowing 随 KV 重建一并生效。
 
         注意：live_tools 可能是中间件原地改写过的 ctx.tools，本方法只读不改它，
@@ -573,17 +626,10 @@ class RAgent:
         self._refresh_durable_snapshot()
         self._visible_tools_snapshot = None
         self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
-
-    def _invalidate_tool_snapshots(self):
-        """工具可见范围「增长」后强制下一轮重算工具/目录快照（增长即刻生效）。
-
-        只清目录快照并标记工具快照需要并入新增项；实际的「只增不减」合并仍由
-        ``_stabilize_request_tools`` 完成，收窄不受影响。
-        """
-        self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
+        self._mark_cache_change("context_compacted")
 
     def _maybe_promote_from_tool_search(self, func_name, result) -> None:
-        """若刚执行的是 tool_search，则把它返回的匹配工具名提升为本次 run 可见。"""
+        """Record discovered contracts without mutating the top-level tools prefix."""
         if func_name != "tool_search":
             return
         try:
@@ -592,16 +638,173 @@ class RAgent:
             if isinstance(inner, str):
                 inner = json.loads(inner)
             matches = (inner or {}).get("matches") if isinstance(inner, dict) else None
-            promoted_any = False
-            for m in matches or []:
-                name = m.get("name") if isinstance(m, dict) else None
-                if name:
-                    self._promoted_tools.add(name)
-                    promoted_any = True
-            if promoted_any:
-                self._invalidate_tool_snapshots()
+            self._register_dynamic_tool_contracts(matches or [])
         except Exception:
             pass
+
+    def _register_dynamic_tool_contracts(self, contracts) -> None:
+        changed = False
+        for item in contracts or []:
+            if not isinstance(item, dict) or not item.get("name"):
+                continue
+            contract = {
+                "name": str(item.get("name")),
+                "description": str(item.get("description") or item.get("summary") or ""),
+                "parameters": item.get("parameters") or {"type": "object", "properties": {}},
+            }
+            contract["schema_hash"] = stable_hash(contract)
+            if self._dynamic_tool_contracts.get(contract["name"]) != contract:
+                self._dynamic_tool_contracts[contract["name"]] = contract
+                changed = True
+        if changed:
+            # This changes only the chronological message tail / durable-next draft,
+            # not catalog/current/tools prefix bytes.
+            self._stage_durable_next(dynamic_tools=self._collect_dynamic_tool_contracts())
+
+    def _dynamic_tool_contract(self, name: str):
+        if name in self._dynamic_tool_contracts:
+            return self._dynamic_tool_contracts[name]
+        durable_current = self.state.durable_current if isinstance(self.state.durable_current, dict) else {}
+        for source in (self.state.durable_next, durable_current.get("components", {})):
+            if not isinstance(source, dict):
+                continue
+            for item in source.get("dynamic_tools") or []:
+                if isinstance(item, dict) and item.get("name") == name:
+                    self._dynamic_tool_contracts[name] = self._durable_copy(item)
+                    return self._dynamic_tool_contracts[name]
+        return None
+
+    def _execute_dynamic_tool_call(
+        self,
+        func_args,
+        *,
+        effective_allowed=None,
+        excluded=None,
+        tool_call_guard=None,
+        cancel_event=None,
+    ) -> str:
+        """Validate and dispatch a discovered tool without changing ``tools=``."""
+        try:
+            payload = json.loads(func_args or "{}") if isinstance(func_args, str) else dict(func_args or {})
+        except Exception:
+            return json.dumps({"success": False, "error": "invoke_dynamic_tool arguments must be valid JSON"}, ensure_ascii=False)
+        target = str(payload.get("tool_name") or "").strip()
+        arguments = payload.get("arguments")
+        if not target or not isinstance(arguments, dict):
+            return json.dumps({
+                "success": False,
+                "error": "tool_name and object arguments are required",
+            }, ensure_ascii=False)
+        if target in {"invoke_dynamic_tool", "tool_search"}:
+            return json.dumps({"success": False, "error": f"dynamic recursion/control call denied: {target}"}, ensure_ascii=False)
+        if target in set(config.get_deferred_tools_always_on()):
+            return json.dumps({
+                "success": False,
+                "error": f"tool {target} is already mounted as a native tool; call it directly",
+            }, ensure_ascii=False)
+
+        discovered = self._dynamic_tool_contract(target)
+        if not discovered:
+            return json.dumps({
+                "success": False,
+                "error": f"dynamic tool {target} was not discovered; call tool_search first",
+            }, ensure_ascii=False)
+        schemas = registry.get_schemas_for([target])
+        if not schemas:
+            return json.dumps({"success": False, "error": f"dynamic tool is no longer registered: {target}"}, ensure_ascii=False)
+        function = schemas[0].get("function", {})
+        live_contract = {
+            "name": function.get("name"),
+            "description": function.get("description") or "",
+            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+        }
+        if discovered.get("schema_hash") != stable_hash(live_contract):
+            return json.dumps({
+                "success": False,
+                "error": f"dynamic tool schema changed: {target}; call tool_search again before invoking",
+            }, ensure_ascii=False)
+
+        validation_error = self._validate_dynamic_arguments(live_contract.get("parameters") or {}, arguments)
+        if validation_error:
+            return json.dumps({
+                "success": False,
+                "error": f"invalid arguments for dynamic tool {target}: {validation_error}",
+            }, ensure_ascii=False)
+
+        denied_reason = None
+        if effective_allowed is not None and target not in effective_allowed:
+            denied_reason = f"dynamic tool {target} is outside the current allowed_tools policy"
+        elif target in set(excluded or set()):
+            denied_reason = f"dynamic tool {target} is excluded in the current context"
+        else:
+            skill_allowed = self._effective_skill_allowed_tools()
+            if skill_allowed is not None and target not in skill_allowed:
+                denied_reason = f"dynamic tool {target} is outside active skill policy"
+        target_args = dict(arguments)
+        if target in {
+            "todo_manage", "memory_search", "read_file", "write_file", "search_files", "delete_file"
+        }:
+            _inject_current_session(target_args, self.session_id)
+        target_args_json = json.dumps(target_args, ensure_ascii=False)
+        if not denied_reason and tool_call_guard is not None:
+            try:
+                denied_reason = tool_call_guard(target, target_args_json)
+            except Exception as exc:
+                denied_reason = f"dynamic tool {target} denied by guard: {exc}"
+        if denied_reason:
+            return json.dumps({"success": False, "error": str(denied_reason)}, ensure_ascii=False)
+
+        result = registry.execute_tool_isolated(
+            target,
+            target_args_json,
+            cancel_event=cancel_event,
+            timeout=config.get_tool_execution_timeout(),
+            interrupted_exception=AgentInterrupted,
+        )
+        try:
+            parsed_result = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            parsed_result = result
+        return json.dumps({
+            "success": True,
+            "dynamic_tool": target,
+            "result": parsed_result,
+        }, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _validate_dynamic_arguments(schema: dict, arguments: dict) -> str:
+        """Small dependency-free guard for the common JSON-Schema subset."""
+        if not isinstance(schema, dict):
+            return "parameters schema is not an object"
+        required = [str(name) for name in (schema.get("required") or [])]
+        missing = [name for name in required if name not in arguments]
+        if missing:
+            return "missing required fields: " + ", ".join(missing)
+        properties = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(set(arguments) - set(properties))
+            if unknown:
+                return "unknown fields: " + ", ".join(unknown)
+        python_types = {
+            "string": str,
+            "integer": int,
+            "number": (int, float),
+            "boolean": bool,
+            "array": list,
+            "object": dict,
+        }
+        for name, value in arguments.items():
+            spec = properties.get(name)
+            if not isinstance(spec, dict) or not spec.get("type"):
+                continue
+            expected = python_types.get(spec.get("type"))
+            if expected is None:
+                continue
+            if spec.get("type") in {"integer", "number"} and isinstance(value, bool):
+                return f"field {name} must be {spec.get('type')}"
+            if not isinstance(value, expected):
+                return f"field {name} must be {spec.get('type')}"
+        return ""
 
     def _maybe_record_skill_context(self, func_name, func_args, result) -> None:
         """若刚执行的是 skill_view，则把该 skill 摘要记入 skill_context channel。
@@ -649,6 +852,7 @@ class RAgent:
             action = inner.get("action")
             if action == "deactivate":
                 self.state.active_skill_policy = {}
+                self._stage_durable_next()
                 return
             if action != "activate":
                 return
@@ -664,12 +868,17 @@ class RAgent:
                 "allowed_tools": sorted(allowed_tools),
                 "description": inner.get("description") or "",
             }
-            before = len(self._promoted_tools)
-            self._promoted_tools.update(allowed_tools)
-            if len(self._promoted_tools) > before:
-                # 激活带来新的可见工具（增长），下一轮立即并入快照；白名单收窄
-                # 不改快照，由执行层保底闸门拦截，前缀保持稳定。
-                self._invalidate_tool_snapshots()
+            schemas = registry.get_schemas_for(sorted(allowed_tools))
+            contracts = []
+            for schema in schemas:
+                function = schema.get("function", {}) if isinstance(schema, dict) else {}
+                if function.get("name"):
+                    contracts.append({
+                        "name": function.get("name"),
+                        "description": function.get("description") or "",
+                        "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+                    })
+            self._register_dynamic_tool_contracts(contracts)
         except Exception:
             pass
 
@@ -680,15 +889,14 @@ class RAgent:
         if not allowed:
             return None
         # 保留控制与发现工具，保证模型能查看、切换或停用策略。
-        allowed.update({"skill_activate", "skill_view", "skill_search", "tool_search"})
+        allowed.update({"skill_activate", "skill_view", "skill_search", "tool_search", "invoke_dynamic_tool"})
         return allowed
 
     def _get_tool_catalog_note(self):
         """返回本次请求使用的工具目录文本，命中缓存则复用备份。
 
-        目录内容只随「已提升工具集」变化，而提升会触发 ``_stabilize_request_tools``
-        把 catalog 快照置为未计算态，因此这里惰性重算一次即可稳定复用，避免每轮
-        重算导致的前缀抖动。
+        目录在当前 run/epoch 内冻结；动态发现不会删除目录项。只有新 run、压缩边界或
+        registry 固定工具面变化时才重算，避免每轮前缀抖动。
         """
         if self._catalog_note_snapshot is _CATALOG_NOTE_UNSET:
             self._catalog_note_snapshot = self._build_tool_catalog_note()
@@ -699,17 +907,17 @@ class RAgent:
 
         目录是**派生上下文**（和工具 schema 同类），不写进 self.messages，而是每次
         请求时临时拼进 messages 头部——避免多轮累积、被压缩或被回滚污染。
-        列表按 name 排序，保证同一提升状态下逐字节稳定。
+        列表按 name 排序，保证逐字节稳定。
         """
         try:
             if not config.get_deferred_tools_enabled():
                 return None
             catalog = registry.get_tool_catalog()
             always_on = set(config.get_deferred_tools_always_on())
-            # 只列"当前未挂载且未提升"的工具，让模型知道可以 tool_search 提升它们。
+            # 目录在整个 epoch 内固定；发现工具后也不删除条目，避免改变早期前缀。
             hidden = [
                 c for c in catalog
-                if c.get("name") not in always_on and c.get("name") not in (self._promoted_tools or set())
+                if c.get("name") not in always_on
             ]
             if not hidden:
                 return None
@@ -717,30 +925,127 @@ class RAgent:
             lines = [f"- {c['name']}: {c.get('summary','')}" for c in hidden]
             return (
                 "# 可用工具目录（延迟暴露）\n"
-                "以下工具当前未直接挂载。需要时先用 tool_search 检索并提升，再调用：\n"
+                "以下工具不直接挂载。需要时先用 tool_search 获取完整契约，再通过 "
+                "invoke_dynamic_tool 调用：\n"
                 + "\n".join(lines)
             )
         except Exception:
             return None
 
-    def _build_durable_context_message(self):
-        """从当前 ThreadState 现算一条 durable context 消息（不读/不写快照）。"""
+    @staticmethod
+    def _durable_copy(value):
         try:
-            if not config.get_durable_context_enabled():
-                return None
-            memory_text = ""
-            if config.get_memory_injection_mode() == "hidden_user":
-                try:
-                    provider = get_memory_provider(config.get_memory_provider_name())
-                    memory_text = provider.get_context() or ""
-                except Exception:
-                    memory_text = ""
-            durable = build_durable_context(self.state, memory_text=memory_text)
-            if not durable:
-                return None
-            return {"role": "user", "content": durable}
+            return json.loads(json.dumps(value, ensure_ascii=False, default=str))
         except Exception:
+            return value
+
+    def _durable_memory_text(self) -> str:
+        if config.get_memory_injection_mode() != "hidden_user":
+            return ""
+        try:
+            provider = get_memory_provider(config.get_memory_provider_name())
+            return provider.get_context() or ""
+        except Exception:
+            return ""
+
+    def _collect_unfinished_todos(self) -> list:
+        try:
+            from tools.todo_tool import get_unfinished_todos
+
+            todos = get_unfinished_todos(self.session_id or "")
+            self.state.todos = self._durable_copy(todos)
+            return todos
+        except Exception:
+            return self._durable_copy(self.state.todos)
+
+    def _collect_dynamic_tool_contracts(self) -> list:
+        previous = self.state.durable_next if isinstance(self.state.durable_next, dict) else {}
+        current = self.state.durable_current if isinstance(self.state.durable_current, dict) else {}
+        current_components = current.get("components") if isinstance(current.get("components"), dict) else {}
+        by_name = {
+            str(item.get("name")): self._durable_copy(item)
+            for item in ((current_components.get("dynamic_tools") or []) + (previous.get("dynamic_tools") or []))
+            if isinstance(item, dict) and item.get("name")
+        }
+        for name, contract in self._dynamic_tool_contracts.items():
+            if name:
+                by_name[str(name)] = self._durable_copy(contract)
+        return [by_name[name] for name in sorted(by_name)]
+
+    def _stage_durable_next(self, **overrides) -> dict:
+        """Capture mutable runtime channels into the non-visible next draft.
+
+        ``durable_current`` stays byte-stable.  This draft may change after every
+        tool/todo/skill event and is promoted only at an explicit context boundary.
+        """
+        current = self.state.durable_current if isinstance(self.state.durable_current, dict) else {}
+        previous = self.state.durable_next if isinstance(self.state.durable_next, dict) else {}
+        current_epoch = int(current.get("epoch") or 0)
+        draft = {
+            "version": 2,
+            "base_epoch": current_epoch,
+            "target_epoch": current_epoch + 1,
+            "summary_text": self.state.summary_text,
+            "delegation_ledger": self._durable_copy(self.state.delegation_ledger),
+            "artifact_index": self._durable_copy(self.state.artifact_index),
+            "skill_context": self._durable_copy(self.state.skill_context),
+            "active_skill_policy": self._durable_copy(self.state.active_skill_policy),
+            # Todo/tool channels are populated by the phase-3 collectors. Preserve
+            # staged values while the rest of ThreadState keeps evolving.
+            "unfinished_todos": self._durable_copy(self._collect_unfinished_todos()),
+            "dynamic_tools": self._durable_copy(self._collect_dynamic_tool_contracts()),
+            "memory_text": self._durable_memory_text(),
+            "updated_at": time.time(),
+        }
+        for key, value in overrides.items():
+            if key in draft:
+                draft[key] = self._durable_copy(value)
+        self.state.durable_next = draft
+        return draft
+
+    def _promote_durable_next(self, reason: str) -> None:
+        """Atomically render and promote next -> current for a new prefix epoch."""
+        if not config.get_durable_context_enabled():
+            self._durable_snapshot = None
+            return
+        draft = self._stage_durable_next()
+        current = self.state.durable_current if isinstance(self.state.durable_current, dict) else {}
+        epoch = int(current.get("epoch") or 0) + 1
+        durable = build_durable_context(
+            self.state,
+            memory_text=str(draft.get("memory_text") or ""),
+            snapshot=draft,
+        )
+        promoted = {
+            "version": 2,
+            "epoch": epoch,
+            "content": durable,
+            "components": self._durable_copy(draft),
+            "component_hash": stable_hash(durable),
+            "promoted_reason": str(reason or "context_boundary"),
+            "promoted_at": time.time(),
+        }
+        self.state.durable_current = promoted
+        next_draft = self._durable_copy(draft)
+        next_draft.update({
+            "base_epoch": epoch,
+            "target_epoch": epoch + 1,
+            "updated_at": time.time(),
+        })
+        self.state.durable_next = next_draft
+        self._durable_snapshot = {"role": "user", "content": durable} if durable else None
+        if epoch > 1:
+            self._mark_cache_change("durable_promoted")
+
+    def _build_durable_context_message(self):
+        """Return the already-promoted current message; never render live state."""
+        if not config.get_durable_context_enabled():
             return None
+        current = self.state.durable_current if isinstance(self.state.durable_current, dict) else {}
+        content = str(current.get("content") or "")
+        if not content:
+            return None
+        return {"role": "user", "content": content}
 
     def _get_durable_snapshot(self):
         """返回本次请求使用的 durable context 消息，稳态复用缓存的备份。
@@ -751,12 +1056,16 @@ class RAgent:
         精炼版并入前缀，从而保证 KV cache 前缀在压缩之间逐字节稳定。
         """
         if self._durable_snapshot is None:
-            self._durable_snapshot = self._build_durable_context_message()
+            current = self.state.durable_current if isinstance(self.state.durable_current, dict) else {}
+            if int(current.get("epoch") or 0) <= 0 and not current.get("content"):
+                self._promote_durable_next("initial")
+            else:
+                self._durable_snapshot = self._build_durable_context_message()
         return self._durable_snapshot
 
     def _refresh_durable_snapshot(self):
-        """在上下文压缩/归档写入新 summary_text 后重建 durable 备份。"""
-        self._durable_snapshot = self._build_durable_context_message()
+        """Promote the staged next version after compression/archive."""
+        self._promote_durable_next("context_compaction")
 
 
     def _messages_without_derived_context(self, *, remove_summary=False):
@@ -1117,6 +1426,67 @@ class RAgent:
                 f"prompt_tokens={prompt_tokens}, total_tokens={total_tokens}"
             )
 
+    def _record_cache_usage(self, response, observation=None, latency_seconds=None) -> dict:
+        """Record provider cache usage separately from local prefix expectations."""
+        usage = getattr(response, "usage", None)
+        prompt_tokens = self._usage_value(usage, "prompt_tokens")
+        cached_tokens, creation_tokens = provider_cache_tokens(usage)
+        supported = cached_tokens is not None
+
+        if latency_seconds is not None:
+            latency_ms = max(0.0, float(latency_seconds) * 1000.0)
+            self.cache_usage["last_request_latency_ms"] = round(latency_ms, 3)
+            self.cache_usage["total_request_latency_ms"] = round(
+                float(self.cache_usage.get("total_request_latency_ms") or 0.0) + latency_ms,
+                3,
+            )
+
+        self.cache_usage["last_provider_prompt_tokens"] = prompt_tokens
+        self.cache_usage["provider_cache_supported"] = supported
+        if supported:
+            cached_tokens = min(max(0, int(cached_tokens or 0)), prompt_tokens) if prompt_tokens else max(0, int(cached_tokens or 0))
+            uncached_tokens = max(0, prompt_tokens - cached_tokens)
+            last_ratio = cached_tokens / prompt_tokens if prompt_tokens else None
+            self.cache_usage["provider_observed_requests"] = int(self.cache_usage.get("provider_observed_requests") or 0) + 1
+            self.cache_usage["provider_prompt_tokens"] = int(self.cache_usage.get("provider_prompt_tokens") or 0) + prompt_tokens
+            self.cache_usage["provider_cached_prompt_tokens"] = int(self.cache_usage.get("provider_cached_prompt_tokens") or 0) + cached_tokens
+            self.cache_usage["provider_uncached_prompt_tokens"] = int(self.cache_usage.get("provider_uncached_prompt_tokens") or 0) + uncached_tokens
+            observed = int(self.cache_usage.get("provider_prompt_tokens") or 0)
+            cached_total = int(self.cache_usage.get("provider_cached_prompt_tokens") or 0)
+            self.cache_usage["provider_cache_hit_ratio"] = cached_total / observed if observed else None
+            self.cache_usage["last_provider_cached_prompt_tokens"] = cached_tokens
+            self.cache_usage["last_provider_uncached_prompt_tokens"] = uncached_tokens
+            self.cache_usage["last_provider_cache_hit_ratio"] = last_ratio
+        else:
+            self.cache_usage["last_provider_cached_prompt_tokens"] = None
+            self.cache_usage["last_provider_uncached_prompt_tokens"] = None
+            self.cache_usage["last_provider_cache_hit_ratio"] = None
+
+        if creation_tokens is not None:
+            self.cache_usage["last_cache_creation_tokens"] = creation_tokens
+        if observation:
+            self.cache_usage["last_prefix_reuse_expected"] = observation.get("prefix_reuse_expected")
+            self.cache_usage["last_prefix_change_reasons"] = list(observation.get("change_reasons") or [])
+        return self.get_cache_usage()
+
+    def get_cache_usage(self):
+        summary = dict(self.cache_usage)
+        child_prompt = int(summary.get("delegated_local_prompt_tokens") or 0)
+        child_reusable = int(summary.get("delegated_local_reusable_tokens") or 0)
+        parent_prompt = int(summary.get("local_prompt_tokens") or 0)
+        parent_reusable = int(summary.get("local_reusable_tokens") or 0)
+        summary["delegated_kv_reuse_ratio"] = (
+            child_reusable / child_prompt if child_prompt else None
+        )
+        overall_prompt = parent_prompt + child_prompt
+        overall_reusable = parent_reusable + child_reusable
+        summary["overall_local_prompt_tokens"] = overall_prompt
+        summary["overall_local_reusable_tokens"] = overall_reusable
+        summary["overall_kv_reuse_ratio"] = (
+            overall_reusable / overall_prompt if overall_prompt else None
+        )
+        return summary
+
     def get_token_usage_total(self):
         """返回本次父 Agent 启动以来自身累计 token；无 usage 信息时返回 'unavailable'。"""
         if not self.token_usage.get("available"):
@@ -1218,6 +1588,57 @@ class RAgent:
             self.delegated_token_usage["observed_calls"] = int(self.delegated_token_usage.get("observed_calls", 0) or 0) + 1
         return self.merge_delegated_token_usage(usage)
 
+    def merge_delegated_cache_usage(self, usage) -> bool:
+        """Merge child local-prefix reuse counters into the parent harness view."""
+        if not isinstance(usage, dict):
+            return False
+        prompt = self._usage_value(usage, "local_prompt_tokens")
+        reusable = self._usage_value(usage, "local_reusable_tokens")
+        new_tokens = self._usage_value(usage, "local_new_tokens")
+        requests = self._usage_value(usage, "request_count")
+        agents = self._usage_value(usage, "observed_agents")
+        if not any((prompt, reusable, new_tokens, requests, agents)):
+            return False
+        self.cache_usage["delegated_local_prompt_tokens"] = int(
+            self.cache_usage.get("delegated_local_prompt_tokens") or 0
+        ) + prompt
+        self.cache_usage["delegated_local_reusable_tokens"] = int(
+            self.cache_usage.get("delegated_local_reusable_tokens") or 0
+        ) + reusable
+        self.cache_usage["delegated_local_new_tokens"] = int(
+            self.cache_usage.get("delegated_local_new_tokens") or 0
+        ) + new_tokens
+        self.cache_usage["delegated_request_count"] = int(
+            self.cache_usage.get("delegated_request_count") or 0
+        ) + requests
+        self.cache_usage["delegated_observed_agents"] = int(
+            self.cache_usage.get("delegated_observed_agents") or 0
+        ) + agents
+        child_prompt = int(self.cache_usage.get("delegated_local_prompt_tokens") or 0)
+        child_reusable = int(self.cache_usage.get("delegated_local_reusable_tokens") or 0)
+        self.cache_usage["delegated_kv_reuse_ratio"] = (
+            child_reusable / child_prompt if child_prompt else None
+        )
+        return True
+
+    def _merge_delegated_cache_usage_from_tool_result(self, result: str) -> bool:
+        try:
+            payload = json.loads(result) if isinstance(result, str) else result
+        except Exception:
+            return False
+        if isinstance(payload, dict) and "result" in payload:
+            inner = payload.get("result")
+            if isinstance(inner, str):
+                try:
+                    inner = json.loads(inner)
+                except Exception:
+                    inner = None
+            if isinstance(inner, dict):
+                payload = inner
+        if not isinstance(payload, dict):
+            return False
+        return self.merge_delegated_cache_usage(payload.get("delegated_cache_usage"))
+
     # ------------------------------------------------------------------
     # 内部工具
     # ------------------------------------------------------------------
@@ -1227,12 +1648,14 @@ class RAgent:
         非瞬时错误（如内容策略 cyber_policy / 鉴权 / 参数错误）直接抛出。
         """
         internal_tags = tuple(kwargs.pop("_internal_tags", ()) or ())
+        cache_observation = kwargs.pop("_cache_observation", None)
         if SUMMARY_NOSTREAM_TAG in internal_tags:
             kwargs["stream"] = False
         max_retries = config.get_llm_max_retries()
         base_delay = config.get_llm_retry_base_delay()
 
         last_exc = None
+        request_started = time.monotonic()
         for attempt in range(max_retries + 1):
             if _is_cancelled(cancel_event):
                 raise AgentInterrupted()
@@ -1241,6 +1664,12 @@ class RAgent:
                 if _is_cancelled(cancel_event):
                     raise AgentInterrupted()
                 self._record_token_usage(response)
+                if cache_observation is not None:
+                    self._record_cache_usage(
+                        response,
+                        observation=cache_observation,
+                        latency_seconds=time.monotonic() - request_started,
+                    )
                 return response
             except Exception as e:
                 last_exc = e
@@ -1303,12 +1732,18 @@ class RAgent:
 
         try:
             request_messages = self._build_request_messages()
+            cache_observation = self._observe_request_prefix(
+                catalog_note=None,
+                request_tools=[],
+                request_kind="force_finalize",
+            )
             response = self._chat_completion_with_retry(
                 on_think=on_think,
                 iteration=used,
                 cancel_event=cancel_event,
                 model=self.model,
                 messages=request_messages,
+                _cache_observation=cache_observation,
             )
         except AgentInterrupted:
             raise
@@ -1375,8 +1810,8 @@ class RAgent:
         self._soft_warned = False
         self._active_exclude_tools = set(exclude_tools or [])
         self._promoted_tools = set()
-        # 新 run 提升集已复位，工具/目录快照随之复位，保证 schema 可见范围与执行层
-        # 保底闸门一致；durable 快照跨轮持久，只在压缩时刷新，故此处不动。
+        # 新 run 重建固定工具/目录对象；只要序列化内容相同，provider 仍可复用前缀。
+        # 动态契约保存在 durable next/current，不在这里清除。
         self._visible_tools_snapshot = None
         self._catalog_note_snapshot = _CATALOG_NOTE_UNSET
 
@@ -1478,7 +1913,12 @@ class RAgent:
             self.middleware.run_before_iteration(mw_ctx)
 
             tools = registry.get_all_schemas()
+            schema_allowed = set(allowed) if allowed is not None else None
             effective_allowed = set(allowed) if allowed is not None else None
+            if schema_allowed:
+                dynamic_controls = {"tool_search", "invoke_dynamic_tool"}
+                schema_allowed.update(dynamic_controls)
+                effective_allowed.update(dynamic_controls)
             skill_allowed = self._effective_skill_allowed_tools()
             if skill_allowed is not None:
                 effective_allowed = (
@@ -1486,10 +1926,13 @@ class RAgent:
                     if effective_allowed is None
                     else effective_allowed & skill_allowed
                 )
-            if effective_allowed is not None:
+            # Caller-level allowlists define which schemas may be sent. Active
+            # skill policy is enforced at execution time so skill changes do not
+            # rewrite the stable top-level tools prefix.
+            if schema_allowed is not None:
                 tools = [
                     schema for schema in tools
-                    if schema.get("function", {}).get("name") in effective_allowed
+                    if schema.get("function", {}).get("name") in schema_allowed
                 ]
             if excluded:
                 tools = [
@@ -1508,6 +1951,10 @@ class RAgent:
             request_tools = self._stabilize_request_tools(mw_ctx.tools)
             catalog_note = self._get_tool_catalog_note()
             request_messages = self._build_request_messages(catalog_note=catalog_note)
+            cache_observation = self._observe_request_prefix(
+                catalog_note=catalog_note,
+                request_tools=request_tools,
+            )
             kwargs = {"model": self.model, "messages": request_messages}
             if request_tools:
                 kwargs["tools"] = request_tools
@@ -1536,6 +1983,7 @@ class RAgent:
                 messages=request_messages,
                 tools=request_tools,
                 iteration=iteration,
+                cache_observation=cache_observation,
             ))
             self._emit_run_event(
                 run_events.EV_LLM_REQUEST,
@@ -1550,6 +1998,7 @@ class RAgent:
                     on_think=on_think,
                     iteration=iteration,
                     cancel_event=cancel_event,
+                    _cache_observation=cache_observation,
                     **kwargs,
                 )
             except AgentInterrupted:
@@ -1566,7 +2015,10 @@ class RAgent:
             if _is_cancelled(cancel_event):
                 raise AgentInterrupted()
             message = response.choices[0].message
-            _emit_event(event_sink, EVENT_LLM_RESPONSE_RECEIVED, {"message": normalize_message(message)})
+            _emit_event(event_sink, EVENT_LLM_RESPONSE_RECEIVED, {
+                "message": normalize_message(message),
+                "cache_usage": self.get_cache_usage(),
+            })
             self._emit_run_event(
                 run_events.EV_LLM_RESPONSE,
                 {
@@ -1575,6 +2027,7 @@ class RAgent:
                     "tool_call_count": len(message.tool_calls) if getattr(message, "tool_calls", None) else 0,
                 },
                 last_total_tokens=self.token_usage.get("last_total_tokens"),
+                cache_usage=self.get_cache_usage(),
             )
             self.messages.append(message)
             _emit_event(event_sink, EVENT_MESSAGE_APPENDED, {"message": normalize_message(message), "message_index": len(self.messages) - 1})
@@ -1653,12 +2106,18 @@ class RAgent:
                     elif func_name in excluded:
                         result = f'工具 {func_name} 已在当前上下文中被禁用，未执行。'
                     elif self._deferred_tool_denied(func_name):
-                        # 保底闸门：工具快照可能滞后于收窄，或前缀里根本没有该工具的
-                        # schema。无论如何，执行层用「当前」提升状态判定合规，未挂载则
-                        # 引导模型先检索提升，绝不误跑未暴露工具。
+                        # 隐藏工具不得凭历史名字直接执行，必须走固定动态调用器。
                         result = (
                             f'工具 {func_name} 尚未在当前上下文挂载（延迟暴露）。'
-                            f'请先用 tool_search 检索并提升该工具，再调用。'
+                            f'请先用 tool_search 获取契约，再通过 invoke_dynamic_tool 调用。'
+                        )
+                    elif func_name == "invoke_dynamic_tool":
+                        result = self._execute_dynamic_tool_call(
+                            func_args,
+                            effective_allowed=effective_allowed,
+                            excluded=excluded,
+                            tool_call_guard=tool_call_guard,
+                            cancel_event=cancel_event,
                         )
                     elif func_name == "delegate_task":
                         # delegate_task 是父进程调度器：内部会启动线程/子 Agent，并需要

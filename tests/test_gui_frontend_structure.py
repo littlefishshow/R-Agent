@@ -348,6 +348,25 @@ def test_learning_selection_menu_and_floating_windows_present():
     assert "/workspace/text" in api
     assert "DELETE" in api
 
+
+def test_selection_feedback_menu_bounds_and_recent_mode_targets_present():
+    app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
+    styles = Path("app_gui_frontend/src/styles.css").read_text(encoding="utf-8")
+
+    assert "markActiveTextSelection" in app
+    assert "selectionVisualRect" in app
+    assert "active-text-selection" in app
+    assert ".md-token.active-text-selection" in styles
+    assert ".md-math-token.active-text-selection" in styles
+    assert "menu.x - width / 2" in app
+    assert "window.innerWidth - width - margin" in app
+    assert "flex-wrap: nowrap" in styles
+    assert "flex: 0 0 auto" in styles
+    assert "lastChatSessionIdRef" in app
+    assert "lastActiveFilePathRef" in app
+    assert "handleSidebarModeChange('chat')" in app
+    assert "handleSidebarModeChange('workspace')" in app
+
 def test_learning_sidebar_keeps_root_order_from_backend():
     app = Path("app_gui_frontend/src/App.tsx").read_text(encoding="utf-8")
     assert "Number(!!b.running) - Number(!!a.running)" not in app

@@ -2,7 +2,7 @@ import json
 from types import SimpleNamespace
 
 from core.agent import RAgent
-from main import _format_token_usage_label, _token_usage_panel_subtitle
+from main import _compact_usage_value, _format_token_usage_label, _token_usage_panel_subtitle
 
 
 class _FakeCompletions:
@@ -41,6 +41,12 @@ def _response_with_usage(usage):
     )
 
 
+def test_compact_usage_value_for_cli_badge():
+    assert _compact_usage_value(12_535) == "12.5k"
+    assert _compact_usage_value(88_620) == "88.6k"
+    assert _compact_usage_value(1_268_405) == "1.3M"
+
+
 def test_agent_accumulates_token_usage_from_response_objects():
     agent = RAgent(model="test", max_iterations=1)
     agent.client = _FakeClient([
@@ -74,16 +80,18 @@ def test_agent_token_usage_unavailable_when_response_has_no_usage():
     agent._record_token_usage(SimpleNamespace())
 
     assert agent.get_token_usage_total() == "unavailable"
-    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: unavailable/unavailable/unavailable/unavailable"
-    assert _token_usage_panel_subtitle(agent) == "[dim]last/parent/children/total tokens: unavailable/unavailable/unavailable/unavailable[/dim]"
+    label = _format_token_usage_label(agent)
+    assert label == "tok L/T —/— · KV L/O —/— · —"
+    assert _token_usage_panel_subtitle(agent) == f"[dim]{label}[/dim]"
 
 
 def test_token_usage_label_and_panel_subtitle_show_total_tokens():
     agent = RAgent(model="test", max_iterations=1)
     agent._record_token_usage(_response_with_usage({"total_tokens": 42}))
 
-    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: 42/42/unavailable/42"
-    assert _token_usage_panel_subtitle(agent) == "[dim]last/parent/children/total tokens: 42/42/unavailable/42[/dim]"
+    label = _format_token_usage_label(agent)
+    assert label == "tok L/T 42/42 · KV L/O —/— · —"
+    assert _token_usage_panel_subtitle(agent) == f"[dim]{label}[/dim]"
 
 
 def test_large_single_message_completion_tokens_prints_warning(capsys):
@@ -178,15 +186,25 @@ def test_agent_merges_delegated_token_usage_from_delegate_tool_result():
                 "total_tokens": 5,
                 "available": True,
             },
+            "delegated_cache_usage": {
+                "request_count": 2,
+                "observed_agents": 1,
+                "local_prompt_tokens": 100,
+                "local_reusable_tokens": 70,
+                "local_new_tokens": 30,
+                "kv_reuse_ratio": 0.7,
+            },
         },
     }
 
     assert agent._merge_delegated_token_usage_from_tool_result(json.dumps(result)) is True
+    assert agent._merge_delegated_cache_usage_from_tool_result(json.dumps(result)) is True
 
     assert agent.get_token_usage_total() == 15
     assert agent.get_delegated_token_usage_total() == 5
     assert agent.get_total_token_usage_including_children() == 20
-    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: 15/15/5/20"
+    assert agent.get_cache_usage()["delegated_kv_reuse_ratio"] == 0.7
+    assert _format_token_usage_label(agent).startswith("tok L/T 15/20")
 
 
 def test_agent_keeps_delegated_token_usage_unavailable_without_child_usage():
@@ -213,4 +231,4 @@ def test_delegate_tool_call_with_unavailable_child_usage_marks_total_partial():
 
     assert agent.get_delegated_token_usage_total() == "unavailable"
     assert agent.get_total_token_usage_including_children() == "15+unavailable"
-    assert _format_token_usage_label(agent) == "last/parent/children/total tokens: 15/15/unavailable/15+unavailable"
+    assert _format_token_usage_label(agent).startswith("tok L/T 15/15+")

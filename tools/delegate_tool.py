@@ -60,6 +60,116 @@ DELEGATE_CHILD_EXCLUDED_TOOLS = [
 ]
 
 
+# Byte-stable across every child in a delegate_task batch.  Task-specific data
+# belongs in the trailing user message, never in this shared prefix.
+SUBAGENT_SYSTEM_PROMPT = (
+    "你是一个专注的子智能体，负责完成父 Agent 委托的一个具体子任务。\n\n"
+    "上下文边界：你不知道父进程完整对话，只能依赖本批次冻结的公共参考上下文、"
+    "当前任务消息、Todo 看板以及你通过工具取得的信息。\n"
+    "你不是全局调度者；拆分审批、并发数量、跨任务依赖与最终综合由父 Agent 负责。\n\n"
+    "执行协议：\n"
+    "- 有 task_id 时，先 todo_manage get，再 claim；只处理自己领取的任务。\n"
+    "- 任务过于笼统、依赖不明或超出预算时，使用 todo_manage propose_split，只提出建议。\n"
+    "- 任务足够具体时直接执行；完成后 update=completed 并写 result，失败则 update=failed。\n"
+    "- 不得批准或拒绝拆分；approve_split/reject_split 只能由父 Agent 执行。\n"
+    "- 达到轮数上限或无法完成时，明确未完成原因、阻塞和可执行的下一步。\n"
+    "- 最终摘要必须说明做了什么、成果、验证、问题和下一步。"
+)
+
+
+def _json_copy(value):
+    return json.loads(json.dumps(value, ensure_ascii=False, default=str))
+
+
+def _build_shared_child_prefix(session_id: str, allowed_tools=None) -> dict:
+    """Freeze one durable prefix for every sibling in this delegation batch."""
+    from core.cache_observability import stable_hash
+    from core.memory_provider import get_memory_provider
+    from core.state import ThreadState, build_durable_context
+    from tools.todo_tool import get_unfinished_todos
+
+    try:
+        todos = get_unfinished_todos(session_id or "")
+    except Exception:
+        todos = []
+    memory_text = ""
+    if config.get_memory_injection_mode() == "hidden_user":
+        try:
+            memory_text = get_memory_provider(config.get_memory_provider_name()).get_context() or ""
+        except Exception:
+            memory_text = ""
+    components = {
+        "version": 2,
+        "base_epoch": 0,
+        "target_epoch": 1,
+        "summary_text": "",
+        "delegation_ledger": [],
+        "artifact_index": [],
+        "skill_context": [],
+        "active_skill_policy": {},
+        "unfinished_todos": _json_copy(todos),
+        "dynamic_tools": [],
+        "memory_text": memory_text,
+        "updated_at": time.time(),
+    }
+    content = build_durable_context(ThreadState(), memory_text=memory_text, snapshot=components)
+    current = {
+        "version": 2,
+        "epoch": 1,
+        "content": content,
+        "components": _json_copy(components),
+        "component_hash": stable_hash(content),
+        "promoted_reason": "delegation_batch_snapshot",
+        "promoted_at": time.time(),
+    }
+    next_draft = _json_copy(components)
+    next_draft.update({"base_epoch": 1, "target_epoch": 2, "updated_at": time.time()})
+    schemas = registry.get_all_schemas()
+    schema_allowed = set(allowed_tools or []) if allowed_tools is not None else None
+    if schema_allowed:
+        schema_allowed.update({"tool_search", "invoke_dynamic_tool"})
+    if schema_allowed is not None:
+        schemas = [
+            schema for schema in schemas
+            if schema.get("function", {}).get("name") in schema_allowed
+        ]
+    excluded = set(DELEGATE_CHILD_EXCLUDED_TOOLS)
+    schemas = [
+        schema for schema in schemas
+        if schema.get("function", {}).get("name") not in excluded
+    ]
+    if config.get_deferred_tools_enabled():
+        always_on = set(config.get_deferred_tools_always_on())
+        schemas = [
+            schema for schema in schemas
+            if schema.get("function", {}).get("name") in always_on
+        ]
+    catalog = sorted(
+        registry.get_tool_catalog(),
+        key=lambda item: str(item.get("name") or ""),
+    )
+    return {
+        "current": current,
+        "next": next_draft,
+        "prefix_hash": stable_hash({
+            "system": SUBAGENT_SYSTEM_PROMPT,
+            "durable": content,
+            "catalog": catalog,
+            "tools": schemas,
+        }),
+    }
+
+
+def _seed_shared_child_prefix(agent, shared_prefix: dict) -> None:
+    state = getattr(agent, "state", None)
+    if state is None:
+        return
+    state.durable_current = _json_copy(shared_prefix.get("current") or {})
+    state.durable_next = _json_copy(shared_prefix.get("next") or {})
+    if hasattr(agent, "_durable_snapshot"):
+        agent._durable_snapshot = None
+
+
 STATUS_LABELS = {
     "completed": "✅ completed",
     "in_progress": "🚧 in_progress",
@@ -134,6 +244,34 @@ def _agent_token_usage_summary(agent):
     }
 
 
+def _agent_cache_usage_summary(agent):
+    if agent is None:
+        return {
+            "request_count": 0,
+            "local_prompt_tokens": 0,
+            "local_reusable_tokens": 0,
+            "local_new_tokens": 0,
+            "kv_reuse_ratio": None,
+        }
+    getter = getattr(agent, "get_cache_usage", None)
+    if callable(getter):
+        try:
+            usage = getter()
+            if isinstance(usage, dict):
+                prompt = _usage_int(usage, "local_prompt_tokens")
+                reusable = _usage_int(usage, "local_reusable_tokens")
+                return {
+                    "request_count": _usage_int(usage, "request_count"),
+                    "local_prompt_tokens": prompt,
+                    "local_reusable_tokens": reusable,
+                    "local_new_tokens": _usage_int(usage, "local_new_tokens"),
+                    "kv_reuse_ratio": reusable / prompt if prompt else None,
+                }
+        except Exception:
+            pass
+    return _agent_cache_usage_summary(None)
+
+
 def _usage_int(usage, key):
     if not isinstance(usage, dict):
         return 0
@@ -177,6 +315,19 @@ def _compact_token_usage(usage):
         "completion_tokens": _usage_int(aggregate, "completion_tokens"),
         "total_tokens": _usage_int(aggregate, "total_tokens"),
         "available": bool(aggregate.get("available")),
+    }
+
+
+def _compact_cache_usage(usage):
+    usage = usage if isinstance(usage, dict) else {}
+    prompt = _usage_int(usage, "local_prompt_tokens")
+    reusable = _usage_int(usage, "local_reusable_tokens")
+    return {
+        "request_count": _usage_int(usage, "request_count"),
+        "local_prompt_tokens": prompt,
+        "local_reusable_tokens": reusable,
+        "local_new_tokens": _usage_int(usage, "local_new_tokens"),
+        "kv_reuse_ratio": reusable / prompt if prompt else None,
     }
 
 
@@ -241,6 +392,9 @@ def _compact_delegate_item(item, *, include_context_artifacts=True, include_toke
         compact["token_usage"] = item.get("token_usage") or _agent_token_usage_summary(None)
     else:
         compact["token_usage"] = _compact_token_usage(item.get("token_usage"))
+    compact["cache_usage"] = _compact_cache_usage(item.get("cache_usage"))
+    if item.get("delegation_prefix_hash"):
+        compact["delegation_prefix_hash"] = item.get("delegation_prefix_hash")
     return compact
 
 def _sum_token_usage(items):
@@ -254,6 +408,35 @@ def _sum_token_usage(items):
         total["completion_tokens"] += _usage_int(aggregate, "completion_tokens")
         total["total_tokens"] += _usage_int(aggregate, "total_tokens")
         total["available"] = True
+    return total
+
+
+def _sum_cache_usage(items):
+    total = {
+        "request_count": 0,
+        "observed_agents": 0,
+        "local_prompt_tokens": 0,
+        "local_reusable_tokens": 0,
+        "local_new_tokens": 0,
+        "kv_reuse_ratio": None,
+    }
+    for item in items or []:
+        usage = item.get("cache_usage") if isinstance(item, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        prompt = _usage_int(usage, "local_prompt_tokens")
+        requests = _usage_int(usage, "request_count")
+        if prompt <= 0 and requests <= 0:
+            continue
+        total["observed_agents"] += 1
+        total["request_count"] += requests
+        total["local_prompt_tokens"] += prompt
+        total["local_reusable_tokens"] += _usage_int(usage, "local_reusable_tokens")
+        total["local_new_tokens"] += _usage_int(usage, "local_new_tokens")
+    if total["local_prompt_tokens"]:
+        total["kv_reuse_ratio"] = (
+            total["local_reusable_tokens"] / total["local_prompt_tokens"]
+        )
     return total
 
 
@@ -666,24 +849,27 @@ def delegate_task(
 
     # We must import RAgent here to avoid circular dependencies
     from core.agent import RAgent
+    shared_child_prefix = _build_shared_child_prefix(session_id, child_allowed_tools)
 
     def _format_goal(task):
         task_id = _task_id_of(task)
         goal = task.get("goal") or task.get("description") or ""
         worker_id = task.get("worker_id") or (f"subagent-{task_id}" if task_id else "")
         if task_id:
+            dependencies = task.get("dependencies") or []
+            context_summary = task.get("context_summary") or ""
+            acceptance = task.get("acceptance_criteria") or []
+            deliverable = task.get("deliverable") or ""
             return (
-                f"你被分配处理动态 todo list 中的任务。\n"
+                "以下是本次委托的任务专属数据；它位于公共稳定前缀之后。\n"
                 f"task_id: {task_id}\n"
                 f"worker_id: {worker_id}\n"
-                f"补充目标/背景：\n{goal}\n\n"
-                "必须遵循协议：\n"
-                "1. 先调用 todo_manage get 查看该任务及上下文；再调用 todo_manage claim 领取该任务（payload 包含 id、worker_id、max_iterations）。\n"
-                "2. 领取后先判断任务是否足够具体、可在当前 max_iterations 内完成。\n"
-                "3. 如果任务过于笼统、依赖不明、需要并行拆解或验收标准不清晰，不要强行执行；调用 todo_manage propose_split 给出拆分建议。proposal 中每个子任务要包含 description、dependencies、context_summary、acceptance_criteria、deliverable；然后结束并汇报已提出拆分。\n"
-                "4. 如果任务足够具体，则完成任务；完成后调用 todo_manage update 将该任务置为 completed，并写入 result。失败则置为 failed 并说明原因。\n"
-                "5. 如果达到最大思考轮数或被强制收尾，应在最终文本中明确未完成事项；父进程会把仍处于 in_progress 的任务标记为 blocked，等待后续调度。\n"
-                "6. 只处理自己领取的任务；不要擅自批准拆分，approve_split/reject_split 只能由父进程执行。"
+                f"goal: {goal}\n"
+                f"dependencies: {json.dumps(dependencies, ensure_ascii=False)}\n"
+                f"context_summary: {context_summary}\n"
+                f"acceptance_criteria: {json.dumps(acceptance, ensure_ascii=False)}\n"
+                f"deliverable: {deliverable}\n\n"
+                "现在先按公共执行协议读取并领取该 task_id，然后完成或提出拆分建议。"
             )
         return goal
 
@@ -726,6 +912,7 @@ def delegate_task(
                     setattr(sub_agent, "session_id", session_id)
                 except Exception:
                     pass
+        _seed_shared_child_prefix(sub_agent, shared_child_prefix)
         cancel_event = cancel_event or threading.Event()
         run_id = f"delegate-{task_index}-{task_id or 'adhoc'}"
         with subagent_refs_lock:
@@ -733,19 +920,7 @@ def delegate_task(
             subagent_refs[subagent_key] = sub_agent
             subagent_step_events[subagent_key] = step_events
 
-        system_prompt = (
-            "你是一个专注的子智能体，负责完成被委托的具体子任务。\n\n"
-            "你必须保持上下文隔离：只依赖任务描述和你通过工具获得的信息，不假设知道父进程完整对话。\n"
-            "你不是全局调度者；全局调度、拆分审批、子进程数量和依赖调度都由父进程负责。\n\n"
-            f"你的任务目标：\n{goal}\n\n"
-            "执行原则：\n"
-            "- 如果任务足够具体且依赖满足，直接完成它。\n"
-            "- 如果任务过于笼统、上下文不足、需要进一步拆分，必须提出拆分建议，而不是盲目执行。\n"
-            "- 如果子任务比较复杂且困难，可以要求父进程进一步拆解；带 task_id 的任务应通过 todo_manage propose_split 记录建议。\n"
-            "- 若使用 todo_manage propose_split，只提出建议，等待父进程判断。\n"
-            "- 完成后提供清晰摘要，包含：做了什么、成果、问题、下一步建议。\n"
-            "- 如果达到最大思考轮数或无法完成，明确说明未完成原因，并尽可能给出可执行的拆分建议。"
-        )
+        system_prompt = SUBAGENT_SYSTEM_PROMPT
 
         def on_think(iteration, **kwargs):
             payload = {"iteration": iteration}
@@ -789,6 +964,7 @@ def delegate_task(
             "goal": task.get("goal") or task.get("description") or "",
             "max_iterations": max_iters,
             "system_prompt": system_prompt,
+            "delegation_prefix_hash": shared_child_prefix.get("prefix_hash"),
         })
 
         try:
@@ -862,6 +1038,7 @@ def delegate_task(
                     except Exception:
                         pass
             token_usage_summary = _agent_token_usage_summary(sub_agent)
+            cache_usage_summary = _agent_cache_usage_summary(sub_agent)
             # Do not discard successful child context here. It is cleaned in one
             # batch at the end of delegate_task if and only if the whole todo has
             # succeeded. In-memory messages can be cleared after artifacting to
@@ -879,6 +1056,8 @@ def delegate_task(
                 "blocked_update": blocked_update,
                 "context_artifact_path": context_artifact_path,
                 "token_usage": token_usage_summary,
+                "cache_usage": cache_usage_summary,
+                "delegation_prefix_hash": shared_child_prefix.get("prefix_hash"),
                 "started_at": started_at,
                 "completed_at": time.time(),
                 "step_events": list(step_events),
@@ -897,6 +1076,7 @@ def delegate_task(
                 metadata={"blocked_reason": "subagent_exception", "max_iterations": max_iters},
             )
             token_usage_summary = _agent_token_usage_summary(locals().get("sub_agent"))
+            cache_usage_summary = _agent_cache_usage_summary(locals().get("sub_agent"))
             context_artifact_path = _save_subagent_context(task_id, locals().get("sub_agent"), "error", session_id=session_id, run_id=run_id)
             if context_artifact_path:
                 _mark_task_blocked(
@@ -915,6 +1095,8 @@ def delegate_task(
                 "blocked_update": blocked_update,
                 "context_artifact_path": context_artifact_path,
                 "token_usage": token_usage_summary,
+                "cache_usage": cache_usage_summary,
+                "delegation_prefix_hash": shared_child_prefix.get("prefix_hash"),
                 "started_at": started_at,
                 "completed_at": time.time(),
                 "step_events": list(step_events),
@@ -1019,6 +1201,7 @@ def delegate_task(
                     metadata={"blocked_reason": "subagent_wall_timeout", "wall_timeout_seconds": timeout_value, **({"context_artifact_path": context_artifact_path, "context_saved_reason": "timeout"} if context_artifact_path else {})},
                 )
                 timed_token_usage = _agent_token_usage_summary(timed_sub_agent)
+                timed_cache_usage = _agent_cache_usage_summary(timed_sub_agent)
                 item = {
                     "task_index": i,
                     "task_id": task_id,
@@ -1028,6 +1211,8 @@ def delegate_task(
                     "blocked_update": blocked_update,
                     "context_artifact_path": context_artifact_path,
                     "token_usage": timed_token_usage,
+                    "cache_usage": timed_cache_usage,
+                    "delegation_prefix_hash": shared_child_prefix.get("prefix_hash"),
                     "step_events": timed_step_events,
                 }
                 results.append(item)
@@ -1043,6 +1228,7 @@ def delegate_task(
     for _item in results:
         _normalize_result_contract(_item)
     delegated_token_usage = _sum_token_usage(results)
+    delegated_cache_usage = _sum_cache_usage(results)
     whole_todo_completed = _all_tasks_completed(session_id)
     cleaned_context_artifacts = _cleanup_all_completed_contexts(session_id)
     if whole_todo_completed:
@@ -1063,6 +1249,7 @@ def delegate_task(
         payload = {
             "tasks": results,
             "delegated_token_usage": delegated_token_usage,
+            "delegated_cache_usage": delegated_cache_usage,
             "todo_digest": todo_digest,
             "cleaned_context_artifacts": cleaned_context_artifacts,
             "note": "delegate_task only returns task status and todo digest; sub-agent message history is not returned inline. Child contexts are retained as artifacts until the whole todo succeeds, then cleaned together. If a task saved context_artifact_path in todo metadata, the parent may explicitly inspect it."
@@ -1080,6 +1267,7 @@ def delegate_task(
         payload = {
             "tasks": compact_tasks,
             "delegated_token_usage": (delegated_token_usage if include_token_detail else _compact_token_usage(delegated_token_usage)),
+            "delegated_cache_usage": delegated_cache_usage,
             "cleaned_context_artifacts": cleaned_context_artifacts,
         }
         if include_todo_digest:
@@ -1094,7 +1282,8 @@ registry.register(
         "支持为每个子任务设置 max_iterations 与 wall_timeout_seconds，避免子进程无限或过长思考；默认墙钟预算来自 DELEGATE_TASK_WALL_TIMEOUT（当前默认 300 秒）。\n"
         "支持动态 todo list 协议：每个子任务都必须传入 task_id/id；子智能体会先领取任务，判断是否需要拆分；需要拆分则用 todo_manage propose_split 提交拆分建议，不会擅自批准；不需要拆分才执行并更新任务状态。\n"
         "执行期间会自动打印 todo 进度快照：启动前、每个子 Agent 结束后、全部结束后都会展示任务总数、状态统计、正在执行与阻塞任务。\n"
-        "默认 return_mode=compact：返回 tasks 中每项仅含 task_index/task_id/status/truncated/max_iterations、简表 token_usage、可选 context_artifact_path，并可附 todo_digest；不返回 goal/note。return_mode=full 保留旧完整结构。\n"
+        "同一批次的子 Agent 共用静态 System Prompt 与冻结 delegation prefix；具体 goal/context 只放尾部 user message，以提高兄弟任务的 KV 前缀复用。\n"
+        "默认 return_mode=compact：返回 tasks 中每项仅含 task_index/task_id/status/truncated/max_iterations、简表 token/cache usage、delegation_prefix_hash、可选 context_artifact_path，并可附 todo_digest；不返回 goal/note。return_mode=full 保留旧完整结构。\n"
         "子 Agent 上下文不会回灌给父进程；会以 artifact 形式保留到整个 todo 成功完成后再统一清理，失败/超时/未完成时父进程可通过 context_artifact_path 显式读取。\n"
         "如果子 Agent 达到 max_iterations 并强制收尾，且对应 todo 任务仍是 in_progress，会自动标记为 blocked，避免任务长期卡住。\n"
         "父进程应先用 todo_manage 查看 ready 任务，基于拓扑依赖决定并发子进程数量，再调用本工具。\n"

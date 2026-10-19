@@ -54,7 +54,12 @@ def _workspace_for_session(default_workspace: FileWorkspace, session_id: str = "
     return default_workspace
 
 
-def _source_context_with_absolute_path(workspace: FileWorkspace, source_context: Any) -> Optional[Dict[str, Any]]:
+def _source_context_with_absolute_path(
+    workspace: FileWorkspace,
+    source_context: Any,
+    *,
+    selected_text: str = "",
+) -> Optional[Dict[str, Any]]:
     if not isinstance(source_context, dict):
         return None
     context = dict(source_context)
@@ -70,6 +75,43 @@ def _source_context_with_absolute_path(workspace: FileWorkspace, source_context:
         return context
     context.setdefault("workspace_path", workspace._rel(resolved))
     context["absolute_path"] = str(resolved)
+    if kind == "markdown" and str(selected_text or "").strip():
+        try:
+            content = resolved.read_text(encoding="utf-8")
+            line_start = context.get("source_line_start_offset")
+            line_end = context.get("source_line_end_offset")
+            original_lines = context.get("source_line_text")
+            valid_client_range = (
+                isinstance(line_start, int)
+                and isinstance(line_end, int)
+                and isinstance(original_lines, str)
+                and 0 <= line_start <= line_end <= len(content)
+                and content[line_start:line_end] == original_lines
+            )
+            if valid_client_range:
+                resolved_range = LearningRuntimeService._line_span_for_selection(content, line_start, line_end)
+            else:
+                resolved_range = LearningRuntimeService._resolve_original_markdown_range(
+                    content,
+                    selected_text=str(selected_text or "").strip(),
+                    original_lines=original_lines if isinstance(original_lines, str) else "",
+                    text_offset=context.get("source_text_offset"),
+                    occurrence=context.get("occurrence"),
+                    preferred_offset=context.get("source_text_offset"),
+                )
+            if resolved_range is not None:
+                start, end = resolved_range
+                context["source_line_start_offset"] = start
+                context["source_line_end_offset"] = end
+                context["source_line_text"] = content[start:end]
+                context["source_line_start"] = content.count("\n", 0, start) + 1
+                context["source_line_end"] = context["source_line_start"] + content[start:end].count("\n")
+                context["source_anchor_resolved_by_server"] = True
+        except (OSError, UnicodeError, ValueError):
+            # Keep non-modifying selection actions available even if the file
+            # cannot be enriched. Accepting a modification will still perform
+            # the strict source check in the runtime service.
+            pass
     return context
 
 
@@ -321,9 +363,10 @@ def create_app(
     @app.post("/learning/sessions/{session_id}/selection-branch")
     def branch_learning_selection(session_id: str, request: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
         try:
+            selected_text = str(request.get("selected_text") or "")
             return learning.branch_from_selection(
                 session_id,
-                selected_text=str(request.get("selected_text") or ""),
+                selected_text=selected_text,
                 action=str(request.get("action") or "question"),
                 custom_question=str(request.get("custom_question") or ""),
                 target_language=str(request.get("target_language") or ""),
@@ -333,6 +376,7 @@ def create_app(
                 source_context=_source_context_with_absolute_path(
                     _workspace_for_session(workspace, str(request.get("workspace_session_id") or "")),
                     request.get("source_context"),
+                    selected_text=selected_text,
                 ),
                 background=bool(request.get("background", True)),
                 child_session_id=request.get("session_id"),

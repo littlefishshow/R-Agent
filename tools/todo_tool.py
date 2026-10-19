@@ -693,6 +693,31 @@ def todo_manage(action: str, payload: str = "{}", session_id: str = "") -> str:
             return _todo_manage_unlocked(action, payload)
 
 
+def get_unfinished_todos(session_id: str = "") -> List[Dict[str, Any]]:
+    """Return a deterministic compact snapshot for durable-next collection.
+
+    This is an internal read-only bridge; it does not expose child transcripts
+    and does not mutate the todo board.  Completed/cancelled tasks are omitted.
+    """
+    sid = _current_session_id(session_id)
+    with _todo_session(sid):
+        with _todo_file_lock(sid):
+            state = _load_state(sid)
+            items = []
+            for task in state.get("tasks") or []:
+                if not isinstance(task, dict):
+                    continue
+                if task.get("status") in {"completed", "cancelled"}:
+                    continue
+                digest = _task_digest(task, result_summary_chars=240, include_artifacts=True)
+                metadata = task.get("metadata") or {}
+                if metadata.get("blocked_reason"):
+                    digest["blocked_reason"] = metadata.get("blocked_reason")
+                items.append(digest)
+            items.sort(key=lambda item: str(item.get("id") or ""))
+            return items
+
+
 registry.register(
     name="todo_manage",
     description=(

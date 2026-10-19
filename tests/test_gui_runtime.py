@@ -219,6 +219,31 @@ def test_learning_runtime_restores_summary_and_artifact_index(monkeypatch, tmp_p
             "call_id": "call-report",
             "original_chars": 120000,
         })
+        self.state.add_delegation({"task_id": "todo-1", "status": "blocked"})
+        self.state.add_skill_context({"skill": "cache-skill", "summary": "stable prefix"})
+        self.state.active_skill_policy = {"skill": "cache-skill", "allowed_tools": ["tool_search"]}
+        self.state.durable_current = {
+            "version": 2,
+            "epoch": 3,
+            "content": "durable-current-exact-bytes",
+            "components": {"summary_text": "压缩后需要保留的摘要"},
+        }
+        self.state.durable_next = {
+            "version": 2,
+            "base_epoch": 3,
+            "target_epoch": 4,
+            "dynamic_tools": [{"name": "dynamic-demo", "schema_hash": "abc"}],
+        }
+        self.state.cache_usage.update({
+            "local_prompt_tokens": 100,
+            "local_reusable_tokens": 75,
+            "kv_reuse_ratio": 0.75,
+            "cache_hit_ratio": 0.75,
+            "last_local_prompt_tokens": 100,
+            "last_local_reusable_tokens": 75,
+            "last_kv_reuse_ratio": 0.75,
+            "last_cache_hit_ratio": 0.75,
+        })
         return "done"
 
     monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
@@ -240,6 +265,13 @@ def test_learning_runtime_restores_summary_and_artifact_index(monkeypatch, tmp_p
         "call_id": "call-report",
         "original_chars": 120000,
     }]
+    assert restored.agent.state.delegation_ledger[0]["task_id"] == "todo-1"
+    assert restored.agent.state.skill_context[0]["skill"] == "cache-skill"
+    assert restored.agent.state.active_skill_policy["skill"] == "cache-skill"
+    assert restored.agent.state.durable_current["content"] == "durable-current-exact-bytes"
+    assert restored.agent.state.durable_next["dynamic_tools"][0]["name"] == "dynamic-demo"
+    assert restored.agent.state.cache_usage["cache_hit_ratio"] == 0.75
+    assert restored.agent.state.cache_usage["kv_reuse_ratio"] == 0.75
 
 
 def test_learning_runtime_backfills_old_thread_state_from_saved_context(monkeypatch, tmp_path):
@@ -557,6 +589,82 @@ def test_learning_selection_branch_prefers_absolute_file_path_in_prompt(monkeypa
     assert "【来源文件】papers/a.md" in seen[-1]
 
 
+def test_markdown_source_context_resolves_rendered_link_and_typographer_text(tmp_path):
+    workspace = FileWorkspace(tmp_path / "files")
+    source = workspace.root / "papers" / "note.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    original_line = '阅读 *[R-Agent](https://example.com)* 的 "source-first"... &amp; 安全流程。'
+    source.write_text(f"# 标题\n\n{original_line}\n\n结尾\n", encoding="utf-8")
+
+    context = _source_context_with_absolute_path(
+        workspace,
+        {"kind": "markdown", "path": "papers/note.md", "occurrence": 0},
+        selected_text='阅读 R-Agent 的 “source-first”… & 安全流程。',
+    )
+
+    assert context is not None
+    assert context["source_anchor_resolved_by_server"] is True
+    assert context["source_line_start"] == 3
+    assert context["source_line_end"] == 3
+    assert context["source_line_text"] == original_line
+    assert source.read_text(encoding="utf-8")[
+        context["source_line_start_offset"]:context["source_line_end_offset"]
+    ] == original_line
+
+
+def test_markdown_source_context_resolves_rendered_cross_block_selection(tmp_path):
+    workspace = FileWorkspace(tmp_path / "files")
+    source = workspace.root / "papers" / "note.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("第一段。\n\n第二段。\n", encoding="utf-8")
+
+    # The preview DOM can concatenate adjacent block text without a separator.
+    context = _source_context_with_absolute_path(
+        workspace,
+        {"kind": "markdown", "path": "papers/note.md"},
+        selected_text="第一段。第二段。",
+    )
+
+    assert context is not None
+    assert context["source_anchor_resolved_by_server"] is True
+    assert context["source_line_start"] == 1
+    assert context["source_line_end"] == 3
+    assert context["source_line_text"] == "第一段。\n\n第二段。"
+
+
+def test_markdown_source_context_resolves_mixed_display_and_inline_math(tmp_path):
+    workspace = FileWorkspace(tmp_path / "files")
+    source = workspace.root / "papers" / "math.md"
+    source.parent.mkdir(parents=True, exist_ok=True)
+    selected_source = (
+        "父节点选择规则：\n\n"
+        "$$\n"
+        "\\\\mathcal{A}^t = \\\\{a_1^t, a_2^t\\\\}\n"
+        "$$\n\n"
+        "其中 $\\\\alpha_i$ 是性能分数。\n\n"
+        "$$\n"
+        "p_i = \\\\frac{w_i}{\\\\sum_j w_j}\n"
+        "$$"
+    )
+    source.write_text(f"# 标题\n\n{selected_source}\n\n结尾\n", encoding="utf-8")
+    selected_text = (
+        "父节点选择规则：\n"
+        "\\\\mathcal{A}^t = \\\\{a_1^t, a_2^t\\\\}\n"
+        "其中 \\\\alpha_i 是性能分数。\n"
+        "p_i = \\\\frac{w_i}{\\\\sum_j w_j}"
+    )
+
+    context = _source_context_with_absolute_path(
+        workspace,
+        {"kind": "markdown", "path": "papers/math.md", "occurrence": 0},
+        selected_text=selected_text,
+    )
+
+    assert context is not None
+    assert context["source_anchor_resolved_by_server"] is True
+    assert context["source_line_text"] == selected_source
+
+
 def test_learning_translate_branch_uses_only_selected_text(monkeypatch, tmp_path):
     seen = []
 
@@ -707,6 +815,42 @@ def test_learning_markdown_modification_waits_for_accept(monkeypatch, tmp_path):
     assert not (tmp_path / "sessions" / result["session_id"]).exists()
 
 
+def test_learning_markdown_modification_accepts_server_resolved_rendered_selection(monkeypatch, tmp_path):
+    def fake_run(self, user_message, **kwargs):
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "改写后的 source-first 说明。"})
+        return "改写后的 source-first 说明。"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    workspace = FileWorkspace(tmp_path / "files")
+    path = workspace.root / "papers" / "note.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original_line = '阅读 [R-Agent](https://example.com) 的 "source-first"... 流程。'
+    path.write_text(f"开头\n{original_line}\n结尾\n", encoding="utf-8")
+    parent = service.create_session(session_id="modify-rendered-source")
+    selected_text = '阅读 R-Agent 的 “source-first”… 流程。'
+    source_context = _source_context_with_absolute_path(
+        workspace,
+        {"kind": "markdown", "path": "papers/note.md", "occurrence": 0},
+        selected_text=selected_text,
+    )
+
+    branch = service.branch_from_selection(
+        parent.session_id,
+        selected_text=selected_text,
+        action="modify",
+        modification_instruction="写得更直接",
+        source_context=source_context,
+        background=False,
+    )
+    accepted = service.accept_selection_modification(branch["session_id"], workspace=workspace)
+
+    assert accepted["content"] == "开头\n改写后的 source-first 说明。\n结尾\n"
+    assert path.read_text(encoding="utf-8") == accepted["content"]
+
+
 def test_learning_markdown_modification_uses_latest_feedback(monkeypatch, tmp_path):
     responses = iter([
         "第一次修改",
@@ -783,6 +927,42 @@ def test_learning_markdown_modification_rejects_changed_source(monkeypatch, tmp_
         service.accept_selection_modification(branch["session_id"], workspace=workspace)
 
     assert path.read_text(encoding="utf-8") == "用户已经手动改过"
+
+
+def test_learning_markdown_modification_rejects_changed_server_resolved_source(monkeypatch, tmp_path):
+    def fake_run(self, user_message, **kwargs):
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": "新内容"})
+        return "新内容"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "sessions")
+    workspace = FileWorkspace(tmp_path / "files")
+    path = workspace.root / "papers" / "note.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original_line = "查看 [原文](https://example.com)。"
+    path.write_text(original_line, encoding="utf-8")
+    parent = service.create_session(session_id="modify-rendered-conflict")
+    source_context = _source_context_with_absolute_path(
+        workspace,
+        {"kind": "markdown", "path": "papers/note.md"},
+        selected_text="查看 原文。",
+    )
+    branch = service.branch_from_selection(
+        parent.session_id,
+        selected_text="查看 原文。",
+        action="modify",
+        modification_instruction="润色",
+        source_context=source_context,
+        background=False,
+    )
+    path.write_text("用户已经手动改过。", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="has changed and could not be located safely"):
+        service.accept_selection_modification(branch["session_id"], workspace=workspace)
+
+    assert path.read_text(encoding="utf-8") == "用户已经手动改过。"
 
 
 def test_learning_markdown_modification_relocates_stale_line_offsets(monkeypatch, tmp_path):
@@ -1440,6 +1620,77 @@ def test_learning_session_state_reads_session_scoped_todo_board(monkeypatch, tmp
     assert first_board["tasks"][0]["description"] == "first board only"
     assert second_board["tasks"][0]["description"] == "second board only"
     assert first_board["tasks"][0]["description"] != second_board["tasks"][0]["description"]
+
+
+def test_new_turn_hides_finished_todo_until_board_changes(monkeypatch, tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    board = {
+        "exists": True,
+        "revision": "previous-turn",
+        "total": 1,
+        "completed": 1,
+        "tasks": [{"id": "done", "description": "old task", "status": "completed"}],
+    }
+
+    def fake_run(self, user_message, **kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return "done"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr("app_gui.runtime._session_todo_board", lambda _session_id: dict(board))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "learning")
+    session = service.create_session(
+        session_id="finished-todo",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+
+    assert session.state()["todo_board"]["revision"] == "previous-turn"
+    session.send_message("next question", background=True)
+    assert started.wait(timeout=1)
+    assert session.state()["todo_board"] is None
+
+    board["revision"] = "current-turn"
+    board["tasks"] = [{"id": "new", "description": "new task", "status": "in_progress"}]
+    assert session.state()["todo_board"]["revision"] == "current-turn"
+
+    release.set()
+    session._thread.join(timeout=1)
+
+
+def test_new_turn_keeps_unfinished_todo_visible(monkeypatch, tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    board = {
+        "exists": True,
+        "revision": "unfinished",
+        "total": 1,
+        "completed": 0,
+        "tasks": [{"id": "pending", "description": "keep working", "status": "pending"}],
+    }
+
+    def fake_run(self, user_message, **kwargs):
+        started.set()
+        release.wait(timeout=2)
+        return "done"
+
+    monkeypatch.setattr("app_gui.runtime.config.create_llm_client", lambda: _FakeClient([_response(_message("ok"))]))
+    monkeypatch.setattr("app_gui.runtime._session_todo_board", lambda _session_id: dict(board))
+    monkeypatch.setattr(RAgent, "run_conversation", fake_run)
+    service = LearningRuntimeService(store_root=tmp_path / "learning")
+    session = service.create_session(
+        session_id="unfinished-todo",
+        agent=RAgent(model="test", max_iterations=1, enable_self_review=False),
+    )
+
+    session.send_message("continue", background=True)
+    assert started.wait(timeout=1)
+    assert session.state()["todo_board"]["revision"] == "unfinished"
+
+    release.set()
+    session._thread.join(timeout=1)
 
 
 

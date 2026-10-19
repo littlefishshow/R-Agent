@@ -101,6 +101,7 @@ class LLMRequestSnapshot:
     tools: List[Dict[str, Any]] = field(default_factory=list)
     request_id: str = field(default_factory=lambda: new_id("llmreq"))
     iteration: int = 0
+    cache_observation: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -111,6 +112,7 @@ class LLMRequestSnapshot:
             "tools": self.tools,
             "message_count": len(self.messages),
             "tool_schema_count": len(self.tools),
+            "cache_observation": self.cache_observation,
         }
 
 

@@ -170,10 +170,9 @@ MEMORY_WRITE_MIDDLEWARE_ENABLED=1
 MEMORY_SESSION_FACTS_ENABLED=1
 ```
 
-> **Defaults vs. example config.** Without these variables the code still runs
-> with the `file` memory backend, durable context off, deferred tools off, and
-> session sandbox off. Copying `.env.example` opts into the recommended combo
-> above. Full semantics live in
+> **Defaults vs. example config.** Current code defaults to `deermem`, hidden-user
+> durable context, and deferred tools off; the example additionally enables the
+> session sandbox and the recommended runtime profile. Full semantics live in
 > [`docs/03_上下文管理.md`](docs/03_上下文管理.md),
 > [`docs/04_Memory系统.md`](docs/04_Memory系统.md), and
 > [`docs/06_工具系统与沙箱.md`](docs/06_工具系统与沙箱.md).
@@ -348,6 +347,7 @@ Read the capability map above, then dive into a topic:
 | [`07_Skills与自定义Agent.md`](docs/07_Skills与自定义Agent.md) | How skill discovery, activation, and SOUL/Skill/Sub-agent composition work |
 | [`08_运行事件流.md`](docs/08_运行事件流.md) | How RunEvent JSONL and live GUI events split responsibilities and replay |
 | [`09_R-Agent整体流程图.md`](docs/09_R-Agent整体流程图.md) | End-to-end runtime flow diagram |
+| [`11_KV缓存与稳定上下文.md`](docs/11_KV缓存与稳定上下文.md) | Cache-hit observability, durable current/next epochs, and stable dynamic tools |
 | [`10_AutoResearch上下文与长任务能力.md`](docs/10_AutoResearch上下文与长任务能力.md) | AutoResearch context handling and long-task capabilities |
 
 ## Repository Map

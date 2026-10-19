@@ -501,10 +501,10 @@ def get_loop_detection_threshold():
 
 
 def get_deferred_tools_enabled():
-    """是否启用延迟工具暴露（deferred tools）：prompt 先给工具目录，模型用 tool_search 提升。
+    """是否启用稳定前缀的延迟工具：目录检索 + 固定动态调用器。
 
     默认**关闭**：R-Agent 默认工具数不多，全量暴露更省事、零行为变化。工具很多或接入
-    大量 MCP 工具时开启，可显著降低上下文占用。
+    大量 MCP 工具时开启，可显著降低上下文占用，并避免查询后改写顶层 tools=。
     """
     raw = str(os.environ.get("DEFERRED_TOOLS_ENABLED", "0")).strip().lower()
     return raw not in ("0", "false", "no", "off", "")
@@ -515,16 +515,23 @@ def get_deferred_tools_always_on():
 
     默认保留"每轮都可能立刻要用"的日常工具（文件/命令/网页/调度/技能发现/记忆），
     延迟暴露只藏起"体量大且专用"的工具（AutoResearch 套件、语音、skill 管理、artifact
-    切片、self-evolution 等）——它们经 tool_search 按需提升即可。可用环境变量覆盖。
+    切片、self-evolution 等）——它们经 tool_search 发现后由固定 dispatcher 调用。可用环境变量覆盖。
     """
     raw = os.environ.get("DEFERRED_TOOLS_ALWAYS_ON", "").strip()
     if raw:
-        return [t.strip() for t in raw.split(",") if t.strip()]
+        configured = [t.strip() for t in raw.split(",") if t.strip()]
+        # These two schemas are the fixed control plane for deferred tools.  A
+        # custom allowlist must not accidentally hide the only discovery/invoke
+        # path and strand already-discovered contracts.
+        for required in ("tool_search", "invoke_dynamic_tool"):
+            if required not in configured:
+                configured.append(required)
+        return configured
     return [
         # 检索入口（必需，否则无法发现被延迟的工具）
-        "tool_search",
+        "tool_search", "invoke_dynamic_tool",
         # 调度骨架
-        "todo_manage", "delegate_task",
+        "todo_manage", "delegate_task", "archive_subtask",
         # 技能发现（小体量，用于找到并阅读技能）
         "skill_search", "skill_view", "skill_activate",
         # 核心文件 / 命令 / 代码执行

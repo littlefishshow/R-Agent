@@ -89,6 +89,15 @@ class _CompletingAgent:
             "available": True,
         }
 
+    def get_cache_usage(self):
+        return {
+            "request_count": 2,
+            "local_prompt_tokens": 100,
+            "local_reusable_tokens": 60,
+            "local_new_tokens": 40,
+            "kv_reuse_ratio": 0.6,
+        }
+
     def run_conversation(self, **kwargs):
         task_id = kwargs["user_message"].split("task_id: ", 1)[1].split("\n", 1)[0]
         worker_id = kwargs["user_message"].split("worker_id: ", 1)[1].split("\n", 1)[0]
@@ -147,6 +156,15 @@ def test_delegate_task_final_snapshot_reports_completed_progress(monkeypatch, tm
         "total_tokens": 10,
         "available": True,
     }
+    assert payload["delegated_cache_usage"] == {
+        "request_count": 4,
+        "observed_agents": 2,
+        "local_prompt_tokens": 200,
+        "local_reusable_tokens": 120,
+        "local_new_tokens": 80,
+        "kv_reuse_ratio": 0.6,
+    }
+    assert all(task["cache_usage"]["kv_reuse_ratio"] == 0.6 for task in tasks)
     assert payload["todo_digest"]["status_counts"]["completed"] == 2
     state = todo_tool._load_state()
     assert all(task["status"] == "completed" for task in state["tasks"])
